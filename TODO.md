@@ -14,12 +14,12 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
 - [x] Scripts and README updated for the new layout
 
 ## Step 0b: fast test suite (target: under 30 s total)
-- [ ] Test hooks in runq: dump token ids (tokenizer) and raw logits per prompt position
-- [ ] Golden references generated once from HF transformers (fp32), committed (compact)
-- [ ] Tokenizer test: ids match HF on varied strings (ASCII, Unicode, code, whitespace, special tokens)
-- [ ] Logits test: Q8_0 logits vs HF fp32, cosine and top-1 agreement within tolerance
-- [ ] Greedy regression test: fixed prompts, `-t 0`, exact output vs our own golden
-- [ ] `make test` runs all of them
+- [x] Test hooks in runq: dump token ids (tokenizer) and raw logits per prompt position
+- [x] Golden references generated once from HF transformers (fp32), committed (compact)
+- [x] Tokenizer test: ids match HF on varied strings (ASCII, Unicode, code, whitespace, special tokens)
+- [x] Logits test: Q8_0 logits vs HF fp32, cosine and top-1 agreement within tolerance
+- [x] Greedy regression test: fixed prompts, `-t 0`, exact output vs our own golden
+- [x] `make test` runs all of them (~15 s; details and baseline in `tests/README.md`)
 
 ## Step 1: skip the classifier during prefill
 - [ ] Compute logits only for the last prompt token (and during generation)
@@ -37,6 +37,19 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
 - [ ] Threading: fewer barriers per token, parallelize over rows
 - [ ] Keep a portable fallback (non-AVX-512); tests compare both
 - [ ] Measure against the memory-bandwidth limit (~87 GB/s at 8 threads)
+
+## Known bugs
+Found by the Step 0b tests; not fixed yet.
+- [ ] Tokenizer: no pre-tokenizer (Qwen's split regex), BPE merges run over the whole text.
+  A whitespace run before a word is merged whole, while HF splits the last space off onto the
+  word (`"   leading"`, indented code, `"a\t\tc"`). Tests: XFAIL `tokenizer/{leading_spaces,
+  multi_spaces,tabs,code_c,code_python}`. Encoding is also O(n^2 * vocab) (linear `str_lookup`).
+- [ ] SwiGLU `1/(1+expf(-x))` under `-Ofast` (finite-math): `expf` overflow gives NaN. Not seen in
+  the shipped int8 path yet, but a scratch build with float activations got whole NaN logits
+  rows; clamping the exponent fixed it. Risk for the Step 2/3 kernels (the logits test checks
+  for NaN).
+- [ ] Minor: `quantize()` divides by a zero scale on an all-zero group (NaN cast to int8 is UB);
+  `encode()` prints its unknown-character warning to stdout and leaves an uninitialized token.
 
 ## Later / ideas
 - [ ] Chat history: stop resetting to position 0 every turn (keep the KV cache across turns)

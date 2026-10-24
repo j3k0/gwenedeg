@@ -14,7 +14,7 @@ make                                  # -> ./runq  (make debug -> ./runq-debug)
 
 OMP_NUM_THREADS=8 ./runq models/Qwen3-0.6B-q8.bin -c 4096   # interactive chat
 OMP_NUM_THREADS=8 ./runq models/Qwen3-0.6B-q8.bin -c 4096 -t 0 -n 200 -i "Why is the sky blue?"
-make test                             # test suite (Step 0b, not written yet)
+make test                             # regression suite, ~15 s (tests/README.md)
 make bench                            # thread sweep, prefill/decode tok/s (scripts/bench_qwen3c.sh)
 scripts/fetch_mynah.sh                # optional reference engine, then scripts/bench_mynah.sh
 ```
@@ -35,7 +35,8 @@ Revisions are pinned. Each file is verified by sha256 (LFS files) or git blob sh
 ## Layout and third-party code
 
 - `src/runq.c`: our engine, from qwen3.c's `runq.c` (MIT, see `LICENSE`). Changes so far:
-  `-n <int>` max new tokens, plus a `[timing]` line on stderr (prefill and decode tok/s).
+  `-n <int>` max new tokens, plus a `[timing]` line on stderr (prefill and decode tok/s);
+  test hooks `-m tokenize` and `-m logits -o <file>` (see `tests/README.md`).
 - `third_party/qwen3.c/`: pristine https://github.com/adriancable/qwen3.c @ `55643ff`
   (2025-07-05), kept for diffs (`diff -u third_party/qwen3.c/runq.c src/runq.c`). Only its
   `export.py`/`model.py` are used, by `scripts/export_q8.sh`. qwen3.c itself started from

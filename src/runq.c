@@ -952,6 +952,55 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
 }
 
 // ----------------------------------------------------------------------------
+// test hooks (cwayn patch): -m tokenize, -m logits (see tests/)
+
+void tokenize(Tokenizer *tokenizer, char *text) {
+    // encode the raw text (no chat template), print the token ids space-separated
+    int n_tokens = 0;
+    int *tokens = (int *)malloc((strlen(text) + 3) * sizeof(int));
+    encode(tokenizer, text, tokens, &n_tokens);
+    for (int i = 0; i < n_tokens; i++)
+        printf(i ? " %d" : "%d", tokens[i]);
+    printf("\n");
+    free(tokens);
+}
+
+void forward_sequential(Transformer *transformer, int *tokens, int n_tokens, float *out) {
+    // reference prefill: one token at a time at positions 0..n_tokens-1,
+    // row pos of out (n_tokens, vocab_size) = logits after feeding tokens[pos]
+    int vocab_size = transformer->config.vocab_size;
+    for (int pos = 0; pos < n_tokens; pos++) {
+        float *logits = forward(transformer, tokens[pos], pos);
+        memcpy(out + (size_t)pos * vocab_size, logits, vocab_size * sizeof(float));
+    }
+}
+
+void dump_logits(Transformer *transformer, Tokenizer *tokenizer, char *text, char *out_path) {
+    // file format: int32 n_tokens, int32 vocab_size, int32 ids[n_tokens], float32 logits[n_tokens][vocab_size]
+    int n_tokens = 0, vocab_size = transformer->config.vocab_size;
+    int *tokens = (int *)malloc((strlen(text) + 3) * sizeof(int));
+    encode(tokenizer, text, tokens, &n_tokens);
+    if (n_tokens < 1 || n_tokens > transformer->config.seq_len) {
+        fprintf(stderr, "dump_logits: need 1..%d tokens, got %d\n", transformer->config.seq_len, n_tokens);
+        exit(EXIT_FAILURE);
+    }
+
+    float *out = (float *)malloc((size_t)n_tokens * vocab_size * sizeof(float));
+    if (!out) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    forward_sequential(transformer, tokens, n_tokens, out);
+
+    FILE *file = fopen(out_path, "wb");
+    if (!file) { fprintf(stderr, "Couldn't open %s for writing\n", out_path); exit(EXIT_FAILURE); }
+    int32_t header[2] = { n_tokens, vocab_size };
+    int ok = fwrite(header, sizeof(int32_t), 2, file) == 2
+          && fwrite(tokens, sizeof(int32_t), n_tokens, file) == (size_t)n_tokens
+          && fwrite(out, sizeof(float), (size_t)n_tokens * vocab_size, file) == (size_t)n_tokens * vocab_size;
+    if (fclose(file) != 0 || !ok) { fprintf(stderr, "Error writing %s\n", out_path); exit(EXIT_FAILURE); }
+    free(out);
+    free(tokens);
+}
+
+// ----------------------------------------------------------------------------
 // CLI
 
 void error_usage() {
@@ -962,8 +1011,11 @@ void error_usage() {
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1], default 0.9\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
     fprintf(stderr, "  -c <int>    context window size, 0 (default) = max_seq_len\n");
-    fprintf(stderr, "  -m <string> mode: generate|chat, default: chat\n");
+    fprintf(stderr, "  -m <string> mode: generate|chat|tokenize|logits, default: chat\n");
+    fprintf(stderr, "              tokenize: print the token ids of -i (raw text, no template)\n");
+    fprintf(stderr, "              logits: write the logits at every position of -i to -o (binary)\n");
     fprintf(stderr, "  -i <string> input prompt\n");
+    fprintf(stderr, "  -o <string> output file for -m logits\n");
     fprintf(stderr, "  -y <string> system prompt in chat mode, default is none\n");
     fprintf(stderr, "  -r <int>    reasoning mode, 0 (default) = no thinking, 1 = thinking\n");
     fprintf(stderr, "  -n <int>    max new tokens per response, 0 (default) = unlimited\n");
@@ -981,6 +1033,7 @@ int main(int argc, char *argv[]) {
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
     int enable_thinking = 0;    // 1 enables thinking
     int ctx_length = 0;         // context length
+    char *out_path = NULL;      // output file for -m logits
 
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
@@ -999,6 +1052,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
         else if (argv[i][1] == 'r') { enable_thinking = atoi(argv[i + 1]); }
         else if (argv[i][1] == 'n') { max_new_tokens = atoi(argv[i + 1]); }
+        else if (argv[i][1] == 'o') { out_path = argv[i + 1]; }
         else { error_usage(); }
     }
 
@@ -1006,6 +1060,8 @@ int main(int argc, char *argv[]) {
     if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
     if (temperature < 0) temperature = 0;
     if (topp < 0 || 1.0 < topp) topp = 0.9;
+    if ((strcmp(mode, "tokenize") == 0 || strcmp(mode, "logits") == 0) && !prompt) { error_usage(); }
+    if (strcmp(mode, "logits") == 0 && !out_path) { error_usage(); }
 
     // build the Transformer via the model .bin file
     Transformer transformer;
@@ -1027,6 +1083,10 @@ int main(int argc, char *argv[]) {
         generate(&transformer, &tokenizer, &sampler, prompt);
     } else if (strcmp(mode, "chat") == 0) {
         chat(&transformer, &tokenizer, &sampler, prompt, system_prompt);
+    } else if (strcmp(mode, "tokenize") == 0) {
+        tokenize(&tokenizer, prompt);
+    } else if (strcmp(mode, "logits") == 0) {
+        dump_logits(&transformer, &tokenizer, prompt, out_path);
     } else {
         fprintf(stderr, "Unknown mode: %s\n", mode);
         error_usage();

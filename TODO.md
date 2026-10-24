@@ -22,8 +22,11 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
 - [x] `make test` runs all of them (~15 s; details and baseline in `tests/README.md`)
 
 ## Step 1: skip the classifier during prefill
-- [ ] Compute logits only for the last prompt token (and during generation)
-- [ ] Tests pass; measure prefill gain
+- [x] Compute logits only for the last prompt token (and during generation)
+  (`forward(..., compute_logits)`; chat still advances the RNG per skipped prompt token, so
+  seeded `-t > 0` output is unchanged)
+- [x] Tests pass; measure prefill gain: 8 threads, 443-token chat prompt 99.4 -> 117.7 tok/s
+  (+18%, best of 3); bench prompt (short) 91.8 -> 121.2 tok/s; decode unchanged (~105)
 
 ## Step 2: batched prefill
 - [ ] `forward_batch(tokens, n, pos)`: chunked (32 to 128 tokens), activations as matrices

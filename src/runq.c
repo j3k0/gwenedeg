@@ -329,7 +329,9 @@ void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
     }
 }
 
-float *forward(Transformer *transformer, int token, int pos) {
+float *forward(Transformer *transformer, int token, int pos, int compute_logits) {
+    // compute_logits = 0 skips the final rmsnorm + classifier (prompt tokens whose
+    // logits are discarded) and returns NULL; the KV cache is filled either way
     Config *p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
     RunState* s = &transformer->state;
@@ -456,6 +458,9 @@ float *forward(Transformer *transformer, int token, int pos) {
         for (int i = 0; i < p->dim; i++)
             s->x[i] += s->xb[i];
     }
+
+    if (!compute_logits)
+        return NULL;
 
     // final rmsnorm
     rmsnorm(s->x, s->x, w->rms_final_weight, p->dim);
@@ -824,7 +829,8 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 
     while (pos < transformer->config.seq_len) {
         // forward the transformer to get logits for the next token
-        float *logits = forward(transformer, token, pos);
+        // (only needed from the last prompt token on)
+        float *logits = forward(transformer, token, pos, pos >= num_prompt_tokens - 1);
 
         // advance the state state machine
         if (pos < num_prompt_tokens - 1) {
@@ -928,9 +934,14 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
             token = next;
         }
 
-        // forward the transformer to get logits for the next token
-        float *logits = forward(transformer, token, pos++);
-        next = sample(sampler, logits);
+        // forward the transformer to get logits for the next token; `next` is only used
+        // from the last prompt token on, so earlier prompt tokens skip the classifier
+        float *logits = forward(transformer, token, pos, pos >= num_prompt_tokens - 1);
+        pos++;
+        if (logits)
+            next = sample(sampler, logits);
+        else if (sampler->temperature != 0)
+            random_f32(&sampler->rng_state); // sample() used to run here too: keep the seeded RNG sequence
         if (pos == num_prompt_tokens) t_prefill = now_s();
         else if (pos > num_prompt_tokens) n_gen++;
 
@@ -970,7 +981,7 @@ void forward_sequential(Transformer *transformer, int *tokens, int n_tokens, flo
     // row pos of out (n_tokens, vocab_size) = logits after feeding tokens[pos]
     int vocab_size = transformer->config.vocab_size;
     for (int pos = 0; pos < n_tokens; pos++) {
-        float *logits = forward(transformer, tokens[pos], pos);
+        float *logits = forward(transformer, tokens[pos], pos, 1);
         memcpy(out + (size_t)pos * vocab_size, logits, vocab_size * sizeof(float));
     }
 }

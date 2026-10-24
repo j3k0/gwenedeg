@@ -36,6 +36,7 @@ Revisions are pinned. Each file is verified by sha256 (LFS files) or git blob sh
 
 - `src/runq.c`: our engine, from qwen3.c's `runq.c` (MIT, see `LICENSE`). Changes so far:
   `-n <int>` max new tokens, plus a `[timing]` line on stderr (prefill and decode tok/s);
+  no classifier matmul for prompt tokens whose logits are unused;
   test hooks `-m tokenize` and `-m logits -o <file>` (see `tests/README.md`).
 - `third_party/qwen3.c/`: pristine https://github.com/adriancable/qwen3.c @ `55643ff`
   (2025-07-05), kept for diffs (`diff -u third_party/qwen3.c/runq.c src/runq.c`). Only its
@@ -57,6 +58,8 @@ Decode tok/s (prefill similar):
 | 12 | ~95 | 34.8 | 34.5 |
 | 16 | **~11** (collapse) | 30.3 | 30.4 |
 
+- Since TODO Step 1 (no classifier for prompt tokens), prefill is ahead of decode: at 8 threads
+  ~118 tok/s on a 443-token prompt (was ~99), ~121 on the short bench prompt (was ~92).
 - qwen3.c at 16 threads collapses. This is not VM throttling (0% steal time), but OpenMP
   spin-barrier oversubscription: with every vCPU spinning, any other process preempting one
   thread stalls all of them at every barrier (hundreds per token). `OMP_WAIT_POLICY=passive`

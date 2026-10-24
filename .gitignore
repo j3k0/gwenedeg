@@ -1,0 +1,9 @@
+/runq
+/runq-debug
+/models/
+/.venv/
+/logs/
+/third_party/mynah-slm/
+__pycache__/
+*.part
+*.o

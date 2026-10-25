@@ -603,8 +603,12 @@ static void kq512_gemm_item(float *out, int ldo, const uint8_t *kp, int type, in
  * bit-identical results.
  *
  * KV cache layout (per layer): tiles of ATT_T = 16 positions; tile tb of kv head h at
- * ((tb * n_kv_heads + h) * 16 * head_dim) elements; inside, K is transposed (dim i, position j at
- * i * 16 + j), so one zmm holds dim i of 16 positions, and V is row-major (j * head_dim + i).
+ * ((h * kv_len + tb * 16) * head_dim) elements (kv_len = the cache's positions), i.e. each head's
+ * tiles are one contiguous stream; inside, K is transposed (dim i, position j at i * 16 + j), so one
+ * zmm holds dim i of 16 positions, and V is row-major (j * head_dim + i). (Step 7b: the tiles of the 8
+ * heads used to alternate, tile-major; with 4-8 KB tiles every tile was a new page 32-64 KB further
+ * on, and the hardware prefetchers restarted per tile: decode after 3,000 tokens, 8 threads, 16-bit
+ * cache ~100 -> ~130 tok/s, prefill +3-5% with the contiguous streams)
  * bf16 cache (-k bf16, Step 7b): the same tiles with 2-byte elements, stored as fp32 -> bf16 with
  * round-to-nearest-even (f32_bf16 in runq.c), and inside a tile the dims paired so that one 64-byte
  * load gives two zmm of fp32 by a shift / a mask (bf16 -> fp32 is exact: the bits << 16):
@@ -708,17 +712,20 @@ void att512_qk(const int NV, const int NT, const int KT, const float *qt, const 
         for (int r = 0; r < NV; r++)
             for (int u = 0; u < NT; u++)
                 acc[r][u] = _mm512_setzero_ps();
-        if (KT == 1) {
+        if (KT == 1) { // (the pair loaded per dim, as the fp32 loop: converting both halves at once spilled)
             const uint16_t *kb = (const uint16_t *)kt;
-            for (int i = i0; i < i0 + ATT_DC; i += 2)
+            for (int i = i0; i < i0 + ATT_DC; i++) {
+                __m512 k[4];
                 for (int u = 0; u < NT; u++) {
-                    __m512i v = _mm512_loadu_si512((const void *)(kb + u * ts + (size_t)i * ATT_T));
-                    __m512 k0 = att512_bf_lo(v), k1 = att512_bf_hi(v);
-                    for (int r = 0; r < NV; r++)
-                        acc[r][u] = _mm512_fmadd_ps(k0, _mm512_set1_ps(qt[i * NV + r]), acc[r][u]);
-                    for (int r = 0; r < NV; r++)
-                        acc[r][u] = _mm512_fmadd_ps(k1, _mm512_set1_ps(qt[(i + 1) * NV + r]), acc[r][u]);
+                    __m512i v = _mm512_loadu_si512((const void *)(kb + u * ts + (size_t)(i & ~1) * ATT_T));
+                    k[u] = i & 1 ? att512_bf_hi(v) : att512_bf_lo(v);
                 }
+                for (int r = 0; r < NV; r++) {
+                    __m512 qb = _mm512_set1_ps(qt[i * NV + r]);
+                    for (int u = 0; u < NT; u++)
+                        acc[r][u] = _mm512_fmadd_ps(k[u], qb, acc[r][u]);
+                }
+            }
         } else {
             for (int i = i0; i < i0 + ATT_DC; i++) {
                 __m512 k[4];

@@ -24,6 +24,21 @@
 #ifndef RUNQ_KERNELS_AVX512_H
 #define RUNQ_KERNELS_AVX512_H
 
+// Attention constants, shared by the AVX-512 attention below and the generic C one in runq.c
+// (attention_vec): the same constants and operations give the same results
+#define ATT_T 16                       // positions per K/V cache tile
+#define ATT_DC 32                      // dims per fma chain of a score (head_dim % ATT_DC == 0)
+#define ATT_EXP_MIN (-86.0f)           // exp argument clamp (2^n stays a normal float)
+#define ATT_LOG2E 1.44269504088896341f
+#define ATT_LN2_HI 0.693359375f        // Cephes expf: ln 2 = HI + LO, polynomial P0..P5
+#define ATT_LN2_LO (-2.12194440e-4f)
+#define ATT_P0 1.9875691500e-4f
+#define ATT_P1 1.3981999507e-3f
+#define ATT_P2 8.3334519073e-3f
+#define ATT_P3 4.1665795894e-2f
+#define ATT_P4 1.6666665459e-1f
+#define ATT_P5 5.0000001201e-1f
+
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && !defined(RUNQ_GENERIC)
 #define RUNQ_VNNI 1
 #include <immintrin.h>
@@ -230,4 +245,220 @@ static void q8p_gemv(float *out, const int8_t *xq, const float *xs, const uint8_
 }
 
 #endif // AVX-512 VNNI
+
+/* ---------------------------------------------------------------------------------------------
+ * fp32 attention (AVX-512F), for decode (forward) and prefill (forward_batch) alike, through
+ * attention_kv() in runq.c; RUNQ_GENERIC or a CPU without AVX-512F uses the generic C version
+ * there (attention_vec), which computes the same operations in the same order, so all give
+ * bit-identical results.
+ *
+ * KV cache layout (per layer): tiles of ATT_T = 16 positions; tile tb of kv head h at
+ * ((tb * n_kv_heads + h) * 16 * head_dim) floats; inside, K is transposed (dim i, position j at
+ * i * 16 + j), so one zmm holds dim i of 16 positions, and V is row-major (j * head_dim + i).
+ *
+ * Arithmetic, per query vector q (n positions), the definition of the attention:
+ *   s[t] = (sum over chunks c of ATT_DC = 32 dims, in order, of (fma chain over the dims i of c
+ *          of q[i] * k[t][i], from 0)) * scale. (One 128-long chain: ~10% larger deviation of
+ *          the logits from a double-precision attention; chunks of 32: as close as the old
+ *          vectorized dot product with 16 partial sums)
+ *   m = max of s[0..n); e[t] = exp_att(s[t] - m) (exp_att: Cephes-style expf, see att512_exp)
+ *   sum: 16 partial sums (lane j: e[t] for t = j mod 16, t in order), then a fixed tree
+ *        (lanes j + 8, then + 4, + 2, + 1); inv = 1 / sum (one division)
+ *   out[i] = (fma chain over t = 0..n-1 of e[t] * v[t][i], from 0) * inv
+ * Every operation is rounded (explicit-rounding intrinsics, opaque to -Ofast's contraction and
+ * reassociation; the C version is compiled with fp-contract=off, no-associative-math). The
+ * results of a query vector do not depend on the other vectors processed with it, so decode
+ * (2 vectors: the query heads of one kv head) and prefill (2 x ATT_ROWS vectors) agree.
+ *
+ * Kernel: groups of up to ATT512_NV = 12 query vectors of one kv head. Scores: register tile of
+ * NV vectors x NT tiles (NV * NT <= 24 accumulators), the K tile loaded once per dim for all NV
+ * vectors (q broadcast; no horizontal sums); scores stored per tile as [NV][16]. Softmax per
+ * vector. V: register tile NV vectors x DW zmm of dims, the score of each vector broadcast per
+ * position, V streamed once per group; a vector's positions beyond its own n (causal rows of a
+ * block) are skipped, so the fma chain is exactly that of the decode path.
+ */
+#if defined(__AVX512F__) && !defined(RUNQ_GENERIC)
+#define RUNQ_ATT512 1
+#include <immintrin.h>
+#include <float.h>
+
+#define ATT512_NV 12    // max query vectors per group
+#define ATT512_HDMAX 256
+#define ATT512_RND (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)
+
+static inline __m512 att512_exp(__m512 x) {
+    // exp(x) for x <= 0 (clamped at ATT_EXP_MIN): x = n ln2 + r, |r| <= ln2 / 2, Cephes polynomial
+    // exp(r) = 1 + r + r^2 P(r), times 2^n by an exponent add. Max rel. error ~2 ulp
+    x = _mm512_max_ps(x, _mm512_set1_ps(ATT_EXP_MIN));
+    __m512 n = _mm512_roundscale_ps(_mm512_mul_round_ps(x, _mm512_set1_ps(ATT_LOG2E), ATT512_RND), ATT512_RND);
+    __m512 r = _mm512_fmadd_ps(n, _mm512_set1_ps(-ATT_LN2_HI), x);
+    r = _mm512_fmadd_ps(n, _mm512_set1_ps(-ATT_LN2_LO), r);
+    __m512 z = _mm512_mul_round_ps(r, r, ATT512_RND);
+    __m512 y = _mm512_set1_ps(ATT_P0);
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(ATT_P1));
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(ATT_P2));
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(ATT_P3));
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(ATT_P4));
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(ATT_P5));
+    y = _mm512_fmadd_ps(y, z, r);
+    y = _mm512_add_round_ps(y, _mm512_set1_ps(1.0f), ATT512_RND);
+    __m512i e = _mm512_slli_epi32(_mm512_cvt_roundps_epi32(n, ATT512_RND), 23);
+    return _mm512_castsi512_ps(_mm512_add_epi32(_mm512_castps_si512(y), e));
+}
+
+static inline float att512_sum16(__m512 v) {
+    // fixed reduction tree: lane j += lane j + 8, then j + 4, j + 2, j + 1 (as attention_vec)
+    v = _mm512_add_round_ps(v, _mm512_shuffle_f32x4(v, v, 0x4e), ATT512_RND);
+    v = _mm512_add_round_ps(v, _mm512_shuffle_f32x4(v, v, 0xb1), ATT512_RND);
+    v = _mm512_add_round_ps(v, _mm512_permute_ps(v, 0x4e), ATT512_RND);
+    v = _mm512_add_round_ps(v, _mm512_permute_ps(v, 0xb1), ATT512_RND);
+    return _mm512_cvtss_f32(v);
+}
+
+static inline __attribute__((always_inline))
+void att512_qk(const int NV, const int NT, const float *qt, const float *kt, size_t ts, int hd, __m512 scale, float *s) {
+    // scores of NV query vectors (transposed: qt[i * NV + r]) for NT tiles (tile u at kt + u * ts)
+    // -> s[(u * NV + r) * 16 + j]: per ATT_DC dims an fma chain, the chunks added in order (the
+    // running sum kept in s), times scale
+    for (int i0 = 0; i0 < hd; i0 += ATT_DC) {
+        __m512 acc[ATT512_NV][4];
+        for (int r = 0; r < NV; r++)
+            for (int u = 0; u < NT; u++)
+                acc[r][u] = _mm512_setzero_ps();
+        for (int i = i0; i < i0 + ATT_DC; i++) {
+            __m512 k[4];
+            for (int u = 0; u < NT; u++)
+                k[u] = _mm512_loadu_ps(kt + u * ts + (size_t)i * ATT_T);
+            for (int r = 0; r < NV; r++) {
+                __m512 qb = _mm512_set1_ps(qt[i * NV + r]);
+                for (int u = 0; u < NT; u++)
+                    acc[r][u] = _mm512_fmadd_ps(k[u], qb, acc[r][u]);
+            }
+        }
+        for (int u = 0; u < NT; u++)
+            for (int r = 0; r < NV; r++) {
+                float *o = s + (u * NV + r) * ATT_T;
+                __m512 a = acc[r][u];
+                if (i0 > 0)
+                    a = _mm512_add_round_ps(_mm512_loadu_ps(o), a, ATT512_RND);
+                if (i0 + ATT_DC == hd)
+                    a = _mm512_mul_round_ps(a, scale, ATT512_RND);
+                _mm512_storeu_ps(o, a);
+            }
+    }
+}
+
+#define ATT512_PV_STEP(COND) do { \
+        const float *p_ = s + (size_t)(t >> 4) * NV * ATT_T + (t & 15); \
+        const float *v_ = vt + (size_t)(t >> 4) * ts + (size_t)(t & 15) * hd + d0; \
+        __m512 vv[8]; \
+        for (int u = 0; u < DW; u++) \
+            vv[u] = _mm512_loadu_ps(v_ + u * 16); \
+        for (int r = 0; r < NV; r++) \
+            if (COND) { \
+                __m512 pb = _mm512_set1_ps(p_[r * ATT_T]); \
+                for (int u = 0; u < DW; u++) \
+                    acc[r][u] = _mm512_fmadd_ps(vv[u], pb, acc[r][u]); \
+            } \
+    } while (0)
+
+static inline __attribute__((always_inline))
+void att512_pv(const int NV, const int DW, const float *s, int nmin, int nmax, const int *np, const float *vt,
+               size_t ts, int hd, const float *inv, float *const *out) {
+    // out[r][i] = (sum over t < np[r] of e[r][t] * v[t][i]) * inv[r], e in s as [tile][NV][16];
+    // DW zmm (16 * DW dims) per pass
+    for (int d0 = 0; d0 < hd; d0 += DW * 16) {
+        __m512 acc[ATT512_NV][8];
+        for (int r = 0; r < NV; r++)
+            for (int u = 0; u < DW; u++)
+                acc[r][u] = _mm512_setzero_ps();
+        int t = 0;
+        for (; t < nmin; t++)
+            ATT512_PV_STEP(1);
+        for (; t < nmax; t++) // causal tail: only the vectors that see position t
+            ATT512_PV_STEP(t < np[r]);
+        for (int r = 0; r < NV; r++) {
+            __m512 iv = _mm512_set1_ps(inv[r]);
+            for (int u = 0; u < DW; u++)
+                _mm512_storeu_ps(out[r] + d0 + u * 16, _mm512_mul_round_ps(acc[r][u], iv, ATT512_RND));
+        }
+    }
+}
+#undef ATT512_PV_STEP
+
+static void att512_group(int nv, const float *const *q, float *const *out, const int *np, const float *kt,
+                         const float *vt, size_t ts, int hd, float scale, float *s) {
+    // nv <= ATT512_NV query vectors of one kv head; s: scratch of nv * (max np rounded to 16) floats
+    int nmin = np[0], nmax = np[0];
+    for (int r = 1; r < nv; r++) {
+        nmin = np[r] < nmin ? np[r] : nmin;
+        nmax = np[r] > nmax ? np[r] : nmax;
+    }
+    int ntl = (nmax + ATT_T - 1) / ATT_T;
+    float qt[ATT512_HDMAX * ATT512_NV] __attribute__((aligned(64)));
+    for (int i = 0; i < hd; i++)
+        for (int r = 0; r < nv; r++)
+            qt[i * nv + r] = q[r][i];
+    __m512 sc = _mm512_set1_ps(scale);
+
+    // scores
+    #define ATT512_QK(V, T) case (V) * 8 + (T): att512_qk(V, T, qt, kt + (size_t)tb * ts, ts, hd, sc, s + (size_t)tb * nv * ATT_T); break;
+    #define ATT512_QK_ANY(nt) switch (nv * 8 + (nt)) { \
+        ATT512_QK(1, 1) ATT512_QK(2, 1) ATT512_QK(3, 1) ATT512_QK(4, 1) ATT512_QK(5, 1) ATT512_QK(6, 1) \
+        ATT512_QK(7, 1) ATT512_QK(8, 1) ATT512_QK(9, 1) ATT512_QK(10, 1) ATT512_QK(11, 1) ATT512_QK(12, 1) \
+        ATT512_QK(1, 4) ATT512_QK(2, 4) ATT512_QK(3, 4) ATT512_QK(4, 4) ATT512_QK(5, 4) ATT512_QK(6, 4) \
+        ATT512_QK(7, 2) ATT512_QK(8, 2) ATT512_QK(9, 2) ATT512_QK(10, 2) ATT512_QK(11, 2) ATT512_QK(12, 2) \
+        default: break; }
+    int ntw = nv <= 6 ? 4 : 2, tb = 0;
+    for (; tb + ntw <= ntl; tb += ntw)
+        ATT512_QK_ANY(ntw)
+    for (; tb < ntl; tb++)
+        ATT512_QK_ANY(1)
+    #undef ATT512_QK_ANY
+    #undef ATT512_QK
+
+    // softmax per vector (scores of vector r, tile tb at s + (tb * nv + r) * 16)
+    float inv[ATT512_NV];
+    for (int r = 0; r < nv; r++) {
+        int n = np[r], nt = (n + ATT_T - 1) / ATT_T;
+        float *sr = s + r * ATT_T;
+        size_t st = (size_t)nv * ATT_T;
+        __mmask16 last = (__mmask16)(0xffffu >> (nt * ATT_T - n));
+        __m512 mx = _mm512_set1_ps(-FLT_MAX);
+        for (int tb = 0; tb < nt - 1; tb++)
+            mx = _mm512_max_ps(mx, _mm512_loadu_ps(sr + tb * st));
+        mx = _mm512_mask_max_ps(mx, last, mx, _mm512_loadu_ps(sr + (nt - 1) * st));
+        __m512 m = _mm512_set1_ps(_mm512_reduce_max_ps(mx)), sum = _mm512_setzero_ps();
+        for (int tb = 0; tb < nt; tb++) {
+            __m512 e = att512_exp(_mm512_sub_round_ps(_mm512_loadu_ps(sr + tb * st), m, ATT512_RND));
+            if (tb == nt - 1)
+                e = _mm512_maskz_mov_ps(last, e);
+            _mm512_storeu_ps(sr + tb * st, e);
+            sum = _mm512_add_round_ps(sum, e, ATT512_RND);
+        }
+        inv[r] = _mm_cvtss_f32(_mm_div_round_ss(_mm_set_ss(1.0f), _mm_set_ss(att512_sum16(sum)), ATT512_RND));
+    }
+
+    // weighted sum of V
+    #define ATT512_PV(V, D) case V: att512_pv(V, D, s, nmin, nmax, np, vt, ts, hd, inv, out); break;
+    switch (nv) {
+        ATT512_PV(1, 8) ATT512_PV(2, 8) ATT512_PV(3, 4) ATT512_PV(4, 4) ATT512_PV(5, 4) ATT512_PV(6, 4)
+        ATT512_PV(7, 2) ATT512_PV(8, 2) ATT512_PV(9, 2) ATT512_PV(10, 2) ATT512_PV(11, 2) ATT512_PV(12, 2)
+        default: break;
+    }
+    #undef ATT512_PV
+}
+
+static inline int att512_ok(int hd) { return hd % 128 == 0 && hd <= ATT512_HDMAX; }
+
+static void att512_kv(int nv, const float *const *q, float *const *out, const int *np, const float *kt,
+                      const float *vt, size_t ts, int hd, float scale, float *s) {
+    // nv query vectors of one kv head (any nv), in groups of ATT512_NV; s: ATT512_NV * kv_len floats
+    for (int g = 0; g < nv; g += ATT512_NV) {
+        int gn = nv - g < ATT512_NV ? nv - g : ATT512_NV;
+        att512_group(gn, q + g, out + g, np + g, kt, vt, ts, hd, scale, s);
+    }
+}
+
+#endif // AVX-512F attention
 #endif // RUNQ_KERNELS_AVX512_H

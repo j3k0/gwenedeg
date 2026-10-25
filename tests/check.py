@@ -7,9 +7,9 @@ Tests (see tests/README.md):
   logits     runq -m logits vs HF fp32 logits         (tests/golden/logits/*.npz)
              sequential path (-b 1) and batched prefill (-b 64), same thresholds
   batched    batched logits (-b 7, -b 64) vs sequential (-b 1): near-exact (bit-identical now)
-  threads    logits bit-identical for 1 vs N OpenMP threads (sequential and batched)
-  kernels    logits bit-identical for the AVX-512 VNNI kernels (runq) and the generic C ones
-             (runq-generic, -DRUNQ_GENERIC): GEMV (-b 1) and GEMM (-b 7, -b 64) paths
+  threads    logits bit-identical for 1 vs N OpenMP threads (sequential and batched), 3 vs N (long)
+  kernels    logits bit-identical for the AVX-512 kernels (runq: VNNI GEMM/GEMV, attention) and the
+             generic C ones (runq-generic, -DRUNQ_GENERIC): GEMV (-b 1) and GEMM (-b 7, -b 64) paths
   greedy     runq -t 0 output vs our own golden text  (tests/golden/greedy/*.txt), with the
              default batched prefill (and -b 5 once); seeded -t 0.8 chat equal for -b 1 and 5
 
@@ -65,6 +65,7 @@ BATCH_CHUNKS = [7, 64]   # 7: several chunks with boundaries mid-prompt; 64: the
 BATCH_MAX_ABS = 1e-3     # logits are O(10)
 BATCH_COS_MIN = 0.99999  # per row, full vocab
 BATCH_LONG = "all"       # extra prompt: all logits prompts concatenated (86 tokens, 2 chunks at -b 64)
+BATCH_LONG2 = "long"     # "all" twice + en: 187 tokens, 12 KV cache tiles, 3 chunks at -b 64
 SEQ, BATCH = 1, 64       # -b of the sequential path and of the default batched path
 
 CTX = "4096"
@@ -87,7 +88,9 @@ THREADS_PROMPT = "en"
 # VNNI vs generic kernels: (prompt, -b). -b 1 on en: GEMV (decode path, incl. the classifier);
 # -b 7 on en (15 tokens): GEMM tiles of 6 + 1 rows, last chunk 1 row; -b 64 on all (86 tokens,
 # chunks 64 + 22): tiles of 6 + 4 rows, LOGITS_ALL classifier GEMM
-KERNEL_CASES = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH)]
+# long on -b 64: attention over 12 KV tiles, causal row blocks in later chunks (generic: C attention)
+KERNEL_CASES = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH), (BATCH_LONG2, BATCH)]
+THREADS_LONG = 3         # long -b 64: OMP_NUM_THREADS=3 vs the default (other work partitions)
 
 
 class Results:
@@ -278,14 +281,15 @@ def test_logits(a, res, tmp, chunk=SEQ, prefix="logits"):
 
 def batched_prompts():
     texts = [(name, str(np.load(path)["text"])) for name, path in golden_prompts()]
-    return texts + [(BATCH_LONG, " ".join(t for _, t in texts))]
+    all_text = " ".join(t for _, t in texts)
+    return texts + [(BATCH_LONG, all_text), (BATCH_LONG2, all_text + " " + all_text + " " + texts[0][1])]
 
 
 def test_batched(a, res, tmp):
     n_same = n_all = 0
     for name, text in batched_prompts():
         ids_s, seq = read_logits(logits_file(a, tmp, name, text, SEQ))
-        for chunk in (BATCH_CHUNKS if name != BATCH_LONG else [BATCH]):  # long: 2 chunks at -b 64
+        for chunk in (BATCH_CHUNKS if name not in (BATCH_LONG, BATCH_LONG2) else [BATCH]):  # 2 / 3 chunks
             n_all += 1
             tname = f"batched/{name}_b{chunk}"
             ids_b, bat = read_logits(logits_file(a, tmp, name, text, chunk))
@@ -298,10 +302,12 @@ def test_batched(a, res, tmp):
                 continue
             same = np.array_equal(bat.view(np.uint32), seq.view(np.uint32))
             n_same += same
-            x, y = seq.astype(np.float64), bat.astype(np.float64)
-            d = np.abs(x - y).max(axis=1)
-            cos = (x * y).sum(1) / (np.linalg.norm(x, axis=1) * np.linalg.norm(y, axis=1))
-            ok = bool(d.max() <= BATCH_MAX_ABS and cos.min() >= BATCH_COS_MIN)
+            ok = True
+            if not same:  # (the float64 metrics take ~0.5 s on the long prompt: only if needed)
+                x, y = seq.astype(np.float64), bat.astype(np.float64)
+                d = np.abs(x - y).max(axis=1)
+                cos = (x * y).sum(1) / (np.linalg.norm(x, axis=1) * np.linalg.norm(y, axis=1))
+                ok = bool(d.max() <= BATCH_MAX_ABS and cos.min() >= BATCH_COS_MIN)
             n_chunks = -(-len(ids_s) // chunk)
             detail = f"n={len(ids_s)}, {n_chunks} chunk(s): " + ("bit-identical" if same else
                      f"max |diff| {d.max():.3g} (pos {int(d.argmax())}), min cos {cos.min():.7f}")
@@ -326,6 +332,15 @@ def test_threads(a, res, tmp):
             xa, xb = read_logits(pa)[1], read_logits(pb)[1]
             detail += f" (max abs diff {np.abs(xa - xb).max():.3g})"
         res.report(same, tname, detail)
+    # long prompt, batched: attention work items (dynamic schedule) over other thread counts
+    text = dict(batched_prompts())[BATCH_LONG2]
+    n_c = THREADS_LONG if n_a != THREADS_LONG else 8
+    pa = logits_file(a, tmp, BATCH_LONG2, text, BATCH, threads=n_a)
+    pb = logits_file(a, tmp, BATCH_LONG2, text, BATCH, threads=n_c)
+    with open(pa, "rb") as fa, open(pb, "rb") as fb:
+        same = fa.read() == fb.read()
+    res.report(same, f"threads/bitwise_{BATCH_LONG2}_b{BATCH}",
+               f"{BATCH_LONG2} -b {BATCH}: OMP_NUM_THREADS={n_a} vs {n_c} " + ("bit-identical" if same else "DIFFER"))
 
 
 # ----------------------------------------------------------------------------- kernels

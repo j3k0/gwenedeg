@@ -108,24 +108,31 @@ typedef struct {
     QuantizedTensor xq; // quantized x (dim,)
     QuantizedTensor hq; // quantized hb (hidden_dim,)
     float *q; // query (dim,)
-    float *k; // key (dim,)
-    float *v; // value (dim,)
-    float *att; // buffer for scores/attention values (n_heads, seq_len)
+    float *k; // key (kv_dim,), copied into the cache tiles after QK-norm + RoPE
+    float *v; // value (kv_dim,), the same
+    float *att; // buffer for scores/attention values (n_heads, kv_len)
     float *logits; // output logits
-    // kv cache
-    float *key_cache;   // (layer, seq_len, dim)
-    float *value_cache; // (layer, seq_len, dim)
+    // kv cache: per layer kv_len / ATT_T tiles of ATT_T positions x n_kv_heads, layout in
+    // kernels_avx512.h (attention); kv_len = seq_len rounded up to a multiple of ATT_T
+    float *key_cache;   // (layer, kv_len, kv_dim)
+    float *value_cache; // (layer, kv_len, kv_dim)
+    int kv_len;
+    size_t kv_size;     // floats per cache
+    float att_scale;    // 1 / sqrt(head_dim)
     // batched prefill buffers (forward_batch), nb_max rows each; not allocated if nb_max <= 1
     int nb_max;
     int xs;         // row stride of xb_b / xq_b: max(dim, all_heads_dim), a multiple of GS
     float *x_b;     // (nb_max, dim) residual stream
     float *xb_b;    // (nb_max, xs)
-    float *q_b;     // (nb_max, all_heads_dim); k and v go straight into the kv cache
+    float *q_b;     // (nb_max, all_heads_dim)
+    float *k_b;     // (nb_max, kv_dim), copied into the cache tiles after QK-norm + RoPE
+    float *v_b;     // (nb_max, kv_dim), the same
     float *hb_b;    // (nb_max, hidden_dim)
     float *hb2_b;   // (nb_max, hidden_dim)
     QuantizedTensor xq_b; // (nb_max, xs)
     QuantizedTensor hq_b; // (nb_max, hidden_dim)
-    float *att_b;   // (att_threads, seq_len): one attention score buffer per OpenMP thread
+    float *att_b;   // (att_threads, att_rows * kv_mul * kv_len): attention scratch per OpenMP thread
+    int att_rows;   // query rows per prefill attention work item
     int att_threads;
     float *rope_b;  // (nb_max, head_dim): RoPE cos / sin of each row's position (rope_row)
     float *rope;    // (head_dim,): the same for forward()'s position
@@ -139,12 +146,51 @@ typedef struct {
     ssize_t file_size; // size of the checkpoint file in bytes
 } Transformer;
 
+#if defined _WIN32
+    #include <malloc.h> // _aligned_malloc
+#endif
+static void *alloc_big(size_t n) {
+    // large zeroed 64-byte aligned buffer (repacked weights, KV cache): page-aligned anonymous
+    // memory on Linux, touched lazily. No MADV_HUGEPAGE: no measurable decode gain here, and with
+    // THP defrag=madvise the faults can stall on compaction (seen for the KV cache: 2-3x slower
+    // prefill)
+#if defined _WIN32
+    void *p = _aligned_malloc(n, 64);
+    if (p) memset(p, 0, n);
+    return p;
+#else
+    void *p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+#endif
+}
+
+static void free_big(void *p, size_t n) {
+#if defined _WIN32
+    (void)n;
+    _aligned_free(p);
+#else
+    if (p) munmap(p, n);
+#endif
+}
+
+#ifndef ATT_ROWS
+#define ATT_ROWS 6 // query rows per prefill attention work item (x kv_mul query heads)
+#endif
+#define ATT_NV_MAX 64 // max query vectors per attention_kv call
+
 void malloc_run_state(RunState* s, Config *p, int nb_max) {
     // we calloc instead of malloc to keep valgrind happy
     int all_heads_dim = p->n_heads * p->head_dim;
     int kv_dim = p->n_kv_heads * p->head_dim;
 
+    int kv_mul = p->n_heads / p->n_kv_heads;
+
     memset(s, 0, sizeof(*s));
+    s->kv_len = (p->seq_len + ATT_T - 1) / ATT_T * ATT_T;
+    s->kv_size = (size_t)p->n_layers * s->kv_len * kv_dim;
+    s->att_scale = 1.0f / sqrtf(p->head_dim);
+    s->att_rows = ATT_NV_MAX / kv_mul < ATT_ROWS ? ATT_NV_MAX / kv_mul : ATT_ROWS;
+    if (kv_mul < 1 || s->att_rows < 1) { fprintf(stderr, "unsupported head counts %d / %d\n", p->n_heads, p->n_kv_heads); exit(EXIT_FAILURE); }
     s->nb_max = nb_max > B_MAX ? B_MAX : nb_max;
     if (s->nb_max > 1) {
         size_t nb = s->nb_max;
@@ -152,6 +198,8 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
         s->x_b = calloc(nb * p->dim, sizeof(float));
         s->xb_b = calloc(nb * s->xs, sizeof(float));
         s->q_b = calloc(nb * all_heads_dim, sizeof(float));
+        s->k_b = calloc(nb * kv_dim, sizeof(float));
+        s->v_b = calloc(nb * kv_dim, sizeof(float));
         s->hb_b = calloc(nb * p->hidden_dim, sizeof(float));
         s->hb2_b = calloc(nb * p->hidden_dim, sizeof(float));
         s->xq_b = (QuantizedTensor) { .q = calloc(nb * s->xs, sizeof(int8_t)), .s = calloc(nb * s->xs / GS, sizeof(float)) };
@@ -161,9 +209,9 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
 #else
         s->att_threads = 1;
 #endif
-        s->att_b = calloc((size_t)s->att_threads * p->seq_len, sizeof(float));
+        s->att_b = calloc((size_t)s->att_threads * s->att_rows * kv_mul * s->kv_len, sizeof(float));
         s->rope_b = calloc(nb * p->head_dim, sizeof(float));
-        if (!s->rope_b || !s->x_b || !s->xb_b || !s->q_b || !s->hb_b || !s->hb2_b || !s->xq_b.q || !s->xq_b.s ||
+        if (!s->rope_b || !s->k_b || !s->v_b || !s->x_b || !s->xb_b || !s->q_b || !s->hb_b || !s->hb2_b || !s->xq_b.q || !s->xq_b.s ||
             !s->hq_b.q || !s->hq_b.s || !s->att_b) {
             fprintf(stderr, "malloc failed!\n");
             exit(EXIT_FAILURE);
@@ -177,14 +225,16 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
     s->xq = (QuantizedTensor) { .q = calloc(all_heads_dim, sizeof(int8_t)), .s = calloc(all_heads_dim / GS, sizeof(float)) };
     s->hq = (QuantizedTensor) { .q = calloc(p->hidden_dim, sizeof(int8_t)), .s = calloc(p->hidden_dim / GS, sizeof(float)) };
     s->q = calloc(all_heads_dim, sizeof(float));
-    s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
+    s->k = calloc(kv_dim, sizeof(float));
+    s->v = calloc(kv_dim, sizeof(float));
+    s->att = calloc((size_t)p->n_heads * s->kv_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
     s->rope = calloc(p->head_dim, sizeof(float));
-    s->key_cache = calloc(p->n_layers * (uint64_t)p->seq_len * kv_dim, sizeof(float));
-    s->value_cache = calloc(p->n_layers * (uint64_t)p->seq_len * kv_dim, sizeof(float));
+    s->key_cache = alloc_big(s->kv_size * sizeof(float));
+    s->value_cache = alloc_big(s->kv_size * sizeof(float));
 
     // ensure all mallocs went fine
-    if (!s->x || !s->xb || !s->hb || !s->hb2 || !s->q || !s->att || !s->logits || !s->rope || !s->key_cache || !s->value_cache) {
+    if (!s->x || !s->xb || !s->hb || !s->hb2 || !s->q || !s->k || !s->v || !s->att || !s->logits || !s->rope || !s->key_cache || !s->value_cache) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
@@ -200,13 +250,17 @@ void free_run_state(RunState* s) {
     free(s->hq.q);
     free(s->hq.s);
     free(s->q);
+    free(s->k);
+    free(s->v);
     free(s->att);
     free(s->logits);
-    free(s->key_cache);
-    free(s->value_cache);
+    free_big(s->key_cache, s->kv_size * sizeof(float));
+    free_big(s->value_cache, s->kv_size * sizeof(float));
     free(s->x_b);
     free(s->xb_b);
     free(s->q_b);
+    free(s->k_b);
+    free(s->v_b);
     free(s->hb_b);
     free(s->hb2_b);
     free(s->xq_b.q);
@@ -306,29 +360,6 @@ void memory_map_weights(TransformerWeights *w, Config *p, void *ptr) {
 }
 
 #ifdef RUNQ_VNNI
-#if defined _WIN32
-    #include <malloc.h> // _aligned_malloc
-#endif
-static void *alloc_big(size_t n) {
-    // large 64-byte aligned buffer (the repacked weights), page-aligned anonymous memory on
-    // Linux. No MADV_HUGEPAGE: no measurable decode gain here, and with THP defrag=madvise the
-    // faults can stall on compaction (seen for the KV cache: 2-3x slower prefill)
-#if defined _WIN32
-    return _aligned_malloc(n, 64);
-#else
-    void *p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    return p == MAP_FAILED ? NULL : p;
-#endif
-}
-
-static void free_big(void *p, size_t n) {
-#if defined _WIN32
-    (void)n;
-    _aligned_free(p);
-#else
-    if (p) munmap(p, n);
-#endif
-}
 
 static void drop_mapped(const void *begin, const void *end) {
     // release the pages of [begin, end) of the read-only checkpoint mapping (MAP_PRIVATE, never
@@ -604,33 +635,116 @@ static void qk_norm_rope(float *v, int n_heads, const float *norm_w, int head_di
     }
 }
 
-static void attention_head(float *xb, const float *q, const float *kc, const float *vc, int kv_dim, int head_dim, int n_pos, float *att) {
-    // one query head over cached positions 0..n_pos-1: kc / vc point at this head's slice of
-    // position 0 in the layer's key / value cache (row stride kv_dim); att: n_pos scratch floats
-    for (int t = 0; t < n_pos; t++) {
-        // get the key vector for this head and at this timestep
-        const float *k = kc + (size_t)t * kv_dim;
-        // calculate the attention score as the dot product of q and k
-        float score = 0;
-        for (int i = 0; i < head_dim; i++)
-            score += q[i] * k[i];
+// Attention. The arithmetic is defined in kernels_avx512.h (with the KV cache tile layout):
+// AVX-512 builds use att512_kv there, the others attention_vec below, the same operations in the
+// same order (bit-identical results; tested by make test's kernels/* with -DRUNQ_GENERIC).
+// gcc: no FP contraction or reassociation in this C version (it would round differently)
+#if defined(__GNUC__) && !defined(__clang__)
+    #define ATT_EXACT __attribute__((optimize("fp-contract=off", "no-associative-math", "no-reciprocal-math")))
+#else
+    #define ATT_EXACT
+#endif
+#ifdef FP_FAST_FMAF
+    #define ATT_FMA(a, b, c) fmaf(a, b, c)
+#else
+    #define ATT_FMA(a, b, c) ((a) * (b) + (c)) // no fast FMA: rounds differently from AVX-512 builds
+#endif
 
-        // save the score to the attention buffer
-        att[t] = score / sqrtf(head_dim);
+ATT_EXACT static inline float exp_att(float x) {
+    // the expf of the attention softmax (x <= 0), operation for operation as att512_exp
+    x = x > ATT_EXP_MIN ? x : ATT_EXP_MIN;
+    float n = rintf(x * ATT_LOG2E);
+    float r = ATT_FMA(n, -ATT_LN2_HI, x);
+    r = ATT_FMA(n, -ATT_LN2_LO, r);
+    float z = r * r;
+    float y = ATT_P0;
+    y = ATT_FMA(y, r, ATT_P1);
+    y = ATT_FMA(y, r, ATT_P2);
+    y = ATT_FMA(y, r, ATT_P3);
+    y = ATT_FMA(y, r, ATT_P4);
+    y = ATT_FMA(y, r, ATT_P5);
+    y = ATT_FMA(y, z, r);
+    y = y + 1.0f;
+    uint32_t bits;
+    memcpy(&bits, &y, 4);
+    bits += (uint32_t)(int32_t)n << 23;
+    memcpy(&y, &bits, 4);
+    return y;
+}
+
+ATT_EXACT static void attention_vec(const float *q, float *out, int n, const float *kt, const float *vt,
+                                    size_t ts, int hd, float scale, float *S) {
+    // one query vector over positions 0..n-1 of one kv head: kt / vt = its tile 0 in the layer's
+    // K / V cache, ts = floats from one tile of this head to the next; S: n (rounded up to 16) floats
+    int nt = (n + ATT_T - 1) / ATT_T;
+    for (int tb = 0; tb < nt; tb++) {
+        const float *k = kt + (size_t)tb * ts;
+        float a[ATT_T], c[ATT_T];
+        for (int i0 = 0; i0 < hd; i0 += ATT_DC) {
+            for (int j = 0; j < ATT_T; j++)
+                c[j] = 0.0f;
+            for (int i = i0; i < i0 + ATT_DC && i < hd; i++)
+                for (int j = 0; j < ATT_T; j++)
+                    c[j] = ATT_FMA(q[i], k[i * ATT_T + j], c[j]);
+            for (int j = 0; j < ATT_T; j++)
+                a[j] = i0 > 0 ? a[j] + c[j] : c[j];
+        }
+        for (int j = 0; j < ATT_T; j++)
+            S[tb * ATT_T + j] = a[j] * scale;
     }
-
-    // softmax the scores to get attention weights, from 0..pos inclusively
-    softmax(att, n_pos);
-
-    // weighted sum of the values, store back into xb
-    memset(xb, 0, head_dim * sizeof(float));
-    for (int t = 0; t < n_pos; t++) {
-        // get the value vector for this head and at this timestep
-        const float *v = vc + (size_t)t * kv_dim;
-        // get the attention weight for this timestep, then accumulate the weighted value into xb
-        for (int i = 0; i < head_dim; i++)
-            xb[i] += att[t] * v[i];
+    float m = S[0];
+    for (int t = 1; t < n; t++)
+        if (S[t] > m)
+            m = S[t];
+    float sum[ATT_T];
+    for (int j = 0; j < ATT_T; j++)
+        sum[j] = 0.0f;
+    for (int tb = 0; tb < nt; tb++)
+        for (int j = 0; j < ATT_T; j++) {
+            int t = tb * ATT_T + j;
+            float e = t < n ? exp_att(S[t] - m) : 0.0f;
+            S[t] = e;
+            sum[j] = sum[j] + e;
+        }
+    for (int w = ATT_T / 2; w >= 1; w /= 2) // the reduction tree of att512_sum16
+        for (int j = 0; j < w; j++)
+            sum[j] = sum[j] + sum[j + w];
+    float inv = 1.0f / sum[0];
+    for (int i = 0; i < hd; i++)
+        out[i] = 0.0f;
+    for (int t = 0; t < n; t++) {
+        const float *v = vt + (size_t)(t / ATT_T) * ts + (size_t)(t % ATT_T) * hd;
+        float e = S[t];
+        for (int i = 0; i < hd; i++)
+            out[i] = ATT_FMA(e, v[i], out[i]);
     }
+    for (int i = 0; i < hd; i++)
+        out[i] = out[i] * inv;
+}
+
+static void attention_kv(int nv, const float *const *q, float *const *out, const int *np, const float *kt,
+                         const float *vt, size_t ts, int hd, float scale, float *S) {
+    // nv query vectors q[r] sharing one kv head, vector r over positions 0..np[r]-1, into out[r];
+    // S: scratch of nv * kv_len floats. Each vector's result does not depend on the others
+#ifdef RUNQ_ATT512
+    if (att512_ok(hd)) { att512_kv(nv, q, out, np, kt, vt, ts, hd, scale, S); return; }
+#endif
+    for (int r = 0; r < nv; r++)
+        attention_vec(q[r], out[r], np[r], kt, vt, ts, hd, scale, S);
+}
+
+static inline size_t kv_tile(int t, int h, int n_kv, int hd) {
+    // offset (floats) of the cache tile holding position t of kv head h, inside a layer
+    return ((size_t)(t / ATT_T) * n_kv + h) * ATT_T * hd;
+}
+
+static void kv_store(float *kl, float *vl, int t, int h, int n_kv, int hd, const float *k, const float *v) {
+    // head h of the key / value rows k, v of position t into the layer's cache tiles kl, vl
+    size_t o = kv_tile(t, h, n_kv, hd);
+    int j = t % ATT_T;
+    for (int i = 0; i < hd; i++)
+        kl[o + (size_t)i * ATT_T + j] = k[i];
+    memcpy(vl + o + (size_t)j * hd, v, hd * sizeof(float));
 }
 
 static void swiglu(float *hb, const float *hb2, int n) {
@@ -656,11 +770,8 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
 
     // forward all the layers
     for (int l = 0; l < p->n_layers; l++) {
-        // save key,value at this time step (pos) to our kv cache
-        uint64_t loff = l * (uint64_t)p->seq_len * kv_dim; // kv cache layer offset for convenience
-
-        s->k = s->key_cache + loff + pos * kv_dim;
-        s->v = s->value_cache + loff + pos * kv_dim;
+        uint64_t loff = l * (uint64_t)s->kv_len * kv_dim; // kv cache layer offset for convenience
+        float *kl = s->key_cache + loff, *vl = s->value_cache + loff;
 
         // attention rmsnorm
         rmsnorm(s->xb, s->x, w->rms_att_weight + l * p->dim, p->dim);
@@ -674,13 +785,24 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
         // Q-RMSNorm + rotate each query head, then the same for each key head
         qk_norm_rope(s->q, p->n_heads, w->q_norm_weights + l * p->head_dim, p->head_dim, s->rope);
         qk_norm_rope(s->k, p->n_kv_heads, w->k_norm_weights + l * p->head_dim, p->head_dim, s->rope);
+        // save key, value at this time step (pos) to our kv cache
+        for (int h = 0; h < p->n_kv_heads; h++)
+            kv_store(kl, vl, pos, h, p->n_kv_heads, p->head_dim, s->k + h * p->head_dim, s->v + h * p->head_dim);
 
-        // multihead attention. iterate over all heads
+        // multihead attention: per kv head, its kv_mul query heads together
         #pragma omp parallel for
-        for (int h = 0; h < p->n_heads; h++) {
-            int ho = (h / kv_mul) * p->head_dim;
-            attention_head(s->xb + h * p->head_dim, s->q + h * p->head_dim, s->key_cache + loff + ho,
-                           s->value_cache + loff + ho, kv_dim, p->head_dim, pos + 1, s->att + h * p->seq_len);
+        for (int g = 0; g < p->n_kv_heads; g++) {
+            const float *qv[ATT_NV_MAX];
+            float *ov[ATT_NV_MAX];
+            int npv[ATT_NV_MAX];
+            for (int r = 0; r < kv_mul; r++) {
+                qv[r] = s->q + (g * kv_mul + r) * p->head_dim;
+                ov[r] = s->xb + (g * kv_mul + r) * p->head_dim;
+                npv[r] = pos + 1;
+            }
+            size_t o = kv_tile(0, g, p->n_kv_heads, p->head_dim);
+            attention_kv(kv_mul, qv, ov, npv, kl + o, vl + o, (size_t)p->n_kv_heads * ATT_T * p->head_dim,
+                         p->head_dim, s->att_scale, s->att + (size_t)g * kv_mul * s->kv_len);
         }
 
         // final matmul to get the output of the attention
@@ -724,10 +846,6 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
     return s->logits;
 }
 
-#ifndef ATT_ROWS
-#define ATT_ROWS 2 // rows per attention work chunk in forward_batch (x kv_mul query heads)
-#endif
-
 static inline QuantizedTensor qrow(QuantizedTensor *t, int b, int ld) {
     // row b of a batch of quantized rows with row stride ld (a multiple of GS)
     return (QuantizedTensor) { .q = t->q + (size_t)b * ld, .s = t->s + (size_t)b * ld / GS, .p = NULL };
@@ -736,8 +854,8 @@ static inline QuantizedTensor qrow(QuantizedTensor *t, int b, int ld) {
 enum { LOGITS_NONE = 0, LOGITS_LAST = 1, LOGITS_ALL = 2 };
 
 static void kv_populate(RunState *s, Config *p, int pos0, int n) {
-    // Pre-fault the KV cache rows pos0..pos0+n-1 of every layer (calloc'd, so untouched pages
-    // are not mapped yet), in parallel and one madvise per range instead of one page fault
+    // Pre-fault the KV cache tiles of positions pos0..pos0+n-1 of every layer (anonymous memory,
+    // untouched pages are not mapped yet), in parallel and one madvise per range instead of one page fault
     // per 4 KB. Otherwise these faults happen inside the K/V GEMMs, serialized in the kernel:
     // ~55 ms of a 451-token prefill (8 threads), vs ~7 ms here. Linux >= 5.14; errors ignored
 #if !defined _WIN32 && defined MADV_POPULATE_WRITE
@@ -746,9 +864,10 @@ static void kv_populate(RunState *s, Config *p, int pos0, int n) {
     #pragma omp parallel for collapse(2) schedule(static)
     for (int l = 0; l < p->n_layers; l++)
         for (int kv = 0; kv < 2; kv++) {
-            float *c = (kv ? s->value_cache : s->key_cache) + l * (uint64_t)p->seq_len * kv_dim;
-            uintptr_t a = (uintptr_t)(c + (size_t)pos0 * kv_dim) & ~(pg - 1);
-            uintptr_t e = (uintptr_t)(c + (size_t)(pos0 + n) * kv_dim);
+            // positions pos0.. of all heads: the tiles pos0 / ATT_T .. (pos0 + n - 1) / ATT_T
+            float *c = (kv ? s->value_cache : s->key_cache) + l * (uint64_t)s->kv_len * kv_dim;
+            uintptr_t a = (uintptr_t)(c + (size_t)(pos0 / ATT_T) * ATT_T * kv_dim) & ~(pg - 1);
+            uintptr_t e = (uintptr_t)(c + (size_t)((pos0 + n - 1) / ATT_T + 1) * ATT_T * kv_dim);
             madvise((void *)a, e - a, MADV_POPULATE_WRITE);
         }
 #else
@@ -785,11 +904,8 @@ float *forward_batch(Transformer *transformer, int *tokens, int n, int pos0, int
     kv_populate(s, p, pos0, n);
 
     for (int l = 0; l < p->n_layers; l++) {
-        uint64_t loff = l * (uint64_t)p->seq_len * kv_dim;
-        // k / v rows of this chunk are contiguous in the cache (row stride kv_dim): the GEMMs
-        // write them in place
-        float *kc = s->key_cache + loff + (size_t)pos0 * kv_dim;
-        float *vc = s->value_cache + loff + (size_t)pos0 * kv_dim;
+        uint64_t loff = l * (uint64_t)s->kv_len * kv_dim;
+        float *kl = s->key_cache + loff, *vl = s->value_cache + loff;
 
         // (residual of the previous layer's ffn,) attention rmsnorm + quantize, per row
         #pragma omp parallel for
@@ -806,36 +922,59 @@ float *forward_batch(Transformer *transformer, int *tokens, int n, int pos0, int
 
         // qkv GEMMs
         matmul_batch(s->q_b, all_heads_dim, &s->xq_b, xs, n, w->wq + l, dim, all_heads_dim);
-        matmul_batch(kc, kv_dim, &s->xq_b, xs, n, w->wk + l, dim, kv_dim);
-        matmul_batch(vc, kv_dim, &s->xq_b, xs, n, w->wv + l, dim, kv_dim);
+        matmul_batch(s->k_b, kv_dim, &s->xq_b, xs, n, w->wk + l, dim, kv_dim);
+        matmul_batch(s->v_b, kv_dim, &s->xq_b, xs, n, w->wv + l, dim, kv_dim);
         PROF(PF_QKV);
 
-        // QK-norm + RoPE, each row at its own position
-        #pragma omp parallel for
-        for (int b = 0; b < n; b++) {
-            const float *cs = s->rope_b + (size_t)b * hd;
-            qk_norm_rope(s->q_b + (size_t)b * all_heads_dim, p->n_heads, w->q_norm_weights + l * hd, hd, cs);
-            qk_norm_rope(kc + (size_t)b * kv_dim, p->n_kv_heads, w->k_norm_weights + l * hd, hd, cs);
+        // QK-norm + RoPE, each row at its own position; then the chunk's K / V rows into the
+        // cache, one (tile, kv head) per work item
+        int tb0 = pos0 / ATT_T, ntb = (pos0 + n - 1) / ATT_T - tb0 + 1;
+        #pragma omp parallel
+        {
+            #pragma omp for
+            for (int b = 0; b < n; b++) {
+                const float *cs = s->rope_b + (size_t)b * hd;
+                qk_norm_rope(s->q_b + (size_t)b * all_heads_dim, p->n_heads, w->q_norm_weights + l * hd, hd, cs);
+                qk_norm_rope(s->k_b + (size_t)b * kv_dim, p->n_kv_heads, w->k_norm_weights + l * hd, hd, cs);
+            }
+            #pragma omp for
+            for (int it = 0; it < ntb * p->n_kv_heads; it++) {
+                int tb = tb0 + it / p->n_kv_heads, h = it % p->n_kv_heads;
+                int t1 = (tb + 1) * ATT_T < pos0 + n ? (tb + 1) * ATT_T : pos0 + n;
+                for (int t = tb * ATT_T > pos0 ? tb * ATT_T : pos0; t < t1; t++)
+                    kv_store(kl, vl, t, h, p->n_kv_heads, hd, s->k_b + (size_t)(t - pos0) * kv_dim + h * hd,
+                             s->v_b + (size_t)(t - pos0) * kv_dim + h * hd);
+            }
         }
         PROF(PF_ROPE);
 
-        // causal attention: row b (position pos0 + b) attends to positions 0..pos0+b, whose
-        // K/V are all in the cache now. One work item per (row, head), ordered by kv head, then
-        // row, then the kv_mul query heads sharing that kv head; each thread takes ATT_ROWS rows
-        // x kv_mul heads in a row, which read nearly the same K/V slice (pos0 + b positions x
-        // head_dim), so it is re-read from L1/L2 instead of L3
-        #pragma omp parallel for schedule(dynamic, ATT_ROWS * kv_mul)
-        for (int it = 0; it < n * p->n_heads; it++) {
-            int g = it / (n * kv_mul), rem = it % (n * kv_mul);
-            int b = rem / kv_mul, h = g * kv_mul + rem % kv_mul;
-            int ho = g * hd;
+        // causal attention: row b (position pos0 + b) attends to positions 0..pos0+b, whose K/V
+        // are all in the cache now. Work item = (block of att_rows rows, kv head): its rows x
+        // kv_mul query heads in one attention_kv call (K/V read once for all of them). Dynamic
+        // schedule, last (longest) row blocks first, for the load balance
+        int ar = s->att_rows, nrb = (n + ar - 1) / ar;
+        size_t ts = (size_t)p->n_kv_heads * ATT_T * hd;
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int it = 0; it < nrb * p->n_kv_heads; it++) {
+            int rb = nrb - 1 - it / p->n_kv_heads, g = it % p->n_kv_heads;
+            int b0 = rb * ar, b1 = b0 + ar < n ? b0 + ar : n, nv = 0;
+            const float *qv[ATT_NV_MAX];
+            float *ov[ATT_NV_MAX];
+            int npv[ATT_NV_MAX];
+            for (int b = b0; b < b1; b++)
+                for (int r = 0; r < kv_mul; r++, nv++) {
+                    int h = g * kv_mul + r;
+                    qv[nv] = s->q_b + (size_t)b * all_heads_dim + h * hd;
+                    ov[nv] = s->xb_b + (size_t)b * xs + h * hd;
+                    npv[nv] = pos0 + b + 1;
+                }
 #ifdef _OPENMP
-            float *att = s->att_b + (size_t)omp_get_thread_num() * p->seq_len;
+            float *att = s->att_b + (size_t)omp_get_thread_num() * ar * kv_mul * s->kv_len;
 #else
             float *att = s->att_b;
 #endif
-            attention_head(s->xb_b + (size_t)b * xs + h * hd, s->q_b + (size_t)b * all_heads_dim + h * hd,
-                           s->key_cache + loff + ho, s->value_cache + loff + ho, kv_dim, hd, pos0 + b + 1, att);
+            size_t o = kv_tile(0, g, p->n_kv_heads, hd);
+            attention_kv(nv, qv, ov, npv, kl + o, vl + o, ts, hd, s->att_scale, att);
         }
         PROF(PF_ATT);
 

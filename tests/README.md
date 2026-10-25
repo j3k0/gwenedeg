@@ -1,8 +1,8 @@
 # Tests
 
 `make test` (or `tests/run_tests.sh`) builds `./runq` and `./runq-generic` if needed (in parallel)
-and runs everything in about 20 s on the 16-vCPU dev box (~22 s with the rebuild; ~33 runq processes
-at ~0.45 s startup each). It needs `models/Qwen3-0.6B-q8.bin`, plus numpy (`.venv/bin/python`
+and runs everything in about 21-25 s on the 16-vCPU dev box (~37 runq processes at ~0.45 s startup
+each; the box is shared, so the time varies). It needs `models/Qwen3-0.6B-q8.bin`, plus numpy (`.venv/bin/python`
 if present, else the system `python3`). Torch is only needed to regenerate the HF goldens.
 
 ```sh
@@ -40,9 +40,10 @@ XPASS = an XFAIL case now passes (remove its mark in `make_golden.py`).
 | `logits/<prompt>` | runq Q8_0 logits vs HF fp32 for 5 prompts (en, code, zh, chat template, counting), 15-24 tokens; ids must match HF first | `golden/logits/*.npz` |
 | `logits/cos_pooled`, `logits/top1_pooled` | the same metrics pooled over all prompts | |
 | `logits_batched/*` | the same test (same thresholds) with the batched prefill, `-b 64` (the default; one chunk here) | `golden/logits/*.npz` |
-| `batched/<prompt>_b7`, `_b64` | batched logits vs sequential (`-b 1`) on every logits prompt; `-b 7` gives 3-4 chunks with boundaries mid-prompt. `all_b64`: all 5 prompts concatenated (86 tokens), 2 chunks at `-b 64`. Max abs diff <= 1e-3 and cos >= 0.99999 per row (full vocab), finite; reports "bit-identical" (currently all 11) | sequential run |
+| `batched/<prompt>_b7`, `_b64` | batched logits vs sequential (`-b 1`) on every logits prompt; `-b 7` gives 3-4 chunks with boundaries mid-prompt. `all_b64`: all 5 prompts concatenated (86 tokens), 2 chunks at `-b 64`; `long_b64`: `all` twice + `en` (187 tokens, 12 KV tiles, 3 chunks: attention over several K/V tiles and causal row blocks in later chunks). Max abs diff <= 1e-3 and cos >= 0.99999 per row (full vocab), finite; reports "bit-identical" (currently all 12) | sequential run |
 | `threads/bitwise`, `threads/bitwise_b7` | logits file for `en` is byte-identical with OMP_NUM_THREADS=8 and 1, sequential and `-b 7` | |
-| `kernels/en_b1`, `en_b7`, `all_b64` | logits file byte-identical for `./runq` (AVX-512 VNNI kernels) and `./runq-generic` (`-DRUNQ_GENERIC`, generic C kernels, same flags otherwise): GEMV incl. classifier (`-b 1`), GEMM with 6 + 1 row tiles and a 1-row chunk (`-b 7`), 2 chunks with 6 + 4 row tiles and the all-rows classifier GEMM (`all`, `-b 64`) | `./runq-generic` |
+| `threads/bitwise_long_b64` | `long` at `-b 64`: OMP_NUM_THREADS=8 vs 3 byte-identical (other partitions of the dynamically scheduled attention work items) | |
+| `kernels/en_b1`, `en_b7`, `all_b64`, `long_b64` | logits file byte-identical for `./runq` (AVX-512: VNNI GEMM/GEMV and the AVX-512 attention) and `./runq-generic` (`-DRUNQ_GENERIC`, generic C kernels and C attention, same flags otherwise): GEMV incl. classifier and decode attention (`-b 1`), GEMM with 6 + 1 row tiles and a 1-row chunk (`-b 7`), 2 chunks with 6 + 4 row tiles and the all-rows classifier GEMM (`all`, `-b 64`), 3 chunks with attention over 12 tiles (`long`) | `./runq-generic` |
 | `greedy/*` | exact stdout of `-t 0 -c 4096` runs: chat, chat with thinking (`-r 1`), chat with system prompt (`-y`), generate; 40-48 tokens. These use the default batched prefill; `generate@b5` = generate in 3 chunks (same golden) | `golden/greedy/*.txt` (our engine) |
 | `greedy/seeded_chunks` | seeded sampling (`-t 0.8 -s 42`, chat): same output with `-b 1` and `-b 5` (chat advances the RNG once per prompt token, as before batched prefill) | |
 
@@ -87,12 +88,13 @@ Sanity check by deliberate breakage (scratch builds, not committed), all caught:
 | no QK-norm / KV written at pos+1 / V read from t-1 / no final norm / attention scale 1/d / rmsnorm eps 1e-2 | | < 0.71 | < 0.16 |
 | activation quantizer truncates instead of rounding (precision loss only) | 0.99713 | en 0.99432 fails, others pass | 0.94 |
 
-Thread invariance: matmul/matmul_batch (generic and VNNI) parallelize over output rows and attention over heads or
-(row, head) items, each computed whole by one thread, so results are bit-identical for any
-thread count (tested 1 vs 8; also checked 13).
+Thread invariance: matmul/matmul_batch (generic and VNNI) parallelize over output rows and attention over
+(kv head, block of query rows) items; each query vector's result does not depend on the other
+vectors in its item, so results are bit-identical for any thread count and any grouping (tested 1
+vs 8, 3 vs 8; also checked 13).
 
 Batched vs sequential: `forward_batch()` gives bit-identical logits to `forward()` because both
-call the same numeric kernels (`dot_q8`, `qk_norm_rope`, `attention_head`, `swiglu`, `rmsnorm`,
+call the same numeric kernels (`dot_q8`, `qk_norm_rope`, `attention_kv`, `swiglu`, `rmsnorm`,
 `quantize`) per row, and the 4-row GEMM kernel `dot_q8_x4` is compiled without FP contraction
 (`NO_FP_CONTRACT`, gcc only) so it rounds like `dot_q8`. With contraction (an FMA in the scale
 accumulation) the logits differ slightly and `greedy/chat_system` flips a token. A future kernel
@@ -119,6 +121,21 @@ Builds without AVX-512 (e.g. `-march=x86-64-v3`) use the generic kernels and pas
 batched and thread tests, but not the greedy goldens: the rest of the float code (rmsnorm,
 softmax, attention) is vectorized at a different width and rounds differently. The greedy
 goldens belong to AVX-512 (`-march=native` here) builds.
+
+Attention (Step 3b): the attention is defined once (arithmetic and tile layout in the
+`src/kernels_avx512.h` header comment): scores as fma chains over chunks of 32 dims, a clamped
+Cephes-style `exp`, 16 partial sums with a fixed reduction tree, one division, V accumulated by
+an fma chain in position order. Decode (`forward`, 2 query vectors per kv head) and prefill
+(`forward_batch`, 2 x 6 vectors per work item, causal per row) run the same per-vector
+operations, so `batched/*` stay bit-identical, and the generic C version (`attention_vec`,
+compiled with FP contraction and reassociation off) does the same, so `kernels/*` stay
+bit-identical (a scratch build with the C reduction tree replaced by a linear sum: max |diff| 1.3-1.5,
+caught by all `kernels/*`). The change of arithmetic from the old attention (expf, one dot product
+per position) changed the logits slightly: against a double-precision attention reference
+(scratch build) the new logits are closer (1-cos 4.7e-4 vs 5.3e-4 on a 288-token prompt) and the
+HF thresholds are unchanged and met (pooled cos 0.99910, top-1 76/84 as before), but two greedy
+goldens flip a token (`chat_system`, `generate`: both texts read fine) and were regenerated
+(`--update-greedy`, both with the same new text on the generic build).
 
 ## Golden data
 

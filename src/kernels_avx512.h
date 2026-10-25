@@ -1,4 +1,5 @@
-/* AVX-512 VNNI Q8_0 kernels for runq.c (GEMM for the batched prefill, GEMV for decode).
+/* AVX-512 VNNI Q8_0 kernels for runq.c (GEMM for the batched prefill, GEMV for decode); further down
+ * the same for the K-quants (Q4_K / Q6_K on the Q4P / Q6P layouts of kquants.h) and the attention.
  *
  * Enabled when the compiler targets AVX-512 F/BW/VNNI (e.g. -march=native on Zen 4 / Ice Lake+)
  * and RUNQ_GENERIC is not defined; it then defines RUNQ_VNNI. Otherwise this header is empty and
@@ -548,6 +549,9 @@ void kq6_tile(const int RB, const int C, const uint8_t *ws, size_t bstride, int 
         const uint8_t *wg = ws + (size_t)g * KQS_Q6;
         const int8_t *xg = x + (size_t)g * 32;
         __m512i I[KQ_RB][8];
+        for (int r = 0; r < RB; r++)
+            for (int c = 0; c < C; c++)
+                I[r][c] = _mm512_setzero_si512(); // (0 + x: folded by the compiler)
         for (int h = 0; h < 2; h++) {
             __m512i t[KQ_RB][8];
             for (int c = 0; c < C; c++) {
@@ -569,7 +573,7 @@ void kq6_tile(const int RB, const int C, const uint8_t *ws, size_t bstride, int 
             for (int r = 0; r < RB; r++) {
                 __m512i sc = _mm512_load_si512((const void *)(wg + r * bstride + 512 + 64 * h));
                 for (int c = 0; c < C; c++)
-                    I[r][c] = h ? _mm512_add_epi32(I[r][c], _mm512_mullo_epi32(t[r][c], sc)) : _mm512_mullo_epi32(t[r][c], sc);
+                    I[r][c] = _mm512_add_epi32(I[r][c], _mm512_mullo_epi32(t[r][c], sc));
             }
         }
         for (int r = 0; r < RB; r++) {

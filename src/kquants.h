@@ -1,8 +1,8 @@
 /* K-quants (GGUF Q4_K and Q6_K, as in llama.cpp's Q4_K_M files) for runq.c: the block formats,
  * their dequantization, the repacked layouts (Q4P, Q6P) the matmul kernels read, and the generic C
  * kernels. The arithmetic of a matmul output is defined here (below); the generic kernels follow
- * it, and AVX-512 kernels must follow it too (Step 6b-2), so that every build gives bit-identical
- * logits.
+ * it, and so do the AVX-512 ones (kernels_avx512.h: kq4_gemv_rows / kq6_gemv_rows, kq512_gemm_n),
+ * so that every build gives bit-identical logits (checked by make test's q4_kernels group).
  *
  * Block formats (ggml-common.h, ggml-quants.c; super-blocks of QK_K = 256 values of one row):
  *   Q4_K, 144 bytes: fp16 d, fp16 dmin, scales[12], qs[128]. 8 sub-blocks j of 32 values, a 6-bit
@@ -359,7 +359,7 @@ KQ_EXACT static void q6p_dot(float *out, size_t ldo, const uint8_t *wb, int k, i
         memcpy(out + c * ldo, val[c], sizeof(val[c]));
 }
 
-static void kq_dot(int type, float *out, size_t ldo, const uint8_t *wb, int k, int nc, const int8_t *xq, size_t ldx,
+static inline void kq_dot(int type, float *out, size_t ldo, const uint8_t *wb, int k, int nc, const int8_t *xq, size_t ldx,
                    const float *xs, size_t ldxs, const float *xf, size_t ldxf) {
     // one 16-row block of a K-quant matrix times nc <= KQ_NC activation rows
     if (type == GGML_Q4_K)

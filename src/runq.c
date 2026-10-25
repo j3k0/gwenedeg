@@ -1284,7 +1284,7 @@ void matmul_batch_n(int nj, const MatJob *job, QuantizedTensor *x, int ldx, int 
             if (!job[j].w->kp)
                 q8[n8++] = job[j];
 #ifdef RUNQ_VNNI
-        KQJob kj[8];
+        KQJob kj[8] = { 0 };
         int nkj = 0;
         for (int j = 0; j < nj; j++)
             if (job[j].w->kp)

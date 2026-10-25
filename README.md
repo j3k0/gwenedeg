@@ -15,11 +15,28 @@ G=models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf
 ```
 
 The GGUF file is all runq needs: weights, hyperparameters, tokenizer (from its metadata) and the
-chat templates (built in). The Q4_K_M GGUF (`scripts/download_models.py q4km`, 397 MB) works too:
-smaller (peak RSS ~420 vs ~670 MB) and a bit less accurate (perplexity +4.9% vs +0.2% over fp32), but
-for now with generic C kernels, so it is slower than Q8_0 (prefill ~170-230 tok/s, decode ~55-75; the
-AVX-512 kernels are Step 6b-2, TODO.md). Alternatively, qwen3.c's own format, exported from the HF weights (needs
-the Python venv; the tests use both):
+chat templates (built in). The Q4_K_M GGUF (`scripts/download_models.py q4km`, 397 MB) works the same
+way. Which file to use (measured 2026-10-25 on the 16-vCPU dev box, TODO.md Steps 6a, 6b-1, 6b-2):
+
+| | Q8_0 GGUF (639 MB) | Q4_K_M GGUF (397 MB) | Q8_0 .bin (export) |
+|---|---|---|---|
+| perplexity vs HF fp32 (Beagle ch. I) | **+0.19%** | +4.9% | +0.85% |
+| logits vs HF: pooled 1-cos, top-1 (84 positions) | **6.1e-4, 79** | 1.6e-2, 69 | 9.0e-4, 76 |
+| prefill 451 tokens, 8 / 12 threads | 1,870 / 2,540 tok/s | 1,670 / 2,140 | **1,960 / 2,690** |
+| decode, 8 / 12 threads (best of a noisy shared box) | ~150 / ~175 tok/s | **~240 / ~300** | ~160 / ~230 |
+| peak RSS, startup (12 threads) | ~670 MB, 0.15 s | **~410 MB, 0.12 s** | ~625 MB, 0.13 s |
+
+- Quality first, and prompt-heavy work (long documents, many short answers): the **Q8_0 GGUF**. It is
+  the closest to the fp32 model by far; the .bin is less accurate and needs the Python export, so it
+  is only worth it for the tests and the comparison with qwen3.c.
+- Generation speed or memory first (long answers, `-r 1` reasoning, small machines): **Q4_K_M**.
+  Decode is memory-bound, and Q4_K_M reads 0.40 GB per token instead of 0.67, so it generates ~1.6x
+  faster with ~40% less RAM; prefill is ~10-15% slower (more arithmetic per weight). The price is the
+  4-bit weights: ~25x the logits error of Q8_0 and +4.9% perplexity (the same for llama.cpp's
+  reference engine, mynah-slm: +4.7%), e.g. it answers "Sydney" for the capital of Australia.
+
+Alternatively, qwen3.c's own format, exported from the HF weights (needs the Python venv; the tests
+use both):
 
 ```sh
 scripts/download_models.py            # default sets: Qwen/Qwen3-0.6B (bf16), Q4_K_M and Q8_0 GGUFs
@@ -28,7 +45,7 @@ scripts/export_q8.sh                  # -> models/Qwen3-0.6B-q8.bin (Q8_0, ~630 
 # (or: make models, which runs download + export if the .bin is missing)
 ./runq models/Qwen3-0.6B-q8.bin -c 4096
 
-make test                             # regression suite, ~30 s (tests/README.md)
+make test                             # regression suite, ~30-35 s (tests/README.md)
 make bench                            # thread sweep, prefill/decode tok/s (scripts/bench_qwen3c.sh)
 make bench-prefill                    # prefill tok/s vs prompt length and -b (scripts/bench_prefill.sh)
 scripts/bench_all.sh                  # all runq speed tables of BENCHMARKS.md (~8 min)
@@ -73,7 +90,7 @@ it the KV cache is sized for the full 40,960-token context, about 9 GB of addres
 | set | source | file(s) |
 |---|---|---|
 | `hf` | `Qwen/Qwen3-0.6B` @ `c1899de` | bf16 safetensors + tokenizer (input for the .bin export, HF test goldens) |
-| `q4km` | `unsloth/Qwen3-0.6B-GGUF` @ `50968a4` | `Qwen3-0.6B-Q4_K_M.gguf` (imatrix; runq loads it directly, generic kernels so far) |
+| `q4km` | `unsloth/Qwen3-0.6B-GGUF` @ `50968a4` | `Qwen3-0.6B-Q4_K_M.gguf` (imatrix; runq loads it directly) |
 | `q8gguf` | `unsloth/Qwen3-0.6B-GGUF` @ `50968a4` | `Qwen3-0.6B-Q8_0.gguf` (runq loads it directly) |
 
 Revisions are pinned. Each file is verified by sha256 (LFS files) or git blob sha1 (small files).
@@ -115,13 +132,15 @@ float folds in the GEMM), decode ~5% (the packed weights are ~6% larger: fp32 sc
   chat templates built in (identical to the exporter's `.template*` files);
   GGUF Q4_K_M (Q4_K / Q6_K tensors, type dispatch per tensor): weights repacked at load into 16-row
   interleaved blocks with the 4 / 6-bit data kept packed (398 MB read per decoded token vs 670 MB for
-  Q8_0), activations int8 per 32, generic C kernels in every build for now, embedding rows
-  dequantized with ggml's expressions (bit-identical to gguf-py), test hook `-m dequant`.
+  Q8_0), activations int8 per 32, AVX-512 VNNI GEMV (at the memory-bandwidth limit: decode ~1.6x
+  the Q8_0 GGUF) and GEMM (weight tile unpacked once per thread into u8, ~1.17x the Q8_0 GEMM time),
+  bit-identical to the generic C kernels, embedding rows dequantized with ggml's expressions
+  (bit-identical to gguf-py), test hook `-m dequant`.
 - `src/kquants.h`: the Q4_K / Q6_K block formats, their dequantization, the repacked layouts (Q4P,
   Q6P) and the generic kernels; the arithmetic of a K-quant matmul output is defined there.
 - `src/kernels_avx512.h`: the AVX-512 VNNI Q8_0 GEMM / GEMV (group size 64 or 32) and the weight
-  repacking, and the fp32 attention with the KV cache layout (layouts, arithmetic and bit-identity
-  argument in its comments).
+  repacking, the Q4_K / Q6_K GEMV / GEMM on the Q4P / Q6P layouts, and the fp32 attention with the KV
+  cache layout (layouts, arithmetic and bit-identity argument in its comments).
 - `src/unicode_tables.h`: \p{L}/\p{N}/\s ranges for the pre-tokenizer, generated by
   `tools/gen_unicode_tables.py` (Python's unicodedata, Unicode 15.1).
 - `src/unicode_nfc.h`: NFC tables (combining classes, decompositions, compositions, quick check),
@@ -148,14 +167,16 @@ Full tables, methodology and baselines: [BENCHMARKS.md](BENCHMARKS.md) (one sess
 Same session: upstream qwen3.c decodes at 101 / 106 tok/s (8 / 12 threads) with ~99 tok/s token-by-token
 prefill; mynah-slm at ~34 (Q8_0 and Q4_K_M). Perplexity vs HF fp32: runq Q8_0 +0.8%, Q4_K_M +4.7%
 (mynah-slm); runq on the Q8_0 GGUF +0.19% (TODO.md Step 6a, measured later), on the Q4_K_M GGUF
-+4.9% (Step 6b-1).
++4.9% (Step 6b-1). Q4_K_M with the AVX-512 kernels (Step 6b-2, not in BENCHMARKS.md yet): see the
+table under Quick start and TODO.md.
 `scripts/bench_all.sh` reruns the runq tables (~8 min).
 
 ## Known limitations
 
-- Q8_0 (.bin or GGUF) and Q4_K_M GGUF (any mix of Q8_0 / Q4_K / Q6_K matrices); Q4_K / Q6_K run on
-  generic C kernels (prefill ~10x and decode ~2.5x slower than Q8_0) until Step 6b-2. Other GGUF
-  types (F16, Q5_K, IQ*, ...) are rejected with a clean error.
+- Q8_0 (.bin or GGUF) and Q4_K_M GGUF (any mix of Q8_0 / Q4_K / Q6_K matrices). Other GGUF types
+  (F16, Q5_K, IQ*, ...) are rejected with a clean error. Without AVX-512 VNNI (or `make generic`)
+  every format runs on the generic C kernels, with the same results; for Q4_K_M they are ~10x
+  slower in prefill and ~3-4x in decode than the AVX-512 ones.
 - GGUF: Qwen3 (`general.architecture` qwen3, RoPE theta 1e6, RMSNorm eps 1e-6) with the gpt2 /
   qwen2 tokenizer only; `tokenizer.chat_template` (Jinja) is not interpreted, Qwen3's templates
   are built in.

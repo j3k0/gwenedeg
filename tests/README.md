@@ -1,7 +1,7 @@
 # Tests
 
 `make test` (or `tests/run_tests.sh`) builds `./runq` and `./runq-generic` if needed (in parallel)
-and runs everything in about 30 s on the 16-vCPU dev box (265 checks; ~20 s without the GGUF and Q4
+and runs everything in about 30-35 s on the 16-vCPU dev box (269 checks; ~20 s without the GGUF and Q4
 groups; the box is shared, so the time varies). It needs `models/Qwen3-0.6B-q8.bin`, plus numpy
 (`.venv/bin/python` if present, else the system `python3`); the `gguf` group and the `gguf_*` greedy
 goldens also `models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (`scripts/download_models.py q8gguf`;
@@ -82,7 +82,8 @@ All hooks work the same on a GGUF file (tokenizer and templates from the file an
 | `q4_dequant/*` | Q4_K_M: 2 rows each of blk.0.attn_q, blk.3.ffn_down (Q4_K, 1024 / 3072 columns), blk.0.attn_v, blk.27.ffn_down, token_embd (Q6_K), across a 16-row block boundary, `-m dequant`: from the blocks and from the repacked layout, both bit-identical to gguf-py's `dequantize` | `golden/dequant/q4_k_m.npz` |
 | `q4_logits_batched/*` | Q4_K_M logits vs HF fp32 (-b 64, 5 prompts, pooled), loose Q4 thresholds (below) | `golden/logits/*.npz` |
 | `q4_ref_batched/*`, `q4_ref/en` | Q4_K_M logits vs the Q4 reference: HF fp32 with the GGUF's weights dequantized by gguf-py (-b 64 on 5 prompts + pooled; -b 1 on en), tight thresholds | `golden/logits_q4/*.npz` |
-| `q4_batched/en_b7`, `_b64`, `q4_threads/bitwise_b7`, `q4_kernels/en_b1`, `en_b7` | Q4_K_M byte-identical logits: -b 7 / 64 vs -b 1, OMP_NUM_THREADS 8 vs 3, `./runq` vs `./runq-generic` (both on the generic K-quant kernels until Step 6b-2) | sequential / other build |
+| `q4_batched/en_b7`, `all_b7`, `all_b64`, `q4_threads/bitwise_all_b7`, `_all_b64` | Q4_K_M byte-identical logits: -b 7 / 64 vs -b 1 (`all`: 13 / 2 chunks), OMP_NUM_THREADS 8 vs 3 (other GEMM chunk sizes and partitions) | sequential run |
+| `q4_kernels/en_b1`, `en_b7`, `all_b7`, `all_b64` | Q4_K_M logits byte-identical for `./runq` (AVX-512 VNNI K-quant GEMV / GEMM, `src/kernels_avx512.h`) and `./runq-generic` (`q4p_dot` / `q6p_dot`, the definition in `src/kquants.h`): GEMV incl. the Q6_K classifier (`-b 1`), GEMM tiles of 6 + 1 rows (Q4_K) / 4 + 3 (Q6_K) and a 1-row chunk (`en -b 7`), 13 chunks (`all -b 7`), 2 chunks with tiles 6 + 4 / 4 + 2 and the all-rows classifier GEMM (`all -b 64`). The generic runs go in the background at 4 threads (the slow part: ~1 s per 86 tokens with all-rows logits) | `./runq-generic` |
 | `greedy/q4_chat`, `greedy/q4_generate` | exact stdout of `-t 0 -n 24` chat / generate on the Q4_K_M file | `golden/greedy/q4_*.txt` |
 | `chat/multiturn`, `chat/thinking`, `chat/context_full` | multi-turn runs with `RUNQ_CHAT_DUMP`: (1) the decoded KV cache equals the expected chat-template rendering, built in Python from the user lines and the replies on stdout (ChatML, `<|im_end|>\n` after every message, the empty think block before each answer with `-r 0`; with `-r 1` earlier answers without their reasoning, as HF's template renders them); (2) re-encoding that text gives the same ids (piecewise encoding == whole-string encoding); (3) every sampled logits vector is **bit-identical** to the same row of a fresh `-m logits` run on the whole conversation (incremental prefill at `pos0 > 0` and decode vs one batched prefill from 0). `thinking`: `-r 1`, 2 turns, turn 1's reasoning dropped (re-prefill of its answer). `context_full`: `-c 160 -n 30 -y ...`, 6 turns: the oldest turns are dropped (stderr `[context] full`), the system prompt kept | |
 
@@ -152,8 +153,12 @@ halves with one scale, Q6_K qh crumbs reversed, Q6_K d of the next row; also two
 (get_scale_min_k4's high bits, the Q6_K qh shift), which fail `q4_dequant/*` too. Precision-level
 changes pass the logits checks (d * sc or d rounded to bf16 in a fold: pooled cos vs the reference
 0.99943 / 0.99954; a -31 instead of -32 in 1 of 16 Q6_K sub-blocks: 0.99921; baseline 0.99954); the
-bf16 ones flip `greedy/q4_generate`. Kernel rounding deviations are the job of `q4_kernels/*` (bitwise)
-once Step 6b-2 adds AVX-512 kernels.
+bf16 ones flip `greedy/q4_generate`. Kernel rounding deviations are the job of `q4_kernels/*` (bitwise):
+an FMA in the AVX-512 Q4_K fold (`fmsub` for (ds xs) isum - dm xf) or Q6_K fold (`fmadd` into the
+output; scratch builds, Step 6b-2) gives max |diff| 1.58 / 1.52 and fails all four `q4_kernels/*` (and
+`greedy/q4_generate`), while `q4_batched/*` and `q4_threads/*` pass (both sides use the same kernel).
+Also checked once: an ASan+UBSan build on Q4_K_M (generate / logits at -b 1 / 7 / 512, chat with
+context full, 3 and 8 threads; AVX-512 and generic): no reports.
 
 Thread invariance: matmul/matmul_batch (generic and VNNI) parallelize over output rows and attention over
 (kv head, block of query rows) items; each query vector's result does not depend on the other

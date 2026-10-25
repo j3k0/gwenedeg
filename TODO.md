@@ -8,8 +8,9 @@ Now (Step 3b, 8 threads, -b 512): prefill ~1,980 tok/s (451-token prompt), ~1,48
 Startup (Step 4): ~0.06 s per process, peak RSS ~0.63-0.74 GB; chat keeps the conversation.
 GGUF (Step 6a): `./runq Qwen3-0.6B-Q8_0.gguf` directly (no export, no side files); closer to HF than
 the .bin (perplexity +0.19% vs +0.85%), prefill ~4-8% slower.
-Q4_K_M (Step 6b-1): `./runq Qwen3-0.6B-Q4_K_M.gguf` works (perplexity +4.9% vs HF, mynah-slm +4.7%),
-with generic kernels so far (prefill ~170-230 tok/s, decode ~55-75); AVX-512 kernels: Step 6b-2.
+Q4_K_M (Step 6b-1/2): `./runq Qwen3-0.6B-Q4_K_M.gguf` (perplexity +4.9% vs HF, mynah-slm +4.7%; Q8_0
+GGUF +0.19%): AVX-512 kernels, decode ~1.6x the Q8_0 GGUF (~200-300 tok/s, bandwidth-bound: 0.40 vs 0.67
+GB per token), prefill ~0.85-0.9x (~1,670 / 2,140 tok/s at 451 tokens, 8 / 12 threads), RSS ~0.41 GB.
 
 Status: `[ ]` todo · `[~]` in progress · `[x]` done
 
@@ -547,43 +548,91 @@ chat, generate, `-m logits`, `-m tokenize`. Generic C kernels in every build for
   `q4_chat`, `q4_generate` (24 tokens each); skipped if the file is missing (`Q4=` to skip)
 
 ## Step 6b-2: AVX-512 kernels for Q4_K / Q6_K (speed)
-Notes from 6b-1 (layouts and arithmetic in `src/kquants.h`; the AVX-512 kernels go into
-`kernels_avx512.h`, dispatched where `kq_dot` / `kq_gemm_n` / `matvec_rows` handle `w->kp`):
-- The kernels must be bit-identical to `q4p_dot` / `q6p_dot` (the definition): integer sums in any
-  order, the float fold per (16-row block, activation row, group) exactly as defined, with explicit
-  rounding intrinsics (`_mm512_mul_round_ps` / `add` / `sub`, as `q8p_fold`; gcc must not contract).
-  `q4_kernels/*` then compares for real: add cases like the Q8 ones (all -b 64: 2 chunks, 6 + 4 row
-  tiles, the all-rows classifier GEMM; a decode with `-b 1` exercises the GEMV incl. the classifier),
-  and check that an FMA in the fold fails them. The greedy goldens `q4_*` and the logits goldens
-  stay unchanged unless the definition changes (it should not)
-- Q4P inner step (per 16-row block, sub-block j): 4 loads of 64 bytes at 320 + 256 j + 64 c; each gives
-  2 vpdpbusd steps: `and 0x0f` (columns 8c..8c+3) and `srli_epi16(4) & 0x0f` (8c+4..8c+7), activations
-  broadcast 4 bytes at a time (xq + 32 g + 8 c, + 4); isum accumulators start at 0. Per (block, group):
-  ds = cvtph2ps(d[16]) * cvt(zx(sc bytes 16 j..16 j + 15)), dm likewise (exact; the d / dmin
-  conversion once per super-block). Per activation row: mul(ds, xs), cvt(isum), mul, mul(dm, xf), sub,
-  add: 6 float ops per 8 vpdpbusd (Q8_0 GS 32: 4), so the GEMM fold pressure is higher than for Q8
-- Q6P inner step (sub-block j of 16 columns): ql loads at 320 + 128 j (+ 64): low / high nibbles = steps
-  0 / 1 (2 / 3); one qh load at 2368 + 64 j: step t's high bits = `(qh << 4 >> 2t) & 0x30` on 16-bit
-  lanes (slli / srli_epi16 + and; bytes stay separate thanks to the mask); q = lo | hi, u8 0..63.
-  Accumulator t_j starts at -32 * (sum of the 16 xq) (activation-only int32: precompute per row, like
-  `q8p_gemv_corr`, e.g. in `matvec_prep` and the GEMM prologue), then I = mullo(t_j0, sc_j0) +
-  mullo(t_j1, sc_j1) with sc from vpmovsxbd of 16 int8 at 64 + 16 j; fold (d * xs) * cvt(I) (d is fp32
-  in Q6P): 4 float ops, as Q8
-- Activation side: `xf` is already precomputed (`matvec_prep` for decode: RunState xq_xf / hq_xf;
-  `kq_gemm_n` per row for prefill); the AVX-512 kernels can use it as is
-- GEMM: a tile as `q8p_tile` (2 row blocks x 6 activation rows), weights unpacked once per step for all
-  activation rows (the unpack is amortized, the fold is not); work items as `q8p_gemm_n` (mixed-type
-  jobs: q / k Q4P with v Q6P in one parallel loop). GEMV (decode): stream each thread's 16-row blocks
-  (one block contiguous over all k), two accumulator chains as `q8p_gemv_blocks`
-- Expected: decode is bandwidth-bound: 398 MB per token vs 670 MB for the Q8_0 GGUF, so up to ~1.6x the
-  Q8_0 decode if both run at the bandwidth limit; the Q6P classifier is 128.8 MB of it (32%), so the
-  Q6P GEMV matters as much as Q4P. Prefill: below Q8_0 (more unpack and fold work per weight)
-- Where the time goes now (generic, 451-token prefill, 8 threads, 2.77 s): GEMM qkv 33%, w1 + w3 28%,
-  w2 25%, wo 10%, rest 3%; decode 55-75 tok/s, compute-bound (generic Q6_K ~2x the cost per weight
-  of Q4_K)
-- Scratch kept for 6b-2: `/tmp/cw6b` (ggml-quants.c / ggml-common.h for reference, a venv with gguf
-  0.19.0 + numpy: `tests/make_dequant_golden.py`, `make_golden.py --q4ref --gguf-py
-  /tmp/cw6b/venv/lib/python3.13/site-packages`)
+AVX-512 VNNI GEMV and GEMM on the Q4P / Q6P layouts (`src/kernels_avx512.h`, after the Q8 kernels),
+bit-identical to the generic `q4p_dot` / `q6p_dot` (the definition in `src/kquants.h`). Before (generic
+kernels, Step 6b-1): prefill 451 tokens 168 / 233 tok/s at 8 / 12 threads, decode 55-58 / 75.
+- [x] GEMV (decode, `kq4_gemv_rows` / `kq6_gemv_rows`): one 16-row block at a time, streamed, the
+  4 / 6-bit data unpacked in registers. Q4_K: per sub-block 4 loads of 64 bytes, each 2 `vpdpbusd`
+  steps (`and 0x0f`; `srli_epi16 4` + `and`), two accumulator chains; ds = cvtph2ps(d) * cvt(zx(sc)),
+  dm likewise, then the fold (6 float ops). Q6_K: per sub-block 2 ql loads + 1 qh load, q of step t =
+  ternary-logic select (low nibble from ql, bits 4-5 from qh shifted by 4 - 2 t on 16-bit lanes) & 0x3f,
+  4 `vpdpbusd` from t_j = c16 (-32 * the 16 activation values' sum, `kq512_c16`, precomputed per row in
+  `matvec_prep`: RunState `xq_c16` / `hq_c16`), I += mullo(t_j, sc_j) (vpmovsxbd), fold (4 ops)
+- [x] Q6P layout change on the way (same size, same arithmetic): each sub-block's qh chunk now follows
+  its 2 ql chunks (320 + 192 j), one sequential stream. With qh in a separate region 2 KB after the ql
+  chunks the Q6P GEMV read memory at 13.4 GB/s on one thread vs 31-33 for Q4P / Q8P and a plain read
+  loop (in L2: 54 GB/s, so not compute): the hardware prefetchers lose two interleaved short streams.
+  Software prefetch of the next super-block only got 20-22 GB/s. Packer, generic kernel, dequant hook
+  (`kq_packed_row`) and the AVX-512 kernels changed together; logits unchanged, `q4_dequant/*` pass
+- [x] GEMV bandwidth (microbenchmark over 256 MB, the box shared, best of 5; a plain read loop the
+  same minute as the reference): 1 thread Q4P 31-34, Q6P 28-31, Q8P 32, read 29-35 GB/s; 8-12 threads
+  all kernels within the run-to-run spread of the read loop (72-130 GB/s that day). In decode (below):
+  ~435 MB per token for Q4_K_M (398.1 MB weights + ~37 MB KV cache at ~161 positions on average) ->
+  86 / 106 / 131 GB/s effective at 4 / 8 / 12 threads (best runs); Q8_0 GGUF ~707 MB per token: 98 /
+  105 / 125 GB/s. So both are at the bandwidth limit and the speed ratio is the byte ratio (~1.6x)
+- [x] GEMM (prefill, `kq512_gemm_n`): work items (2-block = 32-row tile, chunk of activation rows) as
+  `q8p_gemm_n` (static, `q8p_nb` chunk sizes); q / k / v and w1 / w3 with mixed Q4_K / Q6_K types in
+  one parallel loop (`matmul_batch_n` sends the K-quant jobs there, Q8_0 jobs, if any, to `q8p_gemm_n`).
+  Each thread unpacks its weight tile once into a per-thread scratch ("KQS": per block and group of 32
+  columns 8 steps x 64 bytes of u8 q in the Q8P step layout; Q4_K + ds, dm as fp32 = 640 bytes, Q6_K +
+  sc_j0, sc_j1 as int32 + d = 704 bytes; 40-135 KB per tile) and reuses it for all its chunks of that
+  tile (static schedule: a thread's items are consecutive, so each tile is unpacked once per thread);
+  the register tile then reads u8 weights like the Q8 GEMM, no unpacking in the inner loop. Register
+  tiles: Q4_K 2 blocks x 6 rows (12 int32 + 12 float accumulators), Q6_K 2 x 4 (t_j, I and the floats
+  are live together: 3 x 8). xf and c16 per activation row in the prologue (`kq_act_prep`, `kq512_c16`)
+- [x] Unpack strategy measured (451 tokens, 8 threads, `-DRUNQ_PROFILE`, min of 3, twice): scratch tile
+  w1+w3 74-75 ms, wo 26; Q4_K unpacked in registers per 6-row tile instead (`and`, `srli` + `and` per
+  64-byte load, ds / dm recomputed per tile): w1+w3 80-81, wo 27 (~8% slower: 6 extra ALU ops per 24
+  `vpdpbusd`). Not kept. Tile widths Q4 C = 4 / 5 / 7 / 8 and Q6 C = 2 / 3 / 5 / 6: all within noise
+  (+-5%), kept 6 / 4. Thread balance (instrumented scratch build): per-thread busy time within ~5% in
+  every GEMM, prologue < 1 ms per call type
+- [x] GEMM throughput (8 threads, 451 tokens, profile below): 1.8 (qkv, with Q6_K v in half the layers)
+  to 2.15 TOPS (w2; w1+w3 2.1), 63-74% of the measured `vpdpbusd` peak (2.9 TOPS); Q8_0 GGUF 2.2-2.4.
+  The difference is the fold: 6 (Q4_K) /
+  ~7 (Q6_K: 2 mullo + add + 4) ops per 8 `vpdpbusd` vs 4 for Q8_0 group 32. GEMMs Q4_K_M / Q8_0 GGUF:
+  196 / 168 ms at 451 tokens (1.17x), 633 / 545 ms at 1,500 tokens (1.16x)
+- [x] Bit-identity: integer sums exact (any order), the folds per (block, row, group) as defined, with
+  explicit-rounding intrinsics (`kq4_fold`, `kq6_fold`). AVX-512 == generic byte for byte on every
+  checked case (GEMV, GEMM at -b 7 / 64 / 512, 1-row chunks, 3 / 8 threads, a 119-token prompt in 17
+  chunks, the 187-token `long` prompt at -b 1 / 7 / 64 / 512); logits byte-identical to the 6b-1 binaries (which ran the generic kernels in both builds);
+  greedy goldens `q4_*` and all others unchanged. Deliberate breakage (scratch builds): an FMA in the
+  Q4_K fold (`fmsub` for (ds xs) isum - b) or in the Q6_K fold (`fmadd` into val): max |diff| 1.58 /
+  1.52, all four `q4_kernels/*` fail (and `greedy/q4_generate`); `q4_batched/*` / `q4_threads/*` cannot
+  see it (both sides use the same kernel)
+- [x] Tests (`make test` 269 checks, ~30-33 s on the busy box, load 4-6; was 265 / ~30 s): `q4_kernels/*`
+  en -b 1 (GEMV incl. the Q6_K classifier), en -b 7 (tiles 6 + 1 / 4 + 3, a 1-row chunk), all -b 7 (13
+  chunks), all -b 64 (2 chunks, tiles 6 + 4 / 4 + 2, the all-rows classifier GEMM) vs the generic build,
+  which runs in the background at 4 threads (~3 s of generic runs: ~1 s per 86 tokens with all-rows
+  logits, mostly the classifier); `q4_batched` + all -b 7 / 64; `q4_threads` on all -b 7 / 64 (8 vs 3:
+  other chunk sizes and partitions). The q4 group: 2.9 -> ~5 s with these (the AVX-512 side alone ~4 s,
+  half of it process startup + repacking). The generic kernels' `KQ_NC` 4 -> 8 / 16 (unpack amortized
+  over more rows) was only 7-10% faster: not changed
+- [x] ASan+UBSan (`-O1 -g -fsanitize=address,undefined`), AVX-512 and generic builds, Q4_K_M: generate
+  at -b 1 / 7 / 512 on a 119-token prompt, logits -b 1 / 7 / 512 (3 and 8 threads), chat multi-turn at
+  -b 1 / 512 and -c 160 -r 1 -y -b 7 (context full), dequant: no reports; the sanitizer builds agree
+  with each other and across -b / threads byte for byte
+- [x] Speed (2026-10-25, same session, load 4-8 (shared box, other tenants' memory traffic), best of 3-4;
+  prefill `scripts/bench_prefill.sh -m <model> -l "450 1500" -b 512 -t "8 12"`, decode
+  `scripts/bench_qwen3c.sh <model> 4 8 12` (256 tokens) plus 4 interleaved rounds of the same runs):
+
+  | | .bin Q8_0 | GGUF Q8_0 | GGUF Q4_K_M |
+  |---|---|---|---|
+  | prefill 451 tokens, 8 / 12 threads | 1,961 / 2,693 tok/s | 1,874 / 2,540 | 1,670 / 2,142 (0.89x / 0.84x of GGUF Q8_0) |
+  | prefill 1,500 tokens, 8 / 12 threads | 1,542 / 2,029 | 1,448 / 2,028 | 1,317 / 1,843 (0.91x / 0.91x) |
+  | decode 4 / 8 / 12 threads (best) | 136 / 160 / 232 tok/s | 138 / 149 / 176 | 198 / 243 / 302 (1.4x / 1.6x / 1.7x) |
+  | decode, effective GB/s (4 / 8 / 12) | | 98 / 105 / 125 | 86 / 106 / 131 |
+  | process wall `-n 1 -i hi`, 12 / 8 threads (median of 9) | 0.133 / 0.148 s | 0.147 / 0.175 | 0.120 / 0.139 |
+  | peak RSS | 620-632 MB | 667-673 MB | 408-419 MB |
+
+  Decode run to run: +-30% (e.g. Q4_K_M at 12 threads 188-302 tok/s); within one interleaved round
+  Q4_K_M / Q8_0 GGUF was 1.1-2.0x, median ~1.5x. Prefill is ~10-16% slower than Q8_0 GGUF (the GEMM
+  folds, above), decode ~1.6x faster (bytes), startup ~25-35 ms faster (fewer bytes to repack), RSS -38%
+- [x] Profile (`-DRUNQ_PROFILE`, 8 threads, -b 512, min of 3 per phase): 451 tokens 274 ms: GEMMs 71.5%
+  (qkv 58 ms 21.2%, wo 26 9.5%, w1+w3 75 27.4%, w2 37 13.5%), attention+quant 45 16.4%, norm+quant+resid
+  16 5.8%, swiglu+quant 11 4.0%, qk-norm+rope+kv 5 1.8%, classifier 1; 1,500 tokens 1.13 s: GEMMs 56%
+  (qkv 182, wo 86, w1+w3 241, w2 124 ms), attention 386 ms 34%, rest 10%. 12 threads: 196 ms (GEMMs 139,
+  attention 32) / 846 ms (GEMMs 481, attention 272). (Q8_0 GGUF, 8 threads: 245 ms, GEMMs 168 / 1.04 s,
+  GEMMs 545)
 
 ## Known bugs
 Found by the tests.
@@ -610,7 +659,7 @@ Found by the tests.
 - [x] Step 5: NFC normalizer in the tokenizer: done, see above
 - [x] Step 6a: GGUF Q8_0 loading (no export step, no side files): done, see above
 - [x] Step 6b-1: GGUF Q4_K_M correct (loader, repacked layouts, arithmetic, generic kernels, tests): done, see above
-- Step 6b-2: AVX-512 kernels for Q4_K / Q6_K (notes above)
+- [x] Step 6b-2: AVX-512 kernels for Q4_K / Q6_K (GEMV at the bandwidth limit, GEMM ~1.17x Q8_0's): done, see above
 - Step 7: performance leftovers (decode barriers / attention split, bf16 KV cache, 16-thread barriers, prefill rest)
 
 ## Later / ideas

@@ -1813,9 +1813,12 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
 
     int nt = rq_nthreads();
     rq_begin(&s->sync, decode_phases(p), decode_counters(p), nt, rq_spin_dec);
-    // GEMV ranges of 16-row blocks: ~4 per thread (dim / 16 = 64 blocks), the classifier ~8
+    // GEMV claims of 16-row blocks: ~4 per thread (dim / 16 = 64 blocks); the classifier 32 blocks
+    // (~0.6 MB, ~20 us): ~300 claims of 9,496 blocks. (With ~8 claims per thread, ~0.2 ms each at 4
+    // threads, the other threads waited longer than their spin at the end of the phase and slept every
+    // token: decode ~20-40% slower at 4-8 threads)
     s->dec_chunk = p->dim / 16 / (4 * nt) > 1 ? p->dim / 16 / (4 * nt) : 1;
-    s->cls_chunk = (p->vocab_size + 15) / 16 / (8 * nt) > 1 ? (p->vocab_size + 15) / 16 / (8 * nt) : 1;
+    s->cls_chunk = 32;
     DecodeJob job = { transformer, token, pos, compute_logits };
     rq_parallel(decode_worker, &job);
     return compute_logits ? s->logits : NULL;

@@ -71,18 +71,19 @@
 #define RQ_LOAD(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
 #define RQ_ADD(p, v) __atomic_fetch_add((p), (v), __ATOMIC_ACQ_REL)
 
-// pause rounds before sleeping (Zen 4: ~28 ns per round, so 4,000 ~ 110 us): decode phases (~10-60
-// us apart; 16-vCPU VM, best of 6: 1,000 rounds decoded ~30% slower at 8 threads, sleeping and waking
-// too often; 30,000 ~15-20% slower at 12-16 threads, the spinning waiters keep CPUs from a preempted
-// thread), prefill phases (~1-2 ms; 4,000 ~5% faster than 1,000 at 8-12 threads), the pool's wait
-// for the next job
+// pause rounds before sleeping (Zen 4: ~28 ns per round, so 4,000 ~ 110 us), in decode phases (~10-60
+// us apart) and prefill phases (~1-2 ms); 1,000 / 4,000 / 16,000 decode within noise at 4-16 threads
+// (16-vCPU VM, best and median of 6), 4,000 prefill ~5% faster than 1,000 at 8-12 threads; and
+// between jobs (RQ_SPIN_JOB)
 #ifndef RQ_SPIN_DEC
 #define RQ_SPIN_DEC 4000
 #endif
 #ifndef RQ_SPIN_PF
 #define RQ_SPIN_PF 4000
 #endif
-#define RQ_SPIN_JOB 4000
+#ifndef RQ_SPIN_JOB
+#define RQ_SPIN_JOB 20000 // ~0.55 ms: covers the serial part between two decode steps (sampling at -t > 0)
+#endif
 static int rq_spin_dec = RQ_SPIN_DEC, rq_spin_pf = RQ_SPIN_PF;
 static int rq_static = 0; // RUNQ_SYNC=static: fixed item ranges per thread (a plain barrier per phase)
 
@@ -335,10 +336,13 @@ static int rq_threads(void) {
 
 #ifdef RUNQ_POOL
 // Persistent pool: nt - 1 workers (tid 1..nt-1) + the caller (tid 0). Job protocol: the caller sets
-// fn / ctx, bumps gen (futex word), then opens state (bit 0 = closed, the rest 2 x workers inside);
+// fn / ctx, opens state (bit 0 = closed, the rest 2 x workers inside), then bumps gen (futex word);
 // a worker that sees a new gen enters only while the job is open. After its own share the caller
 // closes the job and waits until no worker is inside: workers that have not started yet skip the
-// job (with dynamic phases all the work is done by then; static mode is not supported here)
+// job (with dynamic phases all the work is done by then; static mode is not supported here). A
+// worker delayed between its gen check and entering may enter the next job while the caller has
+// opened it but not bumped gen yet, and then enter that job a second time: harmless (it runs fn
+// after its first run returned, with the same tid: claims find their items taken, scratch per tid)
 static struct {
     int gen, sleepers, state, state_sleepers, nt, entered;
     RqFn fn;
@@ -354,7 +358,7 @@ static void *rq_pool_main(void *arg) {
         int in = 0;
         while (!(s & 1))
             if (__atomic_compare_exchange_n(&rq_pool.state, &s, s + 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { in = 1; break; }
-        my_gen = __atomic_load_n(&rq_pool.gen, __ATOMIC_ACQUIRE); // (the gen of the job entered, or a later one)
+        my_gen = __atomic_load_n(&rq_pool.gen, __ATOMIC_ACQUIRE); // (the gen of the job entered, or one less)
         if (!in)
             continue;
         rq_pool.fn(rq_pool.ctx, tid, rq_pool.nt);
@@ -376,8 +380,11 @@ static void rq_parallel(RqFn fn, void *ctx) {
     nt = rq_pool.nt;
     rq_pool.fn = fn;
     rq_pool.ctx = ctx;
-    __atomic_add_fetch(&rq_pool.gen, 1, __ATOMIC_SEQ_CST);
+    // open the job, then announce it: in the other order, a worker spinning on gen saw the new gen
+    // while the job was still closed and skipped it (most of them, every other job: decode ran with
+    // a fraction of the threads every second token, ~20-40% slower at 4-12 threads)
     __atomic_store_n(&rq_pool.state, 0, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&rq_pool.gen, 1, __ATOMIC_SEQ_CST);
     if (__atomic_load_n(&rq_pool.sleepers, __ATOMIC_SEQ_CST))
         rq_wake(&rq_pool.gen);
     fn(ctx, 0, nt);

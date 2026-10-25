@@ -7,7 +7,7 @@ output of every run: [bench/results-2026-10-25.txt](bench/results-2026-10-25.txt
 measurements are only in [History](#history-earlier-measurements) and are labelled there.
 
 The [Apple M1 Pro section](#apple-m1-pro-macos-neon) is a different machine and different sessions
-(2026-10-25, 14:56-21:07 UTC, branch `mac-m1-pro`) and is not comparable with the tables above
+(2026-10-25, 14:56-22:30 UTC, branch `mac-m1-pro`) and is not comparable with the tables above
 (other CPU; Q4_K_M as well as Q8_0).
 
 ## Setup
@@ -126,21 +126,23 @@ VNNI weights (~630 MB, ~55 ms to pack). mynah-slm reports a 0.14-0.15 s model lo
 ## Apple M1 Pro (macOS, NEON)
 
 Experimental port, branch `mac-m1-pro`: `runq` built with Apple clang (`make`), NEON `sdot` kernels
-for the Q4_K / Q6_K matrices, the attention and Q8_0, all in `src/kernels_neon.h`. Three sessions on
-2026-10-25: Q4_K_M 14:56-15:05 UTC
+for the Q4_K / Q6_K matrices, the attention (all KV cache types) and Q8_0, all in `src/kernels_neon.h`.
+Four sessions on 2026-10-25: Q4_K_M 14:56-15:05 UTC
 ([bench/results-mac-m1-pro-2026-10-25.txt](bench/results-mac-m1-pro-2026-10-25.txt)); Q8_0 with
 Q4_K_M rerun for comparison 16:11-16:20 UTC
 ([bench/results-mac-m1-pro-q8-2026-10-25.txt](bench/results-mac-m1-pro-q8-2026-10-25.txt)); both
 formats after the rebase onto Step 7a, against the build from before it, 20:59-21:07 UTC
-([bench/results-mac-m1-pro-step7a-2026-10-25.txt](bench/results-mac-m1-pro-step7a-2026-10-25.txt)).
+([bench/results-mac-m1-pro-step7a-2026-10-25.txt](bench/results-mac-m1-pro-step7a-2026-10-25.txt));
+the KV cache types after the rebase onto Step 7b's f16 default and the NEON 16-bit attention,
+22:17-22:30 UTC ([bench/results-mac-m1-pro-kv16-2026-10-25.txt](bench/results-mac-m1-pro-kv16-2026-10-25.txt)).
 
 | | |
 |---|---|
 | CPU | Apple M1 Pro, 8 performance + 2 efficiency cores, 32 GB, macOS 26.6.2 |
-| sharing | a desktop in use (iTerm, browser, ...): 1-min load before / after the runs 3 / 9.6 (first session), 6.4 / 8.7 (second), 4.3 / 11.1 (third; the "after" values include the benchmark's own threads) |
+| sharing | a desktop in use (iTerm, browser, ...): 1-min load before / after the runs 3 / 9.6 (first session), 6.4 / 8.7 (second), 4.3 / 11.1 (third), 10.6 / 12.8 (fourth: right after a test run, Spotlight indexing); the "after" values include the benchmark's own threads |
 | compiler | Apple clang 21.0.0, `-O3 -ffast-math -ffp-contract=on -mcpu=native` (`make`; no OpenMP, the pthread pool) |
 | models | `Qwen3-0.6B-Q4_K_M.gguf` (unsloth @ `50968a4`, 396,705,472 bytes); `Qwen3-0.6B-q8.bin` (633,495,808 bytes, group 64); greedy, `-b 512`, `-c 4096` |
-| runq | first session `bb69e5f`; second `a2ab409` + the Q8_0 kernels, committed unchanged as `14169f4` (both before the rebase onto Step 7a, base `92fe41f`; rebased, these commits are `6e7244d` and `6aea56d`); third `33069be` (on `origin/main` `10211a3`) against the pre-rebase build |
+| runq | first session `bb69e5f`; second `a2ab409` + the Q8_0 kernels, committed unchanged as `14169f4` (both on base `92fe41f`); third `33069be` (on `10211a3`); fourth `59d1e34` (on `989f712`). The branch was rebased twice since the first three, so those commits are no longer on it (the Mac's clone keeps them as tags `mac-m1-pro-pre-step7a` = `f4b8a68` and `mac-m1-pro-on-10211a3` = `2b152b6`) |
 
 ### Q4_K_M (first session)
 
@@ -233,7 +235,7 @@ cell, same scripts (round 1 / round 2):
 
   | `-k` | prefill | decode |
   |---|---|---|
-  | f32 (default) | 995 / 970 | 97 / 98 |
+  | f32 (then the default) | 995 / 970 | 97 / 98 |
   | bf16 | 205 / 203 | 67 / 65 |
   | f16 | 104 / 102 | 39 / 39 |
 
@@ -243,10 +245,76 @@ cell, same scripts (round 1 / round 2):
   A NEON version (the exact conversion in registers, then the existing kernels) is not written; it
   would halve the ~340 MB of cache reads per decoded token at 1,500 positions. The M1 Pro has no bf16
   instructions (`hw.optional.arm.FEAT_BF16` 0); the conversion does not need them (a 16-bit shift).
+  (Since `59d1e34` the NEON attention covers bf16 / f16 too: fourth session.)
 - `make test` on the rebased build: 162 passed, 8 failed, the same 8 as unmodified `origin/main`
   built on this Mac (tests that depend on the generated text; README, Known limitations).
 - Disturbed runs, not the reported bests: Q8_0 before, round 2, 9 threads, 1,500 tokens (prefill 373
   vs 1,154-1,159); Q8_0 after, round 2, 10 threads, 1,500 tokens (decode 60 vs 77).
+
+### KV cache types: f16 default, NEON 16-bit attention (fourth session)
+
+`origin/main` moved on again, to `989f712`: Step 7b's cache layout (per block of 256 positions, each
+kv head's 16 tiles contiguous) and f16 as the default KV cache (Step 7b on the dev box: KL to HF
+fp32 on 45k tokens +0.2% for f16, +2.6% for bf16). The branch was rebased onto it (the NEON f32
+attention adapted to the block layout in the port commit), then `59d1e34` added the NEON attention
+for the bf16 / f16 caches: the 16-bit elements converted to fp32 in registers (exact), then the same
+arithmetic, bit-identical to the generic build. Builds, interleaved, two rounds, 8 threads, best of 3
+(round 1 / round 2): **new** `59d1e34`; **rebased** `4426981` (the 16-bit caches on the generic
+attention; one run per cell, none at 3,000 tokens: ~1 min each); **before** the rebase `2b152b6`
+(Step 7a, f32). Prompts: `bench_qwen3c.sh`'s short one then 256 new tokens; `bench_prefill.sh -P`
+451 / 1,500 / 3,000 tokens then 128 new tokens (decode after a long prompt).
+
+Decode, tok/s:
+
+| model, build, `-k` | short | 451 | 1,500 | 3,000 |
+|---|---|---|---|---|
+| Q4_K_M, before, f32 | 218 / 218 | 174 / 173 | 110 / 109 | 70 / 71 |
+| Q4_K_M, rebased, f32 | 227 / 223 | 188 / 188 | 130 / 130 | 88 / 89 |
+| Q4_K_M, rebased, f16 (generic attention) | 160 / 153 | 94 / 91 | 42 / 41 | |
+| Q4_K_M, new, f32 | 225 / 225 | 188 / 186 | 129 / 129 | 90 / 89 |
+| Q4_K_M, new, bf16 | 232 / 231 | 207 / 204 | 158 / 158 | 115 / 115 |
+| **Q4_K_M, new, f16 (default)** | **234 / 230** | **207 / 205** | **157 / 158** | **113 / 115** |
+| Q8_0 .bin, before, f32 | 148 / 150 | 125 / 127 | 89 / 89 | 62 / 62 |
+| Q8_0 .bin, rebased, f32 | 152 / 153 | 132 / 134 | 101 / 101 | 76 / 75 |
+| Q8_0 .bin, rebased, f16 (generic attention) | 108 / 121 | 71 / 82 | 36 / 41 | |
+| Q8_0 .bin, new, f32 | 151 / 152 | 132 / 135 | 100 / 102 | 75 / 75 |
+| Q8_0 .bin, new, bf16 | 155 / 157 | 144 / 146 | 117 / 118 | 93 / 93 |
+| **Q8_0 .bin, new, f16 (default)** | **155 / 158** | **144 / 146** | **117 / 119** | **93 / 93** |
+
+Prefill, tok/s (the short prompt is ~25 tokens: left out):
+
+| model, build, `-k` | 451 | 1,500 | 3,000 |
+|---|---|---|---|
+| Q4_K_M, before, f32 | 1,331 / 1,229 | 906 / 893 | 480 / 618 |
+| Q4_K_M, rebased, f32 | 1,295 / 1,186 | 958 / 912 | 544 / 659 |
+| Q4_K_M, rebased, f16 (generic attention) | 286 / 276 | 101 / 99 | |
+| Q4_K_M, new, f32 | 1,379 / 1,159 | 959 / 910 | 649 / 652 |
+| Q4_K_M, new, bf16 | 1,275 / 1,167 | 948 / 894 | 610 / 659 |
+| **Q4_K_M, new, f16 (default)** | **1,257 / 1,167** | **945 / 889** | **580 / 665** |
+| Q8_0 .bin, before, f32 | 1,272 / 1,787 | 883 / 1,158 | 660 / 721 |
+| Q8_0 .bin, rebased, f32 | 1,186 / 1,824 | 857 / 1,214 | 704 / 789 |
+| Q8_0 .bin, rebased, f16 (generic attention) | 223 / 324 | 88 / 103 | |
+| Q8_0 .bin, new, f32 | 1,151 / 1,799 | 813 / 1,312 | 638 / 780 |
+| Q8_0 .bin, new, bf16 | 1,161 / 1,774 | 817 / 1,258 | 662 / 795 |
+| **Q8_0 .bin, new, f16 (default)** | **1,162 / 1,784** | **826 / 1,266** | **697 / 795** |
+
+- f16 vs f32 cache, new build, decode: +2-4% (short), +8-10% (451), +17-22% (1,500), +23-29%
+  (3,000 tokens): the cache is half the bytes (229 -> 115 KB per position; at 3,000 positions 688 ->
+  344 MB read per token, next to ~400 MB of Q4_K_M weights). Less than a pure bandwidth model gives
+  (~1.3x at 1,500, ~1.45x at 3,000, the estimate before this session). bf16 decodes as fast as f16.
+- Prefill with the 16-bit caches: -4% to +2% vs f32 in round 2 (round 1 was disturbed: Q8_0 ~35%
+  lower for every build, Q4_K_M at 3,000 tokens too). The NEON conversion vs the generic attention
+  (rebased build, f16): prefill 4-12x, decode 1.3-3.9x.
+- Step 7b's layout alone (rebased vs before, f32): decode +2-4% (short) to +22-27% (3,000 tokens).
+  With the f16 default on top, decode vs before the rebase: Q4_K_M +6-8% (short), +19% (451),
+  +43-45% (1,500), +61-63% (3,000); Q8_0 +5%, +15%, +32-33%, +50-51%.
+- Session to session: the before build decodes 218 here (short prompt, Q4_K_M) against 188-193 for
+  the same code in the third session: 13-16% between sessions on this desktop (cause not determined;
+  on AC power, Low Power Mode off). Only the comparisons within a round are meaningful.
+- Tests on the new build: `make kq-neon-test` (84 attention cases: bf16 / f16 vs the fp32 cache with
+  the same values, bit-identical); `make test` 184 passed, 8 failed (text vs the x86 goldens, README
+  Known limitations); 688-position logits, both models, `-k f32 / bf16 / f16`, `-b 512` and `-b 1`:
+  NEON == generic.
 
 ### Both
 

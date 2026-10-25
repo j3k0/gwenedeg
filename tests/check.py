@@ -25,8 +25,9 @@ Tests (see tests/README.md):
   q4         the GGUF Q4_K_M file (--q4; Q4_K / Q6_K weights): dequantized rows vs gguf-py bitwise
              (tests/golden/dequant, from the blocks and from the repacked layouts), logits vs HF
              (loose Q4 thresholds) and vs the Q4 reference (golden/logits_q4: HF fp32 with the
-             dequantized Q4_K_M weights; tight), batched vs sequential, threads and AVX-512 build vs
-             generic bitwise; its greedy goldens (q4_*) run in the greedy group
+             dequantized Q4_K_M weights; tight), batched vs sequential, threads and the AVX-512
+             K-quant kernels (GEMV, GEMM over several chunks) vs the generic ones bitwise; its greedy
+             goldens (q4_*) run in the greedy group
 
 Logits metrics, per position, over U = (fixed 4096-id vocab subset) + (HF top-64 ids):
   cos   cosine similarity of runq vs HF logits on U
@@ -109,7 +110,8 @@ GREEDY_CASES = [
     # the GGUF file (name prefix gguf_: run on --gguf)
     ("gguf_chat", ["-m", "chat", "-n", "40", "-i", "What is the capital of Australia? Answer in one sentence."]),
     ("gguf_generate", ["-m", "generate", "-n", "40", "-i", "Once upon a time, in a small village by the sea,"]),
-    # the Q4_K_M file (prefix q4_: run on --q4; generic K-quant kernels for now: short)
+    # the Q4_K_M file (prefix q4_: run on --q4; 24 tokens: written in Step 6b-1 with the generic
+    # kernels, which the AVX-512 ones match bit for bit)
     ("q4_chat", ["-m", "chat", "-n", "24", "-i", "What is the capital of Australia? Answer in one sentence."]),
     ("q4_generate", ["-m", "generate", "-n", "24", "-i", "Once upon a time, in a small village by the sea,"]),
 ]
@@ -135,12 +137,19 @@ THREADS_LONG = 3         # long -b 64: OMP_NUM_THREADS=3 vs the default (other w
 GGUF_SEQ = [THREADS_PROMPT, "code"]
 GGUF_BATCHED = [(THREADS_PROMPT, BATCH_CHUNKS[0]), (THREADS_PROMPT, BATCH), ("code", BATCH_CHUNKS[0])]
 GGUF_KERNELS = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH)]
-# Q4_K_M (generic K-quant kernels in every build for now, Step 6b-1: few and short runs): logits vs
-# HF and vs the Q4 reference batched on all prompts, sequential on Q4_SEQ; batched vs -b 1 bitwise;
-# threads 8 vs 3 (-b 7); AVX-512 build vs generic (meaningful once 6b-2 adds AVX-512 kernels)
+# Q4_K_M: logits vs HF and vs the Q4 reference batched on all prompts, sequential on Q4_SEQ; batched
+# (prompt, -b) vs -b 1 bitwise; threads 8 vs 3 (Q4_THREADS: other GEMM chunk sizes and partitions);
+# AVX-512 kernels vs the generic ones (Q4_KERNELS, bitwise): en -b 1 = the GEMV (decode, incl. the
+# Q6_K classifier), en -b 7 = GEMM tiles of 6 + 1 rows (Q4_K) / 4 + 3 (Q6_K) and a 1-row chunk,
+# all -b 7 = 13 chunks (last one 2 rows), all -b 64 = 2 chunks with tiles 6 + 4 / 4 + 2 and the
+# all-rows classifier GEMM (Q6_K). ("all", not "long": the generic build takes ~1 s per 86 tokens
+# with all-rows logits, mostly the classifier)
 Q4_SEQ = [THREADS_PROMPT]
-Q4_BATCHED = [(THREADS_PROMPT, BATCH_CHUNKS[0]), (THREADS_PROMPT, BATCH)]
-Q4_KERNELS = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0])]
+Q4_BATCHED = [(THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH)]
+Q4_THREADS = [(BATCH_LONG, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH)]
+Q4_KERNELS = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH)]
+Q4_GEN_THREADS = 4       # the generic runs of Q4_KERNELS go in the background, next to the others at
+                         # OMP_NUM_THREADS (8): 12 spinning threads on the 16-vCPU box, not all of them
 GGUF_TEMPLATES = [("plain", [], ".template"), ("thinking", ["-r", "1"], ".template.with-thinking"),
                   ("system", ["-y", "You are terse."], ".template.with-system"),
                   ("system_thinking", ["-r", "1", "-y", "You are terse."], ".template.with-system-and-thinking")]
@@ -744,6 +753,16 @@ def test_q4(a, res, tmp):
     q4 = argparse.Namespace(**{**vars(a), "model": a.q4})
     qtmp = os.path.join(tmp, "q4")
     os.makedirs(qtmp, exist_ok=True)
+    texts = dict(batched_prompts())
+    # the generic build's runs for q4_kernels (the slow part: ~1 s per 86 tokens with all-rows logits),
+    # one at a time in the background while the AVX-512 build runs the rest
+    gen_ex, gen_runs = None, []
+    if a.generic:
+        gen = argparse.Namespace(**{**vars(q4), "runq": a.generic})
+        gentmp = os.path.join(qtmp, "generic")
+        os.makedirs(gentmp, exist_ok=True)
+        gen_ex = cf.ThreadPoolExecutor(max_workers=1)
+        gen_runs = [gen_ex.submit(logits_file, gen, gentmp, name, texts[name], chunk, Q4_GEN_THREADS) for name, chunk in Q4_KERNELS]
 
     # dequantization vs gguf-py, bitwise: rows from the file's blocks (embedding lookup) and from
     # the repacked Q4P / Q6P layouts (what the matmul kernels read)
@@ -779,23 +798,24 @@ def test_q4(a, res, tmp):
     test_logits(q4, res, qtmp, BATCH, "q4_ref_batched", th=TH_Q4_REF, sub="logits_q4")
     test_logits(q4, res, qtmp, SEQ, "q4_ref", only=Q4_SEQ, th=TH_Q4_REF, sub="logits_q4", pooled=False)
 
-    texts = dict(batched_prompts())
     for name, chunk in Q4_BATCHED:
         same, detail = same_files(logits_file(q4, qtmp, name, texts[name], SEQ), logits_file(q4, qtmp, name, texts[name], chunk))
         res.report(same, f"q4_batched/{name}_b{chunk}", f"-b {chunk} vs -b {SEQ}: {detail}")
     n_a = int(os.environ["OMP_NUM_THREADS"])
     n_b = THREADS_LONG if n_a != THREADS_LONG else 8
-    chunk = BATCH_CHUNKS[0]
-    same, detail = same_files(logits_file(q4, qtmp, THREADS_PROMPT, texts[THREADS_PROMPT], chunk, threads=n_a),
-                              logits_file(q4, qtmp, THREADS_PROMPT, texts[THREADS_PROMPT], chunk, threads=n_b))
-    res.report(same, f"q4_threads/bitwise_b{chunk}", f"{THREADS_PROMPT} -b {chunk}: OMP_NUM_THREADS={n_a} vs {n_b} {detail}")
+    for name, chunk in Q4_THREADS:
+        same, detail = same_files(logits_file(q4, qtmp, name, texts[name], chunk, threads=n_a),
+                                  logits_file(q4, qtmp, name, texts[name], chunk, threads=n_b))
+        res.report(same, f"q4_threads/bitwise_{name}_b{chunk}", f"{name} -b {chunk}: OMP_NUM_THREADS={n_a} vs {n_b} {detail}")
     if a.generic:
-        gen = argparse.Namespace(**{**vars(q4), "runq": a.generic})
-        gentmp = os.path.join(qtmp, "generic")
-        os.makedirs(gentmp, exist_ok=True)
-        for name, chunk in Q4_KERNELS:
-            same, detail = same_files(logits_file(q4, qtmp, name, texts[name], chunk), logits_file(gen, gentmp, name, texts[name], chunk))
-            res.report(same, f"q4_kernels/{name}_b{chunk}", f"AVX-512 build vs generic, -b {chunk}: {detail}")
+        try:
+            for (name, chunk), fut in zip(Q4_KERNELS, gen_runs):
+                pv = logits_file(q4, qtmp, name, texts[name], chunk)
+                same, detail = same_files(pv, fut.result())
+                res.report(same, f"q4_kernels/{name}_b{chunk}", f"AVX-512 kernels vs generic ({Q4_GEN_THREADS} threads), "
+                           f"{name} (n={len(read_logits(pv)[0])}) -b {chunk}: {detail}")
+        finally:
+            gen_ex.shutdown(cancel_futures=True)
     else:
         print("      q4_kernels skipped: no generic build (--generic / RUNQ_GENERIC)")
 

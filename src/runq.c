@@ -76,8 +76,7 @@ typedef struct {
 
 typedef struct {
     // token embedding table
-    QuantizedTensor *q_tokens; // (vocab_size, dim)
-    float *token_embedding_table; // same, but dequantized
+    QuantizedTensor *q_tokens; // (vocab_size, dim); rows dequantized at lookup (embed_row)
     // weights for rmsnorms
     float *rms_att_weight; // (layer, dim) rmsnorm weights
     float *rms_ffn_weight; // (layer, dim)
@@ -291,11 +290,6 @@ void free_run_state(RunState* s) {
 // ----------------------------------------------------------------------------
 // Quantization functions
 
-void dequantize(QuantizedTensor *qx, float *x, int n) {
-    for (int i = 0; i < n; i++)
-        x[i] = qx->q[i] * qx->s[i / GS];
-}
-
 void quantize(QuantizedTensor *qx, float *x, int n) {
     for (int group = 0; group < n / GS; group++) {
         // find the max absolute value in the current group
@@ -322,6 +316,23 @@ void quantize(QuantizedTensor *qx, float *x, int n) {
             int8_t quantized = (int8_t) round(quant_value); // round and clamp
             qx->q[group * GS + i] = quantized;
         }
+    }
+}
+
+static void embed_row(float *x, const QuantizedTensor *t, int token, int dim) {
+    // row `token` of the Q8_0 embedding table t, dequantized with upstream's dequantize()
+    // expression, x[i] = q[i] * s[i / GS] (exact int8 -> float, one rounding): the same floats
+    // as the whole dequantized table upstream kept in memory
+    size_t e0 = (size_t)token * dim;
+    if (dim % GS == 0) {
+        const int8_t *q = t->q + e0;
+        const float *s = t->s + e0 / GS;
+        for (int g = 0; g < dim / GS; g++)
+            for (int i = g * GS; i < (g + 1) * GS; i++)
+                x[i] = q[i] * s[g];
+    } else {
+        for (int i = 0; i < dim; i++)
+            x[i] = t->q[e0 + i] * t->s[(e0 + i) / GS];
     }
 }
 
@@ -359,9 +370,8 @@ void memory_map_weights(TransformerWeights *w, Config *p, void *ptr) {
     // now read all the quantized weights
     ptr = (void *)fptr; // now cast the pointer back to void*
     w->q_tokens = init_quantized_tensors(&ptr, 1, p->vocab_size * p->dim);
-    // dequantize token embedding table
-    w->token_embedding_table = malloc(p->vocab_size * p->dim * sizeof(float));
-    dequantize(w->q_tokens, w->token_embedding_table, p->vocab_size * p->dim);
+    // (the token embeddings are dequantized per row at lookup, embed_row; upstream dequantized
+    // the whole table here: 622 MB of floats, ~0.3 s of page faults at every start)
 
     w->wq = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_heads * p->head_dim));
     w->wk = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_kv_heads * p->head_dim));
@@ -375,25 +385,38 @@ void memory_map_weights(TransformerWeights *w, Config *p, void *ptr) {
     w->wcls = p->shared_classifier ? w->q_tokens : init_quantized_tensors(&ptr, 1, p->dim * p->vocab_size);
 }
 
+static float *runq_data = NULL; // the checkpoint mapping (read_checkpoint), for read_at
+
 #ifdef RUNQ_VNNI
 
-static void drop_mapped(const void *begin, const void *end) {
-    // release the pages of [begin, end) of the read-only checkpoint mapping (MAP_PRIVATE, never
-    // written, so a page touched again later is simply re-read from the page cache)
-#if !defined _WIN32 && defined MADV_DONTNEED
-    uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
-    uintptr_t a = (uintptr_t)begin & ~(pg - 1), b = ((uintptr_t)end + pg - 1) & ~(pg - 1);
-    madvise((void *)a, b - a, MADV_DONTNEED);
+static void read_at(int fd, void *dst, size_t n, const void *mapped) {
+    // n bytes of the checkpoint at the file offset of `mapped` (a pointer into its mapping) into
+    // dst with pread: the file pages are copied from the page cache without being mapped into the
+    // process (no page faults, not part of our resident size, nothing to drop afterwards). Falls
+    // back to copying from the mapping
+    size_t done = 0;
+#ifndef _WIN32
+    off_t off = (off_t)((const char *)mapped - (const char *)runq_data);
+    while (done < n && fd >= 0) {
+        ssize_t r = pread(fd, (char *)dst + done, n - done, off + (off_t)done);
+        if (r <= 0) break;
+        done += (size_t)r;
+    }
 #else
-    (void)begin; (void)end;
+    (void)fd;
 #endif
+    if (done < n)
+        memcpy((char *)dst + done, (const char *)mapped + done, n - done);
 }
 
-void pack_weights(TransformerWeights *w, Config *p) {
+void pack_weights(TransformerWeights *w, Config *p, int fd) {
     // VNNI build: repack every matmul weight (7 per layer + the classifier) into the Q8P layout
-    // of kernels_avx512.h, in one allocation (the same size as the mapped Q8_0 data). The mapped
-    // pages of each tensor are dropped right after packing it, so the resident size stays about
-    // the same as without repacking (the token embedding is already dequantized at this point)
+    // of kernels_avx512.h, in one allocation (the same size as the Q8_0 data), all in one parallel
+    // loop over (matrix, block of rows) items. The source rows are read with pread (read_at), not
+    // through the mapping: only the norms and the token embedding rows looked up later (the
+    // classifier is shared with them) are ever mapped. The destination is pre-faulted in parallel
+    // (MADV_POPULATE_WRITE, 2 MB per call). Was: faults on both sides + one MADV_DONTNEED of the
+    // mapped source per tensor, ~90 ms; now ~25 ms (12 threads)
     int L = p->n_layers, dim = p->dim, hid = p->hidden_dim;
     int qd = p->n_heads * p->head_dim, kvd = p->n_kv_heads * p->head_dim;
     struct { QuantizedTensor *t; int n, d, k; } m[] = {
@@ -401,25 +424,75 @@ void pack_weights(TransformerWeights *w, Config *p) {
         { w->w1, L, hid, dim }, { w->w2, L, dim, hid }, { w->w3, L, hid, dim }, { w->wcls, 1, p->vocab_size, dim } };
     int nm = sizeof(m) / sizeof(m[0]);
     size_t total = 0;
+    int nt = 0, kmax = 0;
     for (int i = 0; i < nm; i++) {
         if (GS != Q8P_GS || !q8p_ok(m[i].d, m[i].k)) {
             fprintf(stderr, "warning: weights not packable for the VNNI kernels (GS %d, %d x %d), using the generic ones\n", GS, m[i].d, m[i].k);
             return;
         }
         total += m[i].n * q8p_size(m[i].d, m[i].k);
+        nt += m[i].n;
+        kmax = m[i].k > kmax ? m[i].k : kmax;
     }
     w->packed = alloc_big(total);
     if (!w->packed) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
     w->packed_size = total;
+
+    // the matrices in order, their place in the packed buffer, and the work items: runs of
+    // bpi(k) 16-row blocks, ~64 KB of source rows each
+    struct { QuantizedTensor *t; int d, k, bpi; size_t off; long it0; } *job = malloc((nt + 1) * sizeof(*job));
+    if (!job) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
     size_t off = 0;
+    long nit = 0;
+    int j = 0;
     for (int i = 0; i < nm; i++)
-        for (int l = 0; l < m[i].n; l++) {
-            QuantizedTensor *t = m[i].t + l;
-            t->p = w->packed + off;
-            q8p_pack(t->p, t->q, t->s, m[i].d, m[i].k);
+        for (int l = 0; l < m[i].n; l++, j++) {
+            int bpi = 65536 / (Q8P_ROWS * m[i].k);
+            job[j].t = m[i].t + l;
+            job[j].d = m[i].d;
+            job[j].k = m[i].k;
+            job[j].bpi = bpi > 0 ? bpi : 1;
+            job[j].off = off;
+            job[j].it0 = nit;
+            job[j].t->p = w->packed + off;
             off += q8p_size(m[i].d, m[i].k);
-            drop_mapped(t->q, t->s + (size_t)m[i].d * m[i].k / GS);
+            nit += (m[i].d / Q8P_ROWS + job[j].bpi - 1) / job[j].bpi;
         }
+    job[nt].it0 = nit;
+    size_t rows_max = 65536 / kmax > Q8P_ROWS ? 65536 / kmax : Q8P_ROWS;
+    rows_max = rows_max / Q8P_ROWS * Q8P_ROWS + Q8P_ROWS;
+    size_t pg_chunk = (size_t)2 << 20;
+    long npg = (long)((total + pg_chunk - 1) / pg_chunk);
+    #pragma omp parallel
+    {
+#if !defined _WIN32 && defined MADV_POPULATE_WRITE
+        #pragma omp for schedule(dynamic, 1)
+        for (long c = 0; c < npg; c++) {
+            size_t a = (size_t)c * pg_chunk, e = a + pg_chunk < total ? a + pg_chunk : total;
+            madvise(w->packed + a, e - a, MADV_POPULATE_WRITE); // (errors ignored: plain faults then)
+        }
+#endif
+        int8_t *qb = malloc(rows_max * kmax);
+        float *sb = malloc(rows_max * (kmax / Q8P_GS) * sizeof(float));
+        if (!qb || !sb) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+        int jj = 0;
+        #pragma omp for schedule(dynamic, 4)
+        for (long it = 0; it < nit; it++) {
+            while (it >= job[jj + 1].it0) jj++; // (items in order per thread)
+            while (it < job[jj].it0) jj--;
+            QuantizedTensor *t = job[jj].t;
+            int k = job[jj].k, ng = k / Q8P_GS, nblk = job[jj].d / Q8P_ROWS;
+            int rb0 = (int)(it - job[jj].it0) * job[jj].bpi;
+            int nb = nblk - rb0 < job[jj].bpi ? nblk - rb0 : job[jj].bpi;
+            size_t r0 = (size_t)rb0 * Q8P_ROWS, nr = (size_t)nb * Q8P_ROWS;
+            read_at(fd, qb, nr * k, t->q + r0 * k);
+            read_at(fd, sb, nr * ng * sizeof(float), t->s + r0 * ng);
+            q8p_pack_blocks(t->p + (size_t)rb0 * ng * Q8P_GROUP, qb, sb, nb, k);
+        }
+        free(qb);
+        free(sb);
+    }
+    free(job);
 }
 #endif
 
@@ -437,7 +510,7 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights* weigh
 
     *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, fileno(file), 0);
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
-    fclose(file);
+    runq_data = *data;
 
     // checkpoint format is 256-byte header, and then the model weights
 
@@ -453,8 +526,9 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights* weigh
     void *weights_ptr = ((char *)*data) + 256; // skip the header (256 bytes)
     memory_map_weights(weights, config, weights_ptr);
 #ifdef RUNQ_VNNI
-    pack_weights(weights, config);
+    pack_weights(weights, config, fileno(file));
 #endif
+    fclose(file);
 }
 
 void build_transformer(Transformer *t, char *checkpoint_path, int ctx_length, int nb_max) {
@@ -467,7 +541,6 @@ void build_transformer(Transformer *t, char *checkpoint_path, int ctx_length, in
 void free_transformer(Transformer *t) {
     // free QuantizedTensors
     free(t->weights.q_tokens);
-    free(t->weights.token_embedding_table);
     free(t->weights.wq);
     free(t->weights.wk);
     free(t->weights.wv);
@@ -865,8 +938,8 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
     int all_heads_dim = nh * hd, ff = s->ff_rows;
     size_t ts = (size_t)nkv * ATT_T * hd;
 
-    // copy the token embedding into s->x
-    memcpy(s->x, w->token_embedding_table + token * dim, dim * sizeof(float));
+    // the token embedding into s->x
+    embed_row(s->x, w->q_tokens, token, dim);
     rope_row(s->rope, hd, pos);
     if (pos % ATT_T == 0)
         kv_populate(s, p, pos, 1); // first position of a KV cache tile: pre-fault the tile (all layers)
@@ -1009,7 +1082,7 @@ float *forward_batch(Transformer *transformer, int *tokens, int n, int pos0, int
 
     #pragma omp parallel for
     for (int b = 0; b < n; b++) {
-        memcpy(s->x_b + (size_t)b * dim, w->token_embedding_table + (size_t)tokens[b] * dim, dim * sizeof(float));
+        embed_row(s->x_b + (size_t)b * dim, w->q_tokens, tokens[b], dim);
         rope_row(s->rope_b + (size_t)b * hd, hd, pos0 + b);
     }
     kv_populate(s, p, pos0, n);

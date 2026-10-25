@@ -1,8 +1,8 @@
 # Tests
 
 `make test` (or `tests/run_tests.sh`) builds `./runq` and `./runq-generic` if needed (in parallel)
-and runs everything in about 21-25 s on the 16-vCPU dev box (~37 runq processes at ~0.45 s startup
-each; the box is shared, so the time varies). It needs `models/Qwen3-0.6B-q8.bin`, plus numpy (`.venv/bin/python`
+and runs everything in about 15 s on the 16-vCPU dev box (~45 runq processes at ~0.06 s startup
+each since Step 4, was ~0.45 s; the box is shared, so the time varies). It needs `models/Qwen3-0.6B-q8.bin`, plus numpy (`.venv/bin/python`
 if present, else the system `python3`). Torch is only needed to regenerate the HF goldens.
 
 ```sh

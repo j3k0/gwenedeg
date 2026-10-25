@@ -72,11 +72,11 @@ static inline size_t q8p_size(int d, int k) { return (size_t)(d / Q8P_ROWS) * (k
 
 static inline int q8p_ok(int d, int k) { return d > 0 && k > 0 && d % Q8P_ROWS == 0 && k % Q8P_GS == 0; }
 
-static void q8p_pack(uint8_t *pk, const int8_t *q, const float *s, int d, int k) {
-    // (q, s): row-major Q8_0 (d, k) with k/64 scales per row -> Q8P layout at pk (64-byte aligned)
+static void q8p_pack_blocks(uint8_t *pk, const int8_t *q, const float *s, int nblk, int k) {
+    // nblk blocks of 16 rows of a Q8_0 matrix with k columns: (q, s) = their rows, row-major, with
+    // k/64 scales per row -> Q8P layout at pk (64-byte aligned). Serial (the caller splits the work)
     int ng = k / Q8P_GS;
-    #pragma omp parallel for schedule(static)
-    for (int rb = 0; rb < d / Q8P_ROWS; rb++) {
+    for (int rb = 0; rb < nblk; rb++) {
         for (int g = 0; g < ng; g++) {
             uint8_t *o = pk + ((size_t)rb * ng + g) * Q8P_GROUP;
             for (int r = 0; r < Q8P_ROWS; r++) {

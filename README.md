@@ -14,7 +14,7 @@ make                                  # -> ./runq  (make debug -> ./runq-debug, 
 
 ./runq models/Qwen3-0.6B-q8.bin -c 4096                     # interactive chat
 ./runq models/Qwen3-0.6B-q8.bin -c 4096 -t 0 -n 200 -i "Why is the sky blue?"
-make test                             # regression suite, ~25 s (tests/README.md)
+make test                             # regression suite, ~15 s (tests/README.md)
 make bench                            # thread sweep, prefill/decode tok/s (scripts/bench_qwen3c.sh)
 make bench-prefill                    # prefill tok/s vs prompt length and -b (scripts/bench_prefill.sh)
 scripts/bench_all.sh                  # all runq speed tables of BENCHMARKS.md (~8 min)
@@ -82,6 +82,9 @@ Revisions are pinned. Each file is verified by sha256 (LFS files) or git blob sh
   multi-turn chat with the conversation in the KV cache (see Chat above);
   faster sampling (top-p: vectorized candidate scan + a heap popped only for the nucleus; argmax
   vectorized; same tokens for the same seed);
+  token embedding rows dequantized at lookup from the Q8_0 table (upstream kept a 622 MB float
+  copy) and the weight repacking done from `pread` in one parallel loop: startup ~0.5 -> ~0.06 s,
+  peak RSS 1.36 -> ~0.63-0.74 GB;
   test hooks `-m tokenize`, `-m logits -o <file>` and `RUNQ_CHAT_DUMP` (see `tests/README.md`).
 - `src/kernels_avx512.h`: the AVX-512 VNNI Q8_0 GEMM / GEMV and the weight repacking, and the
   fp32 attention with the KV cache layout (layouts, arithmetic and bit-identity argument in its

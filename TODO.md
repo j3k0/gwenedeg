@@ -5,6 +5,7 @@ Baseline (16-vCPU EPYC Genoa, 8 threads): prefill ~85 tok/s, decode ~100 tok/s.
 Target: prefill several hundred to 1000+ tok/s; decode limited by memory bandwidth.
 Now (Step 3b, 8 threads, -b 512): prefill ~1,980 tok/s (451-token prompt), ~1,480 (1,500 tokens),
 ~1,070 (3,000 tokens); decode ~180-195. 12 threads (the default): prefill ~2,570 / ~2,020 / ~1,550.
+Startup (Step 4): ~0.06 s per process, peak RSS ~0.63-0.74 GB; chat keeps the conversation.
 
 Status: `[ ]` todo · `[~]` in progress · `[x]` done
 
@@ -123,7 +124,7 @@ w2 16), attention 10%, rest 4%; 1,500 tokens: GEMMs 68%, attention 29%, rest 3%.
   differently. Pre-existing, the previous commit built the same way gives the same text
 - [x] Weight repacking cost: load +~55 ms (0.40 -> 0.45 s for a 1-token run), peak RSS 1,316 ->
   1,362 MB: the packed copy is one anonymous mapping and the mapped Q8_0 pages of each tensor are
-  dropped (`MADV_DONTNEED`) right after packing it
+  dropped (`MADV_DONTNEED`) right after packing it (Step 4: now read with `pread`, ~23 ms)
 - [x] Found on the way: the KV cache is calloc'd and was first touched inside the K/V GEMMs, whose
   page faults serialize in the kernel (~55 ms of a 451-token prefill, half of "gemm qkv"). Now
   pre-faulted per chunk with `MADV_POPULATE_WRITE`, one call per (layer, K/V) range in parallel
@@ -237,6 +238,28 @@ Before (Step 3a, 8 threads, -b 128): 451 tokens: GEMMs 43%, attention 42%, rest 
   faster would mean splitting the exp pass over threads with the sum kept in gcc's exact order: not
   done. Tests: seeded goldens `greedy/seeded_chat` (-t 0.8 -p 0.9) and `greedy/seeded_generate`
   (-t 1.5 -p 0.95), generated with the old binary
+- [x] Startup and RAM. Before (12 threads, `-c 4096`): ~0.50 s per process, peak RSS 1,361 MB; in
+  process ~420 ms of loading: dequantizing the whole token embedding table to floats (622 MB,
+  ~300 ms, nearly all page faults) and packing the weights (~118 ms). Now:
+  - the embedding rows are dequantized at lookup from the Q8_0 table (`embed_row`, upstream's
+    `q * s` expression: same floats; logits files byte-identical to the previous binary, VNNI and
+    generic, -b 1 / 7 / 64). The float table was only used for the lookup (the classifier is the
+    shared Q8_0 table, packed). With the shared classifier its mapped pages are never dropped now
+    (see below), the looked-up rows are simply mapped
+  - packing: one parallel loop over (matrix, ~64 KB of rows) items, the source rows read with
+    `pread` (copied from the page cache, never mapped: no source page faults and no per-tensor
+    `MADV_DONTNEED`, which alone cost ~40 ms in TLB shootdowns / unmapping), the destination
+    pre-faulted with parallel `MADV_POPULATE_WRITE` (2 MB per call, ~8 ms instead of ~40 ms of
+    faults inside the copy). Pack ~90-118 -> ~23 ms (12 threads; ~35 at 8)
+  - result: process wall (`-n 1 -i hi`, chat, 12 threads) ~0.50 -> ~0.06 s; time to first token,
+    1-token prompt (`-m generate`, first stdout byte): 12 threads 476 -> 46 ms (median of 9), 8
+    threads 503 -> 63; peak RSS 1,361 -> ~625-735 MB (618 MiB packed weights + runtime state; the
+    spread: this VM has THP=always, and when free huge pages exist the first KV tile of each layer
+    gets a 2 MB page, 56 x 2 MB). Generic build: first token 351 -> 35 ms, RSS 1,251-1,264 -> ~730
+    MB. `-m tokenize` unchanged (~11 ms, 10 MB). `make test` 25-32 -> ~15 s. Left in a 1-token
+    run (12 threads, in process ~50 ms): pack ~23 ms (now ~2 GB of memory traffic: copy + write),
+    tokenizer load ~8.5 ms (151,936 hash inserts), first forward ~9 ms (incl. KV tile faults),
+    exit ~4 ms
 
 ## Known bugs
 Found by the tests.
@@ -258,7 +281,7 @@ Found by the tests.
   its -Ofast code generation and the rounding of some values.)
 
 ## Plan for the remaining items (in order)
-- Step 4 (usability): chat history across turns, faster sampling, startup (embedding rows from the Q8_0 table)
+- [x] Step 4 (usability): chat history across turns, faster sampling, startup (embedding rows from the Q8_0 table): done, see above
 - Step 5: NFC normalizer in the tokenizer
 - Step 6: GGUF loading (Q8_0 first, then Q4_K_M)
 - Step 7: performance leftovers (decode barriers / attention split, bf16 KV cache, 16-thread barriers, prefill rest)
@@ -278,5 +301,3 @@ Found by the tests.
   27.580 (+0.03%), runq Q8_0 27.805 (+0.85%: int8 activations, group 64), mynah-slm Q4_K_M 28.864
   (+4.7%); 512-token windows: 31.984 / 32.039 / 32.206 / 34.185 (+6.9% for Q4_K_M)
 - [ ] GGUF loading (Q8_0 / Q4_K_M) without the Python export step
-- [ ] Startup ~0.45 s per process (~55 ms of it the VNNI weight repacking), mostly page faults for the dequantized embedding table (~620 MB
-  of floats; parallelizing the dequantize didn't help): look up rows from the Q8_0 table instead

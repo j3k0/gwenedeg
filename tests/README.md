@@ -27,7 +27,7 @@ XPASS = an XFAIL case now passes (remove its mark in `make_golden.py`).
   `[tokenize] B bytes -> N tokens, encode X ms, tokenizer load Y ms` (encode time only).
 - `-m logits -i TEXT -o FILE [-b N]`: writes `int32 n, int32 vocab, int32 ids[n],
   float32 logits[n][vocab]` (row i = logits after token i). `-b 1` feeds the tokens one at a
-  time through `forward()` (`forward_sequential`); `-b N > 1` (default 64) uses the batched
+  time through `forward()` (`forward_sequential`); `-b N > 1` (default 512) uses the batched
   prefill, `forward_batch()` in chunks of N tokens with the logits of every row
   (`forward_chunked`). The tests always pass `-b` explicitly.
 
@@ -39,7 +39,7 @@ XPASS = an XFAIL case now passes (remove its mark in `make_golden.py`).
 | `tokenizer/speed_*` | encode time inside runq (stderr line) < 100 ms for ~2,000 tokens of the golden texts and for one 30,000-byte chunk (no spaces); measured ~0.3-1.3 ms and ~5-13 ms | |
 | `logits/<prompt>` | runq Q8_0 logits vs HF fp32 for 5 prompts (en, code, zh, chat template, counting), 15-24 tokens; ids must match HF first | `golden/logits/*.npz` |
 | `logits/cos_pooled`, `logits/top1_pooled` | the same metrics pooled over all prompts | |
-| `logits_batched/*` | the same test (same thresholds) with the batched prefill, `-b 64` (the default; one chunk here) | `golden/logits/*.npz` |
+| `logits_batched/*` | the same test (same thresholds) with the batched prefill, `-b 64` (one chunk here, the same code as the default `-b 512`) | `golden/logits/*.npz` |
 | `batched/<prompt>_b7`, `_b64` | batched logits vs sequential (`-b 1`) on every logits prompt; `-b 7` gives 3-4 chunks with boundaries mid-prompt. `all_b64`: all 5 prompts concatenated (86 tokens), 2 chunks at `-b 64`; `long_b64`: `all` twice + `en` (187 tokens, 12 KV tiles, 3 chunks: attention over several K/V tiles and causal row blocks in later chunks). Max abs diff <= 1e-3 and cos >= 0.99999 per row (full vocab), finite; reports "bit-identical" (currently all 12) | sequential run |
 | `threads/bitwise`, `threads/bitwise_b7` | logits file for `en` is byte-identical with OMP_NUM_THREADS=8 and 1, sequential and `-b 7` | |
 | `threads/bitwise_long_b64` | `long` at `-b 64`: OMP_NUM_THREADS=8 vs 3 byte-identical (other partitions of the dynamically scheduled attention work items) | |

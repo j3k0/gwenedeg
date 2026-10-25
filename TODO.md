@@ -3,8 +3,8 @@
 Goal: fast Qwen3-0.6B inference in C on CPU, based on qwen3.c (Q8_0).
 Baseline (16-vCPU EPYC Genoa, 8 threads): prefill ~85 tok/s, decode ~100 tok/s.
 Target: prefill several hundred to 1000+ tok/s; decode limited by memory bandwidth.
-Now (Step 3a, 8 threads, -b 128): prefill ~1,180 tok/s (451-token prompt), ~540 (1,500 tokens);
-decode ~139 (memory-bandwidth bound). 12 threads: prefill ~1,560 / ~750.
+Now (Step 3b, 8 threads, -b 512): prefill ~1,980 tok/s (451-token prompt), ~1,480 (1,500 tokens),
+~1,070 (3,000 tokens); decode ~180-195. 12 threads (the default): prefill ~2,570 / ~2,020 / ~1,550.
 
 Status: `[ ]` todo · `[~]` in progress · `[x]` done
 
@@ -135,27 +135,60 @@ w2 16), attention 10%, rest 4%; 1,500 tokens: GEMMs 68%, attention 29%, rest 3%.
   GEMMs 19%, attention 74%, rest 7%
 
 ## Step 3b: attention and threading
-- [ ] Attention for long prompts: now the bottleneck (74% at 1,500 tokens, 42% at 451; fp32, ~126
-  GFLOPS: 258 GFLOP in 2.04 s at 8 threads, ~20% of the fp32 FMA peak). Several query rows per K/V
-  row (tile over positions, a K/V block in L1 for the kv_mul = 2 query heads x several rows), scores
-  for 16 positions per vector instead of one horizontal sum per position, the weighted V sum as a
-  small GEMM. Zen 4 has AVX512_BF16 (`vdpbf16ps`): a bf16 K/V cache would halve the bytes and double
-  the FMA rate, but changes the numerics (fine for the batched == sequential test if both paths use
-  it, the logits vs HF test decides). Online softmax (flash style) changes the rounding too
-- [ ] Rest (15% at 451 tokens): qk-norm+RoPE recomputes powf/cosf/sinf for every (row, head, pair)
-  in every layer (~19M calls at 451 tokens, 25 ms = 6.6%): a per-position cos/sin table shared by
-  all layers and heads (same expressions, so the same values); norm/quantize/residual loops are
-  separate parallel regions per phase (fuse them)
-- [ ] Threading: decode at 12 threads reaches ~94 of ~114 GB/s: ~200 parallel regions per token
-  (fork/join + static imbalance, e.g. 64 blocks of 16 rows over 12 threads) cost more than the
-  bandwidth gained. Fewer barriers per token (one parallel region per layer, `omp for nowait` where
-  possible). Prefill: w2 / wo / k / v have only 32 row tiles x 2 chunks, imbalanced at 12 threads.
-  16 threads still collapse (73 tok/s prefill before Step 3a): any preempted thread stalls the
-  spin barriers; `OMP_WAIT_POLICY=passive` kills decode (~20)
-- [ ] Prefill chunk size: with the VNNI GEMM, `-b 128` / `-b 256` are +4-5% / +7% over the default
-  64 at 8 threads and +1-12% / +4-18% at 12 threads; revisit the default after the attention tiling
-- [ ] Decode: the KV cache rows of each new position still fault one page per layer (56 per token,
-  ~1%); could pre-fault ahead like the prefill
+Before (Step 3a, 8 threads, -b 128): 451 tokens: GEMMs 43%, attention 42%, rest 15% (qk-norm+RoPE
+6.6%); 1,500 tokens: attention 74% (fp32, ~126 GFLOPS).
+- [x] RoPE: `rope_row` computes cos/sin once per position (per chunk in `forward_batch`, per token in
+  `forward`) with the original expressions (scalar `expf` + `sincosf`, as gcc compiled them before):
+  logits byte-identical. qk-norm+RoPE 27 -> 4 ms at 451 tokens (6.8% -> 1.1%)
+- [x] Attention, AVX-512 (`kernels_avx512.h`, `att512_*`), one definition for decode and prefill:
+  KV cache in tiles of 16 positions x kv head, K transposed (one zmm = one dim of 16 positions),
+  V row-major. `attention_kv` takes all query vectors of one kv head (decode: the 2 query heads;
+  prefill work item: 6 rows x 2 heads, dynamic schedule, longest row blocks first) in groups of
+  up to 12: scores for 16 positions per FMA, register tile vectors x tiles (<= 24 accumulators,
+  no horizontal sums), softmax with a Cephes-style `exp` (FMA polynomial + exponent add), V as a
+  small GEMM tile (vectors x 32-128 dims), each vector's causal length respected exactly. Rows per
+  item 3 / 6 / 8 / 12 all within noise. Result: 1,500 tokens 2.0 -> 0.39 s, 3,000 tokens 1.54 s,
+  ~670 GFLOPS at 8 threads (was ~126; FMA peak ~900)
+- [x] Bit-identity, option (a): the arithmetic is defined once (header comment of the attention
+  in `kernels_avx512.h`): score = sum of fma chains over 4 chunks of 32 dims (one 128-long chain:
+  ~10% larger deviation from a double-precision attention; chunks: 1-cos 4.7e-4 vs 5.3e-4 for the
+  old code, on a 288-token prompt), max, `exp_att`, 16 partial sums + fixed tree, one division, V
+  fma chain in position order, times 1/sum. Explicit-rounding intrinsics; the generic C
+  `attention_vec` does the same operations (`fp-contract=off`, no reassociation; also verified at
+  -O1). Decode == prefill == generic, any thread count: all `batched/*`, `kernels/*`, `threads/*`
+  bitwise. Cost of the chunked scores: ~3%. Logits vs HF: thresholds unchanged and met (pooled
+  cos 0.99910, top-1 76/84, as before); greedy `chat_system` and `generate` flipped a token and
+  were regenerated. New test prompt `long` (187 tokens, 12 tiles, 3 chunks): batched vs
+  sequential, VNNI vs generic, threads 8 vs 3. Sanity: a linear instead of tree sum in the C
+  version gives max |diff| 1.3-1.5 (caught by `kernels/*`). ASan+UBSan (-b 1 / 7 / 13 / 64, both
+  builds, chat and generate on 288 tokens): no reports
+- [x] Decode threading: `forward()` is one parallel region per token (was ~230 fork/joins), 7
+  barriers per layer: [single] residual + rmsnorm + quantize, [for] q / k / v per head with its
+  QK-norm + RoPE + cache store, [for] attention per kv head + quantize, [for] wo, [single], [for]
+  w1 + w3 + SwiGLU + quantize per 64 hidden rows, [for] w2. Same functions per output (byte-identical
+  logits). Decode 8 threads ~141-150 -> ~184-195 tok/s, 12 threads ~138-142 -> ~159-185, 4 threads
+  116 -> 140 (busy box, +-30% run to run): ~120 GB/s effective at 8 threads, so the Step 3a
+  "bandwidth limit" was mostly fork/join overhead
+- [x] Prefill threading: `matmul_batch_n` / `q8p_gemm_n` run q + k + v (and w1 + w3) as one
+  parallel loop; `q8p_nb` halves the activation rows per GEMM item while there are fewer than ~6
+  items per thread (wo / w2 at 12 threads: 64 -> 128 items); attention + quantize in one region;
+  residual add fused into the next layer's norm loop. Within noise at 8-12 threads. Dynamic GEMM
+  scheduling: no gain at 8-14 threads and no help at 16, so static
+- [x] 16 threads: still collapse (decode ~15-22 tok/s, prefill 451 tokens ~220-540 vs ~2,570 at 12).
+  `OMP_WAIT_POLICY=passive` ~40, `GOMP_SPINCOUNT` 1e3 / 3e4 / 3e6: ~40 / ~9 / ~54, `OMP_PROC_BIND=close`
+  ~20-30: with 16 spinning threads on 16 vCPUs and other processes running (load 3-5), every
+  barrier waits for a preempted thread. Unfixable with spin barriers on this shared VM: default
+  threads when `OMP_NUM_THREADS` is unset = min(12, nproc - nproc/4) (12 here; libgomp's default
+  was all 16)
+- [x] Chunk size: -b 64 / 128 / 256 / 512 / 1024 at 8 threads: 1,500 tokens 1,237 / 1,370 / 1,467 /
+  1,547 / ~1,526, 3,000 tokens 911 / 1,018 / 1,093 / 1,112 / ~1,136: default 512, B_MAX 512
+  (~58 KB of chunk buffers per row, ~30 MB)
+- [x] Decode: the KV cache tile of a new position (every 16 tokens) is pre-faulted for all layers
+  (`kv_populate`), no page faults inside the K/V stores
+- [x] Profile now (8 threads, -b 512): 451 tokens 0.237 s: GEMMs 67% (qkv 19.0, wo 8.6, w1+w3 27.3,
+  w2 12.2), attention+quantize 18.9%, norm+quant+resid 6.1, swiglu+quant 4.3, qk-norm+rope+kv 2.3,
+  classifier 1.3; 1,500 tokens 0.98 s: GEMMs 50%, attention 40%, rest 10%; 3,000 tokens 2.74 s:
+  attention 57%, GEMMs 36%
 
 ## Known bugs
 Found by the tests.
@@ -178,7 +211,15 @@ Found by the tests.
 
 ## Later / ideas
 - [ ] Chat history: stop resetting to position 0 every turn (keep the KV cache across turns)
-- [ ] Fix the 16-thread collapse (OpenMP spin barriers under oversubscription)
+- [ ] 16-thread collapse: needs barriers that tolerate a preempted thread (e.g. own spin-then-yield
+  barriers, or work stealing with no global barrier per phase); OpenMP knobs did not help
+- [ ] Attention: bf16 K/V cache with `vdpbf16ps` (half the bytes, 2x the FMA rate; changes the
+  numerics, the logits vs HF test decides); a split over positions for decode at long contexts
+  (only 8 kv heads = 8 work items, idle threads at 12+); ~670 GFLOPS now, FMA peak ~900
+- [ ] Decode: fewer barriers (the two `single` sections could be done redundantly per thread on
+  private copies of x); finer q / k / v items at 12 threads (32 heads over 12 threads: 3 vs 2.67)
+- [ ] Prefill rest (14% at 451 tokens): norm / quantize / SwiGLU loops as separate parallel
+  regions per phase; SwiGLU's `expf` (libmvec) is ~4%
 - [ ] Perplexity comparison Q4_K_M vs Q8_0 (small text sample)
 - [ ] GGUF loading (Q8_0 / Q4_K_M) without the Python export step
 - [ ] Faster sampling (top-p currently sorts the whole vocab)

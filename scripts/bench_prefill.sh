@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Prefill benchmark: prompt tok/s vs prompt length, prefill chunk size (-b) and threads.
-# Usage: scripts/bench_prefill.sh [-l "450 1500"] [-b "1 16 32 64 128"] [-t "8"] [-r REPS] [-m model.bin]
+# Usage: scripts/bench_prefill.sh [-l "450 1500"] [-b "1 64 256 512"] [-t "8"] [-r REPS] [-m model.bin]
 #        scripts/bench_prefill.sh -P 450    # only print the prompt of that length
 #   -l  target prompt lengths in tokens (incl. the chat template), approximate (+-10)
 #   -b  chunk sizes; 1 = token-by-token forward() (the old path)
@@ -9,13 +9,13 @@
 # Chat mode, greedy, -n 16, -c 4096. The prompt is a fixed paragraph repeated and cut to length,
 # so runs are reproducible. Column "out" checks that each run's generated text equals that of
 # the first chunk size in the list (batched prefill must not change the output).
-# Defaults take ~3.5 min, mostly the -b 1 runs at 1,500 tokens; -r 1 -b "1 64" ~40 s.
+# Defaults take ~2.5 min, mostly the -b 1 runs at 1,500 tokens; -r 1 -b "1 512" ~30 s.
 # Env: RUNQ=binary (default ./runq). Check /proc/loadavg first: the machine may be shared.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RUNQ="${RUNQ:-$ROOT/runq}"
 MODEL="$ROOT/models/Qwen3-0.6B-q8.bin"
-LENS="450 1500"; CHUNKS="1 16 32 64 128"; THREADS="8"; REPS=3; PRINT=""
+LENS="450 1500"; CHUNKS="1 64 256 512"; THREADS="8"; REPS=3; PRINT=""
 while getopts "l:b:t:r:m:P:h" o; do
   case $o in
     l) LENS=$OPTARG ;; b) CHUNKS=$OPTARG ;; t) THREADS=$OPTARG ;; r) REPS=$OPTARG ;; m) MODEL=$OPTARG ;; P) PRINT=$OPTARG ;;

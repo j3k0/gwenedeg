@@ -38,11 +38,6 @@ int KQ = 0; // the model has K-quant weights (GGUF Q4_K / Q6_K): the activation 
 // noise of 512. The chunk buffers take ~58 KB per row (~30 MB at 512)
 #define B_MAX 512
 #define PREFILL_CHUNK_DEFAULT 512
-#ifdef RUNQ_VNNI
-#define KQ_SCR_HALF(k) ((KQ512_SCRATCH(k) + 63) / 64 * 64) // per-thread K-quant GEMM scratch of one tile, k columns
-#else
-#define KQ_SCR_HALF(k) ((size_t)0)
-#endif
 int prefill_chunk = PREFILL_CHUNK_DEFAULT;
 
 // KV cache element type (-k): fp32, bf16 or f16 (16-bit: half the bytes; layouts in kernels_avx512.h)
@@ -595,8 +590,6 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
 #ifdef RUNQ_VNNI
             int kmax = p->hidden_dim > s->xs ? p->hidden_dim : s->xs;
             s->kq_scr_bytes = (KQ512_SCRATCH(kmax) + 63) / 64 * 64;
-            if (s->kq_scr_bytes < 2 * KQ_SCR_HALF(p->dim)) // (w1 and w3 tiles together: gemm_swiglu_item)
-                s->kq_scr_bytes = 2 * KQ_SCR_HALF(p->dim);
             s->kq_scr = aligned_alloc(64, s->kq_scr_bytes * s->att_threads);
             if (!s->kq_scr) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
 #endif
@@ -1954,51 +1947,6 @@ static void act_prep_row(RunState *s, QuantizedTensor *xq, int k, int32_t *corr,
     (void)s;
 }
 
-static void swiglu_cols(RunState *s, int hidden, int b0, int b1, int c0) {
-    // forward_batch: SwiGLU of the hidden columns c0..c0+GS-1 (one activation group) of rows b0..b1-1
-    // (hb_b, hb2_b), quantized into hq_b, with their GEMM activation prep (as act_prep_row). Per value
-    // and per group the same operations as on whole rows (and as forward()'s ff_rows items)
-    for (int b = b0; b < b1; b++) {
-        float *h1 = s->hb_b + (size_t)b * hidden + c0;
-        swiglu(h1, s->hb2_b + (size_t)b * hidden + c0, GS);
-        QuantizedTensor hq = qrow(&s->hq_b, b, hidden), hg = qsub(&hq, c0);
-        quantize(&hg, h1, GS);
-        matvec_prep(s->bh_corr + (size_t)b * (hidden / GS), s->bh_xf ? s->bh_xf + (size_t)b * (hidden / GS) : NULL,
-                    s->bh_c16 ? s->bh_c16 + (size_t)b * (hidden / 16) : NULL, &hq, c0, GS);
-    }
-}
-
-static void gemm_swiglu_item(const Gemm *g, int f, uint8_t *scr, size_t scr_half, const void **last, RunState *s, int hidden) {
-    // one item of forward_batch's fused w1 / w3 phase (g: the two jobs, w1 into hb_b, w3 into hb2_b):
-    // the columns of activation group c of both matrices (AVX-512: the GS / 32 tiles of 32 rows, for
-    // the rows of chunk ch; generic: their row blocks, all rows), then SwiGLU + quantize of exactly
-    // those values while they are in L1 / L2 (swiglu_cols). Saves the separate SwiGLU phase, which
-    // re-read hb_b / hb2_b (2 x 12 KB per row) after the GEMM. scr: this thread's K-quant scratch, two
-    // halves of scr_half bytes (w1, w3: each keeps its tile unpacked across the chunks), last[2]
-    int c, b0 = 0, b1 = g->nb;
-#ifdef RUNQ_VNNI
-    if (g->tiled[0]) {
-        int u = GS / 32, ch = f % g->nchunk;
-        c = f / g->nchunk;
-        b0 = ch * g->nbi;
-        b1 = b0 + g->nbi < g->nb ? b0 + g->nbi : g->nb;
-        for (int j = 0; j < 2; j++)
-            for (int t = c * u; t < (c + 1) * u; t++)
-                gemm_item(g, g->it0[j] + t * g->nchunk + ch, scr ? scr + j * scr_half : NULL, &last[j]);
-        swiglu_cols(s, hidden, b0, b1, c * GS);
-        return;
-    }
-#endif
-    c = f;
-    for (int j = 0; j < 2; j++) {
-        int rpi = g->job[j].w->kp ? KQ_ROWS : MB_ROWS; // output rows per generic item
-        for (int i = c * GS / rpi; i < (c + 1) * GS / rpi; i++)
-            gemm_item(g, g->it0[j] + i, NULL, &last[j]);
-    }
-    (void)scr; (void)scr_half;
-    swiglu_cols(s, hidden, b0, b1, c * GS);
-}
-
 typedef struct { Transformer *tr; int *tokens; int n, pos0, logits_mode; float *logits_out; } PrefillJob;
 
 static int prefill_phases(Config *p) { return 9 * p->n_layers + 4; }
@@ -2163,31 +2111,24 @@ static void prefill_worker(void *arg, int tid, int nt) {
 
         MatJob w13[2] = { { s->hb_b, hidden, w->w1 + l, hidden }, { s->hb2_b, hidden, w->w3 + l, hidden } };
         gemm_plan(&G, 2, w13, &s->xq_b, xs, n, dim, s->bq_corr, s->bq_xf, s->bq_c16, nt);
-        if (G.tiled[0] == G.tiled[1]) { // w1 + w3 + SwiGLU + quantize per (activation group, row chunk)
-            const void *last[2] = { NULL, NULL };
-            int nf = hidden / GS * (G.tiled[0] ? G.nchunk : 1);
-            PH_BEGIN_U(nf, G.tiled[0] ? G.nchunk : (nf / (8 * nt) > 1 ? nf / (8 * nt) : 1), G.tiled[0] ? G.nchunk : 1)
-            for (int it = lo; it < hi; it++)
-                gemm_swiglu_item(&G, it, scr, KQ_SCR_HALF(dim), last, s, hidden);
-            PH_END_NOEPI
-            PPROF(PF_FFN13);
-        } else { // (w1 / w3 of different kernel kinds: two phases)
+        {
             const void *last = NULL;
             PH_BEGIN_U(G.it0[G.nj], G.chunk, G.unit)
             for (int it = lo; it < hi; it++)
                 gemm_item(&G, it, scr, &last);
             PH_END_NOEPI
-            PPROF(PF_FFN13);
-            PH_BEGIN(n, rch)
-            for (int b = lo; b < hi; b++) {
-                QuantizedTensor hq = qrow(&s->hq_b, b, hidden);
-                swiglu(s->hb_b + (size_t)b * hidden, s->hb2_b + (size_t)b * hidden, hidden);
-                quantize(&hq, s->hb_b + (size_t)b * hidden, hidden);
-                act_prep_row(s, &hq, hidden, s->bh_corr, s->bh_xf, s->bh_c16, b);
-            }
-            PH_END_NOEPI
-            PPROF(PF_SWIGLU);
         }
+        PPROF(PF_FFN13);
+
+        PH_BEGIN(n, rch)
+        for (int b = lo; b < hi; b++) {
+            QuantizedTensor hq = qrow(&s->hq_b, b, hidden);
+            swiglu(s->hb_b + (size_t)b * hidden, s->hb2_b + (size_t)b * hidden, hidden);
+            quantize(&hq, s->hb_b + (size_t)b * hidden, hidden);
+            act_prep_row(s, &hq, hidden, s->bh_corr, s->bh_xf, s->bh_c16, b);
+        }
+        PH_END_NOEPI
+        PPROF(PF_SWIGLU);
 
         MatJob w2 = { s->xb_b, xs, w->w2 + l, dim };
         gemm_plan(&G, 1, &w2, &s->hq_b, hidden, n, hidden, s->bh_corr, s->bh_xf, s->bh_c16, nt);

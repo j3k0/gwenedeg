@@ -716,6 +716,27 @@ static inline QuantizedTensor qrow(QuantizedTensor *t, int b, int ld) {
 
 enum { LOGITS_NONE = 0, LOGITS_LAST = 1, LOGITS_ALL = 2 };
 
+static void kv_populate(RunState *s, Config *p, int pos0, int n) {
+    // Pre-fault the KV cache rows pos0..pos0+n-1 of every layer (calloc'd, so untouched pages
+    // are not mapped yet), in parallel and one madvise per range instead of one page fault
+    // per 4 KB. Otherwise these faults happen inside the K/V GEMMs, serialized in the kernel:
+    // ~55 ms of a 451-token prefill (8 threads), vs ~7 ms here. Linux >= 5.14; errors ignored
+#if !defined _WIN32 && defined MADV_POPULATE_WRITE
+    int kv_dim = p->n_kv_heads * p->head_dim;
+    uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int l = 0; l < p->n_layers; l++)
+        for (int kv = 0; kv < 2; kv++) {
+            float *c = (kv ? s->value_cache : s->key_cache) + l * (uint64_t)p->seq_len * kv_dim;
+            uintptr_t a = (uintptr_t)(c + (size_t)pos0 * kv_dim) & ~(pg - 1);
+            uintptr_t e = (uintptr_t)(c + (size_t)(pos0 + n) * kv_dim);
+            madvise((void *)a, e - a, MADV_POPULATE_WRITE);
+        }
+#else
+    (void)s; (void)p; (void)pos0; (void)n;
+#endif
+}
+
 float *forward_batch(Transformer *transformer, int *tokens, int n, int pos0, int logits_mode, float *logits_out) {
     // Batched prefill: tokens[0..n-1] at positions pos0..pos0+n-1 (1 <= n <= state.nb_max),
     // the same computation as n calls of forward() but with every weight matrix applied to all
@@ -739,6 +760,7 @@ float *forward_batch(Transformer *transformer, int *tokens, int n, int pos0, int
 
     for (int b = 0; b < n; b++)
         memcpy(s->x_b + (size_t)b * dim, w->token_embedding_table + (size_t)tokens[b] * dim, dim * sizeof(float));
+    kv_populate(s, p, pos0, n);
 
     for (int l = 0; l < p->n_layers; l++) {
         uint64_t loff = l * (uint64_t)p->seq_len * kv_dim;

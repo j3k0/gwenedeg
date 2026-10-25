@@ -41,7 +41,7 @@ runq-generic: $(SRC) $(HDR)
 
 debug: runq-debug
 
-# NEON K-quant kernels (kernels_neon.h) vs the generic ones, on random blocks: bit-identical
+# NEON kernels (kernels_neon.h: K-quants, Q8_0) vs the generic ones, on random data: bit-identical
 kq-neon-test: tests/kernels/kq_neon_test.c src/kernels_neon.h src/kquants.h
 	$(CC) $(CFLAGS) $< -o tests/kernels/kq_neon_test && tests/kernels/kq_neon_test
 

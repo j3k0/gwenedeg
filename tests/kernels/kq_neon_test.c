@@ -1,5 +1,6 @@
-// Unit test of the NEON K-quant kernels (kernels_neon.h) against the generic ones (kquants.h) on
-// random packed blocks: GEMV and GEMM must be bit-identical. Build: make kq-neon-test
+// Unit test of the NEON kernels (kernels_neon.h) against the generic ones on random data: K-quants
+// (vs kquants.h) and Q8_0 (vs a copy of runq.c's dot_q8), GEMV and GEMM must be bit-identical.
+// Build: make kq-neon-test
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,8 +35,51 @@ static int cmp(const char *what, const float *a, const float *b, int n) {
     return 0;
 }
 
+static float dot_q8_ref(const int8_t *wq, const float *ws, const int8_t *xq, const float *xs, int n, int gs) { RQ_FP_EXACT
+    // runq.c's dot_q8, the same expression (GS a parameter here)
+    float val = 0;
+    for (int j = 0; j <= n - gs; j += gs) {
+        int32_t ival = 0;
+        for (int k = 0; k < gs; k++)
+            ival += xq[j + k] * wq[j + k];
+        val += ((float) ival) * ws[j / gs] * xs[j / gs];
+    }
+    return val;
+}
+
+static int test_q8(int gs, int k) {
+    int d = 80, nb = 13, ng = k / gs, fails = 0; // 5 blocks: an odd tile at the end
+    int8_t *wq = malloc((size_t)d * k), *xq = malloc((size_t)nb * k);
+    float *ws = malloc(sizeof(float) * d * ng), *xs = malloc(sizeof(float) * nb * ng);
+    for (int i = 0; i < d * k; i++) wq[i] = (int8_t)(rnd() % 255 - 127);
+    for (int i = 0; i < nb * k; i++) xq[i] = (int8_t)(rnd() % 255 - 127);
+    for (int i = 0; i < d * ng; i++) ws[i] = (float)(rnd() % 10000 + 1) * 1e-6f;
+    for (int i = 0; i < nb * ng; i++) xs[i] = (float)(rnd() % 10000 + 1) * 1e-5f;
+    uint8_t *pk = aligned_alloc(64, q8x_size(d, k, gs));
+    q8x_pack_blocks(pk, wq, ws, d / 16, k, gs);
+    float *ref = calloc((size_t)nb * d, 4), *got = calloc((size_t)nb * d, 4);
+    for (int b = 0; b < nb; b++)
+        for (int i = 0; i < d; i++)
+            ref[(size_t)b * d + i] = dot_q8_ref(wq + (size_t)i * k, ws + (size_t)i * ng, xq + (size_t)b * k, xs + b * ng, k, gs);
+    char name[64];
+    for (int b = 0; b < nb; b++)
+        q8x_gemv_rows(got + (size_t)b * d, xq + (size_t)b * k, xs + b * ng, NULL, pk, k, gs, 0, d / 16);
+    snprintf(name, sizeof name, "gemv Q8_0 gs=%d k=%d", gs, k);
+    fails += cmp(name, got, ref, nb * d);
+    memset(got, 0, sizeof(float) * nb * d);
+    int nbi = 5, ntile = (d / 16 + 1) / 2;
+    for (int t = 0; t < ntile; t++)
+        for (int ch = 0; ch * nbi < nb; ch++)
+            q8x_gemm_item(got, d, pk, d, t, ch, nbi, xq, xs, k, nb, k, gs, NULL);
+    snprintf(name, sizeof name, "gemm Q8_0 gs=%d k=%d", gs, k);
+    fails += cmp(name, got, ref, nb * d);
+    free(wq); free(xq); free(ws); free(xs); free(pk); free(ref); free(got);
+    return fails;
+}
+
 int main(void) {
     int fails = 0;
+    fails += test_q8(32, 1024) + test_q8(32, 3072) + test_q8(64, 1024) + test_q8(64, 3072);
     int types[2] = { GGML_Q4_K, GGML_Q6_K };
     int ks[2] = { 1024, 3072 };
     for (int ti = 0; ti < 2; ti++)

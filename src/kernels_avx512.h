@@ -601,6 +601,15 @@ static void kq512_gemm_item(float *out, int ldo, const uint8_t *kp, int type, in
 #define kqx_gemm_item kq512_gemm_item
 #define KQX_SCRATCH KQ512_SCRATCH
 #define kqx_nb q8p_nb
+// the Q8_0 SIMD kernel interface (kernels_neon.h: the same on AArch64, Q8N layout)
+#define RUNQ_Q8X 1
+#define Q8X_GROUP Q8P_GROUP
+#define q8x_size q8p_size
+#define q8x_ok q8p_ok
+#define q8x_pack_blocks q8p_pack_blocks
+#define q8x_gemv_corr q8p_gemv_corr
+#define q8x_gemv_rows q8p_gemv_rows
+#define q8x_gemm_item q8p_gemm_item
 
 #endif // AVX-512 VNNI
 

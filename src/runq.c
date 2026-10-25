@@ -83,8 +83,8 @@ typedef struct {
 typedef struct {
     int8_t *q;    // quantized values
     float *s; // scaling factors
-    uint8_t *p;   // weights only: the same matrix repacked for the VNNI kernels (Q8P layout,
-                  // see kernels_avx512.h), or NULL (generic kernels on q / s)
+    uint8_t *p;   // weights only: the same matrix repacked for the SIMD Q8_0 kernels (Q8P layout,
+                  // kernels_avx512.h; Q8N on AArch64, kernels_neon.h), or NULL (generic kernels on q / s)
     const uint8_t *b; // GGUF weights: the blocks in the file mapping (Q8_0: per 32 values an fp16
                   // scale + 32 int8, Q8_0_BLOCK bytes; Q4_K / Q6_K: kquants.h), converted at load
                   // (prepare_weights); or NULL
@@ -977,9 +977,9 @@ static void prepare_worker(void *arg, int tid, int nt) {
             read_at(fd, q, nr * k, t->q + r0 * k);
             read_at(fd, s, nr * ng * sizeof(float), t->s + r0 * ng);
         }
-#ifdef RUNQ_VNNI
+#ifdef RUNQ_Q8X
         if (pack)
-            q8p_pack_blocks(t->p + (size_t)rb0 * ng * Q8P_GROUP(GS), qb, sb, nb, k, GS);
+            q8x_pack_blocks(t->p + (size_t)rb0 * ng * Q8X_GROUP(GS), qb, sb, nb, k, GS);
 #endif
     }
     free(qb);
@@ -1011,11 +1011,11 @@ void prepare_weights(TransformerWeights *w, Config *p, int fd) {
         { w->w1, L, hid, dim }, { w->w2, L, dim, hid }, { w->w3, L, hid, dim }, { w->wcls, 1, p->vocab_size, dim } };
     int nm = sizeof(m) / sizeof(m[0]);
     int gguf = w->wq[0].b != NULL, pack = 0;
-#ifdef RUNQ_VNNI
+#ifdef RUNQ_Q8X
     pack = 1;
     for (int i = 0; i < nm && pack; i++)
-        if (!q8p_ok(m[i].d, m[i].k, GS)) {
-            fprintf(stderr, "warning: weights not packable for the VNNI kernels (GS %d, %d x %d), using the generic ones\n", GS, m[i].d, m[i].k);
+        if (!q8x_ok(m[i].d, m[i].k, GS)) {
+            fprintf(stderr, "warning: weights not packable for the SIMD Q8_0 kernels (GS %d, %d x %d), using the generic ones\n", GS, m[i].d, m[i].k);
             pack = 0;
         }
 #endif
@@ -1048,9 +1048,9 @@ void prepare_weights(TransformerWeights *w, Config *p, int fd) {
             job[j].it0 = nit;
             if (t->type != GGML_Q8_0) // Q4_K / Q6_K (GGUF; d % 16 == 0, k % 256 == 0 checked)
                 sz = kq_size(t->type, m[i].d, m[i].k);
-#ifdef RUNQ_VNNI
+#ifdef RUNQ_Q8X
             else if (pack)
-                sz = q8p_size(m[i].d, m[i].k, GS);
+                sz = q8x_size(m[i].d, m[i].k, GS);
 #endif
             off += (sz + 63) / 64 * 64;
             nit += ((m[i].d + 15) / 16 + job[j].bpi - 1) / job[j].bpi;
@@ -1065,7 +1065,7 @@ void prepare_weights(TransformerWeights *w, Config *p, int fd) {
         size_t nq = (size_t)job[j].d * job[j].k;
         if (t->type != GGML_Q8_0)
             t->kp = w->packed + job[j].off;
-#ifdef RUNQ_VNNI
+#ifdef RUNQ_Q8X
         else if (pack)
             t->p = w->packed + job[j].off;
 #endif
@@ -1217,8 +1217,8 @@ static inline float dot_q8(const int8_t *wq, const float *ws, const int8_t *xq, 
 // (xf != NULL) the activation group sums xf of kquants.h, plus for the AVX-512 K-quant GEMV the
 // -32 * sums of 16 (c16, Q6_K); matvec_rows: rows i0..i1-1
 static inline void matvec_prep(int32_t *corr, float *xf, int32_t *c16, QuantizedTensor *x, int i0, int n) {
-#ifdef RUNQ_VNNI
-    q8p_gemv_corr(corr + i0 / GS, x->q + i0, n, GS);
+#ifdef RUNQ_Q8X
+    q8x_gemv_corr(corr + i0 / GS, x->q + i0, n, GS);
 #else
     (void)corr;
 #endif
@@ -1246,8 +1246,8 @@ static inline void matvec_rows(float *xout, QuantizedTensor *x, const int32_t *c
 #endif
         return;
     }
-#ifdef RUNQ_VNNI
-    if (w->p) { q8p_gemv_rows(xout, x->q, x->s, corr, w->p, n, GS, i0 / 16, i1 / 16); return; }
+#ifdef RUNQ_Q8X
+    if (w->p) { q8x_gemv_rows(xout, x->q, x->s, corr, w->p, n, GS, i0 / 16, i1 / 16); return; }
 #else
     (void)corr;
 #endif
@@ -1325,7 +1325,7 @@ static void gemm_plan(Gemm *g, int nj, const MatJob *job, QuantizedTensor *x, in
 #ifdef RUNQ_KQX
         g->tiled[j] = job[j].w->kp != NULL;
 #endif
-#ifdef RUNQ_VNNI
+#ifdef RUNQ_Q8X
         g->tiled[j] |= job[j].w->p != NULL;
 #endif
         all_tiled &= g->tiled[j];
@@ -1334,7 +1334,7 @@ static void gemm_plan(Gemm *g, int nj, const MatJob *job, QuantizedTensor *x, in
     }
     g->nbi = nb;
     g->nchunk = 1;
-#if defined RUNQ_VNNI || defined RUNQ_KQX
+#if defined RUNQ_Q8X || defined RUNQ_KQX
     if (ntile) {
         g->nbi = kqx_nb(nb, ntile, nt);
         g->nchunk = (nb + g->nbi - 1) / g->nbi;
@@ -1358,7 +1358,7 @@ NO_FP_CONTRACT static void gemm_item(const Gemm *g, int it, uint8_t *scr, const 
     const MatJob *jb = &g->job[j];
     QuantizedTensor *w = jb->w, *x = g->x;
     int i = it - g->it0[j], k = g->k, ldx = g->ldx, nb = g->nb;
-#if defined RUNQ_VNNI || defined RUNQ_KQX
+#if defined RUNQ_Q8X || defined RUNQ_KQX
     if (g->tiled[j]) {
         int t = i / g->nchunk, ch = i % g->nchunk;
 #ifdef RUNQ_KQX
@@ -1367,8 +1367,8 @@ NO_FP_CONTRACT static void gemm_item(const Gemm *g, int it, uint8_t *scr, const 
             return;
         }
 #endif
-#ifdef RUNQ_VNNI
-        q8p_gemm_item(jb->out, jb->ldo, w->p, jb->d, t, ch, g->nbi, x->q, x->s, ldx, nb, k, GS, g->corr);
+#ifdef RUNQ_Q8X
+        q8x_gemm_item(jb->out, jb->ldo, w->p, jb->d, t, ch, g->nbi, x->q, x->s, ldx, nb, k, GS, g->corr);
 #endif
         return;
     }

@@ -1,6 +1,6 @@
 /* NEON (AArch64 + dot product: Apple M1 and later, Graviton 2+, ...) kernels for the GGUF K-quants
  * (Q4_K / Q6_K on the repacked Q4P / Q6P layouts of kquants.h): GEMV (decode) and GEMM (prefill).
- * Experimental (Step 8: Mac port). Q8_0 and the attention still use the generic C kernels.
+ * Experimental (Step 8: Mac port). Further down: Q8_0 (GEMV, GEMM) and the fp32 attention.
  *
  * The arithmetic is the definition in kquants.h's header comment, as the generic q4p_dot / q6p_dot
  * (and the AVX-512 kernels) compute it: exact int32 sums, then per (row, activation row, group of 32)
@@ -410,6 +410,190 @@ static void kqx_gemm_item(float *out, int ldo, const uint8_t *kp, int type, int 
             kqn_tile_any(type, c, scr + (size_t)(Q / 4) * bstride + 16 * (Q % 4), ng, xq + (size_t)b * ldx, ldx,
                          xs + (size_t)b * ldxs, ldxs, xf + (size_t)b * ng, ng, c16 + (size_t)b * n16, n16,
                          out + (size_t)b * ldo + (size_t)rb0 * KQ_ROWS + 4 * Q, ldo);
+    }
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * Q8_0 (the .bin's group-64 Q8 and GGUF Q8_0, group 32): GEMV (decode) and GEMM (prefill) on weights
+ * repacked at load. Layout "Q8N" = kernels_avx512.h's Q8P without the +128 offset (sdot is s8 x s8,
+ * so the weights stay signed and there is no activation correction): 16-row blocks, per (block,
+ * group) gs / 4 steps of 64 bytes (lane r = bytes 4 r .. 4 r + 3 = 4 consecutive columns of row r of
+ * the block), then the 16 rows' fp32 scales. A quad (4 rows) of a step = 16 bytes at 16 q.
+ *
+ * Arithmetic: dot_q8 / dot_q8_x4 in runq.c as written, per output and group in order:
+ *   val = val + ((float) isum * ws) * xs     (each operation rounded; isum exact in int32)
+ * so the results are bit-identical to the generic build on the same compiler (make test: the kernels group).
+ * (gcc -Ofast on x86 reassociates that expression to (ws * xs) * isum, which the AVX-512 Q8P kernels
+ * follow: arm64 and x86 Q8_0 logits differ in the last bits, as they already did with the generic
+ * kernels.)
+ */
+#define RUNQ_Q8X 1 // Q8_0 SIMD kernels: q8x_* (runq.c)
+#define Q8N_ROWS 16
+#define Q8X_GROUP(gs) (Q8N_ROWS * (gs) + Q8N_ROWS * 4) // bytes per (block, group): 16 x gs + 64
+// GEMM register tile: Q8N_RQ quads (1, 2 or 4) x Q8N_C activation rows (1..Q8N_CMAX)
+#ifndef Q8N_RQ
+#define Q8N_RQ 4
+#endif
+#ifndef Q8N_C
+#define Q8N_C 3
+#endif
+#define Q8N_CMAX 6
+#if Q8N_C < 1 || Q8N_C > Q8N_CMAX || (Q8N_RQ != 1 && Q8N_RQ != 2 && Q8N_RQ != 4)
+#error "Q8N_C must be in 1..Q8N_CMAX, Q8N_RQ 1, 2 or 4"
+#endif
+
+static inline size_t q8x_size(int d, int k, int gs) { return (size_t)(d / Q8N_ROWS) * (k / gs) * Q8X_GROUP(gs); }
+
+static inline int q8x_ok(int d, int k, int gs) {
+    return (gs == 32 || gs == 64) && d > 0 && k > 0 && d % Q8N_ROWS == 0 && k % gs == 0;
+}
+
+static void q8x_pack_blocks(uint8_t *pk, const int8_t *q, const float *s, int nblk, int k, int gs) {
+    // nblk blocks of 16 rows of a Q8_0 matrix with k columns: (q, s) = their rows, row-major, k / gs
+    // scales per row -> Q8N layout at pk. Serial (the caller splits the work)
+    int ng = k / gs;
+    for (int rb = 0; rb < nblk; rb++)
+        for (int g = 0; g < ng; g++) {
+            uint8_t *o = pk + ((size_t)rb * ng + g) * Q8X_GROUP(gs);
+            for (int r = 0; r < Q8N_ROWS; r++) {
+                const int8_t *src = q + (size_t)(rb * Q8N_ROWS + r) * k + g * gs;
+                for (int st = 0; st < gs / 4; st++)
+                    memcpy(o + st * 64 + r * 4, src + 4 * st, 4);
+                memcpy(o + Q8N_ROWS * gs + r * 4, s + (size_t)(rb * Q8N_ROWS + r) * ng + g, 4);
+            }
+        }
+}
+
+static inline void q8x_gemv_corr(int32_t *corr, const int8_t *xq, int k, int gs) {
+    (void)corr; (void)xq; (void)k; (void)gs; // (no weight offset: nothing to correct)
+}
+
+static inline __attribute__((always_inline))
+void q8n_gemv_blocks(const int GSZ, float *out, const int8_t *xq, const float *xs, const uint8_t *wp, int k,
+                     int rb0, int rb1) { RQ_FP_EXACT
+    int ng = k / GSZ;
+    size_t bstride = (size_t)ng * Q8X_GROUP(GSZ);
+    for (int rb = rb0; rb < rb1; rb++) {
+        const uint8_t *wb = wp + (size_t)rb * bstride;
+        float32x4_t f[4];
+        for (int qd = 0; qd < 4; qd++)
+            f[qd] = vdupq_n_f32(0.0f);
+        for (int g = 0; g < ng; g++) {
+            const uint8_t *wg = wb + (size_t)g * Q8X_GROUP(GSZ);
+            const int8_t *xg = xq + g * GSZ;
+            int32x4_t a[4], b[4]; // two chains per quad (even / odd steps)
+            for (int qd = 0; qd < 4; qd++)
+                a[qd] = b[qd] = vdupq_n_s32(0);
+            for (int ch = 0; ch < GSZ / 16; ch++) { // 16 activation bytes = 4 steps
+                int8x16_t xv = vld1q_s8(xg + 16 * ch);
+                const uint8_t *w = wg + ch * 256;
+                for (int qd = 0; qd < 4; qd++) {
+                    a[qd] = vdotq_laneq_s32(a[qd], vld1q_s8((const int8_t *)(w + 16 * qd)), xv, 0);
+                    b[qd] = vdotq_laneq_s32(b[qd], vld1q_s8((const int8_t *)(w + 64 + 16 * qd)), xv, 1);
+                    a[qd] = vdotq_laneq_s32(a[qd], vld1q_s8((const int8_t *)(w + 128 + 16 * qd)), xv, 2);
+                    b[qd] = vdotq_laneq_s32(b[qd], vld1q_s8((const int8_t *)(w + 192 + 16 * qd)), xv, 3);
+                }
+            }
+            const float *ws = (const float *)(wg + Q8N_ROWS * GSZ);
+            float xsg = xs[g];
+            for (int qd = 0; qd < 4; qd++) {
+                float32x4_t p = vmulq_f32(vcvtq_f32_s32(vaddq_s32(a[qd], b[qd])), vld1q_f32(ws + 4 * qd));
+                f[qd] = vaddq_f32(f[qd], vmulq_n_f32(p, xsg));
+            }
+        }
+        for (int qd = 0; qd < 4; qd++)
+            vst1q_f32(out + (size_t)rb * Q8N_ROWS + 4 * qd, f[qd]);
+    }
+}
+
+static void q8x_gemv_rows(float *out, const int8_t *xq, const float *xs, const int32_t *corr, const uint8_t *wp,
+                          int k, int gs, int rb0, int rb1) {
+    // out[i] = W[i, :] . x for the rows i of the 16-row blocks rb0..rb1-1 (decode)
+    (void)corr;
+    if (gs == 64)
+        q8n_gemv_blocks(64, out, xq, xs, wp, k, rb0, rb1);
+    else
+        q8n_gemv_blocks(32, out, xq, xs, wp, k, rb0, rb1);
+}
+
+static inline __attribute__((always_inline))
+void q8n_tile(const int RQ, const int C, const int GSZ, const uint8_t *wq, int ng, const int8_t *x, size_t ldx,
+              const float *xs, size_t ldxs, float *out, size_t ldo) { RQ_FP_EXACT
+    // out[c * ldo + 4 q + lane] for RQ quads starting at wq (a block's group 0 + 16 * first quad: the
+    // scales of quad q are then at the same 16-byte offset in the scale area), c < C activation rows
+    // (x + c * ldx, scales xs + c * ldxs), over all ng groups of GSZ
+    float32x4_t f[4][Q8N_CMAX];
+    for (int q = 0; q < RQ; q++)
+        for (int c = 0; c < C; c++)
+            f[q][c] = vdupq_n_f32(0.0f);
+    for (int g = 0; g < ng; g++) {
+        const uint8_t *wg = wq + (size_t)g * Q8X_GROUP(GSZ);
+        const int8_t *xg = x + (size_t)g * GSZ;
+        int32x4_t acc[4][Q8N_CMAX];
+        for (int q = 0; q < RQ; q++)
+            for (int c = 0; c < C; c++)
+                acc[q][c] = vdupq_n_s32(0);
+        for (int ch = 0; ch < GSZ / 16; ch++) {
+            int8x16_t xv[Q8N_CMAX];
+            for (int c = 0; c < C; c++)
+                xv[c] = vld1q_s8(xg + c * ldx + 16 * ch);
+            const uint8_t *w = wg + ch * 256;
+            #define Q8N_STEP(L) do { \
+                    int8x16_t w_[4]; \
+                    for (int q = 0; q < RQ; q++) \
+                        w_[q] = vld1q_s8((const int8_t *)(w + (L) * 64 + 16 * q)); \
+                    for (int c = 0; c < C; c++) \
+                        for (int q = 0; q < RQ; q++) \
+                            acc[q][c] = vdotq_laneq_s32(acc[q][c], w_[q], xv[c], L); \
+                } while (0)
+            Q8N_STEP(0); Q8N_STEP(1); Q8N_STEP(2); Q8N_STEP(3);
+            #undef Q8N_STEP
+        }
+        const float *ws = (const float *)(wg + Q8N_ROWS * GSZ);
+        for (int q = 0; q < RQ; q++) {
+            float32x4_t wsq = vld1q_f32(ws + 4 * q);
+            for (int c = 0; c < C; c++) {
+                float32x4_t p = vmulq_f32(vcvtq_f32_s32(acc[q][c]), wsq);
+                f[q][c] = vaddq_f32(f[q][c], vmulq_n_f32(p, xs[c * ldxs + g]));
+            }
+        }
+    }
+    for (int q = 0; q < RQ; q++)
+        for (int c = 0; c < C; c++)
+            vst1q_f32(out + c * ldo + 4 * q, f[q][c]);
+}
+
+static void q8n_tile_any(int gs, int c, const uint8_t *wq, int ng, const int8_t *x, size_t ldx, const float *xs,
+                         size_t ldxs, float *out, size_t ldo) {
+    // dispatch to the instance with compile-time group size and C (1..Q8N_C); RQ = Q8N_RQ quads
+    #define Q8N_CASE(G, CC) case (G) * 16 + (CC): \
+        if ((CC) <= Q8N_C) q8n_tile(Q8N_RQ, (CC) <= Q8N_C ? (CC) : 1, G, wq, ng, x, ldx, xs, ldxs, out, ldo); break;
+    switch (gs * 16 + c) {
+        Q8N_CASE(64, 1) Q8N_CASE(64, 2) Q8N_CASE(64, 3) Q8N_CASE(64, 4) Q8N_CASE(64, 5) Q8N_CASE(64, 6)
+        Q8N_CASE(32, 1) Q8N_CASE(32, 2) Q8N_CASE(32, 3) Q8N_CASE(32, 4) Q8N_CASE(32, 5) Q8N_CASE(32, 6)
+        default: break;
+    }
+    #undef Q8N_CASE
+}
+
+static void q8x_gemm_item(float *out, int ldo, const uint8_t *wp, int d, int t, int ch, int nbi, const int8_t *xq,
+                          const float *xs, int ldx, int nb, int k, int gs, const int32_t *corr) {
+    // one GEMM work item (as q8p_gemm_item): out[b * ldo + i] = W[i, :] . x[b, :] for the rows i of
+    // 32-row tile t of W (d x k, Q8N, group size gs) and the activation rows b of chunk ch (nbi rows;
+    // x at xq + b * ldx, scales xs + b * ldx / gs). The weight tile (32 x k bytes + scales) is reused
+    // from L1 / L2 for every C activation rows
+    (void)corr;
+    int ng = k / gs;
+    size_t bstride = (size_t)ng * Q8X_GROUP(gs), ldxs = (size_t)ldx / gs;
+    int nblk = d / Q8N_ROWS, rb0 = t * 2;
+    int rb = nblk - rb0 < 2 ? nblk - rb0 : 2;
+    int b1 = (ch + 1) * nbi < nb ? (ch + 1) * nbi : nb;
+    const uint8_t *wt = wp + (size_t)rb0 * bstride;
+    for (int b = ch * nbi; b < b1; b += Q8N_C) {
+        int c = b1 - b < Q8N_C ? b1 - b : Q8N_C;
+        for (int Q = 0; Q < 4 * rb; Q += Q8N_RQ) // quads of the tile (Q8N_RQ divides 4: within one block)
+            q8n_tile_any(gs, c, wt + (size_t)(Q / 4) * bstride + 16 * (Q % 4), ng, xq + (size_t)b * ldx, ldx,
+                         xs + (size_t)b * ldxs, ldxs, out + (size_t)b * ldo + (size_t)rb0 * Q8N_ROWS + 4 * Q, ldo);
     }
 }
 

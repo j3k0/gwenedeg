@@ -3248,12 +3248,64 @@ void dump_logits(Transformer *transformer, Tokenizer *tokenizer, char *text, cha
     free(tokens);
 }
 
+void dump_dequant(Transformer *tr, const char *spec, const char *out_path) {
+    // test hook, GGUF only: -m dequant -i NAME[:ROW0[:NROWS]] -o FILE writes rows ROW0.. (default 0,
+    // 1 row) of the matrix NAME (llama.cpp tensor name) dequantized from the file's blocks (embed_row:
+    // ggml's expressions) and, for Q4_K / Q6_K, also from the repacked weights (kq_packed_row, the
+    // same expressions: checks the repacking). FILE: int32 nrows, ncols, npacked (0 or 1), float32
+    // [nrows][ncols] from the blocks, then [nrows][ncols] from the repacked layout if npacked
+    Config *p = &tr->config;
+    TransformerWeights *w = &tr->weights;
+    if (!tr->gguf.map) { fprintf(stderr, "-m dequant: GGUF files only\n"); exit(EXIT_FAILURE); }
+    int L = p->n_layers, dim = p->dim, hid = p->hidden_dim, qd = p->n_heads * p->head_dim, kvd = p->n_kv_heads * p->head_dim;
+    struct { const char *fmt; QuantizedTensor *t; int n, d, k; } m[] = {
+        { "token_embd.weight", w->q_tokens, 1, p->vocab_size, dim }, { "output.weight", w->wcls, 1, p->vocab_size, dim },
+        { "blk.%d.attn_q.weight", w->wq, L, qd, dim }, { "blk.%d.attn_k.weight", w->wk, L, kvd, dim },
+        { "blk.%d.attn_v.weight", w->wv, L, kvd, dim }, { "blk.%d.attn_output.weight", w->wo, L, dim, qd },
+        { "blk.%d.ffn_gate.weight", w->w1, L, hid, dim }, { "blk.%d.ffn_down.weight", w->w2, L, dim, hid },
+        { "blk.%d.ffn_up.weight", w->w3, L, hid, dim } };
+    size_t nlen = strcspn(spec, ":");
+    long r0 = 0, nr = 1;
+    if (spec[nlen]) {
+        char *e;
+        r0 = strtol(spec + nlen + 1, &e, 10);
+        if (*e == ':') nr = strtol(e + 1, &e, 10);
+        if (*e) { fprintf(stderr, "-m dequant: bad spec %s\n", spec); exit(EXIT_FAILURE); }
+    }
+    QuantizedTensor *t = NULL;
+    int d = 0, k = 0;
+    for (size_t i = 0; i < sizeof(m) / sizeof(m[0]) && !t; i++) {
+        if (i == 1 && p->shared_classifier) continue; // (no output.weight: tied)
+        for (int l = 0; l < m[i].n && !t; l++) {
+            char name[96];
+            snprintf(name, sizeof(name), m[i].fmt, l);
+            if (strlen(name) == nlen && !memcmp(name, spec, nlen)) { t = m[i].t + l; d = m[i].d; k = m[i].k; }
+        }
+    }
+    if (!t || !t->b) { fprintf(stderr, "-m dequant: no matrix %.*s\n", (int)nlen, spec); exit(EXIT_FAILURE); }
+    if (r0 < 0 || nr < 1 || r0 > d - nr) { fprintf(stderr, "-m dequant: rows %ld..%ld out of range (%d rows)\n", r0, r0 + nr - 1, d); exit(EXIT_FAILURE); }
+    float *out = malloc((size_t)2 * nr * k * sizeof(float));
+    if (!out) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    int32_t hdr[3] = { (int32_t)nr, k, t->kp != NULL };
+    for (long r = 0; r < nr; r++) {
+        embed_row(out + (size_t)r * k, t, (int)(r0 + r), k);
+        if (t->kp)
+            kq_packed_row(t->type, t->kp, (int)(r0 + r), k, out + (size_t)(nr + r) * k);
+    }
+    FILE *f = fopen(out_path, "wb");
+    if (!f) { fprintf(stderr, "Couldn't open %s for writing\n", out_path); exit(EXIT_FAILURE); }
+    size_t nv = (size_t)(1 + hdr[2]) * nr * k;
+    int ok = fwrite(hdr, sizeof(int32_t), 3, f) == 3 && fwrite(out, sizeof(float), nv, f) == nv;
+    if (fclose(f) != 0 || !ok) { fprintf(stderr, "Error writing %s\n", out_path); exit(EXIT_FAILURE); }
+    free(out);
+}
+
 // ----------------------------------------------------------------------------
 // CLI
 
 void error_usage() {
     fprintf(stderr, "Usage:   runq <checkpoint> [options]\n");
-    fprintf(stderr, "         checkpoint: a qwen3.c .bin (with its .tokenizer / .template* files) or a GGUF file (Q8_0)\n");
+    fprintf(stderr, "         checkpoint: a qwen3.c .bin (with its .tokenizer / .template* files) or a GGUF file (Q8_0, Q4_K_M)\n");
     fprintf(stderr, "Example: runq Qwen3-0.6B-Q8_0.gguf -c 4096 -r 1\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
@@ -3261,12 +3313,13 @@ void error_usage() {
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
     fprintf(stderr, "  -c <int>    context window size, 0 (default) = max_seq_len; chat: holds the whole conversation,\n");
     fprintf(stderr, "              when full the oldest turns are dropped (the system prompt is kept)\n");
-    fprintf(stderr, "  -m <string> mode: generate|chat|tokenize|logits, default: chat\n");
+    fprintf(stderr, "  -m <string> mode: generate|chat|tokenize|logits|dequant, default: chat\n");
     fprintf(stderr, "              tokenize: print the token ids of -i (raw text, no template)\n");
     fprintf(stderr, "              logits: write the logits at every position of -i to -o (binary)\n");
     fprintf(stderr, "  -i <string> input prompt (chat: one turn, then exit; without -i, one turn per stdin line,\n");
     fprintf(stderr, "              the conversation is kept until an empty line or EOF)\n");
-    fprintf(stderr, "  -o <string> output file for -m logits\n");
+    fprintf(stderr, "              dequant (GGUF, test hook): rows of the matrix -i NAME[:ROW0[:NROWS]] to -o (binary)\n");
+    fprintf(stderr, "  -o <string> output file for -m logits / dequant\n");
     fprintf(stderr, "  -y <string> system prompt in chat mode, default is none\n");
     fprintf(stderr, "  -r <int>    reasoning mode, 0 (default) = no thinking, 1 = thinking\n");
     fprintf(stderr, "  -n <int>    max new tokens per response, 0 (default) = unlimited\n");
@@ -3316,7 +3369,7 @@ int main(int argc, char *argv[]) {
     if (temperature < 0) temperature = 0;
     if (topp < 0 || 1.0 < topp) topp = 0.9;
     if ((strcmp(mode, "tokenize") == 0 || strcmp(mode, "logits") == 0) && !prompt) { error_usage(); }
-    if (strcmp(mode, "logits") == 0 && !out_path) { error_usage(); }
+    if ((strcmp(mode, "logits") == 0 || strcmp(mode, "dequant") == 0) && (!out_path || !prompt)) { error_usage(); }
     if (prefill_chunk < 0) prefill_chunk = 0;
     if (prefill_chunk > B_MAX) prefill_chunk = B_MAX;
 
@@ -3366,6 +3419,11 @@ int main(int argc, char *argv[]) {
     // build the Transformer via the model .bin file
     Transformer transformer;
     build_transformer(&transformer, checkpoint_path, ctx_length, prefill_chunk);
+    if (strcmp(mode, "dequant") == 0) {
+        dump_dequant(&transformer, prompt, out_path);
+        free_transformer(&transformer);
+        return 0;
+    }
 
     // build the Tokenizer via the tokenizer .bin file (GGUF: from its metadata)
     Tokenizer tokenizer;

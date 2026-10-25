@@ -161,12 +161,12 @@ static void kq_dequant_row(int type, const uint8_t *blk, int n, float *y) {
 
 static void kq_pack_blocks(int type, uint8_t *kp, const uint8_t *src, int nblk, int k) {
     // nblk blocks of 16 rows (k values each, row-major GGUF blocks at src) -> the Q4P / Q6P layout
-    // at kp (block 0 of the run). Serial (the caller splits the work)
+    // at kp (block 0 of the run). Serial (the caller splits the work). Every output byte is written
+    // once, built from the file's bytes (the header comment's index formulas)
     int nsb = k / QK_K, bb = kq_block_bytes(type), sbb = kq_sb_bytes(type);
     for (int rb = 0; rb < nblk; rb++)
         for (int s = 0; s < nsb; s++) {
             uint8_t *o = kp + ((size_t)rb * nsb + s) * sbb;
-            memset(o, 0, sbb);
             for (int r = 0; r < KQ_ROWS; r++) {
                 const uint8_t *b = src + ((size_t)(rb * KQ_ROWS + r) * nsb + s) * bb;
                 if (type == GGML_Q4_K) {
@@ -177,20 +177,35 @@ static void kq_pack_blocks(int type, uint8_t *kp, const uint8_t *src, int nblk, 
                         q4k_scale_min(b + 4, j, &sc, &m);
                         o[64 + 16 * j + r] = (uint8_t)sc;
                         o[192 + 16 * j + r] = (uint8_t)m;
-                    }
-                    for (int i = 0; i < QK_K; i++) {
-                        int j = i / 32, w = i % 32;
-                        o[320 + 256 * j + 64 * (w / 8) + 4 * r + w % 4] |= (uint8_t)(q4k_q(b, i) << (4 * (w % 8 / 4)));
+                        // sub-block j = nibble j % 2 of qs[32 (j / 2) + 0..31]
+                        const uint8_t *qs = b + 16 + 32 * (j / 2);
+                        int sh = 4 * (j % 2);
+                        for (int c = 0; c < 4; c++)
+                            for (int e = 0; e < 4; e++)
+                                o[320 + 256 * j + 64 * c + 4 * r + e] =
+                                    (uint8_t)((qs[8 * c + e] >> sh & 15) | (qs[8 * c + 4 + e] >> sh & 15) << 4);
                     }
                 } else {
                     float d = fp16_to_f32(kq_u16(b + 208));
                     memcpy(o + 4 * r, &d, 4);
-                    for (int j = 0; j < 16; j++)
+                    uint8_t q[QK_K]; // the 6-bit values (ggml's loop order: n, l, p)
+                    for (int n = 0; n < 2; n++)
+                        for (int l = 0; l < 32; l++) {
+                            uint8_t ql0 = b[64 * n + l], ql1 = b[64 * n + 32 + l], qh = b[128 + 32 * n + l];
+                            q[128 * n + l] = (uint8_t)((ql0 & 15) | (qh & 3) << 4);
+                            q[128 * n + 32 + l] = (uint8_t)((ql1 & 15) | (qh >> 2 & 3) << 4);
+                            q[128 * n + 64 + l] = (uint8_t)((ql0 >> 4) | (qh >> 4 & 3) << 4);
+                            q[128 * n + 96 + l] = (uint8_t)((ql1 >> 4) | (qh >> 6 & 3) << 4);
+                        }
+                    for (int j = 0; j < 16; j++) {
                         o[64 + 16 * j + r] = b[192 + j];
-                    for (int i = 0; i < QK_K; i++) {
-                        int j = i / 16, w = i % 16, q = q6k_q(b, i);
-                        o[320 + 128 * j + 64 * (w / 8) + 4 * r + w % 4] |= (uint8_t)((q & 15) << (4 * (w % 8 / 4)));
-                        o[2368 + 64 * j + 4 * r + w % 4] |= (uint8_t)((q >> 4) << (2 * (w / 4)));
+                        const uint8_t *qj = q + 16 * j;
+                        for (int c = 0; c < 2; c++)
+                            for (int e = 0; e < 4; e++)
+                                o[320 + 128 * j + 64 * c + 4 * r + e] = (uint8_t)((qj[8 * c + e] & 15) | (qj[8 * c + 4 + e] & 15) << 4);
+                        for (int e = 0; e < 4; e++)
+                            o[2368 + 64 * j + 4 * r + e] = (uint8_t)((qj[e] >> 4) | (qj[4 + e] >> 4) << 2 |
+                                                                     (qj[8 + e] >> 4) << 4 | (qj[12 + e] >> 4) << 6);
                     }
                 }
             }

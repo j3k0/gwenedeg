@@ -2,8 +2,15 @@
 """Generate the HF golden references for the cwayn test suite (run once, commit the output).
 
 Usage: .venv/bin/python tests/make_golden.py [--tokenizer-only]
+       .venv/bin/python tests/make_golden.py --q4ref [--gguf-py DIR]
 Needs torch + transformers (.venv); reads models/Qwen3-0.6B only (local_files_only, no network).
 --tokenizer-only rewrites tests/golden/tokenizer.json only (no model load, ~2 s).
+--q4ref writes only tests/golden/logits_q4/*.npz (~20 s): the same prompts and format, from the
+same HF model with every weight replaced by the Q4_K_M GGUF's tensors dequantized by gguf-py
+(gguf.quants.dequantize; norms F32 as stored), i.e. Q4_K_M weights with fp32 activations. runq on
+the Q4_K_M file should differ from it by its int8 activations only. Needs the `gguf` package
+(pip install gguf, 0.19.0 used; pure Python): importable, or DIR = a directory containing it
+(e.g. a scratch venv's site-packages; the .venv is not modified).
 The greedy goldens (our own engine) are made by `tests/run_tests.sh --update-greedy` instead.
 
 Output format
@@ -15,7 +22,8 @@ tests/golden/tokenizer.json
     Optional "xfail": str marks a known engine bug (reported, does not fail the suite);
     the marks come from TOKENIZER_XFAIL below.
 
-tests/golden/logits/<name>.npz   (np.savez_compressed, no pickles), one per prompt:
+tests/golden/logits/<name>.npz   (np.savez_compressed, no pickles), one per prompt
+tests/golden/logits_q4/<name>.npz (--q4ref; the reference: HF with the Q4_K_M weights):
     text        0-d unicode array, the raw prompt (no chat template applied)
     ids         int32 (n,)        HF token ids, the model input
     subset_ids  int32 (S,)        fixed sorted vocab subset, S = 4096,
@@ -38,6 +46,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_DIR = os.path.join(ROOT, "models", "Qwen3-0.6B")
+Q4_GGUF = os.path.join(ROOT, "models", "Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_K_M.gguf")
+# llama.cpp tensor roles (blk.N.<role>.weight) -> HF Qwen3 module names (no Q/K permutation for qwen3)
+GGUF_ROLES = {"attn_q": "self_attn.q_proj", "attn_k": "self_attn.k_proj", "attn_v": "self_attn.v_proj",
+              "attn_output": "self_attn.o_proj", "attn_q_norm": "self_attn.q_norm", "attn_k_norm": "self_attn.k_norm",
+              "attn_norm": "input_layernorm", "ffn_norm": "post_attention_layernorm", "ffn_gate": "mlp.gate_proj",
+              "ffn_up": "mlp.up_proj", "ffn_down": "mlp.down_proj"}
 OUT_DIR = os.path.join(ROOT, "tests", "golden")
 
 SUBSET_SIZE = 4096
@@ -157,11 +171,15 @@ LOGITS_PROMPTS = [
 def main():
     ap = argparse.ArgumentParser(description="Generate the HF goldens for the cwayn tests.")
     ap.add_argument("--tokenizer-only", action="store_true", help="only rewrite golden/tokenizer.json")
+    ap.add_argument("--q4ref", action="store_true", help="only write golden/logits_q4 (HF with the Q4_K_M weights)")
+    ap.add_argument("--gguf-py", default="", help="directory containing the gguf package (--q4ref)")
     a = ap.parse_args()
     torch.manual_seed(0)
     tok = AutoTokenizer.from_pretrained(MODEL_DIR, local_files_only=True)
     meta = {"model": "Qwen/Qwen3-0.6B", "torch": torch.__version__,
             "transformers": transformers.__version__, "numpy": np.__version__}
+    if a.q4ref:
+        return write_logits(tok, os.path.join(OUT_DIR, "logits_q4"), q4_weights=Q4_GGUF, gguf_py=a.gguf_py)
 
     tok_path = os.path.join(OUT_DIR, "tokenizer.json")
     cases = []
@@ -178,13 +196,40 @@ def main():
     if a.tokenizer_only:
         return 0
 
+    return write_logits(tok, os.path.join(OUT_DIR, "logits"))
+
+
+def load_q4_weights(model, path, gguf_py):
+    """replace every weight of the HF model with the GGUF tensor of the same role, dequantized"""
+    if gguf_py:
+        sys.path.insert(0, gguf_py)
+    import gguf
+    from gguf.quants import dequantize
+    sd = model.state_dict()
+    for t in gguf.GGUFReader(path).tensors:
+        if t.name == "token_embd.weight":
+            key = "model.embed_tokens.weight"  # (lm_head is tied to it)
+        elif t.name == "output_norm.weight":
+            key = "model.norm.weight"
+        else:
+            _, layer, role, _ = t.name.split(".")
+            key = f"model.layers.{layer}.{GGUF_ROLES[role]}.weight"
+        w = dequantize(t.data, t.tensor_type).astype(np.float32).reshape(tuple(sd[key].shape))
+        with torch.no_grad():
+            sd[key].copy_(torch.from_numpy(w))
+    assert model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
+    print(f"weights from {os.path.relpath(path, ROOT)} (gguf-py at {os.path.dirname(gguf.__file__)})")
+
+
+def write_logits(tok, log_dir, q4_weights=None, gguf_py=""):
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_DIR, local_files_only=True, torch_dtype=torch.float32, attn_implementation="eager")
     model.eval()
+    if q4_weights:
+        load_q4_weights(model, q4_weights, gguf_py)
     vocab = model.config.vocab_size
     subset_ids = np.sort(np.random.default_rng(0).choice(vocab, SUBSET_SIZE, replace=False)).astype(np.int32)
 
-    log_dir = os.path.join(OUT_DIR, "logits")
     os.makedirs(log_dir, exist_ok=True)
     for name, text in LOGITS_PROMPTS:
         ids = tok.encode(text, add_special_tokens=False)

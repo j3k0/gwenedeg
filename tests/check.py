@@ -22,6 +22,11 @@ Tests (see tests/README.md):
              goldens, logits vs HF (-b 1 and -b 64, same thresholds), batched vs sequential, threads
              and VNNI vs generic bitwise, and the 4 chat templates == the .bin side files (chat token
              ids of both models); its greedy goldens (gguf_*) run in the greedy group
+  q4         the GGUF Q4_K_M file (--q4; Q4_K / Q6_K weights): dequantized rows vs gguf-py bitwise
+             (tests/golden/dequant, from the blocks and from the repacked layouts), logits vs HF
+             (loose Q4 thresholds) and vs the Q4 reference (golden/logits_q4: HF fp32 with the
+             dequantized Q4_K_M weights; tight), batched vs sequential, threads and AVX-512 build vs
+             generic bitwise; its greedy goldens (q4_*) run in the greedy group
 
 Logits metrics, per position, over U = (fixed 4096-id vocab subset) + (HF top-64 ids):
   cos   cosine similarity of runq vs HF logits on U
@@ -68,6 +73,16 @@ TOP1_MIN = 0.75        # per prompt, fraction of positions
 TOP1_ALL_MIN = 0.85    # all prompts pooled
 COS_ALL_MIN = 0.997    # all prompts pooled, mean over positions >= 1
 TOP5_MIN = 0.75        # per prompt, mean overlap
+TH_Q8 = dict(cos_mean=COS_MEAN_MIN, cos_pos=COS_POS_MIN, cos_pos0=COS_POS0_MIN, top1=TOP1_MIN,
+             top1_all=TOP1_ALL_MIN, cos_all=COS_ALL_MIN, top5=TOP5_MIN)
+# Q4_K_M (--q4) vs HF fp32: the 4-bit weights alone cost ~25x the Q8_0 error (an fp32 HF model with
+# the dequantized Q4_K_M weights is as far from HF), so these are loose sanity bounds, ~2x the
+# baseline error (tests/README.md). Position 0 is near useless here (cos ~0.36 in the baseline; a
+# broken Q4_K kernel gave 0.44): bound only against NaN-like garbage
+TH_Q4_HF = dict(cos_mean=0.94, cos_pos=0.85, cos_pos0=0.10, top1=0.50, top1_all=0.65, cos_all=0.97, top5=0.50)
+# Q4_K_M vs the Q4 reference (golden/logits_q4: HF fp32 with the GGUF's dequantized weights): only
+# runq's int8 activations differ, as for Q8_0 vs HF; ~3x the baseline error for means, ~5x per position
+TH_Q4_REF = dict(cos_mean=0.995, cos_pos=0.98, cos_pos0=0.99, top1=0.75, top1_all=0.90, cos_all=0.998, top5=0.75)
 
 # Batched vs sequential logits (same engine, same numerics): currently bit-identical. Deliberate
 # breakage (scratch builds) gives max |diff| 17..32 and min cos <= 0.47: causal mask leaking one
@@ -94,6 +109,9 @@ GREEDY_CASES = [
     # the GGUF file (name prefix gguf_: run on --gguf)
     ("gguf_chat", ["-m", "chat", "-n", "40", "-i", "What is the capital of Australia? Answer in one sentence."]),
     ("gguf_generate", ["-m", "generate", "-n", "40", "-i", "Once upon a time, in a small village by the sea,"]),
+    # the Q4_K_M file (prefix q4_: run on --q4; generic K-quant kernels for now: short)
+    ("q4_chat", ["-m", "chat", "-n", "24", "-i", "What is the capital of Australia? Answer in one sentence."]),
+    ("q4_generate", ["-m", "generate", "-n", "24", "-i", "Once upon a time, in a small village by the sea,"]),
 ]
 # seeded sampling (-t 0.8 -s 42): output must not depend on -b (chat advances the RNG once per
 # prompt token, as before batched prefill)
@@ -117,6 +135,12 @@ THREADS_LONG = 3         # long -b 64: OMP_NUM_THREADS=3 vs the default (other w
 GGUF_SEQ = [THREADS_PROMPT, "code"]
 GGUF_BATCHED = [(THREADS_PROMPT, BATCH_CHUNKS[0]), (THREADS_PROMPT, BATCH), ("code", BATCH_CHUNKS[0])]
 GGUF_KERNELS = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH)]
+# Q4_K_M (generic K-quant kernels in every build for now, Step 6b-1: few and short runs): logits vs
+# HF and vs the Q4 reference batched on all prompts, sequential on Q4_SEQ; batched vs -b 1 bitwise;
+# threads 8 vs 3 (-b 7); AVX-512 build vs generic (meaningful once 6b-2 adds AVX-512 kernels)
+Q4_SEQ = [THREADS_PROMPT]
+Q4_BATCHED = [(THREADS_PROMPT, BATCH_CHUNKS[0]), (THREADS_PROMPT, BATCH)]
+Q4_KERNELS = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0])]
 GGUF_TEMPLATES = [("plain", [], ".template"), ("thinking", ["-r", "1"], ".template.with-thinking"),
                   ("system", ["-y", "You are terse."], ".template.with-system"),
                   ("system_thinking", ["-r", "1", "-y", "You are terse."], ".template.with-system-and-thinking")]
@@ -291,17 +315,17 @@ def logit_metrics(g, logits):
     return np.array(cos), np.array(top1), np.array(top5)
 
 
-def golden_prompts():
-    d = os.path.join(GOLDEN, "logits")
+def golden_prompts(sub="logits"):
+    d = os.path.join(GOLDEN, sub)
     order = ["en", "code", "zh", "chat", "count"]
     names = sorted((f[:-4] for f in os.listdir(d) if f.endswith(".npz")),
                    key=lambda n: (order.index(n) if n in order else len(order), n))
     return [(n, os.path.join(d, n + ".npz")) for n in names]
 
 
-def test_logits(a, res, tmp, chunk=SEQ, prefix="logits", only=None):
+def test_logits(a, res, tmp, chunk=SEQ, prefix="logits", only=None, th=TH_Q8, sub="logits", pooled=True):
     all_top1, all_cos, rows = [], [], []
-    for name, path in golden_prompts():
+    for name, path in golden_prompts(sub):
         if only and name not in only:
             continue
         g = np.load(path)
@@ -323,25 +347,25 @@ def test_logits(a, res, tmp, chunk=SEQ, prefix="logits", only=None):
         all_cos.extend(cr.tolist())
         rows.append((name, len(ids), c0, cr.mean(), cr.min(), int(top1.sum()), top5.mean()))
         why = []  # written as `not (x >= t)` so that NaN fails
-        if not cr.mean() >= COS_MEAN_MIN: why.append(f"cos mean < {COS_MEAN_MIN}")
-        if not cr.min() >= COS_POS_MIN: why.append(f"cos min < {COS_POS_MIN} at pos {1 + int(cr.argmin())}")
-        if not c0 >= COS_POS0_MIN: why.append(f"cos pos0 < {COS_POS0_MIN}")
-        if not top1.mean() >= TOP1_MIN: why.append(f"top1 < {TOP1_MIN}")
-        if not top5.mean() >= TOP5_MIN: why.append(f"top5 < {TOP5_MIN}")
+        if not cr.mean() >= th["cos_mean"]: why.append(f"cos mean < {th['cos_mean']}")
+        if not cr.min() >= th["cos_pos"]: why.append(f"cos min < {th['cos_pos']} at pos {1 + int(cr.argmin())}")
+        if not c0 >= th["cos_pos0"]: why.append(f"cos pos0 < {th['cos_pos0']}")
+        if not top1.mean() >= th["top1"]: why.append(f"top1 < {th['top1']}")
+        if not top5.mean() >= th["top5"]: why.append(f"top5 < {th['top5']}")
         detail = (f"n={len(ids)} cos pos0 {c0:.4f}, pos1+ mean {cr.mean():.5f} min {cr.min():.5f} | "
                   f"top1 {int(top1.sum())}/{len(top1)} | top5 {top5.mean():.3f}")
         res.report(not why, tname, detail + ("  <- " + "; ".join(why) if why else ""))
         if a.verbose:
             for i in range(len(cos)):
                 print(f"      pos {i:2d} cos {cos[i]:.5f} top1 {int(top1[i])} top5 {top5[i]:.1f}")
-    if all_cos:
+    if all_cos and pooled:
         c = float(np.mean(all_cos))
-        res.report(bool(c >= COS_ALL_MIN), f"{prefix}/cos_pooled",
-                   f"mean cos over {len(all_cos)} positions (pos >= 1) = {c:.5f} (min {COS_ALL_MIN})")
-    if all_top1:
+        res.report(bool(c >= th["cos_all"]), f"{prefix}/cos_pooled",
+                   f"mean cos over {len(all_cos)} positions (pos >= 1) = {c:.5f} (min {th['cos_all']})")
+    if all_top1 and pooled:
         t = float(np.mean(all_top1))
-        res.report(bool(t >= TOP1_ALL_MIN), f"{prefix}/top1_pooled",
-                   f"{int(np.sum(all_top1))}/{len(all_top1)} = {t:.3f} (min {TOP1_ALL_MIN})")
+        res.report(bool(t >= th["top1_all"]), f"{prefix}/top1_pooled",
+                   f"{int(np.sum(all_top1))}/{len(all_top1)} = {t:.3f} (min {th['top1_all']})")
     if a.verbose and rows:
         print("      prompt  n   cos pos0  cos mean  cos min   top1    top5")
         for r in rows:
@@ -456,7 +480,10 @@ def test_greedy(a, res):
         if name.startswith("gguf_") and not a.gguf:
             print(f"      skipped greedy/{name}: no GGUF file (--gguf)")
             continue
-        got = greedy_output(a, args, a.gguf if name.startswith("gguf_") else None)
+        if name.startswith("q4_") and not a.q4:
+            print(f"      skipped greedy/{name}: no Q4_K_M file (--q4)")
+            continue
+        got = greedy_output(a, args, a.gguf if name.startswith("gguf_") else a.q4 if name.startswith("q4_") else None)
         if a.update_greedy:
             with open(path, "w", encoding="utf-8", newline="") as f:
                 f.write(got)
@@ -708,6 +735,71 @@ def test_gguf(a, res, tmp):
                    if ok else f"DIFFER: gguf {text!r} vs side file {want!r} (ids equal: {ib == ig})"))
 
 
+# ----------------------------------------------------------------------------- Q4_K_M
+
+def test_q4(a, res, tmp):
+    if not a.q4:
+        print("      skipped: no Q4_K_M file (--q4)")
+        return
+    q4 = argparse.Namespace(**{**vars(a), "model": a.q4})
+    qtmp = os.path.join(tmp, "q4")
+    os.makedirs(qtmp, exist_ok=True)
+
+    # dequantization vs gguf-py, bitwise: rows from the file's blocks (embedding lookup) and from
+    # the repacked Q4P / Q6P layouts (what the matmul kernels read)
+    g = np.load(os.path.join(GOLDEN, "dequant", "q4_k_m.npz"))
+    def dequant(i):
+        name, rows = str(g["names"][i]), g[f"rows{i}"]
+        path = os.path.join(qtmp, f"dequant{i}.bin")
+        p = run([a.runq, a.q4, "-c", "64", "-m", "dequant", "-i", f"{name}:{int(g['row0'][i])}:{rows.shape[0]}", "-o", path], threads=2)
+        if p.returncode != 0:
+            return name, rows, None, p.stderr.decode(errors="replace")[-300:]
+        h = np.fromfile(path, dtype=np.int32, count=3)
+        return name, rows, np.fromfile(path, dtype=np.float32, offset=12).reshape(1 + int(h[2]), int(h[0]), int(h[1])), ""
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:
+        outs = list(ex.map(dequant, range(len(g["names"]))))
+    for i, (name, rows, got, err) in enumerate(outs):
+        what = f"{str(g[f'type{i}'])} rows {int(g['row0'][i])}..{int(g['row0'][i]) + rows.shape[0] - 1} x {rows.shape[1]}"
+        if got is None:
+            res.report(False, f"q4_dequant/{name}", f"runq -m dequant failed: {err}")
+            continue
+        ok = got.shape[1:] == rows.shape and got.shape[0] == 2
+        detail = []
+        for j, src in enumerate(["blocks", "repacked"][:got.shape[0]]):
+            same = ok and np.array_equal(got[j].view(np.uint32), rows.view(np.uint32))
+            ok &= same
+            detail.append(f"{src} " + ("bit-identical" if same else
+                          f"DIFFER (max |diff| {np.abs(got[j] - rows).max():.3g})" if got.shape[1:] == rows.shape else "DIFFER (shape)"))
+        res.report(ok, f"q4_dequant/{name}", f"{what}: " + ", ".join(detail) + " (gguf-py)")
+
+    # logits: vs HF fp32 (loose: the 4-bit weights' own error) and vs the Q4 reference (HF fp32 with
+    # the dequantized Q4_K_M weights: runq's int8 activations only), batched on all prompts and
+    # sequential on Q4_SEQ (the same files)
+    test_logits(q4, res, qtmp, BATCH, "q4_logits_batched", th=TH_Q4_HF)
+    test_logits(q4, res, qtmp, BATCH, "q4_ref_batched", th=TH_Q4_REF, sub="logits_q4")
+    test_logits(q4, res, qtmp, SEQ, "q4_ref", only=Q4_SEQ, th=TH_Q4_REF, sub="logits_q4", pooled=False)
+
+    texts = dict(batched_prompts())
+    for name, chunk in Q4_BATCHED:
+        same, detail = same_files(logits_file(q4, qtmp, name, texts[name], SEQ), logits_file(q4, qtmp, name, texts[name], chunk))
+        res.report(same, f"q4_batched/{name}_b{chunk}", f"-b {chunk} vs -b {SEQ}: {detail}")
+    n_a = int(os.environ["OMP_NUM_THREADS"])
+    n_b = THREADS_LONG if n_a != THREADS_LONG else 8
+    chunk = BATCH_CHUNKS[0]
+    same, detail = same_files(logits_file(q4, qtmp, THREADS_PROMPT, texts[THREADS_PROMPT], chunk, threads=n_a),
+                              logits_file(q4, qtmp, THREADS_PROMPT, texts[THREADS_PROMPT], chunk, threads=n_b))
+    res.report(same, f"q4_threads/bitwise_b{chunk}", f"{THREADS_PROMPT} -b {chunk}: OMP_NUM_THREADS={n_a} vs {n_b} {detail}")
+    if a.generic:
+        gen = argparse.Namespace(**{**vars(q4), "runq": a.generic})
+        gentmp = os.path.join(qtmp, "generic")
+        os.makedirs(gentmp, exist_ok=True)
+        for name, chunk in Q4_KERNELS:
+            same, detail = same_files(logits_file(q4, qtmp, name, texts[name], chunk), logits_file(gen, gentmp, name, texts[name], chunk))
+            res.report(same, f"q4_kernels/{name}_b{chunk}", f"AVX-512 build vs generic, -b {chunk}: {detail}")
+    else:
+        print("      q4_kernels skipped: no generic build (--generic / RUNQ_GENERIC)")
+
+
 # ----------------------------------------------------------------------------- main
 
 def main():
@@ -716,7 +808,8 @@ def main():
     ap.add_argument("--model", default=os.path.join(ROOT, "models", "Qwen3-0.6B-q8.bin"))
     ap.add_argument("--generic", default="", help="generic-kernel build for the kernels test (empty: skip)")
     ap.add_argument("--gguf", default="", help="GGUF Q8_0 file for the gguf tests and greedy goldens (empty: skip)")
-    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf",
+    ap.add_argument("--q4", default="", help="GGUF Q4_K_M file for the q4 tests and greedy goldens (empty: skip)")
+    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4",
                     help="comma-separated subset of tests to run")
     ap.add_argument("--update-greedy", action="store_true", help="regenerate the greedy goldens")
     ap.add_argument("--jobs", type=int, default=8, help="parallel runq processes for the tokenizer test")
@@ -739,7 +832,8 @@ def main():
                          ("kernels", lambda: test_kernels(a, res, tmp)),
                          ("greedy", lambda: test_greedy(a, res)),
                          ("chat", lambda: test_chat(a, res, tmp)),
-                         ("gguf", lambda: test_gguf(a, res, tmp))]:
+                         ("gguf", lambda: test_gguf(a, res, tmp)),
+                         ("q4", lambda: test_q4(a, res, tmp))]:
             if name in only:
                 t = time.time()
                 print(f"== {name}")

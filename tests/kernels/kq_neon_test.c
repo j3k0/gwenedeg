@@ -1,5 +1,7 @@
 // Unit test of the NEON kernels (kernels_neon.h) against the generic ones on random data: K-quants
-// (vs kquants.h) and Q8_0 (vs a copy of runq.c's dot_q8), GEMV and GEMM must be bit-identical.
+// (vs kquants.h) and Q8_0 (vs a copy of runq.c's dot_q8), GEMV and GEMM must be bit-identical; the
+// attention on the bf16 / f16 KV caches vs the fp32 cache holding the same values (exact conversion,
+// the same arithmetic: bit-identical; the fp32 attention vs the generic one: make test).
 // Build: make kq-neon-test
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,8 +79,88 @@ static int test_q8(int gs, int k) {
     return fails;
 }
 
+static size_t att_tile(int t, int h, int nkv, int hd) {
+    // runq.c's kv_tile: blocks of ATT_P positions, in a block each head's ATT_PT tiles contiguous
+    return (((size_t)(t / ATT_P) * nkv + h) * ATT_P + (size_t)(t % ATT_P / ATT_T) * ATT_T) * hd;
+}
+
+static int test_attn(int kvt, int hd) {
+    // head 1 of 2 (so a wrong block stride reads the other head), 3 blocks (the last one partial); random
+    // 16-bit values (bf16 / f16 bit patterns, f16 subnormals included) in runq.c's layouts and their
+    // exact fp32 values in the fp32 layout
+    int nkv = 2, npos = 3 * ATT_P - 37, h = 1, fails = 0;
+    size_t bs = (size_t)nkv * ATT_P * hd, n = 3 * bs, pst = ATT_PSTRIDE(hd);
+    float *kf = calloc(n, 4), *vf = calloc(n, 4);
+    uint16_t *kh = calloc(n, 2), *vh = calloc(n, 2);
+    for (int t = 0; t < npos; t++)
+        for (int hh = 0; hh < nkv; hh++)
+            for (int kv = 0; kv < 2; kv++)
+                for (int i = 0; i < hd; i++) {
+                    uint16_t b;
+                    float f;
+                    if (kvt == 1) { // bf16, |x| ~ 2^-7 .. 2^4
+                        b = (uint16_t)((rnd() & 1) << 15 | (120 + rnd() % 11) << 7 | (rnd() & 0x7f));
+                        uint32_t u = (uint32_t)b << 16;
+                        memcpy(&f, &u, 4);
+                    } else { // f16, exponent 0 (subnormal) .. 18
+                        uint32_t e = rnd() % 20;
+                        b = (uint16_t)((rnd() & 1) << 15 | (e > 18 ? 18 : e) << 10 | (rnd() & 0x3ff));
+                        f = fp16_to_f32(b);
+                    }
+                    size_t o = att_tile(t, hh, nkv, hd);
+                    int j = t % ATT_T;
+                    if (kv == 0) {
+                        kf[o + (size_t)i * ATT_T + j] = f;
+                        kh[o + (kvt == 1 ? (size_t)(i & ~1) * ATT_T + 2 * j + (i & 1) : (size_t)i * ATT_T + j)] = b;
+                    } else {
+                        vf[o + (size_t)j * hd + i] = f;
+                        vh[o + (size_t)j * hd + (kvt == 1 ? (i & ~31) + 2 * (i & 15) + ((i >> 4) & 1) : i)] = b;
+                    }
+                }
+    enum { NV = 13 };
+    float *qv = malloc(sizeof(float) * NV * hd), *S = malloc(sizeof(float) * ATTN_NV * 3 * ATT_P);
+    float *o32 = calloc((size_t)NV * 3 * pst, 4), *o16 = calloc((size_t)NV * 3 * pst, 4);
+    for (int i = 0; i < NV * hd; i++) qv[i] = (float)((int)(rnd() % 2001) - 1000) * 1e-3f;
+    const float *q[NV];
+    float *out32[NV], *out16[NV];
+    for (int r = 0; r < NV; r++) q[r] = qv + (size_t)r * hd;
+    const size_t k0 = att_tile(0, h, nkv, hd);
+    float scale = 1.0f / 11.3137085f;
+    static const int nvs[] = { 1, 2, 3, 4, 5, 12, 13 };
+    char name[96];
+    for (unsigned c = 0; c < sizeof nvs / sizeof nvs[0]; c++) {
+        int nv = nvs[c], np[NV];
+        // one block (part NULL): np <= ATT_P, partial tiles
+        for (int r = 0; r < nv; r++) np[r] = ATT_P - (int)((r * 37) % ATT_P);
+        for (int r = 0; r < nv; r++) { out32[r] = o32 + (size_t)r * hd; out16[r] = o16 + (size_t)r * hd; }
+        memset(o32, 0, sizeof(float) * NV * 3 * pst);
+        memset(o16, 0, sizeof(float) * NV * 3 * pst);
+        attn_kv(0, nv, q, out32, NULL, np, 0, 1, kf + k0, vf + k0, bs, hd, scale, S);
+        attn_kv(kvt, nv, q, out16, NULL, np, 0, 1, kh + k0, vh + k0, bs, hd, scale, S);
+        snprintf(name, sizeof name, "attention %s hd=%d nv=%d, one block", kvt == 1 ? "bf16" : "f16", hd, nv);
+        fails += cmp(name, o16, o32, nv * hd);
+        // block partial results (part), all three blocks and the blocks 1..2 only, causal-like np
+        for (int b0 = 0; b0 < 2; b0++) {
+            for (int r = 0; r < nv; r++) {
+                np[r] = npos - (int)((r * 53) % 300);
+                out32[r] = o32 + (size_t)r * 3 * pst;
+                out16[r] = o16 + (size_t)r * 3 * pst;
+            }
+            memset(o32, 0, sizeof(float) * NV * 3 * pst);
+            memset(o16, 0, sizeof(float) * NV * 3 * pst);
+            attn_kv(0, nv, q, NULL, out32, np, b0, 3, kf + k0, vf + k0, bs, hd, scale, S);
+            attn_kv(kvt, nv, q, NULL, out16, np, b0, 3, kh + k0, vh + k0, bs, hd, scale, S);
+            snprintf(name, sizeof name, "attention %s hd=%d nv=%d, blocks %d..2", kvt == 1 ? "bf16" : "f16", hd, nv, b0);
+            fails += cmp(name, o16, o32, nv * 3 * (int)pst);
+        }
+    }
+    free(kf); free(vf); free(kh); free(vh); free(qv); free(S); free(o32); free(o16);
+    return fails;
+}
+
 int main(void) {
     int fails = 0;
+    fails += test_attn(1, 128) + test_attn(2, 128) + test_attn(1, 64) + test_attn(2, 64);
     fails += test_q8(32, 1024) + test_q8(32, 3072) + test_q8(64, 1024) + test_q8(64, 3072);
     int types[2] = { GGML_Q4_K, GGML_Q6_K };
     int ks[2] = { 1024, 3072 };

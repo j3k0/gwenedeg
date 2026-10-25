@@ -1626,7 +1626,7 @@ static void attention_part(int kvt, int nv, const float *const *q, float *const 
     if (att512_ok(hd)) { att512_kv(kvt, nv, q, out, part, np, b0, b1, kt, vt, bs, hd, scale, S); return; }
 #endif
 #ifdef RUNQ_ATTNEON
-    if (kvt == KV_F32 && attn_ok(hd)) { attn_kv(nv, q, out, part, np, b0, b1, kt, vt, bs, hd, scale, S); return; }
+    if (attn_ok(hd)) { attn_kv(kvt, nv, q, out, part, np, b0, b1, kt, vt, bs, hd, scale, S); return; }
 #endif
     // generic C: per block of ATT_P positions (a 16-bit cache converted to fp32 once, for all the
     // vectors), attention_vec per vector

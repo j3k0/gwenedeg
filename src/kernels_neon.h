@@ -1,6 +1,7 @@
 /* NEON (AArch64 + dot product: Apple M1 and later, Graviton 2+, ...) kernels for the GGUF K-quants
  * (Q4_K / Q6_K on the repacked Q4P / Q6P layouts of kquants.h): GEMV (decode) and GEMM (prefill).
- * Experimental (Step 8: Mac port). Further down: Q8_0 (GEMV, GEMM) and the fp32 attention.
+ * Experimental (Step 8: Mac port). Further down: Q8_0 (GEMV, GEMM) and the attention (fp32 arithmetic
+ * on the f32 / bf16 / f16 KV cache).
  *
  * The arithmetic is the definition in kquants.h's header comment, as the generic q4p_dot / q6p_dot
  * (and the AVX-512 kernels) compute it: exact int32 sums, then per (row, activation row, group of 32)
@@ -604,9 +605,10 @@ static void q8x_gemm_item(float *out, int ldo, const uint8_t *wp, int d, int t, 
  * att512_group computes it with 4-lane vectors: a 16-position tile = 4 registers. Bit-identical to
  * attention_vec (runq.c) and att512_kv. Cache layout (kernels_avx512.h): per kv head and block of
  * ATT_P positions ATT_PT contiguous tiles (kt / vt: tile 0 of block 0, block b at + b * bs elements):
- * K transposed in a tile (dim i, position j at i * 16 + j), V rows contiguous in a block. f32 KV cache
- * only (-k f32): with -k bf16 / f16 attention_part (runq.c) takes the generic attention_vec, which
- * converts the tiles to fp32 first.
+ * K transposed in a tile (dim i, position j at i * 16 + j), V rows contiguous in a block. All three
+ * cache types (-k f32 / bf16 / f16): the 16-bit elements are converted to fp32 in registers (exact:
+ * bf16 by a shift / a mask of the dword holding a dim pair, f16 by fcvtl), then the same arithmetic,
+ * so each type gives the generic build's results bit for bit.
  * Scores: RV (<= 4) query vectors x 1 or 2 tiles per register tile, q transposed per group of 4
  * vectors (fmla by element); P.V: RV vectors x DW registers of dims per pass over the positions.
  */
@@ -642,21 +644,58 @@ static inline float32x4_t attn_exp(float32x4_t x) { RQ_FP_EXACT
         if (RV > 3) ACC[3][U] = vfmaq_laneq_f32(ACC[3][U], K, QV, 3); \
     } while (0)
 
+static inline float32x4_t attn_bf_lo(uint16x8_t w) {
+    // the bf16 values in the low halves of 4 dwords, as fp32 (exact: the bits << 16)
+    return vreinterpretq_f32_u32(vshlq_n_u32(vreinterpretq_u32_u16(w), 16));
+}
+
+static inline float32x4_t attn_bf_hi(uint16x8_t w) {
+    // the bf16 values in the high halves
+    return vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_u16(w), vdupq_n_u32(0xffff0000u)));
+}
+
 static inline __attribute__((always_inline))
-void attn_qk(const int RV, const int NT, const float *q4, const float *kt, size_t ts, int hd, float scale, float *s,
-             size_t st) { RQ_FP_EXACT
+void attn_qk(const int RV, const int NT, const int KT, const float *q4, const void *kt, size_t ts, int hd, float scale,
+             float *s, size_t st) { RQ_FP_EXACT
     // scores of RV vectors (q4: their q transposed, dim i at q4 + 4 i, lane r) for NT tiles (tile u at
-    // kt + u * ts) -> s + u * st + r * 16 + j
+    // kt + u * ts elements) -> s + u * st + r * 16 + j. KT (cache type) 0: fp32; 1: bf16, dims i, i + 1
+    // (i even) of 4 positions in one 16-byte load (the low / high halves of its dwords); 2: f16, 8
+    // positions per load (fcvtl / fcvtl2). Converted exactly; per accumulator the dims in order, the same
+    // fma chains as for fp32
+    const float *kf = (const float *)kt;
+    const uint16_t *kh = (const uint16_t *)kt;
     for (int i0 = 0; i0 < hd; i0 += ATT_DC) {
         float32x4_t acc[4][8];
         for (int r = 0; r < RV; r++)
             for (int u = 0; u < 4 * NT; u++)
                 acc[r][u] = vdupq_n_f32(0.0f);
-        for (int i = i0; i < i0 + ATT_DC; i++) {
-            float32x4_t qv = vld1q_f32(q4 + 4 * i);
-            for (int u = 0; u < 4 * NT; u++) {
-                float32x4_t k = vld1q_f32(kt + (u >> 2) * ts + (size_t)i * ATT_T + 4 * (u & 3));
-                ATTN_FMA_LANES(acc, u, k, qv);
+        if (KT == 1) {
+            for (int i = i0; i < i0 + ATT_DC; i += 2) {
+                float32x4_t q0 = vld1q_f32(q4 + 4 * i), q1 = vld1q_f32(q4 + 4 * i + 4);
+                for (int u = 0; u < 4 * NT; u++) {
+                    uint16x8_t w = vld1q_u16(kh + (u >> 2) * ts + (size_t)i * ATT_T + 8 * (u & 3));
+                    float32x4_t k0 = attn_bf_lo(w), k1 = attn_bf_hi(w);
+                    ATTN_FMA_LANES(acc, u, k0, q0);
+                    ATTN_FMA_LANES(acc, u, k1, q1);
+                }
+            }
+        } else if (KT == 2) {
+            for (int i = i0; i < i0 + ATT_DC; i++) {
+                float32x4_t qv = vld1q_f32(q4 + 4 * i);
+                for (int u = 0; u < 4 * NT; u += 2) {
+                    float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(kh + (u >> 2) * ts + (size_t)i * ATT_T + 4 * (u & 3)));
+                    float32x4_t k0 = vcvt_f32_f16(vget_low_f16(h)), k1 = vcvt_high_f32_f16(h);
+                    ATTN_FMA_LANES(acc, u, k0, qv);
+                    ATTN_FMA_LANES(acc, u + 1, k1, qv);
+                }
+            }
+        } else {
+            for (int i = i0; i < i0 + ATT_DC; i++) {
+                float32x4_t qv = vld1q_f32(q4 + 4 * i);
+                for (int u = 0; u < 4 * NT; u++) {
+                    float32x4_t k = vld1q_f32(kf + (u >> 2) * ts + (size_t)i * ATT_T + 4 * (u & 3));
+                    ATTN_FMA_LANES(acc, u, k, qv);
+                }
             }
         }
         for (int r = 0; r < RV; r++)
@@ -673,13 +712,49 @@ void attn_qk(const int RV, const int NT, const float *q4, const float *kt, size_
 }
 #undef ATTN_FMA_LANES
 
+static inline int attn_vdim(const int KT, int d0, int u) {
+    // the first of the 4 dims held by V register u of the pass at d0. KT 1 (bf16): registers 2 k, 2 k + 1
+    // = the low / high halves of dwords w .. w + 3 of the row, w = d0 / 2 + 4 k: dims 32 (w / 16) + w % 16
+    // and + 16 (the layout: dims 32 c + l, 32 c + 16 + l share dword 16 c + l)
+    if (KT != 1)
+        return d0 + 4 * u;
+    int w = d0 / 2 + 4 * (u >> 1);
+    return 32 * (w >> 4) + (w & 15) + 16 * (u & 1);
+}
+
+// one position t of attn_pv: acc[r][u] += e[r][t] * (V row t, register u of the pass), for the vectors r
+// with COND (16-bit: 2 registers per 16-byte load, converted exactly)
+#define ATTN_PV_STEP(COND) do { \
+        const float *p_ = s + (size_t)(t >> 4) * st + (t & 15); \
+        size_t o_ = vo + (size_t)(t - tb) * hd + d0; \
+        if (KT == 0) { \
+            for (int u = 0; u < DW; u++) { \
+                float32x4_t vv = vld1q_f32((const float *)vt + o_ + 4 * u); \
+                for (int r = 0; r < RV; r++) \
+                    if (COND) \
+                        acc[r][u] = vfmaq_n_f32(acc[r][u], vv, p_[r * ATT_T]); \
+            } \
+        } else { \
+            for (int k = 0; k < DW / 2; k++) { \
+                uint16x8_t w_ = vld1q_u16((const uint16_t *)vt + o_ + 8 * k); \
+                float32x4_t v0 = KT == 1 ? attn_bf_lo(w_) : vcvt_f32_f16(vget_low_f16(vreinterpretq_f16_u16(w_))); \
+                float32x4_t v1 = KT == 1 ? attn_bf_hi(w_) : vcvt_high_f32_f16(vreinterpretq_f16_u16(w_)); \
+                for (int r = 0; r < RV; r++) \
+                    if (COND) { \
+                        acc[r][2 * k] = vfmaq_n_f32(acc[r][2 * k], v0, p_[r * ATT_T]); \
+                        acc[r][2 * k + 1] = vfmaq_n_f32(acc[r][2 * k + 1], v1, p_[r * ATT_T]); \
+                    } \
+            } \
+        } \
+    } while (0)
+
 static inline __attribute__((always_inline))
-void attn_pv(const int RV, const int DW, const float *s, size_t st, int nbk, const int *np, const float *vt, size_t bs,
-             int hd, const float *inv, float *const *out, int ob, size_t pst) { RQ_FP_EXACT
+void attn_pv(const int RV, const int DW, const int KT, const float *s, size_t st, int nbk, const int *np, const void *vt,
+             size_t bs, int hd, const float *inv, float *const *out, int ob, size_t pst) { RQ_FP_EXACT
     // as att512_pv for RV vectors (scores s + r * 16, tile stride st): inv != NULL (nbk = 1): out[r][i]
     // = (sum over t < np[r] of e[r][t] * v[t][i]) * inv[r]; inv NULL: per block j < nbk the unnormalized
-    // sums into out[r] + (ob + j) * pst. V: block j at vt + j * bs, its rows contiguous. DW registers
-    // (4 * DW dims) per pass over the positions
+    // sums into out[r] + (ob + j) * pst. V: block j at vt + j * bs elements, its rows contiguous. DW
+    // registers (4 * DW dims, attn_vdim) per pass over the positions; KT: cache type (16-bit: DW even)
     for (int d0 = 0; d0 < hd; d0 += 4 * DW) {
         for (int j = 0; j < nbk; j++) {
             int tb = j * ATT_P, nmin, nmax;
@@ -698,57 +773,45 @@ void attn_pv(const int RV, const int DW, const float *s, size_t st, int nbk, con
             for (int r = 0; r < RV; r++)
                 for (int u = 0; u < DW; u++)
                     acc[r][u] = vdupq_n_f32(0.0f);
-            const float *vb = vt + (size_t)j * bs + d0; // block j: row t at vb + (t - tb) * hd
+            size_t vo = (size_t)j * bs; // block j: row t at vo + (t - tb) * hd elements
             int t = tb;
-            for (; t < nmin; t++) {
-                const float *p = s + (size_t)(t >> 4) * st + (t & 15);
-                const float *v = vb + (size_t)(t - tb) * hd;
-                for (int u = 0; u < DW; u++) {
-                    float32x4_t vv = vld1q_f32(v + 4 * u);
-                    for (int r = 0; r < RV; r++)
-                        acc[r][u] = vfmaq_n_f32(acc[r][u], vv, p[r * ATT_T]);
-                }
-            }
-            for (; t < nmax; t++) { // causal tail: only the vectors that see position t
-                const float *p = s + (size_t)(t >> 4) * st + (t & 15);
-                const float *v = vb + (size_t)(t - tb) * hd;
-                for (int u = 0; u < DW; u++) {
-                    float32x4_t vv = vld1q_f32(v + 4 * u);
-                    for (int r = 0; r < RV; r++)
-                        if (t < np[r])
-                            acc[r][u] = vfmaq_n_f32(acc[r][u], vv, p[r * ATT_T]);
-                }
-            }
+            for (; t < nmin; t++)
+                ATTN_PV_STEP(1);
+            for (; t < nmax; t++) // causal tail: only the vectors that see position t
+                ATTN_PV_STEP(t < np[r]);
             for (int r = 0; r < RV; r++) {
                 if (!inv) {
                     if (np[r] > tb)
                         for (int u = 0; u < DW; u++)
-                            vst1q_f32(out[r] + (size_t)(ob + j) * pst + d0 + 4 * u, acc[r][u]);
+                            vst1q_f32(out[r] + (size_t)(ob + j) * pst + attn_vdim(KT, d0, u), acc[r][u]);
                     continue;
                 }
                 for (int u = 0; u < DW; u++)
-                    vst1q_f32(out[r] + d0 + 4 * u, vmulq_n_f32(acc[r][u], inv[r]));
+                    vst1q_f32(out[r] + attn_vdim(KT, d0, u), vmulq_n_f32(acc[r][u], inv[r]));
             }
         }
     }
 }
+#undef ATTN_PV_STEP
 
-static void attn_group(int nv, const float *const *q, float *const *out, float *const *part, const int *np, int b0,
-                       int b1, const float *kt, const float *vt, size_t bs, int hd, float scale, float *s) { RQ_FP_EXACT
-    // as att512_group: nv <= ATTN_NV query vectors of one kv head, vector r over positions 0..np[r]-1.
+static inline __attribute__((always_inline))
+void attn_group_t(const int KT, int nv, const float *const *q, float *const *out, float *const *part, const int *np,
+                  int b0, int b1, const void *kt0, const void *vt0, size_t bs, int hd, float scale, float *s) { RQ_FP_EXACT
+    // as att512_group_t: nv <= ATTN_NV query vectors of one kv head, vector r over positions 0..np[r]-1.
     // part NULL: the attention into out[r] (all np <= ATT_P; b0 = 0); else the partial results of blocks
     // b0..b1-1 at part[r] + b * ATT_PSTRIDE(hd) (o, m, l). s: nv * (positions in the blocks) floats.
-    // Tile tb of the range: block tb / ATT_PT at + bs, tile tb % ATT_PT in it at + ts (a 2-tile register
-    // tile starts at an even tb: never across a block)
-    size_t pst = ATT_PSTRIDE(hd), ts = (size_t)ATT_T * hd, o0 = (size_t)b0 * bs;
+    // KT: cache type (0 fp32, 1 bf16, 2 f16; kt / vt, bs in its elements). Tile tb of the range: block
+    // tb / ATT_PT at + bs, tile tb % ATT_PT in it at + ts (a 2-tile register tile starts at an even tb:
+    // never across a block)
+    size_t pst = ATT_PSTRIDE(hd), ts = (size_t)ATT_T * hd, esz = KT ? 2 : 4;
     int npr[ATTN_NV], nmax = 0;
     for (int r = 0; r < nv; r++) {
         int n = np[r] - b0 * ATT_P, e = (b1 - b0) * ATT_P;
         npr[r] = n < 0 ? 0 : n < e ? n : e;
         nmax = npr[r] > nmax ? npr[r] : nmax;
     }
-    kt += o0;
-    vt += o0;
+    const char *kt = (const char *)kt0 + (size_t)b0 * bs * esz;
+    const void *vt = (const char *)vt0 + (size_t)b0 * bs * esz;
     int ntl = (nmax + ATT_T - 1) / ATT_T, nbk = part ? (nmax + ATT_P - 1) / ATT_P : 1;
     size_t st = (size_t)nv * ATT_T; // floats per tile of scores (s + tile * st + r * 16 + j)
 
@@ -761,14 +824,14 @@ static void attn_group(int nv, const float *const *q, float *const *out, float *
                 q4[4 * i + l] = l < rv ? q[r0 + l][i] : 0.0f;
         float *sr = s + r0 * ATT_T;
         int tb = 0;
-        #define ATTN_KTILE(tb) (kt + (size_t)((tb) / ATT_PT) * bs + (size_t)((tb) % ATT_PT) * ts)
+        #define ATTN_KTILE(tb) (kt + ((size_t)((tb) / ATT_PT) * bs + (size_t)((tb) % ATT_PT) * ts) * esz)
         switch (rv) {
-            case 1: for (; tb + 2 <= ntl; tb += 2) attn_qk(1, 2, q4, ATTN_KTILE(tb), ts, hd, scale, sr + tb * st, st);
-                    for (; tb < ntl; tb++) attn_qk(1, 1, q4, ATTN_KTILE(tb), ts, hd, scale, sr + tb * st, st); break;
-            case 2: for (; tb + 2 <= ntl; tb += 2) attn_qk(2, 2, q4, ATTN_KTILE(tb), ts, hd, scale, sr + tb * st, st);
-                    for (; tb < ntl; tb++) attn_qk(2, 1, q4, ATTN_KTILE(tb), ts, hd, scale, sr + tb * st, st); break;
-            case 3: for (; tb < ntl; tb++) attn_qk(3, 1, q4, ATTN_KTILE(tb), ts, hd, scale, sr + tb * st, st); break;
-            default: for (; tb < ntl; tb++) attn_qk(4, 1, q4, ATTN_KTILE(tb), ts, hd, scale, sr + tb * st, st); break;
+            case 1: for (; tb + 2 <= ntl; tb += 2) attn_qk(1, 2, KT, q4, ATTN_KTILE(tb), ts, hd, scale, sr + tb * st, st);
+                    for (; tb < ntl; tb++) attn_qk(1, 1, KT, q4, ATTN_KTILE(tb), ts, hd, scale, sr + tb * st, st); break;
+            case 2: for (; tb + 2 <= ntl; tb += 2) attn_qk(2, 2, KT, q4, ATTN_KTILE(tb), ts, hd, scale, sr + tb * st, st);
+                    for (; tb < ntl; tb++) attn_qk(2, 1, KT, q4, ATTN_KTILE(tb), ts, hd, scale, sr + tb * st, st); break;
+            case 3: for (; tb < ntl; tb++) attn_qk(3, 1, KT, q4, ATTN_KTILE(tb), ts, hd, scale, sr + tb * st, st); break;
+            default: for (; tb < ntl; tb++) attn_qk(4, 1, KT, q4, ATTN_KTILE(tb), ts, hd, scale, sr + tb * st, st); break;
         }
         #undef ATTN_KTILE
     }
@@ -832,23 +895,39 @@ static void attn_group(int nv, const float *const *q, float *const *out, float *
         const float *iv = part ? NULL : inv + r0;
         float *const *o = part ? part + r0 : out + r0;
         switch (rv) {
-            case 1: attn_pv(1, 16, sr, st, nbk, npr + r0, vt, bs, hd, iv, o, b0, pst); break;
-            case 2: attn_pv(2, 8, sr, st, nbk, npr + r0, vt, bs, hd, iv, o, b0, pst); break;
-            case 3: attn_pv(3, 4, sr, st, nbk, npr + r0, vt, bs, hd, iv, o, b0, pst); break;
-            default: attn_pv(4, 4, sr, st, nbk, npr + r0, vt, bs, hd, iv, o, b0, pst); break;
+            case 1: attn_pv(1, 16, KT, sr, st, nbk, npr + r0, vt, bs, hd, iv, o, b0, pst); break;
+            case 2: attn_pv(2, 8, KT, sr, st, nbk, npr + r0, vt, bs, hd, iv, o, b0, pst); break;
+            case 3: attn_pv(3, 4, KT, sr, st, nbk, npr + r0, vt, bs, hd, iv, o, b0, pst); break;
+            default: attn_pv(4, 4, KT, sr, st, nbk, npr + r0, vt, bs, hd, iv, o, b0, pst); break;
         }
     }
 }
 
+static void attn_group_f32(int nv, const float *const *q, float *const *out, float *const *part, const int *np, int b0,
+                           int b1, const void *kt, const void *vt, size_t bs, int hd, float scale, float *s) {
+    attn_group_t(0, nv, q, out, part, np, b0, b1, kt, vt, bs, hd, scale, s);
+}
+
+static void attn_group_bf16(int nv, const float *const *q, float *const *out, float *const *part, const int *np, int b0,
+                            int b1, const void *kt, const void *vt, size_t bs, int hd, float scale, float *s) {
+    attn_group_t(1, nv, q, out, part, np, b0, b1, kt, vt, bs, hd, scale, s);
+}
+
+static void attn_group_f16(int nv, const float *const *q, float *const *out, float *const *part, const int *np, int b0,
+                           int b1, const void *kt, const void *vt, size_t bs, int hd, float scale, float *s) {
+    attn_group_t(2, nv, q, out, part, np, b0, b1, kt, vt, bs, hd, scale, s);
+}
+
 static inline int attn_ok(int hd) { return hd % 64 == 0 && hd <= ATTN_HDMAX; }
 
-static void attn_kv(int nv, const float *const *q, float *const *out, float *const *part, const int *np, int b0,
-                    int b1, const float *kt, const float *vt, size_t bs, int hd, float scale, float *s) {
-    // nv query vectors of one kv head (any nv), in groups of ATTN_NV (attn_group); bs: elements from a
-    // head's block to its next
+static void attn_kv(int kvt, int nv, const float *const *q, float *const *out, float *const *part, const int *np, int b0,
+                    int b1, const void *kt, const void *vt, size_t bs, int hd, float scale, float *s) {
+    // nv query vectors of one kv head (any nv), in groups of ATTN_NV (attn_group_t); kvt: cache type, 0
+    // fp32, 1 bf16, 2 f16 (runq.c's KV_F32, KV_BF16, KV_F16); bs: elements from a head's block to its next
     for (int g = 0; g < nv; g += ATTN_NV) {
         int gn = nv - g < ATTN_NV ? nv - g : ATTN_NV;
-        attn_group(gn, q + g, out + g, part ? part + g : NULL, np + g, b0, b1, kt, vt, bs, hd, scale, s);
+        (kvt == 2 ? attn_group_f16 : kvt ? attn_group_bf16 : attn_group_f32)(gn, q + g, out + g, part ? part + g : NULL,
+                                                                          np + g, b0, b1, kt, vt, bs, hd, scale, s);
     }
 }
 #define RUNQ_ATTNEON 1

@@ -1,13 +1,13 @@
 # Tests
 
 `make test` (or `tests/run_tests.sh`) builds `./runq` if needed and runs everything in about
-8 s on the 16-vCPU dev box. It needs `models/Qwen3-0.6B-q8.bin`, plus numpy (`.venv/bin/python`
+18 s on the 16-vCPU dev box (~30 runq processes at ~0.4 s startup each). It needs `models/Qwen3-0.6B-q8.bin`, plus numpy (`.venv/bin/python`
 if present, else the system `python3`). Torch is only needed to regenerate the HF goldens.
 
 ```sh
 tests/run_tests.sh                    # all tests, OMP_NUM_THREADS=8 unless set
 tests/run_tests.sh -v                 # + per-position logits metrics and a summary table
-tests/run_tests.sh --only logits      # subset: tokenizer,logits,threads,greedy
+tests/run_tests.sh --only logits      # subset: tokenizer,logits,batched,threads,greedy
 RUNQ=/path/to/other-binary tests/run_tests.sh   # test another build (no make)
 tests/run_tests.sh --update-greedy    # regenerate the greedy goldens
 .venv/bin/python tests/make_golden.py # regenerate the HF goldens (tokenizer + logits, ~15 s)
@@ -23,9 +23,11 @@ XPASS = an XFAIL case now passes (remove its mark in `make_golden.py`).
 - `-m tokenize -i TEXT`: token ids of the raw text (no chat template), space-separated on stdout.
   Only the checkpoint header and the tokenizer are loaded (no weights). stderr gets
   `[tokenize] B bytes -> N tokens, encode X ms, tokenizer load Y ms` (encode time only).
-- `-m logits -i TEXT -o FILE`: feeds the tokens one at a time (`forward_sequential`) and writes
-  `int32 n, int32 vocab, int32 ids[n], float32 logits[n][vocab]` (row i = logits after token i).
-  `dump_logits()` is where a batched-prefill path will plug in for the same comparison.
+- `-m logits -i TEXT -o FILE [-b N]`: writes `int32 n, int32 vocab, int32 ids[n],
+  float32 logits[n][vocab]` (row i = logits after token i). `-b 1` feeds the tokens one at a
+  time through `forward()` (`forward_sequential`); `-b N > 1` (default 64) uses the batched
+  prefill, `forward_batch()` in chunks of N tokens with the logits of every row
+  (`forward_chunked`). The tests always pass `-b` explicitly.
 
 ## What is checked
 
@@ -35,8 +37,11 @@ XPASS = an XFAIL case now passes (remove its mark in `make_golden.py`).
 | `tokenizer/speed_*` | encode time inside runq (stderr line) < 100 ms for ~2,000 tokens of the golden texts and for one 30,000-byte chunk (no spaces); measured ~0.3-1.3 ms and ~5-13 ms | |
 | `logits/<prompt>` | runq Q8_0 logits vs HF fp32 for 5 prompts (en, code, zh, chat template, counting), 15-24 tokens; ids must match HF first | `golden/logits/*.npz` |
 | `logits/cos_pooled`, `logits/top1_pooled` | the same metrics pooled over all prompts | |
-| `threads/bitwise` | logits file for `en` is byte-identical with OMP_NUM_THREADS=8 and 1 | |
-| `greedy/*` | exact stdout of `-t 0 -c 4096` runs: chat, chat with thinking (`-r 1`), chat with system prompt (`-y`), generate; 40-48 tokens | `golden/greedy/*.txt` (our engine) |
+| `logits_batched/*` | the same test (same thresholds) with the batched prefill, `-b 64` (the default; one chunk here) | `golden/logits/*.npz` |
+| `batched/<prompt>_b7`, `_b64` | batched logits vs sequential (`-b 1`) on every logits prompt; `-b 7` gives 3-4 chunks with boundaries mid-prompt. `all_b64`: all 5 prompts concatenated (86 tokens), 2 chunks at `-b 64`. Max abs diff <= 1e-3 and cos >= 0.99999 per row (full vocab), finite; reports "bit-identical" (currently all 11) | sequential run |
+| `threads/bitwise`, `threads/bitwise_b7` | logits file for `en` is byte-identical with OMP_NUM_THREADS=8 and 1, sequential and `-b 7` | |
+| `greedy/*` | exact stdout of `-t 0 -c 4096` runs: chat, chat with thinking (`-r 1`), chat with system prompt (`-y`), generate; 40-48 tokens. These use the default batched prefill; `generate@b5` = generate in 3 chunks (same golden) | `golden/greedy/*.txt` (our engine) |
+| `greedy/seeded_chunks` | seeded sampling (`-t 0.8 -s 42`, chat): same output with `-b 1` and `-b 5` (chat advances the RNG once per prompt token, as before batched prefill) | |
 
 Logits metrics, per position, over the union of a fixed 4096-id vocab subset and HF's top-64 ids:
 cosine similarity, top-1 agreement (runq argmax vs HF top-1), top-5 overlap. Position 0 has its
@@ -61,6 +66,10 @@ Measured 2026-10-24 (Q8_0 engine at the commit adding this suite, unchanged from
 | count | 15 | 0.8653 | 0.99941 | 0.99901 | 14/15 | 0.907 |
 | pooled | 84 | | 0.99909 | | 76/84 = 0.905 | |
 
+Since the SwiGLU NaN fix (2026-10-25, see `../TODO.md` Known bugs; it changed the last layer of
+`zh` and `chat`): zh top-5 0.893, chat cos mean 0.99891, pooled cos mean 0.99910; the rest is
+unchanged. The batched path gives exactly the same numbers.
+
 Thresholds (`tests/check.py`): per prompt cos mean >= 0.995, every position >= 1 cos >= 0.98,
 pos 0 cos >= 0.75, top-1 >= 0.75, top-5 >= 0.75; pooled cos mean >= 0.997, pooled top-1 >= 0.85.
 Logits must be finite. That is about 3x the baseline error (1 - cos) for means, 5x per position.
@@ -75,8 +84,23 @@ Sanity check by deliberate breakage (scratch builds, not committed), all caught:
 | no QK-norm / KV written at pos+1 / V read from t-1 / no final norm / attention scale 1/d / rmsnorm eps 1e-2 | | < 0.71 | < 0.16 |
 | activation quantizer truncates instead of rounding (precision loss only) | 0.99713 | en 0.99432 fails, others pass | 0.94 |
 
-Thread invariance: matmul parallelizes over output rows and attention over heads, so results are
-bit-identical for any thread count (verified 1 vs 8).
+Thread invariance: matmul/matmul_batch parallelize over output rows and attention over heads or
+(row, head) items, each computed whole by one thread, so results are bit-identical for any
+thread count (tested 1 vs 8; also checked 13).
+
+Batched vs sequential: `forward_batch()` gives bit-identical logits to `forward()` because both
+call the same numeric kernels (`dot_q8`, `qk_norm_rope`, `attention_head`, `swiglu`, `rmsnorm`,
+`quantize`) per row, and the 4-row GEMM kernel `dot_q8_x4` is compiled without FP contraction
+(`NO_FP_CONTRACT`, gcc only) so it rounds like `dot_q8`. With contraction (an FMA in the scale
+accumulation) the logits differ slightly and `greedy/chat_system` flips a token. A Step 3 kernel
+that sums in another order may legitimately need the 1e-3 tolerance (or a looser one, justified);
+real bugs are far off. Deliberate breakage (scratch builds, all caught):
+
+| breakage in forward_batch | max abs diff | min cos | caught by |
+|---|---|---|---|
+| causal mask leaks one position (row b sees b+1) | 22.4 .. 32.1 | <= 0.41 | every `batched/*` |
+| K RoPE at the chunk-local position (b, not pos0+b) | 17.3 / 32.1 | 0.47 / -0.42 | `_b7`, `all_b64` |
+| chunk K written one position early (pos0-1) | 13 .. 33.7 | <= 0.68 | `_b7`, `all_b64` (single-chunk `_b64` pass) |
 
 ## Golden data
 

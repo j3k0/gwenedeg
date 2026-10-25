@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# cwayn fast regression suite: tokenizer + logits vs HF, thread invariance, greedy tripwire.
+# cwayn fast regression suite: tokenizer + logits vs HF (sequential and batched prefill),
+# batched vs sequential logits, thread invariance, greedy tripwire.
 # Usage: tests/run_tests.sh [--update-greedy] [other tests/check.py options, e.g. -v, --only logits]
 # Env:   OMP_NUM_THREADS (default 8), RUNQ (binary to test, default ./runq, built with make).
 set -euo pipefail

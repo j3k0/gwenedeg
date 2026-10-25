@@ -5,8 +5,11 @@ Tests (see tests/README.md):
   tokenizer  runq -m tokenize vs HF ids              (tests/golden/tokenizer.json)
              + encode speed (~2,000 tokens, one 30,000-byte chunk), from runq's stderr timing
   logits     runq -m logits vs HF fp32 logits         (tests/golden/logits/*.npz)
-  threads    logits bit-identical for 1 vs N OpenMP threads
-  greedy     runq -t 0 output vs our own golden text  (tests/golden/greedy/*.txt)
+             sequential path (-b 1) and batched prefill (-b 64), same thresholds
+  batched    batched logits (-b 7, -b 64) vs sequential (-b 1): near-exact (bit-identical now)
+  threads    logits bit-identical for 1 vs N OpenMP threads (sequential and batched)
+  greedy     runq -t 0 output vs our own golden text  (tests/golden/greedy/*.txt), with the
+             default batched prefill (and -b 5 once); seeded -t 0.8 chat equal for -b 1 and 5
 
 Logits metrics, per position, over U = (fixed 4096-id vocab subset) + (HF top-64 ids):
   cos   cosine similarity of runq vs HF logits on U
@@ -53,6 +56,15 @@ TOP1_ALL_MIN = 0.85    # all prompts pooled
 COS_ALL_MIN = 0.997    # all prompts pooled, mean over positions >= 1
 TOP5_MIN = 0.75        # per prompt, mean overlap
 
+# Batched vs sequential logits (same engine, same numerics): currently bit-identical. Deliberate
+# breakage (scratch builds) gives max |diff| 17..32 and min cos <= 0.47: causal mask leaking one
+# position, K RoPE at the chunk-local position, chunk K written one position early.
+BATCH_CHUNKS = [7, 64]   # 7: several chunks with boundaries mid-prompt; 64: the default
+BATCH_MAX_ABS = 1e-3     # logits are O(10)
+BATCH_COS_MIN = 0.99999  # per row, full vocab
+BATCH_LONG = "all"       # extra prompt: all logits prompts concatenated (86 tokens, 2 chunks at -b 64)
+SEQ, BATCH = 1, 64       # -b of the sequential path and of the default batched path
+
 CTX = "4096"
 TOKENIZE_MAX_MS = 100.0  # encode time limit for the speed checks (measured ~1 ms and ~13 ms)
 GREEDY_CASES = [
@@ -62,7 +74,13 @@ GREEDY_CASES = [
     ("chat_system", ["-m", "chat", "-n", "40", "-y", "You are a pirate. Always answer like a pirate.",
                      "-i", "How are you today?"]),
     ("generate", ["-m", "generate", "-n", "40", "-i", "Once upon a time, in a small village by the sea,"]),
+    # the same golden with several prefill chunks (generate prints the prompt tokens itself)
+    ("generate@b5", ["-m", "generate", "-n", "40", "-b", "5", "-i", "Once upon a time, in a small village by the sea,"]),
 ]
+# seeded sampling (-t 0.8 -s 42): output must not depend on -b (chat advances the RNG once per
+# prompt token, as before batched prefill)
+SEEDED_ARGS = ["-m", "chat", "-n", "40", "-t", "0.8", "-s", "42", "-c", CTX, "-i", "Tell me about cats."]
+SEEDED_CHUNKS = [1, 5]  # token by token vs 2 chunks (-b 64 runs the same code)
 THREADS_PROMPT = "en"
 
 
@@ -107,8 +125,8 @@ def runq_tokenize(a, text, timing=False):
     return ids, float(f[f.index("encode") + 1]), float(f[f.index("load") + 1])
 
 
-def runq_logits(a, text, path, threads=None):
-    p = run([a.runq, a.model, "-c", CTX, "-m", "logits", "-i", text, "-o", path], threads=threads)
+def runq_logits(a, text, path, threads=None, chunk=SEQ):
+    p = run([a.runq, a.model, "-c", CTX, "-m", "logits", "-b", str(chunk), "-i", text, "-o", path], threads=threads)
     if p.returncode != 0:
         raise RuntimeError(f"runq -m logits failed: {p.stderr.decode(errors='replace')[-500:]}")
     raw = np.fromfile(path, dtype=np.int32, count=2)
@@ -117,6 +135,22 @@ def runq_logits(a, text, path, threads=None):
     logits = np.fromfile(path, dtype=np.float32, offset=4 * (2 + n))
     assert logits.size == n * vocab, f"{path}: bad size"
     return ids, logits.reshape(n, vocab)
+
+
+def logits_file(a, tmp, name, text, chunk, threads=None):
+    """runq -m logits for (prompt, chunk, threads), cached in tmp across tests."""
+    t = threads or int(os.environ["OMP_NUM_THREADS"])
+    path = os.path.join(tmp, f"logits_{name}_b{chunk}_t{t}.bin")
+    if not os.path.exists(path):
+        runq_logits(a, text, path, threads=t, chunk=chunk)
+    return path
+
+
+def read_logits(path):
+    raw = np.fromfile(path, dtype=np.int32, count=2)
+    n = int(raw[0])
+    return np.fromfile(path, dtype=np.int32, count=2 + n)[2:], \
+        np.fromfile(path, dtype=np.float32, offset=4 * (2 + n)).reshape(n, int(raw[1]))
 
 
 def first_diff(a, b):
@@ -189,14 +223,13 @@ def golden_prompts():
     return [(n, os.path.join(d, n + ".npz")) for n in names]
 
 
-def test_logits(a, res, tmp):
+def test_logits(a, res, tmp, chunk=SEQ, prefix="logits"):
     all_top1, all_cos, rows = [], [], []
     for name, path in golden_prompts():
         g = np.load(path)
         text = str(g["text"])
-        out = os.path.join(tmp, f"logits_{name}.bin")
-        ids, logits = runq_logits(a, text, out)
-        tname = f"logits/{name}"
+        ids, logits = read_logits(logits_file(a, tmp, name, text, chunk))
+        tname = f"{prefix}/{name}"
         if ids.tolist() != g["ids"].tolist():
             i = first_diff(ids.tolist(), g["ids"].tolist())
             res.report(False, tname, f"token ids differ from HF at index {i} (tokenizer bug?), cannot compare\n"
@@ -225,11 +258,11 @@ def test_logits(a, res, tmp):
                 print(f"      pos {i:2d} cos {cos[i]:.5f} top1 {int(top1[i])} top5 {top5[i]:.1f}")
     if all_cos:
         c = float(np.mean(all_cos))
-        res.report(bool(c >= COS_ALL_MIN), "logits/cos_pooled",
+        res.report(bool(c >= COS_ALL_MIN), f"{prefix}/cos_pooled",
                    f"mean cos over {len(all_cos)} positions (pos >= 1) = {c:.5f} (min {COS_ALL_MIN})")
     if all_top1:
         t = float(np.mean(all_top1))
-        res.report(bool(t >= TOP1_ALL_MIN), "logits/top1_pooled",
+        res.report(bool(t >= TOP1_ALL_MIN), f"{prefix}/top1_pooled",
                    f"{int(np.sum(all_top1))}/{len(all_top1)} = {t:.3f} (min {TOP1_ALL_MIN})")
     if a.verbose and rows:
         print("      prompt  n   cos pos0  cos mean  cos min   top1    top5")
@@ -237,26 +270,56 @@ def test_logits(a, res, tmp):
             print(f"      {r[0]:<7} {r[1]:<3} {r[2]:.4f}    {r[3]:.5f}   {r[4]:.5f}   {r[5]:>2}/{r[1]:<4} {r[6]:.3f}")
 
 
+def batched_prompts():
+    texts = [(name, str(np.load(path)["text"])) for name, path in golden_prompts()]
+    return texts + [(BATCH_LONG, " ".join(t for _, t in texts))]
+
+
+def test_batched(a, res, tmp):
+    n_same = n_all = 0
+    for name, text in batched_prompts():
+        ids_s, seq = read_logits(logits_file(a, tmp, name, text, SEQ))
+        for chunk in (BATCH_CHUNKS if name != BATCH_LONG else [BATCH]):  # long: 2 chunks at -b 64
+            n_all += 1
+            tname = f"batched/{name}_b{chunk}"
+            ids_b, bat = read_logits(logits_file(a, tmp, name, text, chunk))
+            if ids_b.tolist() != ids_s.tolist() or bat.shape != seq.shape:
+                res.report(False, tname, "token ids / shape differ from the sequential run")
+                continue
+            if not np.isfinite(bat).all():
+                bad = np.where(~np.isfinite(bat).all(axis=1))[0].tolist()
+                res.report(False, tname, f"non-finite logits at positions {bad}")
+                continue
+            same = np.array_equal(bat.view(np.uint32), seq.view(np.uint32))
+            n_same += same
+            x, y = seq.astype(np.float64), bat.astype(np.float64)
+            d = np.abs(x - y).max(axis=1)
+            cos = (x * y).sum(1) / (np.linalg.norm(x, axis=1) * np.linalg.norm(y, axis=1))
+            ok = bool(d.max() <= BATCH_MAX_ABS and cos.min() >= BATCH_COS_MIN)
+            n_chunks = -(-len(ids_s) // chunk)
+            detail = f"n={len(ids_s)}, {n_chunks} chunk(s): " + ("bit-identical" if same else
+                     f"max |diff| {d.max():.3g} (pos {int(d.argmax())}), min cos {cos.min():.7f}")
+            if not ok:
+                detail += f"  <- max {BATCH_MAX_ABS}, cos {BATCH_COS_MIN}"
+            res.report(ok, tname, detail)
+    print(f"      {n_same}/{n_all} batched runs bit-identical to the sequential path")
+
+
 def test_threads(a, res, tmp):
     g = np.load(os.path.join(GOLDEN, "logits", THREADS_PROMPT + ".npz"))
     text = str(g["text"])
     n_a = int(os.environ.get("OMP_NUM_THREADS", "8"))
     n_b = 1 if n_a != 1 else 8
-    pa, pb = os.path.join(tmp, "threads_a.bin"), os.path.join(tmp, "threads_b.bin")
-    a_path = os.path.join(tmp, f"logits_{THREADS_PROMPT}.bin")
-    if os.path.exists(a_path):  # reuse the logits-test output (made with n_a threads)
-        pa = a_path
-    else:
-        runq_logits(a, text, pa, threads=n_a)
-    runq_logits(a, text, pb, threads=n_b)
-    with open(pa, "rb") as fa, open(pb, "rb") as fb:
-        same = fa.read() == fb.read()
-    detail = f"{THREADS_PROMPT}: OMP_NUM_THREADS={n_a} vs {n_b} " + ("bit-identical" if same else "DIFFER")
-    if not same:
-        xa = np.fromfile(pa, dtype=np.float32, offset=4 * (2 + len(g["ids"])))
-        xb = np.fromfile(pb, dtype=np.float32, offset=4 * (2 + len(g["ids"])))
-        detail += f" (max abs diff {np.abs(xa - xb).max():.3g})"
-    res.report(same, "threads/bitwise", detail)
+    for chunk, tname in [(SEQ, "threads/bitwise"), (BATCH_CHUNKS[0], f"threads/bitwise_b{BATCH_CHUNKS[0]}")]:
+        pa = logits_file(a, tmp, THREADS_PROMPT, text, chunk, threads=n_a)
+        pb = logits_file(a, tmp, THREADS_PROMPT, text, chunk, threads=n_b)
+        with open(pa, "rb") as fa, open(pb, "rb") as fb:
+            same = fa.read() == fb.read()
+        detail = f"{THREADS_PROMPT} -b {chunk}: OMP_NUM_THREADS={n_a} vs {n_b} " + ("bit-identical" if same else "DIFFER")
+        if not same:
+            xa, xb = read_logits(pa)[1], read_logits(pb)[1]
+            detail += f" (max abs diff {np.abs(xa - xb).max():.3g})"
+        res.report(same, tname, detail)
 
 
 # ----------------------------------------------------------------------------- greedy
@@ -272,7 +335,9 @@ def test_greedy(a, res):
     d = os.path.join(GOLDEN, "greedy")
     os.makedirs(d, exist_ok=True)
     for name, args in GREEDY_CASES:
-        path = os.path.join(d, name + ".txt")
+        path = os.path.join(d, name.split("@")[0] + ".txt")  # name@variant: same golden
+        if a.update_greedy and "@" in name:
+            continue
         got = greedy_output(a, args)
         if a.update_greedy:
             with open(path, "w", encoding="utf-8", newline="") as f:
@@ -294,6 +359,19 @@ def test_greedy(a, res):
                        f"      --- golden ---\n{want}\n      --- runq ---\n{got}\n"
                        f"      (if the numerics changed on purpose and logits/* pass: "
                        f"tests/run_tests.sh --update-greedy)")
+    if a.update_greedy:
+        return
+    outs = {}
+    for chunk in SEEDED_CHUNKS:
+        p = run([a.runq, a.model, "-b", str(chunk)] + SEEDED_ARGS)
+        if p.returncode != 0:
+            raise RuntimeError(f"runq failed: {p.stderr.decode(errors='replace')[-500:]}")
+        outs[chunk] = p.stdout
+    ref = outs[SEEDED_CHUNKS[0]]
+    bad = [c for c in SEEDED_CHUNKS if outs[c] != ref]
+    res.report(not bad, "greedy/seeded_chunks",
+               f"chat -t 0.8 -s 42, -b {'/'.join(map(str, SEEDED_CHUNKS))}: " +
+               ("identical" if not bad else f"-b {bad} differ from -b {SEEDED_CHUNKS[0]}"))
 
 
 # ----------------------------------------------------------------------------- main
@@ -302,7 +380,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--runq", default=os.path.join(ROOT, "runq"))
     ap.add_argument("--model", default=os.path.join(ROOT, "models", "Qwen3-0.6B-q8.bin"))
-    ap.add_argument("--only", default="tokenizer,logits,threads,greedy",
+    ap.add_argument("--only", default="tokenizer,logits,batched,threads,greedy",
                     help="comma-separated subset of tests to run")
     ap.add_argument("--update-greedy", action="store_true", help="regenerate the greedy goldens")
     ap.add_argument("--jobs", type=int, default=8, help="parallel runq processes for the tokenizer test")
@@ -317,7 +395,9 @@ def main():
         only = {"greedy"}
     with tempfile.TemporaryDirectory(prefix="cwayn-test-") as tmp:
         for name, fn in [("tokenizer", lambda: test_tokenizer(a, res)),
-                         ("logits", lambda: test_logits(a, res, tmp)),
+                         ("logits", lambda: (test_logits(a, res, tmp),
+                                             test_logits(a, res, tmp, BATCH, "logits_batched"))),
+                         ("batched", lambda: test_batched(a, res, tmp)),
                          ("threads", lambda: test_threads(a, res, tmp)),
                          ("greedy", lambda: test_greedy(a, res))]:
             if name in only:

@@ -18,6 +18,10 @@ Tests (see tests/README.md):
              KV cache conversation (RUNQ_CHAT_DUMP) == the chat-template rendering, its logits
              bit-identical to a fresh -m logits run on it; also -r 1 (reasoning dropped from the
              history) and context full (-c 160: oldest turns dropped, system prompt kept)
+  gguf       the GGUF Q8_0 file (--gguf; tokenizer, templates and weights read from it): tokenizer
+             goldens, logits vs HF (-b 1 and -b 64, same thresholds), batched vs sequential, threads
+             and VNNI vs generic bitwise, and the 4 chat templates == the .bin side files (chat token
+             ids of both models); its greedy goldens (gguf_*) run in the greedy group
 
 Logits metrics, per position, over U = (fixed 4096-id vocab subset) + (HF top-64 ids):
   cos   cosine similarity of runq vs HF logits on U
@@ -87,6 +91,9 @@ GREEDY_CASES = [
     ("generate", ["-m", "generate", "-n", "40", "-i", "Once upon a time, in a small village by the sea,"]),
     # the same golden with several prefill chunks (generate prints the prompt tokens itself)
     ("generate@b5", ["-m", "generate", "-n", "40", "-b", "5", "-i", "Once upon a time, in a small village by the sea,"]),
+    # the GGUF file (name prefix gguf_: run on --gguf)
+    ("gguf_chat", ["-m", "chat", "-n", "40", "-i", "What is the capital of Australia? Answer in one sentence."]),
+    ("gguf_generate", ["-m", "generate", "-n", "40", "-i", "Once upon a time, in a small village by the sea,"]),
 ]
 # seeded sampling (-t 0.8 -s 42): output must not depend on -b (chat advances the RNG once per
 # prompt token, as before batched prefill)
@@ -103,6 +110,16 @@ THREADS_PROMPT = "en"
 # long on -b 64: attention over 12 KV tiles, causal row blocks in later chunks (generic: C attention)
 KERNEL_CASES = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH), (BATCH_LONG2, BATCH)]
 THREADS_LONG = 3         # long -b 64: OMP_NUM_THREADS=3 vs the default (other work partitions)
+# GGUF (group size 32): logits vs HF batched on all prompts and sequential on GGUF_SEQ; batched
+# (prompt, -b) vs -b 1 bitwise (2-chunk GEMM tiles and the all-rows classifier: GGUF_KERNELS all_b64);
+# threads 8 vs 3 (-b 7); VNNI vs generic (prompt, -b); the chat templates (-r / -y variants) vs the
+# .bin side files
+GGUF_SEQ = [THREADS_PROMPT, "code"]
+GGUF_BATCHED = [(THREADS_PROMPT, BATCH_CHUNKS[0]), (THREADS_PROMPT, BATCH), ("code", BATCH_CHUNKS[0])]
+GGUF_KERNELS = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH)]
+GGUF_TEMPLATES = [("plain", [], ".template"), ("thinking", ["-r", "1"], ".template.with-thinking"),
+                  ("system", ["-y", "You are terse."], ".template.with-system"),
+                  ("system_thinking", ["-r", "1", "-y", "You are terse."], ".template.with-system-and-thinking")]
 # multi-turn chat (stdin, one line per turn; all -t 0): (name, args, user lines, checks). Each run
 # dumps its KV cache ids and sampled logits (RUNQ_CHAT_DUMP), compared with a fresh -m logits run on
 # the decoded conversation (bitwise), whose text must be the expected chat-template rendering
@@ -198,7 +215,7 @@ def first_diff(a, b):
 
 # ----------------------------------------------------------------------------- tokenizer
 
-def test_tokenizer(a, res):
+def test_tokenizer(a, res, prefix="tokenizer"):
     with open(os.path.join(GOLDEN, "tokenizer.json"), encoding="utf-8") as f:
         cases = json.load(f)["cases"]
     with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
@@ -211,7 +228,7 @@ def test_tokenizer(a, res):
             i = first_diff(got, want)
             detail = (f"text={c['text']!r} first diff at index {i}\n"
                       f"      hf  : {want[max(0, i - 3):i + 6]}\n      runq: {got[max(0, i - 3):i + 6]}")
-        res.report(ok, f"tokenizer/{c['name']}", detail, c.get("xfail"))
+        res.report(ok, f"{prefix}/{c['name']}", detail, c.get("xfail"))
         if not ok and c.get("xfail") and a.verbose:
             print("      " + detail)
 
@@ -228,7 +245,7 @@ def test_tokenizer(a, res):
             else:
                 cur += ch
         return out
-    vocab = load_vocab(a.model)
+    vocab = load_vocab(a.vocab_model)
     bad = []
     for b in [b"cafe\xff\xcc\x81 e\xcc\x81\xff", b"q\xcc\x87\xcc\xa3\xc0\xafa\xcc\x8a\x80\xcc\x81",
               b"\xed\xa0\x80\xcc\x81\xe2\x84\xab\xfe", b"\xe1\x84\x80\xff\xe1\x85\xa1 \xe1\x84\x80\xe1\x85\xa1\xe2\x82",
@@ -236,7 +253,7 @@ def test_tokenizer(a, res):
         got = b"".join(vocab[i] for i in runq_tokenize(a, b))
         if got != nfc_runs(b):
             bad.append(f"{b!r}: runq {got!r} want {nfc_runs(b)!r}")
-    res.report(not bad, "tokenizer/nfc_invalid_utf8", "\n      ".join(bad))
+    res.report(not bad, f"{prefix}/nfc_invalid_utf8", "\n      ".join(bad))
 
     # speed: ~2,000 tokens of varied text (the short golden cases, repeated), and one long
     # pre-tokenizer chunk (no spaces); the encode time is measured inside runq, without the load
@@ -250,7 +267,7 @@ def test_tokenizer(a, res):
                 break
     for name, text in [("speed_2k", "\n".join(parts)), ("speed_long_chunk", "Supercalifragilistic" * 1500)]:
         ids, ms, load_ms = runq_tokenize(a, text, timing=True)
-        res.report(ms < TOKENIZE_MAX_MS, f"tokenizer/{name}",
+        res.report(ms < TOKENIZE_MAX_MS, f"{prefix}/{name}",
                    f"{len(text.encode())} bytes -> {len(ids)} tokens: encode {ms:.2f} ms "
                    f"(max {TOKENIZE_MAX_MS:.0f}), tokenizer load {load_ms:.1f} ms")
 
@@ -282,9 +299,11 @@ def golden_prompts():
     return [(n, os.path.join(d, n + ".npz")) for n in names]
 
 
-def test_logits(a, res, tmp, chunk=SEQ, prefix="logits"):
+def test_logits(a, res, tmp, chunk=SEQ, prefix="logits", only=None):
     all_top1, all_cos, rows = [], [], []
     for name, path in golden_prompts():
+        if only and name not in only:
+            continue
         g = np.load(path)
         text = str(g["text"])
         ids, logits = read_logits(logits_file(a, tmp, name, text, chunk))
@@ -420,8 +439,8 @@ def test_kernels(a, res, tmp):
 
 # ----------------------------------------------------------------------------- greedy
 
-def greedy_output(a, args):
-    p = run([a.runq, a.model, "-t", "0", "-c", CTX, "-s", "1"] + args)
+def greedy_output(a, args, model=None):
+    p = run([a.runq, model or a.model, "-t", "0", "-c", CTX, "-s", "1"] + args)
     if p.returncode != 0:
         raise RuntimeError(f"runq failed: {p.stderr.decode(errors='replace')[-500:]}")
     return p.stdout.decode("utf-8", errors="replace")
@@ -434,7 +453,10 @@ def test_greedy(a, res):
         path = os.path.join(d, name.split("@")[0] + ".txt")  # name@variant: same golden
         if a.update_greedy and "@" in name:
             continue
-        got = greedy_output(a, args)
+        if name.startswith("gguf_") and not a.gguf:
+            print(f"      skipped greedy/{name}: no GGUF file (--gguf)")
+            continue
+        got = greedy_output(a, args, a.gguf if name.startswith("gguf_") else None)
         if a.update_greedy:
             with open(path, "w", encoding="utf-8", newline="") as f:
                 f.write(got)
@@ -492,7 +514,8 @@ def test_greedy(a, res):
 # ----------------------------------------------------------------------------- chat (multi-turn)
 
 def load_vocab(model):
-    """token bytes from the .tokenizer file (header: 3 x u32; per token: f32 score, i32 len, bytes)"""
+    """token bytes from the .tokenizer file (header: 3 x u32; per token: f32 score, i32 len, bytes) of
+    the .bin model (also for GGUF runs: its tokens decode to the same bytes)"""
     with open(model + ".tokenizer", "rb") as f:
         data = f.read()
     vocab, off = [], 12
@@ -533,7 +556,7 @@ def split_transcript(out, users):
 
 
 def test_chat(a, res, tmp):
-    vocab = load_vocab(a.model)
+    vocab = load_vocab(a.vocab_model)
     d = os.path.join(GOLDEN, "greedy")
     for name, args, users, chk in CHAT_CASES:
         tname = f"chat/{name}"
@@ -616,6 +639,75 @@ def test_chat(a, res, tmp):
         res.report(not why, tname, detail + ("  <- " + "; ".join(why) if why else ""))
 
 
+# ----------------------------------------------------------------------------- GGUF
+
+def same_files(pa, pb):
+    """(byte-identical?, detail) for two logits files"""
+    with open(pa, "rb") as fa, open(pb, "rb") as fb:
+        if fa.read() == fb.read():
+            return True, "bit-identical"
+    xa, xb = read_logits(pa)[1], read_logits(pb)[1]
+    if xa.shape != xb.shape:
+        return False, "DIFFER (shapes)"
+    d = np.abs(xa.astype(np.float64) - xb)
+    return False, f"DIFFER (max abs diff {d.max():.3g} at pos {int(d.max(axis=1).argmax())})"
+
+
+def test_gguf(a, res, tmp):
+    if not a.gguf:
+        print("      skipped: no GGUF file (--gguf)")
+        return
+    gg = argparse.Namespace(**{**vars(a), "model": a.gguf})
+    gtmp = os.path.join(tmp, "gguf")
+    os.makedirs(gtmp, exist_ok=True)
+    test_tokenizer(gg, res, "gguf_tokenizer")
+    test_logits(gg, res, gtmp, SEQ, "gguf_logits", only=GGUF_SEQ)
+    test_logits(gg, res, gtmp, BATCH, "gguf_logits_batched")
+    texts = dict(batched_prompts())
+    for name, chunk in GGUF_BATCHED:
+        same, detail = same_files(logits_file(gg, gtmp, name, texts[name], SEQ), logits_file(gg, gtmp, name, texts[name], chunk))
+        res.report(same, f"gguf_batched/{name}_b{chunk}", f"-b {chunk} vs -b {SEQ}: {detail}")
+    n_a = int(os.environ["OMP_NUM_THREADS"])
+    n_b = THREADS_LONG if n_a != THREADS_LONG else 8
+    chunk = BATCH_CHUNKS[0]
+    same, detail = same_files(logits_file(gg, gtmp, THREADS_PROMPT, texts[THREADS_PROMPT], chunk, threads=n_a),
+                              logits_file(gg, gtmp, THREADS_PROMPT, texts[THREADS_PROMPT], chunk, threads=n_b))
+    res.report(same, f"gguf_threads/bitwise_b{chunk}", f"{THREADS_PROMPT} -b {chunk}: OMP_NUM_THREADS={n_a} vs {n_b} {detail}")
+    if a.generic:
+        gen = argparse.Namespace(**{**vars(gg), "runq": a.generic})
+        gentmp = os.path.join(gtmp, "generic")
+        os.makedirs(gentmp, exist_ok=True)
+        for name, chunk in GGUF_KERNELS:
+            same, detail = same_files(logits_file(gg, gtmp, name, texts[name], chunk), logits_file(gen, gentmp, name, texts[name], chunk))
+            res.report(same, f"gguf_kernels/{name}_b{chunk}", f"VNNI vs generic, -b {chunk}: {detail}")
+    else:
+        print("      gguf_kernels skipped: no generic build (--generic / RUNQ_GENERIC)")
+
+    # chat templates: built into runq for GGUF, read from the .template* side files for the .bin. A
+    # 1-turn chat (-n 1) on both: the KV cache ids up to the reply (the rendered prompt) must be equal
+    # (same vocab, so the same bytes), and decode to the side file rendering
+    def chat_ids(model, tag, args):
+        prefix = os.path.join(tmp, f"tmpl_{tag}")
+        env = dict(os.environ, RUNQ_CHAT_DUMP=prefix, OMP_NUM_THREADS="2")
+        p = subprocess.run([a.runq, model, "-t", "0", "-c", CTX, "-n", "1", "-i", "Hi there"] + args, env=env, capture_output=True)
+        if p.returncode != 0:
+            raise RuntimeError(f"runq chat failed: {p.stderr.decode(errors='replace')[-300:]}")
+        return [int(x) for x in open(prefix + ".ids").read().split()][:-1]  # (minus the 1 reply token)
+    vocab = load_vocab(a.vocab_model)
+    jobs = [(m, f"{name}_{k}", args) for name, args, _ in GGUF_TEMPLATES for k, m in (("bin", a.model), ("gguf", a.gguf))]
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:
+        ids = dict(zip([j[1] for j in jobs], ex.map(lambda j: chat_ids(*j), jobs)))
+    for name, args, sfx in GGUF_TEMPLATES:
+        with open(a.model + sfx, encoding="utf-8", newline="") as f:
+            tmpl = f.read()
+        want = tmpl.replace("%s", "You are terse.", 1).replace("%s", "Hi there", 1) if "-y" in args else tmpl.replace("%s", "Hi there")
+        ib, ig = ids[f"{name}_bin"], ids[f"{name}_gguf"]
+        text = b"".join(vocab[i] for i in ig).decode("utf-8", errors="replace")
+        ok = ib == ig and text == want
+        res.report(ok, f"gguf_template/{name}", f"{len(ig)} prompt tokens, " + (f"same ids as the .bin ({os.path.basename(a.model + sfx)})"
+                   if ok else f"DIFFER: gguf {text!r} vs side file {want!r} (ids equal: {ib == ig})"))
+
+
 # ----------------------------------------------------------------------------- main
 
 def main():
@@ -623,12 +715,14 @@ def main():
     ap.add_argument("--runq", default=os.path.join(ROOT, "runq"))
     ap.add_argument("--model", default=os.path.join(ROOT, "models", "Qwen3-0.6B-q8.bin"))
     ap.add_argument("--generic", default="", help="generic-kernel build for the kernels test (empty: skip)")
-    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat",
+    ap.add_argument("--gguf", default="", help="GGUF Q8_0 file for the gguf tests and greedy goldens (empty: skip)")
+    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf",
                     help="comma-separated subset of tests to run")
     ap.add_argument("--update-greedy", action="store_true", help="regenerate the greedy goldens")
     ap.add_argument("--jobs", type=int, default=8, help="parallel runq processes for the tokenizer test")
     ap.add_argument("-v", "--verbose", action="store_true", help="per-position logits metrics")
     a = ap.parse_args()
+    a.vocab_model = a.model  # token bytes for decoding ids (.tokenizer file), also for GGUF runs
     os.environ.setdefault("OMP_NUM_THREADS", "8")
 
     t0 = time.time()
@@ -644,7 +738,8 @@ def main():
                          ("threads", lambda: test_threads(a, res, tmp)),
                          ("kernels", lambda: test_kernels(a, res, tmp)),
                          ("greedy", lambda: test_greedy(a, res)),
-                         ("chat", lambda: test_chat(a, res, tmp))]:
+                         ("chat", lambda: test_chat(a, res, tmp)),
+                         ("gguf", lambda: test_gguf(a, res, tmp))]:
             if name in only:
                 t = time.time()
                 print(f"== {name}")

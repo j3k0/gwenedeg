@@ -4,7 +4,9 @@
 # Usage: tests/run_tests.sh [--update-greedy] [other tests/check.py options, e.g. -v, --only logits]
 # Env:   OMP_NUM_THREADS (default 8), RUNQ (binary to test, default ./runq, built with make),
 #        RUNQ_GENERIC (generic-kernel build to compare with, default ./runq-generic when RUNQ is
-#        not set; with RUNQ set and RUNQ_GENERIC unset the kernels test is skipped).
+#        not set; with RUNQ set and RUNQ_GENERIC unset the kernels test is skipped),
+#        GGUF (GGUF Q8_0 file for the gguf tests, default models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf;
+#        skipped if missing).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -13,6 +15,11 @@ MODEL="models/Qwen3-0.6B-q8.bin"
 if [[ ! -f "$MODEL" ]]; then
     echo "error: $MODEL not found (run: make models)" >&2
     exit 1
+fi
+GGUF="${GGUF-models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf}"
+if [[ -n "$GGUF" && ! -f "$GGUF" ]]; then
+    echo "note: $GGUF not found, skipping the GGUF tests (scripts/download_models.py q8gguf)" >&2
+    GGUF=""
 fi
 
 if [[ -z "${RUNQ:-}" ]]; then
@@ -28,4 +35,4 @@ else
 fi
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
-exec "${PY[@]}" tests/check.py --runq "$RUNQ" --generic "${RUNQ_GENERIC:-}" --model "$MODEL" "$@"
+exec "${PY[@]}" tests/check.py --runq "$RUNQ" --generic "${RUNQ_GENERIC:-}" --model "$MODEL" --gguf "$GGUF" "$@"

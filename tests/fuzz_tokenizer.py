@@ -3,7 +3,10 @@
 
 Usage: .venv/bin/python tests/fuzz_tokenizer.py [-n 5000] [--seed 1] [--jobs 8] [--show 5]
        .venv/bin/python tests/fuzz_tokenizer.py --nfc-all     (exhaustive NFC check, see below)
-Needs transformers (.venv) and models/Qwen3-0.6B (local files only) plus models/Qwen3-0.6B-q8.bin.
+       .venv/bin/python tests/fuzz_tokenizer.py --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf
+                                                     (the tokenizer runq builds from GGUF metadata)
+Needs transformers (.venv) and models/Qwen3-0.6B (local files only) plus models/Qwen3-0.6B-q8.bin
+(its .tokenizer file gives the token bytes, --vocab; a GGUF file's tokens decode to the same bytes).
 
 Cases:
   random  -n strings built from a mix of character classes (ASCII words, digits, punctuation,
@@ -207,7 +210,7 @@ class Runner:
         self.a = a
         self.tok = AutoTokenizer.from_pretrained(MODEL_DIR, local_files_only=True)
         self.hf_nfc = NFC().normalize_str
-        self.vocab = load_vocab(a.model)
+        self.vocab = load_vocab(a.vocab)
 
     def hf(self, s):
         return self.tok.encode(s, add_special_tokens=False)
@@ -322,7 +325,9 @@ def main():
     ap.add_argument("--show", type=int, default=5, help="minimize and print this many mismatches")
     ap.add_argument("--no-files", action="store_true", help="skip the real-text cases")
     ap.add_argument("--runq", default=os.path.join(ROOT, "runq"))
-    ap.add_argument("--model", default=os.path.join(ROOT, "models", "Qwen3-0.6B-q8.bin"))
+    ap.add_argument("--model", default=os.path.join(ROOT, "models", "Qwen3-0.6B-q8.bin"), help=".bin or GGUF checkpoint")
+    ap.add_argument("--vocab", default=os.path.join(ROOT, "models", "Qwen3-0.6B-q8.bin"),
+                    help=".bin checkpoint whose .tokenizer file gives the token bytes")
     a = ap.parse_args()
 
     t0 = time.time()

@@ -3,6 +3,7 @@
 
 Usage: .venv/bin/python tests/make_golden.py [--tokenizer-only]
        .venv/bin/python tests/make_golden.py --q4ref [--gguf-py DIR]
+       .venv/bin/python tests/make_golden.py --long
 Needs torch + transformers (.venv); reads models/Qwen3-0.6B only (local_files_only, no network).
 --tokenizer-only rewrites tests/golden/tokenizer.json only (no model load, ~2 s).
 --q4ref writes only tests/golden/logits_q4/*.npz (~20 s): the same prompts and format, from the
@@ -11,6 +12,11 @@ same HF model with every weight replaced by the Q4_K_M GGUF's tensors dequantize
 the Q4_K_M file should differ from it by its int8 activations only. Needs the `gguf` package
 (pip install gguf, 0.19.0 used; pure Python): importable, or DIR = a directory containing it
 (e.g. a scratch venv's site-packages; the .venv is not modified).
+--long writes only tests/golden/logits_long/long2.npz (~5 s): the 297-token "long2" prompt of
+tests/check.py (the logits prompts joined: all twice + en, all, code), HF logits at every 4th position
+from 248 on, i.e. mostly past runq's first attention block of 256 positions (ATT_P, see
+src/kernels_avx512.h): the same format with a `positions` array (int32 (m,)): row j is position
+positions[j]; `ids` holds all n prompt ids.
 The greedy goldens (our own engine) are made by `tests/run_tests.sh --update-greedy` instead.
 
 Output format
@@ -173,6 +179,7 @@ def main():
     ap.add_argument("--tokenizer-only", action="store_true", help="only rewrite golden/tokenizer.json")
     ap.add_argument("--q4ref", action="store_true", help="only write golden/logits_q4 (HF with the Q4_K_M weights)")
     ap.add_argument("--gguf-py", default="", help="directory containing the gguf package (--q4ref)")
+    ap.add_argument("--long", action="store_true", help="only write golden/logits_long (positions past 256)")
     a = ap.parse_args()
     torch.manual_seed(0)
     tok = AutoTokenizer.from_pretrained(MODEL_DIR, local_files_only=True)
@@ -180,6 +187,8 @@ def main():
             "transformers": transformers.__version__, "numpy": np.__version__}
     if a.q4ref:
         return write_logits(tok, os.path.join(OUT_DIR, "logits_q4"), q4_weights=Q4_GGUF, gguf_py=a.gguf_py)
+    if a.long:
+        return write_long(tok, os.path.join(OUT_DIR, "logits_long"))
 
     tok_path = os.path.join(OUT_DIR, "tokenizer.json")
     cases = []
@@ -244,6 +253,36 @@ def write_logits(tok, log_dir, q4_weights=None, gguf_py=""):
                             top_ids=top_ids, top_logits=top_logits)
         print(f"wrote {path} ({len(ids)} tokens, {os.path.getsize(path)} bytes, "
               f"top-1 after last token: {tok.decode([int(top_ids[-1, 0])])!r})")
+    return 0
+
+
+def long_prompt():
+    """tests/check.py's "long2" prompt (batched_prompts): must stay identical"""
+    texts = [t for _, t in LOGITS_PROMPTS]
+    all_text = " ".join(texts)
+    return all_text + " " + all_text + " " + texts[0] + " " + all_text + " " + texts[1]
+
+
+def write_long(tok, log_dir):
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_DIR, local_files_only=True, torch_dtype=torch.float32, attn_implementation="eager")
+    model.eval()
+    vocab = model.config.vocab_size
+    subset_ids = np.sort(np.random.default_rng(0).choice(vocab, SUBSET_SIZE, replace=False)).astype(np.int32)
+    text = long_prompt()
+    ids = tok.encode(text, add_special_tokens=False)
+    with torch.no_grad():
+        logits = model(torch.tensor([ids])).logits[0].float().numpy()
+    pos = np.arange(248, len(ids), 4, dtype=np.int32)
+    logits = logits[pos]
+    top_ids = np.argsort(-logits, axis=1, kind="stable")[:, :TOPK].astype(np.int32)
+    top_logits = np.take_along_axis(logits, top_ids, axis=1).astype(np.float32)
+    os.makedirs(log_dir, exist_ok=True)
+    path = os.path.join(log_dir, "long2.npz")
+    np.savez_compressed(path, text=np.array(text), ids=np.array(ids, dtype=np.int32), positions=pos,
+                        subset_ids=subset_ids, subset=logits[:, subset_ids].astype(np.float16),
+                        top_ids=top_ids, top_logits=top_logits)
+    print(f"wrote {path} ({len(ids)} tokens, positions {pos[0]}..{pos[-1]} step 4, {os.path.getsize(path)} bytes)")
     return 0
 
 

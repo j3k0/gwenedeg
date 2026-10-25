@@ -93,6 +93,11 @@ BATCH_MAX_ABS = 1e-3     # logits are O(10)
 BATCH_COS_MIN = 0.99999  # per row, full vocab
 BATCH_LONG = "all"       # extra prompt: all logits prompts concatenated (86 tokens, 2 chunks at -b 64)
 BATCH_LONG2 = "long"     # "all" twice + en: 187 tokens, 12 KV cache tiles, 3 chunks at -b 64
+BATCH_LONG3 = "long2"    # long + all + code: 297 tokens, more than one attention block (ATT_P = 256
+                         # positions, src/kernels_avx512.h): the partial results and their combination
+LONG3_CHUNKS = [64, 512]  # 5 chunks / one chunk, both bitwise vs -b 1 (sequential decode: positions
+                          # 256.. split over threads per (kv head, block))
+LONG3_THREADS = [1, 3, 16]  # -b 64 vs OMP_NUM_THREADS (8): other attention / GEMM partitions
 SEQ, BATCH = 1, 64       # -b of the sequential path and of the batched path (default -b is 512: the
                          # same code, one chunk for the short prompts either way)
 
@@ -128,7 +133,8 @@ THREADS_PROMPT = "en"
 # -b 7 on en (15 tokens): GEMM tiles of 6 + 1 rows, last chunk 1 row; -b 64 on all (86 tokens,
 # chunks 64 + 22): tiles of 6 + 4 rows, LOGITS_ALL classifier GEMM
 # long on -b 64: attention over 12 KV tiles, causal row blocks in later chunks (generic: C attention)
-KERNEL_CASES = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH), (BATCH_LONG2, BATCH)]
+KERNEL_CASES = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH), (BATCH_LONG2, BATCH),
+                (BATCH_LONG3, BATCH)]
 THREADS_LONG = 3         # long -b 64: OMP_NUM_THREADS=3 vs the default (other work partitions)
 # GGUF (group size 32): logits vs HF batched on all prompts and sequential on GGUF_SEQ; batched
 # (prompt, -b) vs -b 1 bitwise (2-chunk GEMM tiles and the all-rows classifier: GGUF_KERNELS all_b64);
@@ -148,8 +154,10 @@ Q4_SEQ = [THREADS_PROMPT]
 Q4_BATCHED = [(THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH)]
 Q4_THREADS = [(BATCH_LONG, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH)]
 Q4_KERNELS = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH)]
-Q4_GEN_THREADS = 4       # the generic runs of Q4_KERNELS go in the background, next to the others at
-                         # OMP_NUM_THREADS (8): 12 spinning threads on the 16-vCPU box, not all of them
+GEN_THREADS = 4          # all generic-build runs (kernels/*, gguf_kernels/*, q4_kernels/*), in the
+                         # background (results do not depend on the thread count)
+PREFETCH_JOBS = 3        # runq -m logits runs at OMP_NUM_THREADS in parallel (prefetch_all), next to the
+                         # background generic runs: the suite's ~60 logits runs, ~0.1 s of startup each
 GGUF_TEMPLATES = [("plain", [], ".template"), ("thinking", ["-r", "1"], ".template.with-thinking"),
                   ("system", ["-y", "You are terse."], ".template.with-system"),
                   ("system_thinking", ["-r", "1", "-y", "You are terse."], ".template.with-system-and-thinking")]
@@ -167,7 +175,23 @@ CHAT_CASES = [
     ("context_full", ["-c", "160", "-n", "30", "-y", "You are a terse assistant."],
      ["My name is Ada.", "Name three fruits.", "Name three animals.", "Name three colours.",
       "Name three cities.", "What is my name?"], {"dropped": True}),
+    # a ~390-token prompt (system prompt: LONG_SYSTEM): the reply is decoded at positions past one
+    # attention block (256), split over 16 threads per (kv head, block) and combined; its logits must
+    # equal the batched prefill's (-m logits, 8 threads) bit for bit, and the generic build's
+    ("long_context", ["-n", "12", "-y", "LONG_SYSTEM"], ["Summarize this in one sentence."],
+     {"threads": 16, "generic": True}),
 ]
+LONG_SYSTEM = ("The history of the printing press begins long before Gutenberg. Carved wooden blocks were used in "
+               "China to print text and images on paper and silk, and movable type made of baked clay, later of wood "
+               "and bronze, appeared there and in Korea centuries before it reached Europe. Around 1440, in Mainz, "
+               "Johannes Gutenberg combined several existing technologies into a practical system: an adjustable hand "
+               "mould for casting uniform metal type, an oil-based ink that adhered to metal, and a screw press adapted "
+               "from those used to make wine and paper. The result was a dramatic reduction in the cost of books. Within "
+               "fifty years, presses were operating in more than two hundred cities, and millions of volumes had been "
+               "printed. Scholars could compare identical copies of a text, errors could be corrected in later editions, "
+               "and ideas spread faster than any authority could suppress them. Questions for the reader: what changed "
+               "first, and why did it matter?")
+LONG_SYSTEM = LONG_SYSTEM + " " + LONG_SYSTEM  # 374 tokens
 
 
 class Results:
@@ -211,25 +235,96 @@ def runq_tokenize(a, text, timing=False):
     return ids, float(f[f.index("encode") + 1]), float(f[f.index("load") + 1])
 
 
-def runq_logits(a, text, path, threads=None, chunk=SEQ):
+def runq_logits_run(a, text, path, threads, chunk):
     p = run([a.runq, a.model, "-c", CTX, "-m", "logits", "-b", str(chunk), "-i", text, "-o", path], threads=threads)
     if p.returncode != 0:
         raise RuntimeError(f"runq -m logits failed: {p.stderr.decode(errors='replace')[-500:]}")
-    raw = np.fromfile(path, dtype=np.int32, count=2)
-    n, vocab = int(raw[0]), int(raw[1])
-    ids = np.fromfile(path, dtype=np.int32, count=2 + n)[2:]
-    logits = np.fromfile(path, dtype=np.float32, offset=4 * (2 + n))
-    assert logits.size == n * vocab, f"{path}: bad size"
-    return ids, logits.reshape(n, vocab)
+
+
+PENDING = {}  # logits file path -> future of the run writing it (prefetch_all)
 
 
 def logits_file(a, tmp, name, text, chunk, threads=None):
-    """runq -m logits for (prompt, chunk, threads), cached in tmp across tests."""
+    """runq -m logits for (prompt, chunk, threads), cached in tmp across tests (and prefetched)."""
     t = threads or int(os.environ["OMP_NUM_THREADS"])
     path = os.path.join(tmp, f"logits_{name}_b{chunk}_t{t}.bin")
-    if not os.path.exists(path):
-        runq_logits(a, text, path, threads=t, chunk=chunk)
+    fut = PENDING.get(path)
+    if fut is not None:
+        fut.result()
+    elif not os.path.exists(path):
+        runq_logits_run(a, text, path, t, chunk)
     return path
+
+
+def prefetch_all(a, tmp, only, fg, bg):
+    """Start every runq -m logits run the selected groups will read (the same files logits_file
+    names): the generic build's at GEN_THREADS on bg, the others in group order on fg. The tests then
+    run as before, waiting for their files (~60 short processes: their startup and serial parts
+    overlap instead of adding up)"""
+    texts = dict(batched_prompts())
+    nd = int(os.environ["OMP_NUM_THREADS"])
+    def sub(ex, var, d, name, chunk, threads=None):
+        os.makedirs(d, exist_ok=True)
+        t = threads or nd
+        path = os.path.join(d, f"logits_{name}_b{chunk}_t{t}.bin")
+        if path not in PENDING and not os.path.exists(path):
+            PENDING[path] = ex.submit(runq_logits_run, var, texts[name], path, t, chunk)
+    gg = argparse.Namespace(**{**vars(a), "model": a.gguf}) if a.gguf else None
+    q4 = argparse.Namespace(**{**vars(a), "model": a.q4}) if a.q4 else None
+    if a.generic:  # (slowest first)
+        for var, d, cases, grp in [(q4, os.path.join(tmp, "q4", "generic"), Q4_KERNELS, "q4"),
+                                   (a, os.path.join(tmp, "generic"), KERNEL_CASES, "kernels"),
+                                   (gg, os.path.join(tmp, "gguf", "generic"), GGUF_KERNELS, "gguf")]:
+            if var is not None and grp in only:
+                gen = argparse.Namespace(**{**vars(var), "runq": a.generic})
+                for name, chunk in cases:
+                    sub(bg, gen, d, name, chunk, GEN_THREADS)
+    names = [n for n, _ in golden_prompts()]
+    if "batched" in only:  # (the longest runs first: sequential, logits of every row)
+        for n in (BATCH_LONG3, BATCH_LONG2):
+            sub(fg, a, tmp, n, SEQ)
+    if "logits" in only:
+        for n in names:
+            sub(fg, a, tmp, n, SEQ)
+            sub(fg, a, tmp, n, BATCH)
+        sub(fg, a, tmp, BATCH_LONG3, BATCH)
+    if "batched" in only:
+        for n, _ in batched_prompts():
+            sub(fg, a, tmp, n, SEQ)
+            for c in batched_chunks(n):
+                sub(fg, a, tmp, n, c)
+    if "threads" in only:
+        n_b = 1 if nd != 1 else 8
+        for c in (SEQ, BATCH_CHUNKS[0]):
+            sub(fg, a, tmp, THREADS_PROMPT, c)
+            sub(fg, a, tmp, THREADS_PROMPT, c, n_b)
+        sub(fg, a, tmp, BATCH_LONG2, BATCH)
+        sub(fg, a, tmp, BATCH_LONG2, BATCH, THREADS_LONG if nd != THREADS_LONG else 8)
+        sub(fg, a, tmp, BATCH_LONG3, BATCH)
+        for t in LONG3_THREADS:
+            sub(fg, a, tmp, BATCH_LONG3, BATCH, t if t != nd else 8)
+    if "kernels" in only and a.generic:
+        for n, c in KERNEL_CASES:
+            sub(fg, a, tmp, n, c)
+    if "gguf" in only and gg:
+        gt = os.path.join(tmp, "gguf")
+        for n in GGUF_SEQ:
+            sub(fg, gg, gt, n, SEQ)
+        for n in names:
+            sub(fg, gg, gt, n, BATCH)
+        for n, c in GGUF_BATCHED + GGUF_KERNELS:
+            sub(fg, gg, gt, n, SEQ)
+            sub(fg, gg, gt, n, c)
+        sub(fg, gg, gt, THREADS_PROMPT, BATCH_CHUNKS[0], THREADS_LONG if nd != THREADS_LONG else 8)
+    if "q4" in only and q4:
+        qt = os.path.join(tmp, "q4")
+        for n in names:
+            sub(fg, q4, qt, n, BATCH)
+        for n, c in Q4_BATCHED + Q4_KERNELS:
+            sub(fg, q4, qt, n, SEQ)
+            sub(fg, q4, qt, n, c)
+        for n, c in Q4_THREADS:
+            sub(fg, q4, qt, n, c, THREADS_LONG if nd != THREADS_LONG else 8)
 
 
 def read_logits(path):
@@ -381,17 +476,50 @@ def test_logits(a, res, tmp, chunk=SEQ, prefix="logits", only=None, th=TH_Q8, su
             print(f"      {r[0]:<7} {r[1]:<3} {r[2]:.4f}    {r[3]:.5f}   {r[4]:.5f}   {r[5]:>2}/{r[1]:<4} {r[6]:.3f}")
 
 
+def test_logits_long(a, res, tmp):
+    # positions past the first attention block (256): the block partial results and their
+    # combination vs HF fp32 (golden/logits_long: every 4th position from 248 of long2), Q8_0 thresholds
+    g = np.load(os.path.join(GOLDEN, "logits_long", f"{BATCH_LONG3}.npz"))
+    text = dict(batched_prompts())[BATCH_LONG3]
+    tname = f"logits_long/{BATCH_LONG3}"
+    if str(g["text"]) != text:
+        res.report(False, tname, "the golden's text is not check.py's long2 prompt (make_golden.py --long)")
+        return
+    ids, logits = read_logits(logits_file(a, tmp, BATCH_LONG3, text, BATCH))
+    if ids.tolist() != g["ids"].tolist():
+        res.report(False, tname, f"token ids differ from HF at index {first_diff(ids.tolist(), g['ids'].tolist())}")
+        return
+    pos = g["positions"]
+    cos, top1, top5 = logit_metrics({**{k: g[k] for k in g.files}, "ids": pos}, logits[pos])
+    why = []
+    if not cos.mean() >= COS_MEAN_MIN: why.append(f"cos mean < {COS_MEAN_MIN}")
+    if not cos.min() >= COS_POS_MIN: why.append(f"cos min < {COS_POS_MIN} at pos {int(pos[cos.argmin()])}")
+    if not top1.mean() >= TOP1_MIN: why.append(f"top1 < {TOP1_MIN}")
+    if not top5.mean() >= TOP5_MIN: why.append(f"top5 < {TOP5_MIN}")
+    res.report(not why, tname, f"n={len(ids)}, positions {int(pos[0])}..{int(pos[-1])} step 4 ({len(pos)}): cos mean "
+               f"{cos.mean():.5f} min {cos.min():.5f} | top1 {int(top1.sum())}/{len(pos)} | top5 {top5.mean():.3f}"
+               + ("  <- " + "; ".join(why) if why else ""))
+
+
 def batched_prompts():
     texts = [(name, str(np.load(path)["text"])) for name, path in golden_prompts()]
     all_text = " ".join(t for _, t in texts)
-    return texts + [(BATCH_LONG, all_text), (BATCH_LONG2, all_text + " " + all_text + " " + texts[0][1])]
+    long_text = all_text + " " + all_text + " " + texts[0][1]
+    return texts + [(BATCH_LONG, all_text), (BATCH_LONG2, long_text),
+                    (BATCH_LONG3, long_text + " " + all_text + " " + texts[1][1])]
+
+
+def batched_chunks(name):
+    # -b values compared with -b 1: 7 and 64 on the short prompts, 64 on all / long (2 / 3 chunks),
+    # 64 and 512 on long2 (more than one attention block)
+    return LONG3_CHUNKS if name == BATCH_LONG3 else [BATCH] if name in (BATCH_LONG, BATCH_LONG2) else BATCH_CHUNKS
 
 
 def test_batched(a, res, tmp):
     n_same = n_all = 0
     for name, text in batched_prompts():
         ids_s, seq = read_logits(logits_file(a, tmp, name, text, SEQ))
-        for chunk in (BATCH_CHUNKS if name not in (BATCH_LONG, BATCH_LONG2) else [BATCH]):  # 2 / 3 chunks
+        for chunk in batched_chunks(name):
             n_all += 1
             tname = f"batched/{name}_b{chunk}"
             ids_b, bat = read_logits(logits_file(a, tmp, name, text, chunk))
@@ -443,6 +571,13 @@ def test_threads(a, res, tmp):
         same = fa.read() == fb.read()
     res.report(same, f"threads/bitwise_{BATCH_LONG2}_b{BATCH}",
                f"{BATCH_LONG2} -b {BATCH}: OMP_NUM_THREADS={n_a} vs {n_c} " + ("bit-identical" if same else "DIFFER"))
+    # more than one attention block (prefill: a vector's blocks in one item, then combined)
+    text = dict(batched_prompts())[BATCH_LONG3]
+    pa = logits_file(a, tmp, BATCH_LONG3, text, BATCH, threads=n_a)
+    for t in LONG3_THREADS:
+        t = t if t != n_a else 8
+        same, detail = same_files(pa, logits_file(a, tmp, BATCH_LONG3, text, BATCH, threads=t))
+        res.report(same, f"threads/bitwise_{BATCH_LONG3}_b{BATCH}_t{t}", f"{BATCH_LONG3} -b {BATCH}: OMP_NUM_THREADS={n_a} vs {t} {detail}")
 
 
 # ----------------------------------------------------------------------------- kernels
@@ -457,7 +592,7 @@ def test_kernels(a, res, tmp):
     os.makedirs(gtmp, exist_ok=True)
     for name, chunk in KERNEL_CASES:
         pv = logits_file(a, tmp, name, texts[name], chunk)    # VNNI build (shared cache)
-        pg = logits_file(gen, gtmp, name, texts[name], chunk)
+        pg = logits_file(gen, gtmp, name, texts[name], chunk, GEN_THREADS)
         with open(pv, "rb") as fv, open(pg, "rb") as fg:
             same = fv.read() == fg.read()
         n = len(read_logits(pv)[0])
@@ -482,6 +617,17 @@ def greedy_output(a, args, model=None):
 def test_greedy(a, res):
     d = os.path.join(GOLDEN, "greedy")
     os.makedirs(d, exist_ok=True)
+    # all runs at once, 3 at a time (outputs do not depend on the thread count or timing)
+    ex = cf.ThreadPoolExecutor(max_workers=3)
+    outs = {}
+    for name, args in GREEDY_CASES:
+        if (a.update_greedy and "@" in name) or (name.startswith("gguf_") and not a.gguf) or (name.startswith("q4_") and not a.q4):
+            continue
+        outs[name] = ex.submit(greedy_output, a, args, a.gguf if name.startswith("gguf_") else a.q4 if name.startswith("q4_") else None)
+    seeded = {c: ex.submit(run, [a.runq, a.model, "-b", str(c)] + SEEDED_ARGS)
+              for c in (SEEDED_CHUNKS[:1] if a.update_greedy else SEEDED_CHUNKS)}
+    seeded_gen = ex.submit(run, [a.runq, a.model] + SEEDED_GEN_ARGS)
+    ex.shutdown(wait=False)
     for name, args in GREEDY_CASES:
         path = os.path.join(d, name.split("@")[0] + ".txt")  # name@variant: same golden
         if a.update_greedy and "@" in name:
@@ -492,7 +638,7 @@ def test_greedy(a, res):
         if name.startswith("q4_") and not a.q4:
             print(f"      skipped greedy/{name}: no Q4_K_M file (--q4)")
             continue
-        got = greedy_output(a, args, a.gguf if name.startswith("gguf_") else a.q4 if name.startswith("q4_") else None)
+        got = outs[name].result()
         if a.update_greedy:
             with open(path, "w", encoding="utf-8", newline="") as f:
                 f.write(got)
@@ -515,7 +661,7 @@ def test_greedy(a, res):
                        f"tests/run_tests.sh --update-greedy)")
     outs = {}
     for chunk in SEEDED_CHUNKS[:1] if a.update_greedy else SEEDED_CHUNKS:
-        p = run([a.runq, a.model, "-b", str(chunk)] + SEEDED_ARGS)
+        p = seeded[chunk].result()
         if p.returncode != 0:
             raise RuntimeError(f"runq failed: {p.stderr.decode(errors='replace')[-500:]}")
         outs[chunk] = p.stdout
@@ -525,7 +671,7 @@ def test_greedy(a, res):
         res.report(not bad, "greedy/seeded_chunks",
                    f"chat -t 0.8 -s 42, -b {'/'.join(map(str, SEEDED_CHUNKS))}: " +
                    ("identical" if not bad else f"-b {bad} differ from -b {SEEDED_CHUNKS[0]}"))
-    p = run([a.runq, a.model] + SEEDED_GEN_ARGS)
+    p = seeded_gen.result()
     if p.returncode != 0:
         raise RuntimeError(f"runq failed: {p.stderr.decode(errors='replace')[-500:]}")
     for name, out, what in [("seeded_chat", ref, "chat -t 0.8 -p 0.9 -s 42"),
@@ -591,88 +737,125 @@ def split_transcript(out, users):
     return replies
 
 
+def chat_case(a, tmp, vocab, d, name, args, users, chk):
+    """one CHAT_CASES case; returns its reports [(ok, name, detail)] (cases run in parallel)"""
+    reports = []
+    rep = lambda ok, n, detail="": reports.append((ok, n, detail))
+    args = [LONG_SYSTEM if x == "LONG_SYSTEM" else x for x in args]
+    def chat_run(runq, prefix, threads):
+        env = dict(os.environ, RUNQ_CHAT_DUMP=prefix)
+        if threads:
+            env["OMP_NUM_THREADS"] = str(threads)
+        return subprocess.run([runq, a.model, "-t", "0", "-c", CTX, "-s", "1"] + args,
+                              input=("\n".join(users) + "\n").encode(), env=env, capture_output=True)
+    tname = f"chat/{name}"
+    prefix = os.path.join(tmp, f"chat_{name}")
+    gex = gfut = None
+    if chk.get("generic") and a.generic and not a.update_greedy:
+        gex = cf.ThreadPoolExecutor(max_workers=1)
+        gfut = gex.submit(chat_run, a.generic, prefix + "_generic", GEN_THREADS)
+    try:
+        return chat_case_check(a, tmp, vocab, d, name, args, users, chk, tname, prefix, chat_run, gfut, reports, rep)
+    finally:
+        if gex:
+            gex.shutdown(wait=True)
+
+
+def chat_case_check(a, tmp, vocab, d, name, args, users, chk, tname, prefix, chat_run, gfut, reports, rep):
+    p = chat_run(a.runq, prefix, chk.get("threads"))
+    if p.returncode != 0:
+        rep(False, tname, f"runq failed: {p.stderr.decode(errors='replace')[-500:]}")
+        return reports
+    out, err = p.stdout.decode("utf-8", errors="replace"), p.stderr.decode(errors="replace")
+    if chk.get("golden"):
+        path = os.path.join(d, f"chat_{name}.txt")
+        if a.update_greedy:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(out)
+            print(f"UPDATED {tname} -> {os.path.relpath(path, ROOT)}")
+            return reports
+        want = open(path, encoding="utf-8", newline="").read() if os.path.exists(path) else None
+        if want is None:
+            rep(False, f"{tname}_golden", "no golden; run tests/run_tests.sh --update-greedy")
+        elif out != want:
+            i = first_diff(out, want)
+            rep(False, f"{tname}_golden", f"REGRESSION (greedy): transcript differs at char {i}: "
+                       f"golden {want[i:i + 30]!r} vs runq {out[i:i + 30]!r}\n      --- runq ---\n{out}")
+        else:
+            rep(True, f"{tname}_golden", f"{len(users)} turns")
+    elif a.update_greedy:
+        return reports
+    try:
+        replies = split_transcript(out, users)
+    except ValueError:
+        rep(False, tname, f"cannot split the transcript into {len(users)} turns:\n{out}")
+        return reports
+    if "mentions" in chk:
+        t, words = chk["mentions"]
+        miss = [w for w in words if w not in replies[t].lower()]
+        rep(not miss, f"{tname}_memory", f"turn {t + 1} reply {replies[t]!r}" +
+                   (f"  <- missing {miss}" if miss else ""))
+    # the KV cache: expected rendering, and logits == a fresh run on the whole conversation
+    ids = [int(x) for x in open(prefix + ".ids").read().split()]
+    text = b"".join(vocab[i] for i in ids).decode("utf-8", errors="replace")
+    system = args[args.index("-y") + 1] if "-y" in args else None
+    n_kept = text.count("<|im_start|>user\n")
+    why = []
+    if chk.get("dropped"):
+        if "[context] full" not in err or n_kept >= len(users):
+            why.append("no turns dropped (context full not reached?)")
+        c = int(args[args.index("-c") + 1])
+        if len(ids) > c:
+            why.append(f"{len(ids)} tokens in a {c}-token context")
+    if "stripped" in chk and "</think>" not in replies[chk["stripped"] - 1]:
+        why.append(f"turn {chk['stripped']} has no complete reasoning block (raise -n?)")
+    expect = chat_expected(system, users[-n_kept:], replies[-n_kept:], "-r" in args and args[args.index("-r") + 1] == "1")
+    if text != expect:
+        i = first_diff(text, expect)
+        why.append(f"KV cache conversation differs from the template rendering at char {i}: "
+                   f"{text[max(0, i - 20):i + 30]!r} vs expected {expect[max(0, i - 20):i + 30]!r}")
+    raw = np.fromfile(prefix + ".logits", dtype=np.int32, count=2)
+    n_rec, nv = int(raw[0]), int(raw[1])
+    pos = np.fromfile(prefix + ".logits", dtype=np.int32, count=2 + n_rec)[2:]
+    rec = np.fromfile(prefix + ".logits", dtype=np.float32, offset=4 * (2 + n_rec)).reshape(n_rec, nv)
+    lpath = os.path.join(tmp, f"chat_{name}_full.bin")
+    p = run([a.runq, a.model, "-c", CTX, "-m", "logits", "-i", text, "-o", lpath])
+    if p.returncode != 0:
+        rep(False, tname, f"runq -m logits failed: {p.stderr.decode(errors='replace')[-300:]}")
+        return reports
+    fids, full = read_logits(lpath)
+    detail = f"{len(users)} turns, {n_kept} in the cache, {len(ids)} tokens, {n_rec} sampled positions"
+    if fids.tolist() != ids:
+        i = first_diff(fids.tolist(), ids)
+        why.append(f"token ids of the re-encoded conversation differ at {i}: {fids[i:i + 5].tolist()} vs {ids[i:i + 5]}")
+    else:
+        same = np.array_equal(full[pos].view(np.uint32), rec.view(np.uint32))
+        if not same:
+            dd = np.abs(full[pos].astype(np.float64) - rec).max(axis=1)
+            why.append(f"logits differ from the single-shot run: max |diff| {dd.max():.3g} at pos {int(pos[dd.argmax()])}")
+        else:
+            detail += ": logits bit-identical to -m logits on the whole conversation"
+    rep(not why, tname, detail + ("  <- " + "; ".join(why) if why else ""))
+    if gfut is not None:
+        # the generic build (C attention, generic kernels) on the same conversation: the same cache
+        # ids and the same sampled logits, bit for bit
+        gp = gfut.result()
+        ok = gp.returncode == 0 and open(prefix + ".ids").read() == open(prefix + "_generic.ids").read()
+        with open(prefix + ".logits", "rb") as fa, open(prefix + "_generic.logits", "rb") as fb:
+            ok = ok and fa.read() == fb.read()
+        rep(ok, f"{tname}_generic", f"generic build ({GEN_THREADS} threads): cache ids and sampled logits " +
+            ("bit-identical" if ok else "DIFFER"))
+    return reports
+
+
 def test_chat(a, res, tmp):
     vocab = load_vocab(a.vocab_model)
     d = os.path.join(GOLDEN, "greedy")
-    for name, args, users, chk in CHAT_CASES:
-        tname = f"chat/{name}"
-        prefix = os.path.join(tmp, f"chat_{name}")
-        cmd = [a.runq, a.model, "-t", "0", "-c", CTX, "-s", "1"] + args
-        env = dict(os.environ, RUNQ_CHAT_DUMP=prefix)
-        p = subprocess.run(cmd, input=("\n".join(users) + "\n").encode(), env=env, capture_output=True)
-        if p.returncode != 0:
-            res.report(False, tname, f"runq failed: {p.stderr.decode(errors='replace')[-500:]}")
-            continue
-        out, err = p.stdout.decode("utf-8", errors="replace"), p.stderr.decode(errors="replace")
-        if chk.get("golden"):
-            path = os.path.join(d, f"chat_{name}.txt")
-            if a.update_greedy:
-                with open(path, "w", encoding="utf-8", newline="") as f:
-                    f.write(out)
-                print(f"UPDATED {tname} -> {os.path.relpath(path, ROOT)}")
-                continue
-            want = open(path, encoding="utf-8", newline="").read() if os.path.exists(path) else None
-            if want is None:
-                res.report(False, f"{tname}_golden", "no golden; run tests/run_tests.sh --update-greedy")
-            elif out != want:
-                i = first_diff(out, want)
-                res.report(False, f"{tname}_golden", f"REGRESSION (greedy): transcript differs at char {i}: "
-                           f"golden {want[i:i + 30]!r} vs runq {out[i:i + 30]!r}\n      --- runq ---\n{out}")
-            else:
-                res.report(True, f"{tname}_golden", f"{len(users)} turns")
-        elif a.update_greedy:
-            continue
-        try:
-            replies = split_transcript(out, users)
-        except ValueError:
-            res.report(False, tname, f"cannot split the transcript into {len(users)} turns:\n{out}")
-            continue
-        if "mentions" in chk:
-            t, words = chk["mentions"]
-            miss = [w for w in words if w not in replies[t].lower()]
-            res.report(not miss, f"{tname}_memory", f"turn {t + 1} reply {replies[t]!r}" +
-                       (f"  <- missing {miss}" if miss else ""))
-        # the KV cache: expected rendering, and logits == a fresh run on the whole conversation
-        ids = [int(x) for x in open(prefix + ".ids").read().split()]
-        text = b"".join(vocab[i] for i in ids).decode("utf-8", errors="replace")
-        system = args[args.index("-y") + 1] if "-y" in args else None
-        n_kept = text.count("<|im_start|>user\n")
-        why = []
-        if chk.get("dropped"):
-            if "[context] full" not in err or n_kept >= len(users):
-                why.append("no turns dropped (context full not reached?)")
-            c = int(args[args.index("-c") + 1])
-            if len(ids) > c:
-                why.append(f"{len(ids)} tokens in a {c}-token context")
-        if "stripped" in chk and "</think>" not in replies[chk["stripped"] - 1]:
-            why.append(f"turn {chk['stripped']} has no complete reasoning block (raise -n?)")
-        expect = chat_expected(system, users[-n_kept:], replies[-n_kept:], "-r" in args and args[args.index("-r") + 1] == "1")
-        if text != expect:
-            i = first_diff(text, expect)
-            why.append(f"KV cache conversation differs from the template rendering at char {i}: "
-                       f"{text[max(0, i - 20):i + 30]!r} vs expected {expect[max(0, i - 20):i + 30]!r}")
-        raw = np.fromfile(prefix + ".logits", dtype=np.int32, count=2)
-        n_rec, nv = int(raw[0]), int(raw[1])
-        pos = np.fromfile(prefix + ".logits", dtype=np.int32, count=2 + n_rec)[2:]
-        rec = np.fromfile(prefix + ".logits", dtype=np.float32, offset=4 * (2 + n_rec)).reshape(n_rec, nv)
-        lpath = os.path.join(tmp, f"chat_{name}_full.bin")
-        p = run([a.runq, a.model, "-c", CTX, "-m", "logits", "-i", text, "-o", lpath])
-        if p.returncode != 0:
-            res.report(False, tname, f"runq -m logits failed: {p.stderr.decode(errors='replace')[-300:]}")
-            continue
-        fids, full = read_logits(lpath)
-        detail = f"{len(users)} turns, {n_kept} in the cache, {len(ids)} tokens, {n_rec} sampled positions"
-        if fids.tolist() != ids:
-            i = first_diff(fids.tolist(), ids)
-            why.append(f"token ids of the re-encoded conversation differ at {i}: {fids[i:i + 5].tolist()} vs {ids[i:i + 5]}")
-        else:
-            same = np.array_equal(full[pos].view(np.uint32), rec.view(np.uint32))
-            if not same:
-                dd = np.abs(full[pos].astype(np.float64) - rec).max(axis=1)
-                why.append(f"logits differ from the single-shot run: max |diff| {dd.max():.3g} at pos {int(pos[dd.argmax()])}")
-            else:
-                detail += ": logits bit-identical to -m logits on the whole conversation"
-        res.report(not why, tname, detail + ("  <- " + "; ".join(why) if why else ""))
+    with cf.ThreadPoolExecutor(max_workers=3) as ex:
+        futs = [ex.submit(chat_case, a, tmp, vocab, d, *case) for case in CHAT_CASES]
+        for f in futs:
+            for ok, n, detail in f.result():
+                res.report(ok, n, detail)
 
 
 # ----------------------------------------------------------------------------- GGUF
@@ -714,7 +897,8 @@ def test_gguf(a, res, tmp):
         gentmp = os.path.join(gtmp, "generic")
         os.makedirs(gentmp, exist_ok=True)
         for name, chunk in GGUF_KERNELS:
-            same, detail = same_files(logits_file(gg, gtmp, name, texts[name], chunk), logits_file(gen, gentmp, name, texts[name], chunk))
+            same, detail = same_files(logits_file(gg, gtmp, name, texts[name], chunk),
+                                      logits_file(gen, gentmp, name, texts[name], chunk, GEN_THREADS))
             res.report(same, f"gguf_kernels/{name}_b{chunk}", f"VNNI vs generic, -b {chunk}: {detail}")
     else:
         print("      gguf_kernels skipped: no generic build (--generic / RUNQ_GENERIC)")
@@ -754,16 +938,7 @@ def test_q4(a, res, tmp):
     qtmp = os.path.join(tmp, "q4")
     os.makedirs(qtmp, exist_ok=True)
     texts = dict(batched_prompts())
-    # the generic build's runs for q4_kernels (the slow part: ~1 s per 86 tokens with all-rows logits),
-    # one at a time in the background while the AVX-512 build runs the rest
-    gen_ex, gen_runs = None, []
-    if a.generic:
-        gen = argparse.Namespace(**{**vars(q4), "runq": a.generic})
-        gentmp = os.path.join(qtmp, "generic")
-        os.makedirs(gentmp, exist_ok=True)
-        gen_ex = cf.ThreadPoolExecutor(max_workers=1)
-        gen_runs = [gen_ex.submit(logits_file, gen, gentmp, name, texts[name], chunk, Q4_GEN_THREADS) for name, chunk in Q4_KERNELS]
-
+    # (the generic build's runs for q4_kernels are prefetched in the background: prefetch_all)
     # dequantization vs gguf-py, bitwise: rows from the file's blocks (embedding lookup) and from
     # the repacked Q4P / Q6P layouts (what the matmul kernels read)
     g = np.load(os.path.join(GOLDEN, "dequant", "q4_k_m.npz"))
@@ -808,14 +983,14 @@ def test_q4(a, res, tmp):
                                   logits_file(q4, qtmp, name, texts[name], chunk, threads=n_b))
         res.report(same, f"q4_threads/bitwise_{name}_b{chunk}", f"{name} -b {chunk}: OMP_NUM_THREADS={n_a} vs {n_b} {detail}")
     if a.generic:
-        try:
-            for (name, chunk), fut in zip(Q4_KERNELS, gen_runs):
-                pv = logits_file(q4, qtmp, name, texts[name], chunk)
-                same, detail = same_files(pv, fut.result())
-                res.report(same, f"q4_kernels/{name}_b{chunk}", f"AVX-512 kernels vs generic ({Q4_GEN_THREADS} threads), "
-                           f"{name} (n={len(read_logits(pv)[0])}) -b {chunk}: {detail}")
-        finally:
-            gen_ex.shutdown(cancel_futures=True)
+        gen = argparse.Namespace(**{**vars(q4), "runq": a.generic})
+        gentmp = os.path.join(qtmp, "generic")
+        os.makedirs(gentmp, exist_ok=True)
+        for name, chunk in Q4_KERNELS:
+            pv = logits_file(q4, qtmp, name, texts[name], chunk)
+            same, detail = same_files(pv, logits_file(gen, gentmp, name, texts[name], chunk, GEN_THREADS))
+            res.report(same, f"q4_kernels/{name}_b{chunk}", f"AVX-512 kernels vs generic ({GEN_THREADS} threads), "
+                       f"{name} (n={len(read_logits(pv)[0])}) -b {chunk}: {detail}")
     else:
         print("      q4_kernels skipped: no generic build (--generic / RUNQ_GENERIC)")
 
@@ -843,10 +1018,14 @@ def main():
     only = set(a.only.split(","))
     if a.update_greedy:
         only = {"greedy", "chat"}
-    with tempfile.TemporaryDirectory(prefix="cwayn-test-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="cwayn-test-") as tmp, \
+            cf.ThreadPoolExecutor(max_workers=PREFETCH_JOBS) as fg, cf.ThreadPoolExecutor(max_workers=2) as bg:
+        if not a.update_greedy:
+            prefetch_all(a, tmp, only, fg, bg)
         for name, fn in [("tokenizer", lambda: test_tokenizer(a, res)),
                          ("logits", lambda: (test_logits(a, res, tmp),
-                                             test_logits(a, res, tmp, BATCH, "logits_batched"))),
+                                             test_logits(a, res, tmp, BATCH, "logits_batched"),
+                                             test_logits_long(a, res, tmp))),
                          ("batched", lambda: test_batched(a, res, tmp)),
                          ("threads", lambda: test_threads(a, res, tmp)),
                          ("kernels", lambda: test_kernels(a, res, tmp)),
@@ -860,8 +1039,10 @@ def main():
                 try:
                     fn()
                 except Exception as e:  # a crashing runq is a failure, not a traceback
-                    res.report(False, f"{name}/error", str(e))
+                    res.report(False, f"{name}/error", f"{type(e).__name__}: {e}")
                 print(f"   ({time.time() - t:.1f} s)")
+        for f in PENDING.values():  # (runs nobody waited for, e.g. after a group that errored)
+            f.cancel()
     dt = time.time() - t0
     print(f"\nSummary: {len(res.passed)} passed, {len(res.failed)} failed, "
           f"{len(res.xfailed)} xfail, {len(res.xpassed)} xpass, {dt:.1f} s "

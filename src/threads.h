@@ -1,5 +1,5 @@
 /* Threading for runq.c: phase synchronization that tolerates a preempted thread, and the parallel
- * region the phases run in (OpenMP, or a small persistent thread pool).
+ * region the phases run in (a small persistent thread pool, or OpenMP). Measurements: TODO.md Step 7a.
  *
  * Why not OpenMP's barriers: decode runs ~100-200 synchronization points per token (~25 us apart).
  * libgomp's barriers spin, and every thread must arrive. With as many threads as vCPUs on a shared
@@ -9,28 +9,30 @@
  * (futex at once) costs a sleep / wake per barrier instead (~40 tok/s).
  *
  * Phases. A parallel job (one decoded token, one prefill chunk) is a sequence of phases 0, 1, ...;
- * phase k has n_k >= 1 work items. Each thread works through its own contiguous range of them, and
- * then steals from the back of the others' ranges (rq_next; chunks of items), and counts the
- * finished ones (rq_finish); the thread finishing the last item of phase k may
- * run an epilogue (serial work, e.g. the residual + rmsnorm + quantize after a matmul) and then
+ * phase k has n_k >= 1 work items. Each thread works through its own contiguous range of them and
+ * then steals single items from the back of the others' ranges, or (phases whose items wait on
+ * other items, and unequal items) all threads claim in order from one shared counter (rq_next), and
+ * count the finished ones (rq_finish); the thread finishing the last item of phase k may run an
+ * epilogue (serial work, e.g. the residual + rmsnorm + quantize after a matmul) and then
  * publishes "k + 1 phases complete" (rq_publish); a thread enters phase k + 1 once that is visible
  * (rq_wait). So a phase ends when its *work* is done, not when every thread has arrived: a thread
  * preempted between phases holds nothing up (it finds the phases done when it runs again, and
  * catches up), only one preempted inside an item does, until it runs again. Waiting threads spin
- * (with pause) for a while (RQ_SPIN_DEC / RQ_SPIN_PF rounds), then sleep on a futex (Linux; elsewhere they yield), so a stall
- * frees their CPUs for the preempted thread and the other processes; the publisher wakes sleepers
- * only if there are any (no syscall in the common case).
+ * (with pause) for a while (RQ_SPIN_DEC / RQ_SPIN_PF rounds), then sleep on a futex (Linux;
+ * elsewhere they yield), so a stall frees their CPUs for the preempted thread and the other
+ * processes; the publisher wakes sleepers only if there are any (no syscall in the common case).
  * Results do not depend on which thread runs an item (each output is computed whole by one thread,
  * as with the static schedules before), so any thread count and any interleaving give the same bits.
- * Static mode (RUNQ_SYNC=static, for comparison): no stealing, thread t does exactly its range
- * [t n / nt, (t + 1) n / nt) of every phase, i.e. a barrier per phase with the same wait.
+ * Static mode (RUNQ_SYNC=static, for comparison, OpenMP-region builds only): no stealing and no
+ * shared counter, thread t does exactly its range [t n / nt, (t + 1) n / nt) of every phase, i.e. a
+ * barrier per phase with the same wait.
  *
  * Parallel region (rq_parallel): a persistent pthread pool (default, except on Windows), which waits
  * at the end only for the threads that actually joined the job (a worker that has not started when
  * the work is done skips it), with the same spin-then-futex wait for the next job. With
  * -DRUNQ_NO_POOL (and on Windows) `#pragma omp parallel` instead: libgomp's fork / join per job is
- * itself a barrier every thread must reach, and at 16 threads on the 16-vCPU VM decode got ~80 tok/s
- * that way vs ~180 with the pool (~15-20 before, with OpenMP barriers). The pool also gives a
+ * itself a barrier every thread must reach, and at 16 threads on the 16-vCPU VM decode got ~70 tok/s
+ * that way vs ~150-170 with the pool (~2-20 before, with OpenMP barriers). The pool also gives a
  * ThreadSanitizer build without OpenMP (libgomp is not instrumented).
  */
 #ifndef RUNQ_THREADS_H

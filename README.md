@@ -16,14 +16,14 @@ G=models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf
 
 The GGUF file is all runq needs: weights, hyperparameters, tokenizer (from its metadata) and the
 chat templates (built in). The Q4_K_M GGUF (`scripts/download_models.py q4km`, 397 MB) works the same
-way. Which file to use (measured 2026-10-25 on the 16-vCPU dev box, TODO.md Steps 6a, 6b-1, 6b-2):
+way. Which file to use (measured 2026-10-25 on the 16-vCPU dev box, TODO.md Steps 6a, 6b-1, 6b-2, 7a):
 
 | | Q8_0 GGUF (639 MB) | Q4_K_M GGUF (397 MB) | Q8_0 .bin (export) |
 |---|---|---|---|
 | perplexity vs HF fp32 (Beagle ch. I) | **+0.19%** | +4.9% | +0.85% |
 | logits vs HF: pooled 1-cos, top-1 (84 positions) | **6.1e-4, 79** | 1.6e-2, 69 | 9.0e-4, 76 |
 | prefill 451 tokens, 8 / 12 threads | 1,870 / 2,540 tok/s | 1,670 / 2,140 | **1,960 / 2,690** |
-| decode, 8 / 12 threads (best of a noisy shared box) | ~180 / ~200 tok/s | **~280 / ~300** | ~170 / ~230 |
+| decode, 8 / 12 threads (best of a noisy shared box; Step 7a) | ~190 / ~210 tok/s | **~280 / ~350** | ~200 / ~250 |
 | peak RSS, startup (12 threads) | ~670 MB, 0.15 s | **~410 MB, 0.12 s** | ~625 MB, 0.13 s |
 
 - Quality first, and prompt-heavy work (long documents, many short answers): the **Q8_0 GGUF**. It is
@@ -45,7 +45,7 @@ scripts/export_q8.sh                  # -> models/Qwen3-0.6B-q8.bin (Q8_0, ~630 
 # (or: make models, which runs download + export if the .bin is missing)
 ./runq models/Qwen3-0.6B-q8.bin -c 4096
 
-make test                             # regression suite, ~30-35 s (tests/README.md)
+make test                             # regression suite, ~25 s (tests/README.md)
 make bench                            # thread sweep, prefill/decode tok/s (scripts/bench_qwen3c.sh)
 make bench-prefill                    # prefill tok/s vs prompt length and -b (scripts/bench_prefill.sh)
 scripts/bench_all.sh                  # all runq speed tables of BENCHMARKS.md (~8 min)
@@ -80,10 +80,14 @@ printf 'My name is Ada.\nWhat is my name?\n' | ./runq models/Qwen3-0.6B-q8.bin -
   that reaches the end of the context is cut; a single message that does not fit is skipped.
 - `-n` limits each answer; `-y` sets the system prompt for the whole conversation.
 
-Threads: without `OMP_NUM_THREADS`, runq uses min(12, nproc - nproc/4) threads (12 on the 16-vCPU
-dev box: ~30% faster prefill than 8, decode about the same). Never all CPUs on a shared machine:
-16 threads on 16 vCPUs collapse (see BENCHMARKS.md). Always pass `-c` (context size): without
-it the KV cache is sized for the full 40,960-token context, about 9 GB of address space.
+Threads: without `OMP_NUM_THREADS`, runq uses nproc - nproc/8 threads (14 on the 16-vCPU dev box).
+Decode is memory-bound: 12-14 threads saturate the bandwidth there (~190-210 tok/s Q8_0 GGUF,
+~280-350 Q4_K_M), 8 give ~90% of it; prefill scales to 14 (~2,580 tok/s at 439 tokens vs ~2,400 at 12).
+All CPUs work too since Step 7a (16 of 16 vCPUs: decode ~140-170 tok/s with other processes running;
+with OpenMP barriers it collapsed to ~2-20), but are not faster on a busy machine. Long prompts: decode
+splits each kv head's attention over threads per 256 positions (3,000 tokens at 12 threads: ~70 ->
+~100 tok/s). Always pass `-c` (context size): without it the KV cache is sized for the full
+40,960-token context, about 9 GB of address space.
 
 ## Models (`scripts/download_models.py --list`)
 
@@ -112,7 +116,13 @@ float folds in the GEMM), decode ~5% (the packed weights are ~6% larger: fp32 sc
   and an AVX-512 attention (shared by decode and prefill) on a tiled KV cache
   (`src/kernels_avx512.h`, compile-time selection; `-DRUNQ_GENERIC` / `make generic` or a CPU
   without AVX-512 gives the generic C kernels, bit-identical results);
-  RoPE cos/sin once per position; decode in one OpenMP parallel region per token;
+  RoPE cos/sin once per position;
+  threading (`src/threads.h`, Step 7a): a decode step / prefill chunk is one job on a persistent
+  thread pool, in phases of work items that end when the work is done (not when every thread has
+  arrived; waiting threads spin, then sleep on a futex), so a preempted thread no longer stalls the
+  others (16 threads on 16 vCPUs used to collapse); 4 phases per decoded layer (113 sync points per
+  token, was 198 OpenMP barriers); the attention defined over blocks of 256 positions, decode splitting
+  long contexts over threads per block (same results for decode, prefill and any thread count);
   SwiGLU NaN fix (`-Ofast` expf overflow, it did corrupt some last-layer activations);
   a rewritten tokenizer matching HF (added tokens, Qwen2 pre-tokenizer regex, byte-level BPE
   with a hash map and a merge heap; ~1 ms for 2,000 tokens) with HF's NFC normalizer (quick check
@@ -141,6 +151,8 @@ float folds in the GEMM), decode ~5% (the packed weights are ~6% larger: fp32 sc
 - `src/kernels_avx512.h`: the AVX-512 VNNI Q8_0 GEMM / GEMV (group size 64 or 32) and the weight
   repacking, the Q4_K / Q6_K GEMV / GEMM on the Q4P / Q6P layouts, and the fp32 attention with the KV
   cache layout (layouts, arithmetic and bit-identity argument in its comments).
+- `src/threads.h`: the thread pool and the phase synchronization (design and measurements in its
+  header comment; OpenMP's parallel region instead with `-DRUNQ_NO_POOL` and on Windows).
 - `src/unicode_tables.h`: \p{L}/\p{N}/\s ranges for the pre-tokenizer, generated by
   `tools/gen_unicode_tables.py` (Python's unicodedata, Unicode 15.1).
 - `src/unicode_nfc.h`: NFC tables (combining classes, decompositions, compositions, quick check),
@@ -162,13 +174,16 @@ Full tables, methodology and baselines: [BENCHMARKS.md](BENCHMARKS.md) (one sess
 | threads | prefill 451 / 1,500 / 3,000 tokens | decode tok/s |
 |---|---|---|
 | 8 | 2,058 / 1,570 / 1,132 tok/s | 148 |
-| 12 (default) | 2,758 / 1,976 / 1,531 tok/s | 170 |
+| 12 (the default then; 14 since Step 7a) | 2,758 / 1,976 / 1,531 tok/s | 170 |
 
 Same session: upstream qwen3.c decodes at 101 / 106 tok/s (8 / 12 threads) with ~99 tok/s token-by-token
 prefill; mynah-slm at ~34 (Q8_0 and Q4_K_M). Perplexity vs HF fp32: runq Q8_0 +0.8%, Q4_K_M +4.7%
 (mynah-slm); runq on the Q8_0 GGUF +0.19% (TODO.md Step 6a, measured later), on the Q4_K_M GGUF
 +4.9% (Step 6b-1). Q4_K_M with the AVX-512 kernels (Step 6b-2, not in BENCHMARKS.md yet): see the
-table under Quick start and TODO.md.
+table under Quick start and TODO.md. Step 7a (threading, not in BENCHMARKS.md yet; same box, later
+session, interleaved with the Step 6b-2 binary, best / median of 8): decode Q8_0 GGUF 8 / 12 / 16 threads
+192 / 168, 210 / 182, ~140-170 / ~115-160 tok/s (before: 198 / 137, 179 / 118, collapse); prefill
+within ~5% at 8-14 threads, no collapse at 16 (TODO.md Step 7a).
 `scripts/bench_all.sh` reruns the runq tables (~8 min).
 
 ## Known limitations

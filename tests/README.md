@@ -1,8 +1,11 @@
 # Tests
 
 `make test` (or `tests/run_tests.sh`) builds `./runq` and `./runq-generic` if needed (in parallel)
-and runs everything in about 30-35 s on the 16-vCPU dev box (269 checks; ~20 s without the GGUF and Q4
-groups; the box is shared, so the time varies). It needs `models/Qwen3-0.6B-q8.bin`, plus numpy
+and runs everything in about 23-26 s on the 16-vCPU dev box (277 checks; the box is shared, so the time
+varies). Every `-m logits` run the selected groups need starts up front, 3 at a time, the generic
+build's at 4 threads in the background (`prefetch_all` in `check.py`); the tests then read the
+files in their usual order. Greedy and chat cases run 3 at a time (their outputs do not depend on
+the thread count or the timing). It needs `models/Qwen3-0.6B-q8.bin`, plus numpy
 (`.venv/bin/python` if present, else the system `python3`); the `gguf` group and the `gguf_*` greedy
 goldens also `models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (`scripts/download_models.py q8gguf`;
 skipped with a note if it is missing, `GGUF=` to skip), the `q4` group and the `q4_*` greedy goldens
@@ -22,6 +25,7 @@ tests/run_tests.sh --update-greedy    # regenerate the greedy goldens (incl. the
 .venv/bin/python tests/make_golden.py # regenerate the HF goldens (tokenizer + logits, ~15 s)
 .venv/bin/python tests/make_golden.py --tokenizer-only   # only golden/tokenizer.json (~2 s)
 .venv/bin/python tests/make_golden.py --q4ref --gguf-py DIR   # only golden/logits_q4 (~20 s; DIR holds the gguf package)
+.venv/bin/python tests/make_golden.py --long  # only golden/logits_long (positions past 256 of long2, ~5 s)
 python3 tests/make_dequant_golden.py  # golden/dequant/q4_k_m.npz (needs numpy + gguf, no torch; ~1 s)
 .venv/bin/python tests/fuzz_tokenizer.py                 # on-demand tokenizer fuzz vs HF (~12 s)
 .venv/bin/python tests/fuzz_tokenizer.py --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf   # GGUF tokenizer (~20 s)
@@ -68,7 +72,10 @@ All hooks work the same on a GGUF file (tokenizer and templates from the file an
 | `batched/<prompt>_b7`, `_b64` | batched logits vs sequential (`-b 1`) on every logits prompt; `-b 7` gives 3-4 chunks with boundaries mid-prompt. `all_b64`: all 5 prompts concatenated (86 tokens), 2 chunks at `-b 64`; `long_b64`: `all` twice + `en` (187 tokens, 12 KV tiles, 3 chunks: attention over several K/V tiles and causal row blocks in later chunks). Max abs diff <= 1e-3 and cos >= 0.99999 per row (full vocab), finite; reports "bit-identical" (currently all 12) | sequential run |
 | `threads/bitwise`, `threads/bitwise_b7` | logits file for `en` is byte-identical with OMP_NUM_THREADS=8 and 1, sequential and `-b 7` | |
 | `threads/bitwise_long_b64` | `long` at `-b 64`: OMP_NUM_THREADS=8 vs 3 byte-identical (other partitions of the dynamically scheduled attention work items) | |
-| `kernels/en_b1`, `en_b7`, `all_b64`, `long_b64` | logits file byte-identical for `./runq` (AVX-512: VNNI GEMM/GEMV and the AVX-512 attention) and `./runq-generic` (`-DRUNQ_GENERIC`, generic C kernels and C attention, same flags otherwise): GEMV incl. classifier and decode attention (`-b 1`), GEMM with 6 + 1 row tiles and a 1-row chunk (`-b 7`), 2 chunks with 6 + 4 row tiles and the all-rows classifier GEMM (`all`, `-b 64`), 3 chunks with attention over 12 tiles (`long`) | `./runq-generic` |
+| `logits_long/long2` | `long2` (297 tokens: `long` + `all` + `code`), `-b 64`, vs HF fp32 at every 4th position from 248 on, i.e. past the first attention block of 256 positions (Step 7a: per-block partial results, combined): Q8_0 thresholds (cos mean, every position, top-1, top-5); measured cos mean 0.99927, min 0.99791, top-1 13/13 | `golden/logits_long/long2.npz` |
+| `batched/long2_b64`, `long2_b512` | `long2` at `-b 64` (5 chunks) and `-b 512` (one chunk) vs `-b 1` (sequential decode: from position 256 on, the attention of each kv head split over threads per block), bitwise | sequential run |
+| `threads/bitwise_long2_b64_t1`, `_t3`, `_t16` | `long2` at `-b 64`: OMP_NUM_THREADS=8 vs 1, 3, 16 byte-identical | |
+| `kernels/en_b1`, `en_b7`, `all_b64`, `long_b64`, `long2_b64` | logits file byte-identical for `./runq` (AVX-512: VNNI GEMM/GEMV and the AVX-512 attention) and `./runq-generic` (`-DRUNQ_GENERIC`, generic C kernels and C attention, same flags otherwise): GEMV incl. classifier and decode attention (`-b 1`), GEMM with 6 + 1 row tiles and a 1-row chunk (`-b 7`), 2 chunks with 6 + 4 row tiles and the all-rows classifier GEMM (`all`, `-b 64`), 3 chunks with attention over 12 tiles (`long`), attention over 2 blocks of 256 positions (`long2`). The generic runs (all groups) go in the background at 4 threads | `./runq-generic` |
 | `greedy/*` | exact stdout of `-t 0 -c 4096` runs: chat, chat with thinking (`-r 1`), chat with system prompt (`-y`), generate; 40-48 tokens. These use the default batched prefill; `generate@b5` = generate in 3 chunks (same golden) | `golden/greedy/*.txt` (our engine) |
 | `greedy/seeded_chunks` | seeded sampling (`-t 0.8 -s 42`, chat): same output with `-b 1` and `-b 5` (chat advances the RNG once per prompt token, as before batched prefill) | |
 | `greedy/seeded_chat`, `greedy/seeded_generate` | exact stdout of seeded sampling: the `-b 1` run of `seeded_chunks` (`-t 0.8 -p 0.9 -s 42`) and generate at `-t 1.5 -p 0.95 -s 7` (~1-2k top-p candidates per token, nuclei up to ~100 tokens); goldens written by the binary before the top-p heap / vectorized argmax (Step 4), which give the same tokens | `golden/greedy/seeded_*.txt` |
@@ -86,6 +93,7 @@ All hooks work the same on a GGUF file (tokenizer and templates from the file an
 | `q4_kernels/en_b1`, `en_b7`, `all_b7`, `all_b64` | Q4_K_M logits byte-identical for `./runq` (AVX-512 VNNI K-quant GEMV / GEMM, `src/kernels_avx512.h`) and `./runq-generic` (`q4p_dot` / `q6p_dot`, the definition in `src/kquants.h`): GEMV incl. the Q6_K classifier (`-b 1`), GEMM tiles of 6 + 1 rows (Q4_K) / 4 + 3 (Q6_K) and a 1-row chunk (`en -b 7`), 13 chunks (`all -b 7`), 2 chunks with tiles 6 + 4 / 4 + 2 and the all-rows classifier GEMM (`all -b 64`). The generic runs go in the background at 4 threads (the slow part: ~1 s per 86 tokens with all-rows logits) | `./runq-generic` |
 | `greedy/q4_chat`, `greedy/q4_generate` | exact stdout of `-t 0 -n 24` chat / generate on the Q4_K_M file | `golden/greedy/q4_*.txt` |
 | `chat/multiturn`, `chat/thinking`, `chat/context_full` | multi-turn runs with `RUNQ_CHAT_DUMP`: (1) the decoded KV cache equals the expected chat-template rendering, built in Python from the user lines and the replies on stdout (ChatML, `<|im_end|>\n` after every message, the empty think block before each answer with `-r 0`; with `-r 1` earlier answers without their reasoning, as HF's template renders them); (2) re-encoding that text gives the same ids (piecewise encoding == whole-string encoding); (3) every sampled logits vector is **bit-identical** to the same row of a fresh `-m logits` run on the whole conversation (incremental prefill at `pos0 > 0` and decode vs one batched prefill from 0). `thinking`: `-r 1`, 2 turns, turn 1's reasoning dropped (re-prefill of its answer). `context_full`: `-c 160 -n 30 -y ...`, 6 turns: the oldest turns are dropped (stderr `[context] full`), the system prompt kept | |
+| `chat/long_context`, `chat/long_context_generic` | the same checks on a 411-token conversation (a 374-token system prompt, `-n 12`) decoded at OMP_NUM_THREADS=16: the reply's positions are past one attention block, so decode splits each kv head's attention over threads per block and combines (Step 7a); its sampled logits equal the batched prefill's (`-m logits`, 8 threads) bit for bit, and the generic build's run (4 threads: C attention, generic kernels) gives the same cache ids and logits file | `-m logits`, `./runq-generic` |
 
 Logits metrics, per position, over the union of a fixed 4096-id vocab subset and HF's top-64 ids:
 cosine similarity, top-1 agreement (runq argmax vs HF top-1), top-5 overlap. Position 0 has its
@@ -160,10 +168,12 @@ output; scratch builds, Step 6b-2) gives max |diff| 1.58 / 1.52 and fails all fo
 Also checked once: an ASan+UBSan build on Q4_K_M (generate / logits at -b 1 / 7 / 512, chat with
 context full, 3 and 8 threads; AVX-512 and generic): no reports.
 
-Thread invariance: matmul/matmul_batch (generic and VNNI) parallelize over output rows and attention over
-(kv head, block of query rows) items; each query vector's result does not depend on the other
-vectors in its item, so results are bit-identical for any thread count and any grouping (tested 1
-vs 8, 3 vs 8; also checked 13).
+Thread invariance: the GEMV / GEMM work items are blocks of output rows (and of activation rows),
+the attention items (kv head, block of query rows) in prefill and (kv head, block of 256 positions)
+in decode; each output is computed whole by one item, the same way whichever thread runs it (Step 7a:
+threads claim items from shared counters or steal them, src/threads.h), and each query vector's
+result does not depend on the other vectors in its item. So results are bit-identical for any thread
+count and any interleaving (tested 1 / 3 / 16 vs 8; also checked 5 and 13).
 
 Batched vs sequential: `forward_batch()` gives bit-identical logits to `forward()` because both
 call the same numeric kernels (`dot_q8`, `qk_norm_rope`, `attention_kv`, `swiglu`, `rmsnorm`,
@@ -200,6 +210,21 @@ Builds without AVX-512 (e.g. `-march=x86-64-v3`) use the generic kernels and pas
 batched and thread tests, but not the greedy goldens: the rest of the float code (rmsnorm,
 softmax, attention) is vectorized at a different width and rounds differently. The greedy
 goldens belong to AVX-512 (`-march=native` here) builds.
+
+Attention blocks (Step 7a): the attention is defined over blocks of 256 positions (per block the max,
+exponentials, sum and weighted V, then a fixed-order combination; `src/kernels_avx512.h` header). Up
+to 256 positions this is exactly the Step 3b definition below, so every shorter prompt (all the HF
+goldens, the greedy goldens) gives the same bits as before. Past it: `logits_long/long2` against HF,
+`batched/long2_*`, `threads/bitwise_long2_*`, `kernels/long2_b64` and `chat/long_context*`. Breakage
+(scratch builds): the combination without the rescale (c_b = 1) fails `logits_long/long2` (cos mean
+0.397) and `chat/long_context`; a sum of the l_b without fma in the generic build only fails
+`kernels/long2_b64` (max |diff| 0.54) and `chat/long_context_generic`.
+
+Sanitizers (Step 7a, scratch builds, not in `make test`): ASan + UBSan (`-O1 -g -fsanitize=address,undefined`,
+AVX-512 and generic) and ThreadSanitizer (`-O1 -g -fsanitize=thread`, built without `-fopenmp`, so the
+thread pool runs everything: loading, prefill, decode; libgomp is not instrumented): 17 runs each
+(Q8_0 / Q4_K_M GGUF generate and logits at 3 / 8 / 16 threads on a 274-token prompt, -b 1 / 7 / 13 /
+64 / 512, the .bin, chat with context full, chat -r 1 -t 0.8): no reports.
 
 Attention (Step 3b): the attention is defined once (arithmetic and tile layout in the
 `src/kernels_avx512.h` header comment): scores as fma chains over chunks of 32 dims, a clamped

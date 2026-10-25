@@ -11,6 +11,11 @@ the .bin (perplexity +0.19% vs +0.85%), prefill ~4-8% slower.
 Q4_K_M (Step 6b-1/2): `./runq Qwen3-0.6B-Q4_K_M.gguf` (perplexity +4.9% vs HF, mynah-slm +4.7%; Q8_0
 GGUF +0.19%): AVX-512 kernels, decode ~1.5x the Q8_0 GGUF (~200-300 tok/s, bandwidth-bound: 0.40 vs 0.67
 GB per token), prefill ~0.85-0.9x (~1,670 / 2,140 tok/s at 451 tokens, 8 / 12 threads), RSS ~0.41 GB.
+Threads (Step 7a): own phase synchronization on a thread pool (no OpenMP at run time); 16 threads on
+the 16 vCPUs no longer collapse (decode ~140-170 tok/s, was ~2-20; prefill ~2,300-2,500 at 439
+tokens, was ~100-600); decode 8 / 12 threads ~190 / ~210 tok/s best (Q8_0 GGUF; Q4_K_M ~280 / ~350),
+~+20-50% median; long contexts split per 256-position block (3,000 tokens, 12 threads: ~70 -> ~100
+tok/s). Default threads nproc - nproc/8 (14 here).
 
 Status: `[ ]` todo · `[~]` in progress · `[x]` done
 
@@ -638,6 +643,130 @@ kernels, Step 6b-1): prefill 451 tokens 168 / 233 tok/s at 8 / 12 threads, decod
   attention 32) / 846 ms (GEMMs 481, attention 272). (Q8_0 GGUF, 8 threads: 245 ms, GEMMs 168 / 1.04 s,
   GEMMs 545)
 
+## Step 7a: threading (barriers, decode work split)
+Before (Step 6b-2): decode = one OpenMP parallel region per token with 7 barriers per layer (198 per
+token + the fork / join); prefill = ~9 OpenMP parallel regions and ~10 more barriers per layer; 16
+threads on the 16 vCPUs collapsed (decode ~2-20 tok/s, prefill ~100-600 at 451 tokens; every barrier
+waits for a preempted thread while the others spin on CPUs it could use); decode attention had 8 work
+items (one per kv head), idle threads at 12+ and slow at long contexts.
+- [x] Phase synchronization instead of barriers (`src/threads.h`): a job (one decode step, one prefill
+  chunk) is a sequence of phases of work items; a phase ends when its *work* is done, not when every
+  thread has arrived: the thread finishing the last item runs the phase's serial epilogue (if any) and
+  publishes the phase count, the others wait for it. A thread preempted between phases holds nothing
+  up (it finds the phases done and catches up); only one preempted inside an item does. Waiting: spin
+  with `pause` for 4,000 rounds (~110 us on Zen 4, ~28 ns per round), then sleep on a futex (Linux;
+  elsewhere yield); the publisher wakes only if someone sleeps (registered first, seq_cst on both
+  sides, so no lost wake-up). Spin 1,000 / 4,000 / 16,000 rounds: within noise at 4-16 threads for
+  decode (best and median of 6), 4,000 ~5% faster than 1,000 for prefill at 8-12 threads; 100 (~3 us)
+  ~30% slower (sleeps and wake-ups every phase). Work distribution, measured: GEMV / GEMM phases give
+  each thread its own contiguous range of items (long weight streams, as a static schedule; 64-bit
+  range words, CAS, epoch-tagged so nothing is reset per job), taken from the front a chunk at a time,
+  then single items stolen from the back of the others' ranges (a preempted thread's work gets done,
+  and the end of a phase balances item by item). Shared-counter claims of single GEMM tiles were ~15%
+  slower in prefill (shorter streams) and of 1-4 blocks ~10-20% slower in decode at 4-12 threads.
+  Phases whose items wait on other items (decode qkv -> attention) claim in order from one shared
+  counter: with ranges and stealing all threads can end up waiting in stolen items whose dependencies
+  sit unclaimed in their own ranges (an intermediate build deadlocked so at 4 threads); the prefill
+  attention too (items of unequal cost, longest first). `RUNQ_SPIN=decode[,prefill]`,
+  `RUNQ_SYNC=static` (no stealing, i.e. a barrier per phase; OpenMP region builds only) for tuning
+- [x] Thread pool instead of `#pragma omp parallel` per job: libgomp's fork / join is itself a barrier
+  every thread must reach; with the phases inside an OpenMP region decode at 16 threads got ~70-80
+  tok/s vs ~150-170 on the pool. Persistent pthread workers + the caller; job protocol: fn / ctx, open
+  the job (state), bump gen (futex word); a worker enters only while the job is open, the caller closes
+  it after its own share and waits only for the workers inside (one that has not started yet skips the
+  job: its range is stolen). Found by measuring: gen bumped *before* the state was opened let workers
+  spinning on gen see a closed job and skip it, every other token with most of the threads (decode
+  ~20-40% slower at 4-12 threads, every second token 2-3x as long; per-token timing histograms): fixed
+  in `0380a83`. Weight loading (`prepare_weights`) and the GGUF merge lookups run on the pool too, so
+  no OpenMP threads exist at run time (`-DRUNQ_NO_POOL` and Windows: the OpenMP region; a build
+  without `-fopenmp` still runs threaded on the pool). Thread count: `rq_set_threads`
+  (`OMP_NUM_THREADS` or the default)
+- [x] Fewer sync points. Decode: 4 phases per layer instead of 7 barriers: [q, k, v per head + QK-norm
+  + RoPE + cache store; attention per (kv head, block)] in one phase, each attention item waiting on a
+  dependency counter for the 4 items of its kv head (the attention output is quantized into its own
+  buffer `aq`, as `xq` may still be read); [wo; epilogue: residual + rmsnorm + quantize]; [w1 + w3 +
+  SwiGLU + quantize]; [w2; epilogue: residual + the next layer's rmsnorm + quantize]; layer 0's norm
+  before the job. **113 sync points per token instead of 198** (4 x 28 + the classifier; +1 every 16
+  tokens for the KV tile pre-fault, now a phase of the job). Prefill: one job per chunk, 9 phases per
+  layer (8 in layer 0) instead of ~19 OpenMP sync points (9 regions + 10 barriers); the GEMM activation
+  prep (VNNI corrections, K-quant sums) is computed per row where the row is quantized, the attention
+  output quantized by the last kv head of each row block (dependency counter), LOGITS_LAST / ALL in
+  the job. All outputs computed by the same functions per item: logits byte-identical to Step 6b-2
+- [x] Attention over blocks of ATT_P = 256 positions (`src/kernels_avx512.h` header, option (a)): per
+  block the max, the exponentials, their sum (16 lanes + the fixed tree) and the weighted V; with more
+  than one block M = max m_b, c_b = exp_att(m_b - M), L = fma chain of c_b * l_b, out = (fma chain of
+  c_b * o_b) * (1 / L), blocks in order (`att_combine`). One block (<= 256 positions) is exactly the Step
+  3b definition: every shorter prompt gives the same bits as before (all HF and greedy goldens
+  unchanged). The block size is a constant, so the arithmetic depends on neither the thread count nor
+  the chunk size: decode, prefill, the generic C version and all thread counts stay bit-identical
+  (tests below). Decode splits a long context: one work item per (kv head, block) (3,000 positions: 96
+  items instead of 8), the last of a head's items to finish combines (flash-decoding). Prefill runs
+  all blocks of its vectors in one item. Accuracy vs a double-precision attention (scratch build;
+  1,488-token prompt, mean 1-cos of the logits): positions >= 256 2.81e-4 vs 2.77e-4 with the Step 3b
+  definition (the ranges [256, 512) / [512, 1024) / [1024, 1488): 4.06 / 2.86 / 2.07e-4 vs 3.49 / 3.04
+  / 2.08e-4), ATT_P 128 / 512 the same within ~5%: equally good. Against HF fp32 past 256 (new golden):
+  cos mean 0.99927, min 0.99791, top-1 13/13. Prefill cost: with one kernel call per block the
+  attention at 3,000 tokens was ~27% slower (each block restarted the 4 strided V passes: prefetcher
+  ramp-ups, ~5% single-threaded but 27% with 8 threads competing for L3 / DRAM); with the passes
+  running over all blocks (accumulators restart per block, one long stream) ~10% (kernel
+  microbenchmark 3-5%), i.e. ~4-6% of a 1,500-3,000-token prefill, nothing below 256 tokens. ATT_P 512:
+  the same prefill cost, fewer decode items at mid contexts: 256 kept
+- [x] Results (2026-10-25, the shared 16-vCPU VM, ~2.5-4.5 other CPUs busy, measured between runs;
+  generate mode, greedy, interleaved with the Step 6b-2 binary `0cea116`, best / median of 8 (decode)
+  or best of 5-6 (prefill); `/tmp` scripts like `scripts/bench_qwen3c.sh`):
+
+  | decode tok/s, best / median | 4 threads | 8 | 12 | 14 | 16 |
+  |---|---|---|---|---|---|
+  | Q8_0 GGUF before | 145 / 101 | 198 / 137 | 179 / 118 | 136 / 121 | 1.3-23 (collapse) |
+  | Q8_0 GGUF now | 142 / 108 | 192 / 168 | 210 / 182 | 206 / 171 | 141-172 / 116-160 |
+  | Q4_K_M before | 171 / 154 | 237 / 212 | 296 / 234 | 298 / 195 | 1.5-28 |
+  | Q4_K_M now | 193 / 169 | 277 / 249 | 351 / 265 | 319 / 276 | 218 / 196 |
+  | Q8_0 .bin before / now (6 runs) | | 145 / 124 -> 199 / 180 | 207 / 153 -> 252 / 188 | 178 / 123 -> 218 / 185 | |
+
+  | prefill tok/s (best) | 8 threads | 12 | 14 | 16 |
+  |---|---|---|---|---|
+  | Q8_0 GGUF, 439 tokens, before / now | 1,860 / 1,880 | 2,350 / 2,370-2,420 | 2,456 / 2,580 | 115-631 / 2,290-2,500 |
+  | Q8_0 GGUF, 1,488 tokens, before / now | 1,477 / 1,384 | 1,937 / 1,853 | 2,000 / 2,019 | 308 / 1,922 |
+  | Q4_K_M, 439 tokens, before / now | 1,681 / 1,688 | 2,297 / 2,290 | | 214 / 2,162 |
+
+  | decode after a long prompt (Q8_0 GGUF, 128 tokens), best / median | 8 threads | 12 | 16 (now) |
+  |---|---|---|---|
+  | 488 tokens, before / now | 141 / 115 -> 148 / 124 | 128 / 103 -> 162 / 143 | 125 / 115 |
+  | 1,488 tokens, before / now | 109 / 87 -> 119 / 111 | 105 / 100 -> 131 / 126 | 112 / 106 |
+  | 2,988 tokens, before / now | 85 / 80 -> 86 / 80 | 71 / 66 -> 102 / 101 | 84 / 83 |
+
+  With 4 extra busy threads (a scratch CPU hog; ~6.8 CPUs busy besides runq): 8 threads 150 / 133 ->
+  169 / 162 tok/s, 12 threads ~11 -> 143 / 120, 16 threads -> 118 / 104. Decode is memory-bound: 12-14
+  threads saturate the bandwidth and 16 only add contention with the other processes; 4 threads are
+  bandwidth-per-thread limited (best equal, median +7%). The attention split helps from ~1,000
+  positions on at 12+ threads (8 items were 8 threads' worth of work); at 8 threads and 3,000 tokens
+  the 0.7 GB of KV cache per token keeps it at the bandwidth limit either way (7b: bf16 cache).
+  Prefill: within ~+-5% at 8-14 threads (1,500 tokens -4..-6%: the attention blocks), no collapse at 16
+- [x] Default threads (no `OMP_NUM_THREADS`): nproc - nproc/8 = 14 on the 16-vCPU VM (was min(12, nproc
+  - nproc/4) = 12): decode 12 ~ 14 > 16, prefill 14 > 16 > 12 (2,580 / 2,290-2,500 / 2,370-2,420 at 439
+  tokens, 2,019 / 1,922 / 1,853 at 1,488). All 16 work, but leave room for the other processes
+- [x] Tests (`make test` 278 checks, ~23-26 s on the busy box, load 4-12; was 269 / ~27-33 s): new
+  `logits_long/long2` (HF fp32 golden at every 4th position 248..296 of a 297-token prompt,
+  `make_golden.py --long`, 111 KB), `batched/long2_b64` / `_b512` vs -b 1, `threads/bitwise_long2_b64_t1`
+  / `_t3` / `_t16`, `kernels/long2_b64`, `chat/long_context` (411-token conversation decoded at 16
+  threads vs the batched prefill, bitwise) and `chat/long_context_generic` (the generic build's run,
+  bitwise). Breakage (scratch builds): the combination without the rescale fails `logits_long` (cos mean
+  0.397) and `chat/long_context`; another rounding of the l_b sum in the generic build only fails
+  `kernels/long2_b64` (max |diff| 0.54) and `chat/long_context_generic`. Faster: every `-m logits` run
+  of the selected groups is started up front, 3 at a time (`prefetch_all`), the generic build's at 4
+  threads in the background; greedy and chat cases 3 at a time
+- [x] Sanitizers (scratch builds): ASan + UBSan (`-O1 -g -fsanitize=address,undefined`, AVX-512 and
+  generic) and ThreadSanitizer (`-O1 -g -fsanitize=thread` without `-fopenmp`: the pool runs loading,
+  prefill and decode, all instrumented; libgomp is not, hence no OpenMP build): 17 runs each (Q8_0 /
+  Q4_K_M GGUF generate + logits at 3 / 8 / 16 threads on a 274-token prompt, -b 1 / 7 / 13 / 64 / 512,
+  the .bin, chat with context full, chat -r 1 -t 0.8 on Q4_K_M): no reports; the TSan build's -b 1 and
+  -b 7 logits agree bit for bit
+- Notes for Step 7b: bf16 K/V cache (`vdpbf16ps`; halves the 0.7 GB per token at 3,000 positions that
+  keeps 8-thread decode at the bandwidth limit; numerics change, the logits tests decide); prefill rest
+  (norm / quantize / SwiGLU ~14% at 451 tokens, SwiGLU's `expf` ~4%); the prefill attention could use
+  the blocks for balance (one item per (row block, kv head, block range)) and the remaining ~10% block
+  overhead; decode at 4 threads is per-thread-bandwidth bound
+
 ## Known bugs
 Found by the tests.
 - [x] Tokenizer: no NFC normalizer (HF's tokenizer.json normalizer is NFC); the input was assumed
@@ -664,16 +793,18 @@ Found by the tests.
 - [x] Step 6a: GGUF Q8_0 loading (no export step, no side files): done, see above
 - [x] Step 6b-1: GGUF Q4_K_M correct (loader, repacked layouts, arithmetic, generic kernels, tests): done, see above
 - [x] Step 6b-2: AVX-512 kernels for Q4_K / Q6_K (GEMV at the bandwidth limit, GEMM ~1.17x Q8_0's): done, see above
-- Step 7: performance leftovers (decode barriers / attention split, bf16 KV cache, 16-thread barriers, prefill rest)
+- [x] Step 7a: threading (phase sync on a thread pool, 113 sync points per decode step, no 16-thread
+  collapse, attention blocks of 256 positions with the decode split over them): done, see above
+- Step 7b: bf16 KV cache, prefill rest (see the Step 7a notes)
 
 ## Later / ideas
-- [ ] 16-thread collapse: needs barriers that tolerate a preempted thread (e.g. own spin-then-yield
-  barriers, or work stealing with no global barrier per phase); OpenMP knobs did not help
+- [x] 16-thread collapse: phase synchronization that waits for the work, not for every thread, on a
+  thread pool, spin then futex (Step 7a)
 - [ ] Attention: bf16 K/V cache with `vdpbf16ps` (half the bytes, 2x the FMA rate; changes the
-  numerics, the logits vs HF test decides); a split over positions for decode at long contexts
-  (only 8 kv heads = 8 work items, idle threads at 12+); ~670 GFLOPS now, FMA peak ~900
-- [ ] Decode: fewer barriers (the two `single` sections could be done redundantly per thread on
-  private copies of x); finer q / k / v items at 12 threads (32 heads over 12 threads: 3 vs 2.67)
+  numerics, the logits vs HF test decides): Step 7b. The split over positions for decode: done (Step
+  7a, blocks of 256); ~670 GFLOPS now, FMA peak ~900
+- [x] Decode: fewer barriers (Step 7a: 4 phases per layer, epilogues instead of `single` sections);
+  q / k / v items at 12 threads: shared-counter claims of single heads, no idle tail
 - [ ] Prefill rest (14% at 451 tokens): norm / quantize / SwiGLU loops as separate parallel
   regions per phase; SwiGLU's `expf` (libmvec) is ~4%
 - [x] Perplexity comparison Q4_K_M vs Q8_0 (2026-10-25, `scripts/ppl.py`, BENCHMARKS.md): Voyage of

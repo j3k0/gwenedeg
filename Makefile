@@ -34,7 +34,8 @@ generic: runq-generic
 clean:
 	rm -f runq runq-debug runq-generic
 
-test: runq runq-generic
+# (run_tests.sh builds runq and runq-generic itself, in parallel)
+test:
 	@if [ -f tests/run_tests.sh ]; then bash tests/run_tests.sh; else echo "no tests yet"; fi
 
 bench: runq

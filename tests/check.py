@@ -84,10 +84,10 @@ GREEDY_CASES = [
 SEEDED_ARGS = ["-m", "chat", "-n", "40", "-t", "0.8", "-s", "42", "-c", CTX, "-i", "Tell me about cats."]
 SEEDED_CHUNKS = [1, 5]  # token by token vs 2 chunks (-b 64 runs the same code)
 THREADS_PROMPT = "en"
-# VNNI vs generic kernels: (prompt, -b). -b 1: GEMV (decode path, incl. the classifier);
+# VNNI vs generic kernels: (prompt, -b). -b 1 on en: GEMV (decode path, incl. the classifier);
 # -b 7 on en (15 tokens): GEMM tiles of 6 + 1 rows, last chunk 1 row; -b 64 on all (86 tokens,
 # chunks 64 + 22): tiles of 6 + 4 rows, LOGITS_ALL classifier GEMM
-KERNEL_CASES = [(BATCH_LONG, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH)]
+KERNEL_CASES = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH)]
 
 
 class Results:

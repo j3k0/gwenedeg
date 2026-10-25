@@ -3,10 +3,10 @@
 # Usage: scripts/bench_qwen3c.sh [model.bin] [threads...]
 #   default model: models/Qwen3-0.6B-q8.bin, default threads: 1 2 4 8 12
 #   (16 threads collapses: OpenMP spin-barrier oversubscription, see README)
-# Env: N=new tokens per run (256), REPS=runs per thread count, best kept (3)
+# Env: N=new tokens per run (256), REPS=runs per thread count, best kept (3), RUNQ=binary
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RUNQ="$ROOT/runq"
+RUNQ="${RUNQ:-$ROOT/runq}"
 MODEL="${1:-$ROOT/models/Qwen3-0.6B-q8.bin}"; shift || true
 THREADS=("${@:-1 2 4 8 12}"); THREADS=(${THREADS[@]})
 N="${N:-256}"; REPS="${REPS:-3}"

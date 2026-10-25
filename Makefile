@@ -11,7 +11,7 @@ SRC = src/runq.c
 HDR = src/unicode_tables.h
 Q8  = models/Qwen3-0.6B-q8.bin
 
-.PHONY: all debug clean test bench models
+.PHONY: all debug clean test bench bench-prefill models
 
 all: runq
 
@@ -31,6 +31,9 @@ test: runq
 
 bench: runq
 	scripts/bench_qwen3c.sh
+
+bench-prefill: runq
+	scripts/bench_prefill.sh
 
 # Downloads ~2 GB and runs the Python exporter; only if the Q8_0 model is missing.
 models:

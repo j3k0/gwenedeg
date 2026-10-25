@@ -121,6 +121,7 @@ typedef struct {
     float *hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
     QuantizedTensor xq; // quantized x (dim,)
     QuantizedTensor hq; // quantized hb (hidden_dim,)
+    QuantizedTensor aq; // quantized attention output (all_heads_dim,), the input of wo
     float *q; // query (dim,)
     float *k; // key (kv_dim,), copied into the cache tiles after QK-norm + RoPE
     float *v; // value (kv_dim,), the same
@@ -139,6 +140,9 @@ typedef struct {
     float *hq_xf;
     int32_t *xq_c16;    // AVX-512 K-quant GEMV: -32 * sums of 16 of xq / hq (kq512_c16), or NULL
     int32_t *hq_c16;
+    int32_t *aq_corr;   // the same for aq
+    float *aq_xf;
+    int32_t *aq_c16;
     int ff_rows;        // hidden rows per forward() ffn work item (w1 + w3 + swiglu + quantize)
     // batched prefill buffers (forward_batch), nb_max rows each; not allocated if nb_max <= 1
     int nb_max;
@@ -578,7 +582,13 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
     s->q = calloc(all_heads_dim, sizeof(float));
     s->xq_corr = calloc((all_heads_dim > p->dim ? all_heads_dim : p->dim) / GS + 1, sizeof(int32_t));
     s->hq_corr = calloc(p->hidden_dim / GS + 1, sizeof(int32_t));
+    s->aq = (QuantizedTensor) { .q = calloc(all_heads_dim, sizeof(int8_t)), .s = calloc(all_heads_dim / GS, sizeof(float)) };
+    s->aq_corr = calloc(all_heads_dim / GS + 1, sizeof(int32_t));
+    if (!s->aq.q || !s->aq.s || !s->aq_corr) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
     if (KQ) {
+        s->aq_xf = calloc(all_heads_dim / GS + 1, sizeof(float));
+        s->aq_c16 = calloc(all_heads_dim / 16 + 1, sizeof(int32_t));
+        if (!s->aq_xf || !s->aq_c16) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
         s->xq_xf = calloc((all_heads_dim > p->dim ? all_heads_dim : p->dim) / GS + 1, sizeof(float));
         s->hq_xf = calloc(p->hidden_dim / GS + 1, sizeof(float));
         s->xq_c16 = calloc((all_heads_dim > p->dim ? all_heads_dim : p->dim) / 16 + 1, sizeof(int32_t));
@@ -590,7 +600,7 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
     s->att = calloc((size_t)p->n_heads * s->kv_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
     s->rope = calloc(p->head_dim, sizeof(float));
-    rq_sync_init(&s->sync, 8 * p->n_layers + 8);
+    rq_sync_init(&s->sync, 8 * p->n_layers + 8, 8 * p->n_layers * p->n_kv_heads + 64);
     s->key_cache = alloc_big(s->kv_size * sizeof(float));
     s->value_cache = alloc_big(s->kv_size * sizeof(float));
 
@@ -617,6 +627,11 @@ void free_run_state(RunState* s) {
     free(s->hq_xf);
     free(s->xq_c16);
     free(s->hq_c16);
+    free(s->aq.q);
+    free(s->aq.s);
+    free(s->aq_corr);
+    free(s->aq_xf);
+    free(s->aq_c16);
     free(s->k);
     free(s->v);
     free(s->att);
@@ -1541,7 +1556,27 @@ static inline QuantizedTensor qsub(QuantizedTensor *t, int i0) {
 
 typedef struct { Transformer *tr; int token, pos, compute_logits; } DecodeJob;
 
-static int decode_phases(Config *p) { return 7 * p->n_layers + 3; }
+// phases of a decode job: per layer 4 (qkv + attention, wo, w1 + w3, w2), the classifier, the KV
+// tile pre-fault every ATT_T positions; dependency counters: one per (layer, kv head)
+static int decode_phases(Config *p) { return 4 * p->n_layers + 2; }
+static int decode_counters(Config *p) { return p->n_layers * p->n_kv_heads; }
+
+static void decode_norm(RunState *s, Config *p, TransformerWeights *w, int l, int resid) {
+    // (x += xb,) rmsnorm with layer l's attention weights (l < n_layers) or the final ones (l ==
+    // n_layers: into x itself, as before), quantize into xq, the GEMV activation prep
+    int dim = p->dim;
+    if (resid)
+        for (int i = 0; i < dim; i++)
+            s->x[i] += s->xb[i];
+    if (l < p->n_layers) {
+        rmsnorm(s->xb, s->x, w->rms_att_weight + l * dim, dim);
+        quantize(&s->xq, s->xb, dim);
+    } else {
+        rmsnorm(s->x, s->x, w->rms_final_weight, dim);
+        quantize(&s->xq, s->x, dim);
+    }
+    matvec_prep(s->xq_corr, s->xq_xf, s->xq_c16, &s->xq, 0, dim);
+}
 
 static void decode_worker(void *arg, int tid, int nt) {
     (void)nt;
@@ -1556,6 +1591,7 @@ static void decode_worker(void *arg, int tid, int nt) {
     int kv_dim = nkv * hd;
     int kv_mul = nh / nkv; // integer multiplier of the kv sharing in multiquery
     int all_heads_dim = nh * hd, ff = s->ff_rows;
+    int ng = kv_mul + 2; // qkv items per kv head: its kv_mul query heads, its key head, its value head
     size_t ts = (size_t)nkv * ATT_T * hd;
 
     if (pos % ATT_T == 0) { // first position of a KV cache tile: pre-fault the tile (all layers)
@@ -1565,45 +1601,38 @@ static void decode_worker(void *arg, int tid, int nt) {
         PH_END_NOEPI
     }
 
-    // forward all the layers
+    // forward all the layers (layer 0's attention rmsnorm + quantize: done by forward())
     for (int l = 0; l < p->n_layers; l++) {
         uint64_t loff = l * (uint64_t)s->kv_len * kv_dim; // kv cache layer offset for convenience
         float *kl = s->key_cache + loff, *vl = s->value_cache + loff;
+        int *dep = S->cnt + l * nkv; (void)dep;
 
-        // (residual connection of the previous layer's ffn,) attention rmsnorm, quantize
-        PH_BEGIN(1, 1)
-            if (l > 0)
-                for (int i = 0; i < dim; i++)
-                    s->x[i] += s->xb[i];
-            rmsnorm(s->xb, s->x, w->rms_att_weight + l * dim, dim);
-            quantize(&s->xq, s->xb, dim);
-            matvec_prep(s->xq_corr, s->xq_xf, s->xq_c16, &s->xq, 0, dim);
-        PH_END_NOEPI
-
-        // qkv matmuls for this position, one head per item: Q-RMSNorm + rotate each query head,
-        // the same for each key head, then save key, value at this time step (pos) to our kv cache
-        PH_BEGIN(nh + 2 * nkv, 1)
+        // qkv matmuls for this position, then the attention, in one phase. Items 0 .. nkv * ng - 1:
+        // per kv head g its query heads (QK-norm + RoPE), its key head (QK-norm + RoPE, cache store)
+        // and value head (cache store), counted in dependency counter g; then items for the
+        // attention of each kv head (its kv_mul query heads together, after the ng items of its
+        // group) + the quantization of their outputs for wo (into aq: xq is still being read)
+        PH_BEGIN(nkv * ng + nkv, 1)
         for (int it = lo; it < hi; it++) {
-            if (it < nh) {
-                matvec_rows(s->q, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->wq + l, dim, it * hd, (it + 1) * hd);
-                qk_norm_rope(s->q + it * hd, 1, w->q_norm_weights + l * hd, hd, s->rope);
-            } else if (it < nh + nkv) {
-                int h = it - nh;
-                matvec_rows(s->k, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->wk + l, dim, h * hd, (h + 1) * hd);
-                qk_norm_rope(s->k + h * hd, 1, w->k_norm_weights + l * hd, hd, s->rope);
-                kv_store(kl, NULL, pos, h, nkv, hd, s->k + h * hd, NULL);
-            } else {
-                int h = it - nh - nkv;
-                matvec_rows(s->v, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->wv + l, dim, h * hd, (h + 1) * hd);
-                kv_store(NULL, vl, pos, h, nkv, hd, NULL, s->v + h * hd);
+            if (it < nkv * ng) {
+                int g = it / ng, r = it % ng;
+                if (r < kv_mul) {
+                    int h = g * kv_mul + r;
+                    matvec_rows(s->q, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->wq + l, dim, h * hd, (h + 1) * hd);
+                    qk_norm_rope(s->q + h * hd, 1, w->q_norm_weights + l * hd, hd, s->rope);
+                } else if (r == kv_mul) {
+                    matvec_rows(s->k, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->wk + l, dim, g * hd, (g + 1) * hd);
+                    qk_norm_rope(s->k + g * hd, 1, w->k_norm_weights + l * hd, hd, s->rope);
+                    kv_store(kl, NULL, pos, g, nkv, hd, s->k + g * hd, NULL);
+                } else {
+                    matvec_rows(s->v, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->wv + l, dim, g * hd, (g + 1) * hd);
+                    kv_store(NULL, vl, pos, g, nkv, hd, NULL, s->v + g * hd);
+                }
+                rq_count(S, l * nkv + g, 1);
+                continue;
             }
-        }
-        PH_END_NOEPI
-
-        // multihead attention: per kv head, its kv_mul query heads together; then quantize
-        // their outputs (kv_mul * hd values, whole quantization groups) for wo
-        PH_BEGIN(nkv, 1)
-        for (int g = lo; g < hi; g++) {
+            int g = it - nkv * ng;
+            rq_wait_count(S, l * nkv + g, ng);
             const float *qv[ATT_NV_MAX];
             float *ov[ATT_NV_MAX];
             int npv[ATT_NV_MAX];
@@ -1615,25 +1644,23 @@ static void decode_worker(void *arg, int tid, int nt) {
             size_t o = kv_tile(0, g, nkv, hd);
             attention_kv(kv_mul, qv, ov, npv, kl + o, vl + o, ts, hd, s->att_scale, s->att + (size_t)g * kv_mul * s->kv_len);
             int i0 = g * kv_mul * hd;
-            QuantizedTensor xg = qsub(&s->xq, i0);
-            quantize(&xg, s->xb + i0, kv_mul * hd);
-            matvec_prep(s->xq_corr, s->xq_xf, s->xq_c16, &s->xq, i0, kv_mul * hd);
+            QuantizedTensor ag = qsub(&s->aq, i0);
+            quantize(&ag, s->xb + i0, kv_mul * hd);
+            matvec_prep(s->aq_corr, s->aq_xf, s->aq_c16, &s->aq, i0, kv_mul * hd);
         }
         PH_END_NOEPI
 
-        // final matmul to get the output of the attention (16-row blocks)
+        // final matmul to get the output of the attention (16-row blocks); epilogue: residual
+        // connection back into s->x, ffn rmsnorm, quantize
         PH_BEGIN(dim / 16, s->dec_chunk)
-            matvec_rows(s->xb, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->wo + l, all_heads_dim, lo * 16, hi * 16);
-        PH_END_NOEPI
-
-        // residual connection back into s->x, ffn rmsnorm, quantize
-        PH_BEGIN(1, 1)
+            matvec_rows(s->xb, &s->aq, s->aq_corr, s->aq_xf, s->aq_c16, w->wo + l, all_heads_dim, lo * 16, hi * 16);
+        PH_EPILOGUE
             for (int i = 0; i < dim; i++)
                 s->x[i] += s->xb[i];
             rmsnorm(s->xb, s->x, w->rms_ffn_weight + l * dim, dim);
             quantize(&s->xq, s->xb, dim);
             matvec_prep(s->xq_corr, s->xq_xf, s->xq_c16, &s->xq, 0, dim);
-        PH_END_NOEPI
+        PH_END
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x)): per item,
         // ff rows of self.w1(x) and self.w3(x), the SwiGLU non-linearity and their quantization
@@ -1648,21 +1675,17 @@ static void decode_worker(void *arg, int tid, int nt) {
         }
         PH_END_NOEPI
 
-        // final matmul to get the output of the ffn (its residual: next layer, or below)
+        // final matmul to get the output of the ffn; epilogue: its residual, then the next layer's
+        // attention rmsnorm + quantize (or the final rmsnorm for the classifier; none without logits)
         PH_BEGIN(dim / 16, s->dec_chunk)
             matvec_rows(s->xb, &s->hq, s->hq_corr, s->hq_xf, s->hq_c16, w->w2 + l, hidden, lo * 16, hi * 16);
-        PH_END_NOEPI
+        PH_EPILOGUE
+            if (l + 1 < p->n_layers || job->compute_logits)
+                decode_norm(s, p, w, l + 1, 1);
+        PH_END
     }
 
-    if (job->compute_logits) {
-        // residual connection, final rmsnorm, classifier into logits
-        PH_BEGIN(1, 1)
-            for (int i = 0; i < dim; i++)
-                s->x[i] += s->xb[i];
-            rmsnorm(s->x, s->x, w->rms_final_weight, dim);
-            quantize(&s->xq, s->x, dim);
-            matvec_prep(s->xq_corr, s->xq_xf, s->xq_c16, &s->xq, 0, dim);
-        PH_END_NOEPI
+    if (job->compute_logits) { // classifier into logits
         int nblk = (p->vocab_size + 15) / 16;
         PH_BEGIN(nblk, s->cls_chunk)
             matvec_rows(s->logits, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->wcls, dim, lo * 16,
@@ -1674,20 +1697,24 @@ static void decode_worker(void *arg, int tid, int nt) {
 float *forward(Transformer *transformer, int token, int pos, int compute_logits) {
     // compute_logits = 0 skips the final rmsnorm + classifier (prompt tokens whose
     // logits are discarded) and returns NULL; the KV cache is filled either way.
-    // One parallel job for the whole token (decode_worker), in phases (threads.h): per layer
-    //   residual + rmsnorm + quantize -> q, k, v, one item per head, with its QK-norm + RoPE and the
-    //   K/V cache store -> attention per kv head + quantize -> wo -> residual + rmsnorm + quantize
-    //   -> w1 + w3 + SwiGLU + quantize per ff_rows hidden rows -> w2
-    // Every output is computed whole by one thread, by the same functions as before (same results)
+    // One parallel job for the whole token (decode_worker), in phases (threads.h), 4 per layer:
+    //   [q, k, v, one item per head, with its QK-norm + RoPE and the K/V cache store; attention per
+    //   kv head (once the 4 items of its heads are done: dependency counters) + quantize] ->
+    //   [wo; epilogue: residual + rmsnorm + quantize] -> [w1 + w3 + SwiGLU + quantize per ff_rows
+    //   hidden rows] -> [w2; epilogue: residual + the next layer's rmsnorm + quantize], then the
+    //   classifier: 4 * 28 + 1 = 113 synchronization points per token (was 7 * 28 + 2 = 198 OpenMP
+    //   barriers). Every output is computed whole by one thread, by the same functions as before
+    //   (same results)
     Config *p = &transformer->config;
     RunState* s = &transformer->state;
 
     // the token embedding into s->x
     embed_row(s->x, transformer->weights.q_tokens, token, p->dim);
     rope_row(s->rope, p->head_dim, pos);
+    decode_norm(s, p, &transformer->weights, 0, 0); // layer 0's attention rmsnorm + quantize
 
     int nt = rq_nthreads();
-    rq_begin(&s->sync, decode_phases(p), nt);
+    rq_begin(&s->sync, decode_phases(p), decode_counters(p), nt);
     // GEMV ranges of 16-row blocks: ~4 per thread (dim / 16 = 64 blocks), the classifier ~8
     s->dec_chunk = p->dim / 16 / (4 * nt) > 1 ? p->dim / 16 / (4 * nt) : 1;
     s->cls_chunk = (p->vocab_size + 15) / 16 / (8 * nt) > 1 ? (p->vocab_size + 15) / 16 / (8 * nt) : 1;

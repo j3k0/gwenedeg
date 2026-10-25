@@ -127,27 +127,33 @@ typedef struct {
     int nph;       // capacity
     int nt;        // threads of the job
     int *ready;    // phases complete (futex word; own cache line)
-    int *sleepers; // threads sleeping on ready
+    int *sleepers; // threads sleeping on ready (or on a dependency counter)
+    int *cnt;      // dependency counters inside phases (reset by rq_begin)
+    int ncnt;
     void *mem;
 } RqSync;
 
-static void rq_sync_init(RqSync *s, int nph) {
-    s->mem = aligned_alloc(64, (size_t)(nph + 2) * 64);
+static void rq_sync_init(RqSync *s, int nph, int ncnt) {
+    size_t bytes = (size_t)(nph + 2) * 64 + ((size_t)ncnt * sizeof(int) + 63) / 64 * 64;
+    s->mem = aligned_alloc(64, bytes);
     if (!s->mem) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
-    memset(s->mem, 0, (size_t)(nph + 2) * 64);
+    memset(s->mem, 0, bytes);
     s->ph = (RqPhase *)((char *)s->mem + 128);
     s->ready = (int *)s->mem;
     s->sleepers = (int *)((char *)s->mem + 64);
+    s->cnt = (int *)((char *)s->mem + (size_t)(nph + 2) * 64);
     s->nph = nph;
+    s->ncnt = ncnt;
     s->nt = 1;
 }
 
 static void rq_sync_free(RqSync *s) { free(s->mem); s->mem = NULL; }
 
-static void rq_begin(RqSync *s, int nph, int nt) {
-    // before a job (serial): reset the counters of phases 0..nph-1
-    if (nph > s->nph) { fprintf(stderr, "rq_begin: too many phases\n"); exit(EXIT_FAILURE); }
+static void rq_begin(RqSync *s, int nph, int ncnt, int nt) {
+    // before a job (serial): reset the counters of phases 0..nph-1 and dependency counters 0..ncnt-1
+    if (nph > s->nph || ncnt > s->ncnt) { fprintf(stderr, "rq_begin: too many phases / counters\n"); exit(EXIT_FAILURE); }
     memset(s->ph, 0, (size_t)nph * sizeof(RqPhase));
+    memset(s->cnt, 0, (size_t)ncnt * sizeof(int));
     __atomic_store_n(s->ready, 0, __ATOMIC_RELAXED);
     s->nt = nt;
 }
@@ -188,10 +194,19 @@ static inline void rq_wait(RqSync *s, int nk) {
     rq_wait_ge(s->ready, nk, s->sleepers);
 }
 
-static inline void rq_wait_count(RqSync *s, int *cnt, int target) {
-    // until a dependency counter (inside a phase) reaches target
-    if (RQ_LOAD(cnt) >= target) return;
-    rq_wait_ge(cnt, target, s->sleepers);
+static inline int rq_count(RqSync *s, int i, int v) {
+    // dependency counter i += v (after the work it stands for); returns the new value. Wakes the
+    // sleepers, if any (they may wait for another counter or phase: they re-check and sleep again)
+    int r = __atomic_add_fetch(&s->cnt[i], v, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(s->sleepers, __ATOMIC_SEQ_CST))
+        rq_wake(&s->cnt[i]);
+    return r;
+}
+
+static inline void rq_wait_count(RqSync *s, int i, int target) {
+    // until dependency counter i (inside a phase) reaches target
+    if (RQ_LOAD(&s->cnt[i]) >= target) return;
+    rq_wait_ge(&s->cnt[i], target, s->sleepers);
 }
 
 // ----------------------------------------------------------------------------------- parallel region

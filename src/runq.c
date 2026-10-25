@@ -558,7 +558,7 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
     s->att_rows = ATT_NV_MAX / kv_mul < ATT_ROWS ? ATT_NV_MAX / kv_mul : ATT_ROWS;
     s->ff_rows = GS > 64 ? GS : 64;
     if (kv_mul < 1 || s->att_rows < 1 || p->head_dim % 16 || (kv_mul * p->head_dim) % GS ||
-        p->hidden_dim % s->ff_rows || s->ff_rows % GS || p->dim % 16 || (s->kvt != KV_F32 && (p->head_dim % 32 || p->head_dim > ATT_HD_MAX))) {
+        p->hidden_dim % s->ff_rows || s->ff_rows % GS || p->dim % 16 || (s->kvt != KV_F32 && p->head_dim % 32)) {
         fprintf(stderr, "unsupported model shape (heads %d / %d, head_dim %d, dim %d, hidden %d, GS %d)\n",
                 p->n_heads, p->n_kv_heads, p->head_dim, p->dim, p->hidden_dim, GS);
         exit(EXIT_FAILURE);
@@ -1494,32 +1494,15 @@ static inline uint16_t f32_bf16(float f) {
     return (uint16_t)((u & 0x7fffffffu) > 0x7f800000u ? (u >> 16) | 0x40 : r);
 }
 
-ATT_EXACT static void attention_vec(int kvt, const float *q, float *out, float *ml, int n, const void *kt0, const void *vt0,
+ATT_EXACT static void attention_vec(const float *q, float *out, float *ml, int n, const float *kt, const float *vt,
                                     size_t ts, int hd, float scale, float *S) {
-    // one query vector over positions 0..n-1 (n <= ATT_P: one block) of one kv head: kt / vt = its tile
-    // 0 of the block in the layer's K / V cache, ts = elements from one tile to the next (ATT_T *
+    // one query vector over positions 0..n-1 (n <= ATT_P: one block) of one kv head: kt / vt = its fp32
+    // tile 0 of the block (layout in kernels_avx512.h), ts = floats from one tile to the next (ATT_T *
     // head_dim: a block's tiles are contiguous); S: n (rounded up to 16) floats.
-    // ml != NULL: one block's partial result (out unnormalized, ml[0] = max score, ml[1] = sum).
-    // kvt: cache type; bf16 / f16 (layouts in kernels_avx512.h): each tile / V row converted to fp32
-    // first (exact), then the same operations
-    const float *kt = kt0, *vt = vt0;
-    const uint16_t *kb = kt0, *vb = vt0;
-    float kc[ATT_HD_MAX * ATT_T], vc[ATT_HD_MAX];
+    // ml != NULL: one block's partial result (out unnormalized, ml[0] = max score, ml[1] = sum)
     int nt = (n + ATT_T - 1) / ATT_T;
     for (int tb = 0; tb < nt; tb++) {
-        const float *k = kc;
-        if (kvt == KV_BF16) {
-            const uint16_t *kh = kb + (size_t)tb * ts;
-            for (int i = 0; i < hd; i++)
-                for (int j = 0; j < ATT_T; j++)
-                    kc[i * ATT_T + j] = bf16_f32(kh[(i & ~1) * ATT_T + 2 * j + (i & 1)]);
-        } else if (kvt == KV_F16) {
-            const uint16_t *kh = kb + (size_t)tb * ts;
-            for (int i = 0; i < hd * ATT_T; i++)
-                kc[i] = fp16_to_f32(kh[i]);
-        } else {
-            k = kt + (size_t)tb * ts;
-        }
+        const float *k = kt + (size_t)tb * ts;
         float a[ATT_T], c[ATT_T];
         for (int j = 0; j < ATT_T; j++)
             a[j] = 0.0f; // (not used: chunk 0 is assigned)
@@ -1560,17 +1543,7 @@ ATT_EXACT static void attention_vec(int kvt, const float *q, float *out, float *
     for (int i = 0; i < hd; i++)
         out[i] = 0.0f;
     for (int t = 0; t < n; t++) {
-        const float *v = vc;
-        const uint16_t *vh = vb + (size_t)(t / ATT_T) * ts + (size_t)(t % ATT_T) * hd;
-        if (kvt == KV_BF16) {
-            for (int i = 0; i < hd; i++)
-                vc[i] = bf16_f32(vh[(i & ~31) + 2 * (i & 15) + ((i >> 4) & 1)]);
-        } else if (kvt == KV_F16) {
-            for (int i = 0; i < hd; i++)
-                vc[i] = fp16_to_f32(vh[i]);
-        } else {
-            v = vt + (size_t)(t / ATT_T) * ts + (size_t)(t % ATT_T) * hd;
-        }
+        const float *v = vt + (size_t)(t / ATT_T) * ts + (size_t)(t % ATT_T) * hd;
         float e = S[t];
         for (int i = 0; i < hd; i++)
             out[i] = ATT_FMA(e, v[i], out[i]);
@@ -1608,6 +1581,26 @@ ATT_EXACT static void att_combine(float *out, int nb, const float *part, size_t 
         out[i] = out[i] * inv;
 }
 
+static void kv_block_f32(int kvt, float *kf, float *vf, const uint16_t *kh, const uint16_t *vh, int ntl, int hd) {
+    // the first ntl tiles of one (kv head, block) of a 16-bit cache as fp32 tiles (the fp32 layout, exact
+    // conversion; layouts in kernels_avx512.h): the generic attention's input
+    size_t ne = (size_t)ntl * ATT_T * hd;
+    if (kvt == KV_F16) {
+        for (size_t e = 0; e < ne; e++) {
+            kf[e] = fp16_to_f32(kh[e]);
+            vf[e] = fp16_to_f32(vh[e]);
+        }
+        return;
+    }
+    for (size_t t0 = 0; t0 < ne; t0 += (size_t)ATT_T * hd)     // K: dims 2p, 2p + 1 of position j at
+        for (int i = 0; i < hd; i++)                            // 32 p + 2 j (+ 1)
+            for (int j = 0; j < ATT_T; j++)
+                kf[t0 + (size_t)i * ATT_T + j] = bf16_f32(kh[t0 + (size_t)(i & ~1) * ATT_T + 2 * j + (i & 1)]);
+    for (size_t r0 = 0; r0 < ne; r0 += hd)                      // V rows: dims 32 c + l, 32 c + 16 + l at
+        for (int i = 0; i < hd; i++)                            // 32 c + 2 l (+ 1)
+            vf[r0 + i] = bf16_f32(vh[r0 + (i & ~31) + 2 * (i & 15) + ((i >> 4) & 1)]);
+}
+
 static void attention_part(int kvt, int nv, const float *const *q, float *const *out, float *const *part, const int *np,
                            int b0, int b1, const void *kt, const void *vt, size_t bs, int hd, float scale, float *S) {
     // nv query vectors q[r] sharing one kv head (kt / vt: its tile 0; kvt: cache type), vector r over
@@ -1618,19 +1611,39 @@ static void attention_part(int kvt, int nv, const float *const *q, float *const 
 #ifdef RUNQ_ATT512
     if (att512_ok(hd)) { att512_kv(kvt, nv, q, out, part, np, b0, b1, kt, vt, bs, hd, scale, S); return; }
 #endif
+    // generic C: per block of ATT_P positions (a 16-bit cache converted to fp32 once, for all the
+    // vectors), attention_vec per vector
     size_t esz = kvt == KV_F32 ? 4 : 2, ts = (size_t)ATT_T * hd;
-    for (int r = 0; r < nv; r++) {
-        if (!part) {
-            attention_vec(kvt, q[r], out[r], NULL, np[r], kt, vt, ts, hd, scale, S);
-            continue;
-        }
-        for (int b = b0; b < b1 && b * ATT_P < np[r]; b++) {
-            float *o = part[r] + (size_t)b * ATT_PSTRIDE(hd);
+    float *conv = kvt == KV_F32 ? NULL : malloc((size_t)2 * ATT_P * hd * sizeof(float));
+    if (kvt != KV_F32 && !conv) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    for (int b = b0; b < b1; b++) {
+        int nmax = 0; // positions of block b any vector needs
+        for (int r = 0; r < nv; r++) {
             int n = np[r] - b * ATT_P < ATT_P ? np[r] - b * ATT_P : ATT_P;
-            size_t t0 = (size_t)b * bs * esz;
-            attention_vec(kvt, q[r], o, o + hd, n, (const char *)kt + t0, (const char *)vt + t0, ts, hd, scale, S);
+            nmax = n > nmax ? n : nmax;
+        }
+        if (nmax <= 0)
+            break;
+        const char *kb = (const char *)kt + (size_t)b * bs * esz, *vb = (const char *)vt + (size_t)b * bs * esz;
+        const float *kf = (const float *)kb, *vf = (const float *)vb;
+        if (conv) {
+            kv_block_f32(kvt, conv, conv + (size_t)ATT_P * hd, (const uint16_t *)kb, (const uint16_t *)vb,
+                         (nmax + ATT_T - 1) / ATT_T, hd);
+            kf = conv;
+            vf = conv + (size_t)ATT_P * hd;
+        }
+        for (int r = 0; r < nv; r++) {
+            int n = np[r] - b * ATT_P < ATT_P ? np[r] - b * ATT_P : ATT_P;
+            if (n <= 0)
+                continue;
+            if (!part)
+                attention_vec(q[r], out[r], NULL, n, kf, vf, ts, hd, scale, S);
+            else
+                attention_vec(q[r], part[r] + (size_t)b * ATT_PSTRIDE(hd), part[r] + (size_t)b * ATT_PSTRIDE(hd) + hd, n,
+                              kf, vf, ts, hd, scale, S);
         }
     }
+    free(conv);
 }
 
 static void attention_kv(int kvt, int nv, const float *const *q, float *const *out, const int *np, const void *kt,

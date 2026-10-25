@@ -37,7 +37,6 @@
 #define ATT_PT (ATT_P / ATT_T)         // tiles per block
 #define ATT_PSTRIDE(hd) ((hd) + 16)    // floats per block partial result: o[hd], m, l (64-byte aligned)
 #define ATT_DC 32                      // dims per fma chain of a score (head_dim % ATT_DC == 0)
-#define ATT_HD_MAX 256                 // bf16 cache: max head_dim (the generic version's conversion scratch)
 #define ATT_EXP_MIN (-86.0f)           // exp argument clamp (2^n stays a normal float)
 #define ATT_LOG2E 1.44269504088896341f
 #define ATT_LN2_HI 0.693359375f        // Cephes expf: ln 2 = HI + LO, polynomial P0..P5

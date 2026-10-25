@@ -21,6 +21,34 @@ scripts/bench_all.sh                  # all runq speed tables of BENCHMARKS.md (
 scripts/fetch_mynah.sh                # optional reference engine, then scripts/bench_mynah.sh
 ```
 
+## Chat
+
+`-m chat` (the default) without `-i` reads one user message per stdin line and keeps the whole
+conversation in the KV cache; an empty line or EOF ends it. `-i` is a single turn, then exit.
+Piped input works the same way (each line echoed after the `> ` prompt), e.g. with `-t 0` for a
+deterministic transcript:
+
+```sh
+printf 'My name is Ada.\nWhat is my name?\n' | ./runq models/Qwen3-0.6B-q8.bin -c 4096 -t 0
+```
+
+- Each turn prefills only what is new: the `<|im_end|>` that ended the previous answer, `\n`, and
+  the next user turn of Qwen3's chat template (`<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n`,
+  plus `<think>\n\n</think>\n\n` with `-r 0`). The `[timing]` line per turn counts those new tokens.
+- Thinking (`-r 1`): as in Qwen3's template, earlier answers stay in the history without their
+  `<think>...</think>` block: at the next turn the cache is cut back to where the answer started and
+  the visible answer is re-prefilled (usually a few dozen tokens; the reasoning is usually much
+  longer, so this also saves context). With `-r 0` the empty think block of the template stays in
+  the cache before each answer (HF's template drops it from earlier turns; removing it would mean
+  re-prefilling every answer, for a 4-token difference). Otherwise the cache holds exactly what the
+  template renders (checked against HF's `apply_chat_template`).
+- Context full (`-c`): when the conversation plus a reserve for the answer (`-n`, else `-c`/4, at
+  most `-c`/2) does not fit, the oldest turns are dropped until it takes at most half of the rest,
+  keeping the system prompt (`-y`, stays cached) and the most recent turns, and the rest is
+  re-prefilled (~2,000 tok/s). stderr says `[context] full ... dropped N oldest turn(s)`. An answer
+  that reaches the end of the context is cut; a single message that does not fit is skipped.
+- `-n` limits each answer; `-y` sets the system prompt for the whole conversation.
+
 Threads: without `OMP_NUM_THREADS`, runq uses min(12, nproc - nproc/4) threads (12 on the 16-vCPU
 dev box: ~30% faster prefill than 8, decode about the same). Never all CPUs on a shared machine:
 16 threads on 16 vCPUs collapse (see BENCHMARKS.md). Always pass `-c` (context size): without
@@ -51,7 +79,8 @@ Revisions are pinned. Each file is verified by sha256 (LFS files) or git blob sh
   SwiGLU NaN fix (`-Ofast` expf overflow, it did corrupt some last-layer activations);
   a rewritten tokenizer matching HF (added tokens, Qwen2 pre-tokenizer regex, byte-level BPE
   with a hash map and a merge heap; ~1 ms for 2,000 tokens; input assumed NFC);
-  test hooks `-m tokenize` and `-m logits -o <file>` (see `tests/README.md`).
+  multi-turn chat with the conversation in the KV cache (see Chat above);
+  test hooks `-m tokenize`, `-m logits -o <file>` and `RUNQ_CHAT_DUMP` (see `tests/README.md`).
 - `src/kernels_avx512.h`: the AVX-512 VNNI Q8_0 GEMM / GEMV and the weight repacking, and the
   fp32 attention with the KV cache layout (layouts, arithmetic and bit-identity argument in its
   comments).
@@ -81,5 +110,4 @@ prefill; mynah-slm at ~34 (Q8_0 and Q4_K_M). Perplexity vs HF fp32: runq Q8_0 +0
 
 ## Known limitations of qwen3.c
 
-- Chat mode keeps no history: each user turn restarts at position 0.
 - Q8_0 only; there is no GGUF loader.

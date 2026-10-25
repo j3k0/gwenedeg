@@ -12,6 +12,10 @@ Tests (see tests/README.md):
              generic C ones (runq-generic, -DRUNQ_GENERIC): GEMV (-b 1) and GEMM (-b 7, -b 64) paths
   greedy     runq -t 0 output vs our own golden text  (tests/golden/greedy/*.txt), with the
              default batched prefill (and -b 5 once); seeded -t 0.8 chat equal for -b 1 and 5
+  chat       multi-turn chat from piped stdin (-t 0): transcript golden, memory across turns, and the
+             KV cache conversation (RUNQ_CHAT_DUMP) == the chat-template rendering, its logits
+             bit-identical to a fresh -m logits run on it; also -r 1 (reasoning dropped from the
+             history) and context full (-c 160: oldest turns dropped, system prompt kept)
 
 Logits metrics, per position, over U = (fixed 4096-id vocab subset) + (HF top-64 ids):
   cos   cosine similarity of runq vs HF logits on U
@@ -92,6 +96,21 @@ THREADS_PROMPT = "en"
 # long on -b 64: attention over 12 KV tiles, causal row blocks in later chunks (generic: C attention)
 KERNEL_CASES = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH), (BATCH_LONG2, BATCH)]
 THREADS_LONG = 3         # long -b 64: OMP_NUM_THREADS=3 vs the default (other work partitions)
+# multi-turn chat (stdin, one line per turn; all -t 0): (name, args, user lines, checks). Each run
+# dumps its KV cache ids and sampled logits (RUNQ_CHAT_DUMP), compared with a fresh -m logits run on
+# the decoded conversation (bitwise), whose text must be the expected chat-template rendering
+CHAT_CASES = [
+    # memory across turns; transcript golden golden/greedy/chat_multiturn.txt
+    ("multiturn", ["-n", "32"],
+     ["My name is Ada and my favourite colour is green.", "What is my name and favourite colour?",
+      "Spell my name backwards."], {"golden": True, "mentions": (1, ["ada", "green"])}),
+    # -r 1: the reasoning of turn 1 is dropped from the history (re-prefill of its answer)
+    ("thinking", ["-r", "1", "-n", "100"], ["Hi!", "And in French?"], {"stripped": 1}),
+    # context full at -c 160: the oldest turns are dropped, the system prompt kept
+    ("context_full", ["-c", "160", "-n", "30", "-y", "You are a terse assistant."],
+     ["My name is Ada.", "Name three fruits.", "Name three animals.", "Name three colours.",
+      "Name three cities.", "What is my name?"], {"dropped": True}),
+]
 
 
 class Results:
@@ -421,6 +440,133 @@ def test_greedy(a, res):
                ("identical" if not bad else f"-b {bad} differ from -b {SEEDED_CHUNKS[0]}"))
 
 
+# ----------------------------------------------------------------------------- chat (multi-turn)
+
+def load_vocab(model):
+    """token bytes from the .tokenizer file (header: 3 x u32; per token: f32 score, i32 len, bytes)"""
+    with open(model + ".tokenizer", "rb") as f:
+        data = f.read()
+    vocab, off = [], 12
+    while off + 8 <= len(data):
+        n = int.from_bytes(data[off + 4:off + 8], "little", signed=True)
+        vocab.append(data[off + 8:off + 8 + n])
+        off += 8 + n
+    return vocab
+
+
+def chat_expected(system, users, replies, thinking):
+    """the conversation as runq should have it in the KV cache (Qwen3 chat template, ChatML): the
+    last reply as generated, earlier ones with -r 1 as the template renders them (no reasoning),
+    with -r 0 after the empty think block of the generation prompt"""
+    gen = "" if thinking else "<think>\n\n</think>\n\n"
+    s = f"<|im_start|>system\n{system}<|im_end|>\n" if system else ""
+    for i, (u, r) in enumerate(zip(users, replies)):
+        if thinking and i < len(users) - 1 and "</think>" in r:
+            r = r.split("</think>")[-1].lstrip("\n")
+        s += f"<|im_start|>user\n{u}<|im_end|>\n<|im_start|>assistant\n{gen}{r}"
+        if i < len(users) - 1:
+            s += "<|im_end|>\n"
+    return s
+
+
+def split_transcript(out, users):
+    """replies from a piped chat transcript: per turn '\\n> ' + user + '\\n' + reply + '\\n'"""
+    replies, at = [], 0
+    marks = []
+    for u in users:
+        m = out.index(f"\n> {u}\n", at)
+        marks.append((m, m + len(u) + 4))
+        at = m + len(u) + 4
+    for i, (m, e) in enumerate(marks):
+        end = marks[i + 1][0] if i + 1 < len(marks) else out.rindex("\n> ")
+        replies.append(out[e:end - 1] if out[end - 1] == "\n" else out[e:end])
+    return replies
+
+
+def test_chat(a, res, tmp):
+    vocab = load_vocab(a.model)
+    d = os.path.join(GOLDEN, "greedy")
+    for name, args, users, chk in CHAT_CASES:
+        tname = f"chat/{name}"
+        prefix = os.path.join(tmp, f"chat_{name}")
+        cmd = [a.runq, a.model, "-t", "0", "-c", CTX, "-s", "1"] + args
+        env = dict(os.environ, RUNQ_CHAT_DUMP=prefix)
+        p = subprocess.run(cmd, input=("\n".join(users) + "\n").encode(), env=env, capture_output=True)
+        if p.returncode != 0:
+            res.report(False, tname, f"runq failed: {p.stderr.decode(errors='replace')[-500:]}")
+            continue
+        out, err = p.stdout.decode("utf-8", errors="replace"), p.stderr.decode(errors="replace")
+        if chk.get("golden"):
+            path = os.path.join(d, f"chat_{name}.txt")
+            if a.update_greedy:
+                with open(path, "w", encoding="utf-8", newline="") as f:
+                    f.write(out)
+                print(f"UPDATED {tname} -> {os.path.relpath(path, ROOT)}")
+                continue
+            want = open(path, encoding="utf-8", newline="").read() if os.path.exists(path) else None
+            if want is None:
+                res.report(False, f"{tname}_golden", "no golden; run tests/run_tests.sh --update-greedy")
+            elif out != want:
+                i = first_diff(out, want)
+                res.report(False, f"{tname}_golden", f"REGRESSION (greedy): transcript differs at char {i}: "
+                           f"golden {want[i:i + 30]!r} vs runq {out[i:i + 30]!r}\n      --- runq ---\n{out}")
+            else:
+                res.report(True, f"{tname}_golden", f"{len(users)} turns")
+        elif a.update_greedy:
+            continue
+        try:
+            replies = split_transcript(out, users)
+        except ValueError:
+            res.report(False, tname, f"cannot split the transcript into {len(users)} turns:\n{out}")
+            continue
+        if "mentions" in chk:
+            t, words = chk["mentions"]
+            miss = [w for w in words if w not in replies[t].lower()]
+            res.report(not miss, f"{tname}_memory", f"turn {t + 1} reply {replies[t]!r}" +
+                       (f"  <- missing {miss}" if miss else ""))
+        # the KV cache: expected rendering, and logits == a fresh run on the whole conversation
+        ids = [int(x) for x in open(prefix + ".ids").read().split()]
+        text = b"".join(vocab[i] for i in ids).decode("utf-8", errors="replace")
+        system = args[args.index("-y") + 1] if "-y" in args else None
+        n_kept = text.count("<|im_start|>user\n")
+        why = []
+        if chk.get("dropped"):
+            if "[context] full" not in err or n_kept >= len(users):
+                why.append("no turns dropped (context full not reached?)")
+            c = int(args[args.index("-c") + 1])
+            if len(ids) > c:
+                why.append(f"{len(ids)} tokens in a {c}-token context")
+        if "stripped" in chk and "</think>" not in replies[chk["stripped"] - 1]:
+            why.append(f"turn {chk['stripped']} has no complete reasoning block (raise -n?)")
+        expect = chat_expected(system, users[-n_kept:], replies[-n_kept:], "-r" in args and args[args.index("-r") + 1] == "1")
+        if text != expect:
+            i = first_diff(text, expect)
+            why.append(f"KV cache conversation differs from the template rendering at char {i}: "
+                       f"{text[max(0, i - 20):i + 30]!r} vs expected {expect[max(0, i - 20):i + 30]!r}")
+        raw = np.fromfile(prefix + ".logits", dtype=np.int32, count=2)
+        n_rec, nv = int(raw[0]), int(raw[1])
+        pos = np.fromfile(prefix + ".logits", dtype=np.int32, count=2 + n_rec)[2:]
+        rec = np.fromfile(prefix + ".logits", dtype=np.float32, offset=4 * (2 + n_rec)).reshape(n_rec, nv)
+        lpath = os.path.join(tmp, f"chat_{name}_full.bin")
+        p = run([a.runq, a.model, "-c", CTX, "-m", "logits", "-i", text, "-o", lpath])
+        if p.returncode != 0:
+            res.report(False, tname, f"runq -m logits failed: {p.stderr.decode(errors='replace')[-300:]}")
+            continue
+        fids, full = read_logits(lpath)
+        detail = f"{len(users)} turns, {n_kept} in the cache, {len(ids)} tokens, {n_rec} sampled positions"
+        if fids.tolist() != ids:
+            i = first_diff(fids.tolist(), ids)
+            why.append(f"token ids of the re-encoded conversation differ at {i}: {fids[i:i + 5].tolist()} vs {ids[i:i + 5]}")
+        else:
+            same = np.array_equal(full[pos].view(np.uint32), rec.view(np.uint32))
+            if not same:
+                dd = np.abs(full[pos].astype(np.float64) - rec).max(axis=1)
+                why.append(f"logits differ from the single-shot run: max |diff| {dd.max():.3g} at pos {int(pos[dd.argmax()])}")
+            else:
+                detail += ": logits bit-identical to -m logits on the whole conversation"
+        res.report(not why, tname, detail + ("  <- " + "; ".join(why) if why else ""))
+
+
 # ----------------------------------------------------------------------------- main
 
 def main():
@@ -428,7 +574,7 @@ def main():
     ap.add_argument("--runq", default=os.path.join(ROOT, "runq"))
     ap.add_argument("--model", default=os.path.join(ROOT, "models", "Qwen3-0.6B-q8.bin"))
     ap.add_argument("--generic", default="", help="generic-kernel build for the kernels test (empty: skip)")
-    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy",
+    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat",
                     help="comma-separated subset of tests to run")
     ap.add_argument("--update-greedy", action="store_true", help="regenerate the greedy goldens")
     ap.add_argument("--jobs", type=int, default=8, help="parallel runq processes for the tokenizer test")
@@ -440,7 +586,7 @@ def main():
     res = Results()
     only = set(a.only.split(","))
     if a.update_greedy:
-        only = {"greedy"}
+        only = {"greedy", "chat"}
     with tempfile.TemporaryDirectory(prefix="cwayn-test-") as tmp:
         for name, fn in [("tokenizer", lambda: test_tokenizer(a, res)),
                          ("logits", lambda: (test_logits(a, res, tmp),
@@ -448,7 +594,8 @@ def main():
                          ("batched", lambda: test_batched(a, res, tmp)),
                          ("threads", lambda: test_threads(a, res, tmp)),
                          ("kernels", lambda: test_kernels(a, res, tmp)),
-                         ("greedy", lambda: test_greedy(a, res))]:
+                         ("greedy", lambda: test_greedy(a, res)),
+                         ("chat", lambda: test_chat(a, res, tmp))]:
             if name in only:
                 t = time.time()
                 print(f"== {name}")

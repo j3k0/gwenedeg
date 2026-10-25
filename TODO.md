@@ -190,6 +190,32 @@ Before (Step 3a, 8 threads, -b 128): 451 tokens: GEMMs 43%, attention 42%, rest 
   classifier 1.3; 1,500 tokens 0.98 s: GEMMs 50%, attention 40%, rest 10%; 3,000 tokens 2.74 s:
   attention 57%, GEMMs 36%
 
+## Step 4: usability
+- [x] Chat history across turns (was: every user turn restarted at position 0). The conversation
+  stays in the KV cache, kept as token pieces (system block, per turn the user prompt P_i, the
+  reply as generated, `<|im_end|>\n`) in Qwen3's chat template; each turn prefills only the part of
+  the canonical sequence not in the cache yet (longest common prefix): normally the `<|im_end|>`
+  sampled at the end of the previous answer (so it is in the cache before the next turn), `\n` and
+  the new user turn, e.g. 22 tokens in 0.016 s. Pieces are separated by added tokens, so encoding
+  them separately = encoding the whole rendering (checked). `-r 1`: earlier answers lose their
+  `<think>` block, as in HF's template: the cache is cut back to the answer start and the visible
+  answer re-prefilled (2+3 example: 16 tokens instead of 117 kept). `-r 0`: the empty think block
+  stays before each earlier answer (the only difference from HF's rendering; checked with
+  `apply_chat_template`). Context full: drop the oldest turns until the conversation is at most
+  half of (`-c` - reserve), reserve = `-n` or `-c`/4 (<= `-c`/2); system prompt kept (cached
+  prefix), the rest re-prefilled; a reply reaching `-c` is cut; a single message too long for `-c`
+  is skipped. stdin: one turn per line (any length), EOF or an empty line ends (EOF used to repeat
+  the last line forever), piped lines are echoed. `-i` unchanged (one turn; greedy goldens and
+  seeded `-t 0.8` single-turn output byte-identical to before)
+- [x] Tests (`chat/*`, ~6 s): 3-turn transcript golden; turn 2 remembers "Ada" / "green";
+  `RUNQ_CHAT_DUMP` hook (cache ids + every sampled logits vector): the cache text equals the
+  template rendering built in Python, re-encodes to the same ids, and the logits are bit-identical
+  to a fresh `-m logits` run on the whole conversation, for 3 turns, `-r 1` (stripped reasoning)
+  and context full (`-c 160`, 6 turns, 3 dropped). Breakage caught: follow-up prefill at pos0 + 1,
+  `\n` after `<|im_end|>` missing. `-b 1` / `7` / `512`: same transcripts. ASan+UBSan: multi-turn
+  with `-c 256` (cut replies, dropped turns, a skipped message), `-r 1`, `-b 1/7/512`: clean (one
+  `memcpy(NULL, ..., 0)` in the new code fixed)
+
 ## Known bugs
 Found by the tests.
 - [ ] Tokenizer: no NFC normalizer (HF's tokenizer.json normalizer is NFC); the input is assumed
@@ -209,8 +235,13 @@ Found by the tests.
   writes q = 0. (Written as an early `continue`: rewriting the `x / scale` loop itself changes
   its -Ofast code generation and the rounding of some values.)
 
+## Plan for the remaining items (in order)
+- Step 4 (usability): chat history across turns, faster sampling, startup (embedding rows from the Q8_0 table)
+- Step 5: NFC normalizer in the tokenizer
+- Step 6: GGUF loading (Q8_0 first, then Q4_K_M)
+- Step 7: performance leftovers (decode barriers / attention split, bf16 KV cache, 16-thread barriers, prefill rest)
+
 ## Later / ideas
-- [ ] Chat history: stop resetting to position 0 every turn (keep the KV cache across turns)
 - [ ] 16-thread collapse: needs barriers that tolerate a preempted thread (e.g. own spin-then-yield
   barriers, or work stealing with no global barrier per phase); OpenMP knobs did not help
 - [ ] Attention: bf16 K/V cache with `vdpbf16ps` (half the bytes, 2x the FMA rate; changes the

@@ -8,10 +8,10 @@ if present, else the system `python3`). Torch is only needed to regenerate the H
 ```sh
 tests/run_tests.sh                    # all tests, OMP_NUM_THREADS=8 unless set
 tests/run_tests.sh -v                 # + per-position logits metrics and a summary table
-tests/run_tests.sh --only logits      # subset: tokenizer,logits,batched,threads,kernels,greedy
+tests/run_tests.sh --only logits      # subset: tokenizer,logits,batched,threads,kernels,greedy,chat
 RUNQ=/path/to/other-binary tests/run_tests.sh   # test another build (no make; kernels test skipped)
 RUNQ=./runq RUNQ_GENERIC=./runq-generic tests/run_tests.sh   # ... with the kernels test
-tests/run_tests.sh --update-greedy    # regenerate the greedy goldens
+tests/run_tests.sh --update-greedy    # regenerate the greedy goldens (incl. the chat transcript)
 .venv/bin/python tests/make_golden.py # regenerate the HF goldens (tokenizer + logits, ~15 s)
 .venv/bin/python tests/make_golden.py --tokenizer-only   # only golden/tokenizer.json (~2 s)
 .venv/bin/python tests/fuzz_tokenizer.py                 # on-demand tokenizer fuzz vs HF (~6 s)
@@ -30,7 +30,11 @@ XPASS = an XFAIL case now passes (remove its mark in `make_golden.py`).
   time through `forward()` (`forward_sequential`); `-b N > 1` (default 512) uses the batched
   prefill, `forward_batch()` in chunks of N tokens with the logits of every row
   (`forward_chunked`). The tests always pass `-b` explicitly.
-
+- `RUNQ_CHAT_DUMP=PREFIX` (chat mode): at exit, writes `PREFIX.ids` (the token ids in the KV
+  cache, i.e. the conversation as the model saw it, space-separated) and `PREFIX.logits`
+  (`int32 n, int32 vocab, int32 pos[n], float32 logits[n][vocab]`: every logits vector chat
+  sampled from, `pos` = position of the token that produced it; records of positions that a
+  re-prefill overwrote are dropped, so they always match the final cache).
 ## What is checked
 
 | test | what | golden |
@@ -46,6 +50,9 @@ XPASS = an XFAIL case now passes (remove its mark in `make_golden.py`).
 | `kernels/en_b1`, `en_b7`, `all_b64`, `long_b64` | logits file byte-identical for `./runq` (AVX-512: VNNI GEMM/GEMV and the AVX-512 attention) and `./runq-generic` (`-DRUNQ_GENERIC`, generic C kernels and C attention, same flags otherwise): GEMV incl. classifier and decode attention (`-b 1`), GEMM with 6 + 1 row tiles and a 1-row chunk (`-b 7`), 2 chunks with 6 + 4 row tiles and the all-rows classifier GEMM (`all`, `-b 64`), 3 chunks with attention over 12 tiles (`long`) | `./runq-generic` |
 | `greedy/*` | exact stdout of `-t 0 -c 4096` runs: chat, chat with thinking (`-r 1`), chat with system prompt (`-y`), generate; 40-48 tokens. These use the default batched prefill; `generate@b5` = generate in 3 chunks (same golden) | `golden/greedy/*.txt` (our engine) |
 | `greedy/seeded_chunks` | seeded sampling (`-t 0.8 -s 42`, chat): same output with `-b 1` and `-b 5` (chat advances the RNG once per prompt token, as before batched prefill) | |
+| `chat/multiturn_golden` | exact stdout of a 3-turn chat piped on stdin (`-t 0 -n 32`) | `golden/greedy/chat_multiturn.txt` |
+| `chat/multiturn_memory` | the turn-2 reply to "What is my name and favourite colour?" mentions `Ada` and `green` (told in turn 1) | |
+| `chat/multiturn`, `chat/thinking`, `chat/context_full` | multi-turn runs with `RUNQ_CHAT_DUMP`: (1) the decoded KV cache equals the expected chat-template rendering, built in Python from the user lines and the replies on stdout (ChatML, `<|im_end|>\n` after every message, the empty think block before each answer with `-r 0`; with `-r 1` earlier answers without their reasoning, as HF's template renders them); (2) re-encoding that text gives the same ids (piecewise encoding == whole-string encoding); (3) every sampled logits vector is **bit-identical** to the same row of a fresh `-m logits` run on the whole conversation (incremental prefill at `pos0 > 0` and decode vs one batched prefill from 0). `thinking`: `-r 1`, 2 turns, turn 1's reasoning dropped (re-prefill of its answer). `context_full`: `-c 160 -n 30 -y ...`, 6 turns: the oldest turns are dropped (stderr `[context] full`), the system prompt kept | |
 
 Logits metrics, per position, over the union of a fixed 4096-id vocab subset and HF's top-64 ids:
 cosine similarity, top-1 agreement (runq argmax vs HF top-1), top-5 overlap. Position 0 has its
@@ -118,6 +125,13 @@ them. The `batched/*` tests cannot see a kernel rounding change (both paths use 
 Also checked once (scratch builds, not in `make test`): tile variants (`-DQ8P_RB=1`, the odd
 block-count tail that Qwen3-0.6B never hits; `-DQ8P_C=1/3/8`, `-DQ8P_NB=5`) byte-identical, and an
 ASan+UBSan build (`-O1 -g -fsanitize=address,undefined`, -b 1/7/13/64): no reports.
+
+Multi-turn chat (`chat/*`): the conversation in the KV cache was also checked once against HF's
+`apply_chat_template` (transformers 4.53.0): identical text with `-r 1`; with `-r 0` the only
+difference is the empty `<think>\n\n</think>\n\n` that runq keeps before each earlier answer (see
+`../README.md`). Deliberate breakage (scratch builds), caught: a follow-up prefill one position too
+far (`pos0 + 1`): max |diff| 6-25 on all three cases, and the turn-2 reply forgets the name; the
+`\n` after `<|im_end|>` dropped from the history: the template-rendering check on all three.
 
 Builds without AVX-512 (e.g. `-march=x86-64-v3`) use the generic kernels and pass the logits,
 batched and thread tests, but not the greedy goldens: the rest of the float code (rmsnorm,

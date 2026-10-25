@@ -1,0 +1,12 @@
+hidden_size=1024, intermediate_size=3072, num_hidden_layers=28, num_attention_heads=16, num_kv_heads=8, head_dim=128, ctx_length=4096, vocab_size=151936, shared_classifier=1, quantization_block_size=64
+
+> My name is Ada and my favourite colour is green.
+Hello Ada! Your favorite color is green, and that's a great choice. I'm glad to hear that! 🌈 Let me know if there's
+
+> What is my name and favourite colour?
+Hello! Your name is Ada, and your favorite color is green. 😊
+
+> Spell my name backwards.
+Your name backwards is **DadaA**.
+
+> 

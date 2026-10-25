@@ -1807,119 +1807,314 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     free(prompt_tokens);
 }
 
-void read_stdin(const char *guide, char *buffer, size_t bufsize) {
-    // read a line from stdin, up to but not including \n
-    printf("%s", guide);
-    if (fgets(buffer, bufsize, stdin) != NULL) {
-        size_t len = strlen(buffer);
-        if (len > 0 && buffer[len - 1] == '\n')
-            buffer[len - 1] = 0; // strip newline
-    }
+// ----------------------------------------------------------------------------
+// chat loop (cwayn: multi-turn, the conversation stays in the KV cache)
+//
+// The conversation is kept as token pieces, rendered with Qwen3's chat template (ChatML,
+// models/Qwen3-0.6B/tokenizer_config.json; the exporter's .template* files hold its renderings):
+//   [system]  "<|im_start|>system\n" SYS "<|im_end|>\n"                       (-y; = the start of
+//             .template.with-system, i.e. that file minus .template)
+//   turn i    P_i = "<|im_start|>user\n" U_i "<|im_end|>\n<|im_start|>assistant\n" [+ G]
+//             (= .template / .template.with-thinking; G = "<think>\n\n</think>\n\n" with -r 0)
+//             then the reply R_i as generated (token ids, without the final <|im_end|>)
+//             then E = "<|im_end|>\n" (template: '<|im_end|>' + '\n' after every message)
+// A new turn k is the canonical sequence  [system] + sum over kept turns i < k (P_i + H_i + E) + P_k,
+// where H_i is the history form of R_i: -r 0: R_i as generated (and the empty think block G stays in
+// P_i); -r 1: R_i after its last </think>, leading newlines stripped, as the template does for
+// earlier assistant turns (it drops their reasoning). Of that sequence, the longest prefix that is
+// already in the cache is kept and the rest is prefilled from there: normally just
+// E + P_k (the sampled <|im_end|> that ended the reply is the first token of the next prefill, so
+// it is in the cache before the next turn), with -r 1 from the start of the previous answer
+// (its reasoning is dropped and the answer re-prefilled). Text pieces are encoded separately; they
+// are separated by added tokens (<|im_start|>, <|im_end|>), so this is the same as encoding the
+// whole rendered string.
+// Context full: if the canonical sequence plus a reserve for the reply (-n, else seq_len / 4, at most
+// seq_len / 2) does not fit in -c, the oldest turns are dropped until it is at most half of the
+// rest (seq_len - reserve) / 2, keeping the system prompt (cached prefix) and the newest turns, and
+// the rest is re-prefilled. A reply reaching the end of the context is cut there.
+// RNG: one draw per prefilled token but the last, then one per sampled token (seeded output does
+// not depend on -b; for a single turn the same draws as before batched prefill).
+
+typedef struct { int *v; int n, cap; } IntVec;
+
+static void iv_reserve(IntVec *a, size_t n) {
+    if (n <= (size_t)a->cap) return;
+    size_t cap = a->cap ? (size_t)a->cap : 256;
+    while (cap < n) cap *= 2;
+    a->v = realloc(a->v, cap * sizeof(int));
+    if (!a->v || cap > 0x7fffffff) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    a->cap = (int)cap;
 }
 
-// ----------------------------------------------------------------------------
-// chat loop
+static void iv_append(IntVec *a, const int *x, int n) {
+    if (n <= 0) return; // (x may be NULL then)
+    iv_reserve(a, (size_t)a->n + n);
+    memcpy(a->v + a->n, x, n * sizeof(int));
+    a->n += n;
+}
 
-void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *cli_user_prompt, char *system_prompt) {
-    // buffers for reading the system prompt and user prompt from stdin
-    char user_prompt[PROMPT_BUFFER_SIZE];
-    char rendered_prompt[PROMPT_BUFFER_SIZE];
-    int num_prompt_tokens = 0;
-    int *prompt_tokens = (int *)malloc(PROMPT_BUFFER_SIZE * sizeof(int));
+static void iv_push(IntVec *a, int x) { iv_append(a, &x, 1); }
 
-    // start the main loop
-    int user_turn = 1; // user starts
-    int next = 0;    // will store the next token in the sequence
-    int token;       // stores the current token to feed into the transformer
-    int pos = 0;     // position in the sequence
-    int n_gen = 0;
-    double t0 = 0, t_prefill = 0;
+static void encode_append(Tokenizer *t, IntVec *v, const char *text) {
+    // append the tokens of text (raw, no template); encode needs at most one token per byte
+    iv_reserve(v, (size_t)v->n + strlen(text) + 3);
+    int n = 0;
+    encode(t, (char *)text, v->v + v->n, &n);
+    v->n += n;
+}
 
-    while (1) {
-        // if context window is exceeded, clear it
-        if (pos >= transformer->config.seq_len) {
-            printf("\n(context window full, clearing)\n");
-            user_turn = 1;
-            pos = 0;
-        }
+static char *render1(const char *tmpl, const char *arg) {
+    // tmpl with its one %s replaced by arg (malloc'd)
+    int n = snprintf(NULL, 0, tmpl, arg);
+    char *s = malloc((size_t)n + 1);
+    if (!s) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    snprintf(s, (size_t)n + 1, tmpl, arg);
+    return s;
+}
 
-        // when it is the user's turn to contribute tokens to the dialog...
-        if (user_turn) {
-            // get the user prompt
-            if (cli_user_prompt != NULL) {
-                // user prompt for position 0 was passed in, use it
-                if (pos > 0)
-                    break;
-                strcpy(user_prompt, cli_user_prompt);
-            } else {
-                // otherwise get user prompt from stdin
-                read_stdin("\n> ", user_prompt, sizeof(user_prompt));
-                // terminate if user enters a blank prompt
-                if (!user_prompt[0])
-                    break;
-            }
-
-            // render user/system prompts into the Qwen3 prompt template schema
-            if (pos == 0 && system_prompt)
-                sprintf(rendered_prompt, tokenizer->system_prompt_template, system_prompt, user_prompt);
-            else
-                sprintf(rendered_prompt, tokenizer->prompt_template, user_prompt);
-
-            // encode the rendered prompt into tokens
-            encode(tokenizer, rendered_prompt, prompt_tokens, &num_prompt_tokens);
-            pos = 0; // reset the user index
-            user_turn = 0;
-            n_gen = 0;
-            t0 = t_prefill = now_s();
-        }
-
-        float *logits;
-        if (pos == 0 && transformer->state.nb_max > 1 && num_prompt_tokens <= transformer->config.seq_len) {
-            // batched prefill of the whole prompt: same as the token-by-token branch below,
-            // ending at the last prompt token (incl. the RNG draws of the skipped tokens)
-            logits = prefill(transformer, prompt_tokens, num_prompt_tokens, 0);
-            token = prompt_tokens[num_prompt_tokens - 1];
-            pos = num_prompt_tokens;
-            if (sampler->temperature != 0)
-                for (int i = 0; i < num_prompt_tokens - 1; i++)
-                    random_f32(&sampler->rng_state);
-        } else {
-            // determine the token to pass into the transformer next
-            if (pos < num_prompt_tokens) {
-                // if we are still processing the input prompt, force the next prompt token
-                token = prompt_tokens[pos];
-            } else {
-                // otherwise use the next token sampled from previous turn
-                token = next;
-            }
-
-            // forward the transformer to get logits for the next token; `next` is only used
-            // from the last prompt token on, so earlier prompt tokens skip the classifier
-            logits = forward(transformer, token, pos, pos >= num_prompt_tokens - 1);
-            pos++;
-        }
-        if (logits)
-            next = sample(sampler, logits);
-        else if (sampler->temperature != 0)
-            random_f32(&sampler->rng_state); // sample() used to run here too: keep the seeded RNG sequence
-        if (pos == num_prompt_tokens) t_prefill = now_s();
-        else if (pos > num_prompt_tokens) n_gen++;
-
-        // assistant is responding
-        if (pos >= num_prompt_tokens) {
-            int limit_hit = max_new_tokens > 0 && n_gen >= max_new_tokens;
-            if (limit_hit || token == tokenizer->bos_token_id || token == tokenizer->eos_token_id) {
-                // EOS token (or -n limit) ends the assistant turn
-                printf("\n");
-                report_timing(num_prompt_tokens, t0, t_prefill, n_gen, now_s());
-                user_turn = 1;
-            } else if (next != tokenizer->bos_token_id && next != tokenizer->eos_token_id) {
-                printf("%s", decode(tokenizer, next));
-                fflush(stdout);
-            }
-        }
+static char *read_line(FILE *f) {
+    // one line of any length without its "\n" (or "\r\n"), malloc'd; NULL at EOF with nothing read
+    size_t cap = 256, n = 0;
+    char *s = malloc(cap);
+    if (!s) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    int c;
+    while ((c = fgetc(f)) != EOF && c != '\n') {
+        if (n + 1 >= cap && !(s = realloc(s, cap *= 2))) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+        s[n++] = (char)c;
     }
-    free(prompt_tokens);
+    if (c == EOF && n == 0) { free(s); return NULL; }
+    if (n > 0 && s[n - 1] == '\r') n--;
+    s[n] = 0;
+    return s;
+}
+
+static float *feed_tokens(Transformer *tr, const int *tokens, int n, int pos0) {
+    // tokens[0..n-1] at positions pos0.. (n >= 1, pos0 + n <= seq_len): batched prefill, or one
+    // token at a time with -b 0/1; returns the logits of the last one
+    if (tr->state.nb_max > 1)
+        return prefill(tr, (int *)tokens, n, pos0);
+    float *logits = NULL;
+    for (int i = 0; i < n; i++)
+        logits = forward(tr, tokens[i], pos0 + i, i == n - 1);
+    return logits;
+}
+
+static void history_reply(Tokenizer *t, const IntVec *r, int think_end, IntVec *h) {
+    // -r 1: the reply as the template renders an earlier assistant turn: the text after the last
+    // </think> (if any), leading "\n" stripped (content.split('</think>')[-1].lstrip('\n'))
+    h->n = 0;
+    int i = 0;
+    for (int j = r->n - 1; j >= 0 && think_end >= 0; j--)
+        if (r->v[j] == think_end) { i = j + 1; break; }
+    if (i == 0) { iv_append(h, r->v, r->n); return; } // no reasoning block: as generated
+    for (; i < r->n; i++) {
+        const char *s = t->vocab[r->v[i]];
+        int m = (int)strspn(s, "\n");
+        if (m == t->vocab_len[r->v[i]]) continue; // only newlines
+        if (m > 0) encode_append(t, h, s + m), i++; // newlines + text in one token: re-encode the text
+        break;
+    }
+    iv_append(h, r->v + i, r->n - i);
+}
+
+// test hook: RUNQ_CHAT_DUMP=<prefix> writes <prefix>.ids (the token ids in the KV cache at the end,
+// space-separated) and <prefix>.logits (int32 n, int32 vocab, int32 pos[n], float32 logits[n][vocab]:
+// every logits vector chat sampled from, pos = the position of the token that produced it; those of
+// positions overwritten later, by a re-prefill, are dropped). tests/check.py compares them with
+// -m logits on the decoded conversation
+static struct { const char *prefix; int n, cap, vocab; int *pos; float *logits; } cdump;
+
+static void cdump_record(int pos, const float *logits) {
+    if (!cdump.prefix) return;
+    if (cdump.n == cdump.cap) {
+        cdump.cap = cdump.cap ? 2 * cdump.cap : 64;
+        cdump.pos = realloc(cdump.pos, cdump.cap * sizeof(int));
+        cdump.logits = realloc(cdump.logits, (size_t)cdump.cap * cdump.vocab * sizeof(float));
+        if (!cdump.pos || !cdump.logits) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    }
+    cdump.pos[cdump.n] = pos;
+    memcpy(cdump.logits + (size_t)cdump.n * cdump.vocab, logits, cdump.vocab * sizeof(float));
+    cdump.n++;
+}
+
+static void cdump_truncate(int pos) {
+    // positions >= pos are about to be overwritten
+    while (cdump.n > 0 && cdump.pos[cdump.n - 1] >= pos)
+        cdump.n--;
+}
+
+static void cdump_write(const IntVec *kv) {
+    if (!cdump.prefix) return;
+    size_t len = strlen(cdump.prefix) + 8;
+    char *path = malloc(len);
+    snprintf(path, len, "%s.ids", cdump.prefix);
+    FILE *f = fopen(path, "w");
+    if (!f) { fprintf(stderr, "Couldn't open %s for writing\n", path); exit(EXIT_FAILURE); }
+    for (int i = 0; i < kv->n; i++)
+        fprintf(f, i ? " %d" : "%d", kv->v[i]);
+    fprintf(f, "\n");
+    fclose(f);
+    snprintf(path, len, "%s.logits", cdump.prefix);
+    f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "Couldn't open %s for writing\n", path); exit(EXIT_FAILURE); }
+    int32_t header[2] = { cdump.n, cdump.vocab };
+    int ok = fwrite(header, sizeof(int32_t), 2, f) == 2 && fwrite(cdump.pos, sizeof(int32_t), cdump.n, f) == (size_t)cdump.n
+          && fwrite(cdump.logits, sizeof(float), (size_t)cdump.n * cdump.vocab, f) == (size_t)cdump.n * cdump.vocab;
+    if (fclose(f) != 0 || !ok) { fprintf(stderr, "Error writing %s\n", path); exit(EXIT_FAILURE); }
+    free(path);
+}
+
+typedef struct {
+    IntVec prompt; // P_i: user message + assistant header (+ empty think block with -r 0)
+    IntVec reply;  // R_i: the generated tokens, without the <|im_end|> that ended them
+    IntVec hist;   // H_i: the reply as part of the history
+} ChatTurn;
+
+static void render_conversation(IntVec *out, const IntVec *sys, const ChatTurn *turns, int j0, int k, const IntVec *close) {
+    // [system] + turns j0..k-1 (prompt, history reply, <|im_end|>\n) + the prompt of turn k
+    out->n = 0;
+    iv_append(out, sys->v, sys->n);
+    for (int i = j0; i < k; i++) {
+        iv_append(out, turns[i].prompt.v, turns[i].prompt.n);
+        iv_append(out, turns[i].hist.v, turns[i].hist.n);
+        iv_append(out, close->v, close->n);
+    }
+    iv_append(out, turns[k].prompt.v, turns[k].prompt.n);
+}
+
+void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *cli_user_prompt, char *system_prompt,
+          int enable_thinking) {
+    int seq_len = transformer->config.seq_len;
+    IntVec sys = { 0 }, close = { 0 }, kv = { 0 }, want = { 0 };
+    ChatTurn *turns = NULL;
+    int n_turns = 0, j0 = 0; // turns[j0..] are in the conversation, older ones were dropped (context full)
+
+    // the system block template: .template.with-system = system block + .template
+    char sys_tmpl[1024] = "<|im_start|>system\n%s<|im_end|>\n";
+    size_t ls = strlen(tokenizer->system_prompt_template), lp = strlen(tokenizer->prompt_template);
+    if (ls > lp && !strcmp(tokenizer->system_prompt_template + ls - lp, tokenizer->prompt_template)) {
+        memcpy(sys_tmpl, tokenizer->system_prompt_template, ls - lp);
+        sys_tmpl[ls - lp] = 0;
+    }
+    if (system_prompt) {
+        char *s = render1(sys_tmpl, system_prompt);
+        encode_append(tokenizer, &sys, s);
+        free(s);
+    }
+    encode_append(tokenizer, &close, "<|im_end|>\n");
+    IntVec te = { 0 };
+    encode_append(tokenizer, &te, "</think>");
+    int think_end = te.n == 1 ? te.v[0] : -1;
+    free(te.v);
+    int reserve = max_new_tokens > 0 ? max_new_tokens : seq_len / 4;
+    if (reserve > seq_len / 2) reserve = seq_len / 2;
+    if (reserve < 1) reserve = 1;
+    cdump.prefix = getenv("RUNQ_CHAT_DUMP");
+    cdump.vocab = transformer->config.vocab_size;
+#ifndef _WIN32
+    int echo = !isatty(fileno(stdin)); // piped stdin: echo each user line, for a readable transcript
+#else
+    int echo = 0;
+#endif
+
+    for (int asked = 0;; asked++) {
+        // the user message: -i (one turn only), else one line of stdin per turn (empty line or EOF ends)
+        char *user;
+        if (cli_user_prompt) {
+            if (asked) break;
+            user = render1("%s", cli_user_prompt);
+        } else {
+            printf("\n> ");
+            fflush(stdout);
+            user = read_line(stdin);
+            if (!user || !user[0]) { free(user); break; }
+            if (echo) printf("%s\n", user);
+            fflush(stdout);
+        }
+        turns = realloc(turns, (size_t)(n_turns + 1) * sizeof(ChatTurn));
+        if (!turns) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+        int k = n_turns;
+        ChatTurn *tn = &turns[k];
+        memset(tn, 0, sizeof(*tn));
+        char *r = render1(tokenizer->prompt_template, user);
+        encode_append(tokenizer, &tn->prompt, r);
+        free(r);
+        free(user);
+
+        // the canonical conversation; context full: drop the oldest turns (see above)
+        int j = j0;
+        render_conversation(&want, &sys, turns, j, k, &close);
+        if (want.n + reserve > seq_len)
+            while (j < k && want.n > (seq_len - reserve) / 2)
+                render_conversation(&want, &sys, turns, ++j, k, &close);
+        if (want.n > seq_len) {
+            fprintf(stderr, "(message too long: %d tokens with the template%s, context %d (-c); skipped)\n", want.n,
+                    sys.n ? " and the system prompt" : "", seq_len);
+            free(tn->prompt.v);
+            continue;
+        }
+        n_turns++;
+        if (j > j0)
+            fprintf(stderr, "[context] full (-c %d): dropped the %d oldest turn(s), kept %s%d earlier turn(s)\n", seq_len,
+                    j - j0, sys.n ? "the system prompt and " : "", k - j);
+        j0 = j;
+
+        // prefill what is not in the cache yet (the cache holds kv.v[0 .. kv.n), positions 0 .. kv.n-1)
+        int L = 0;
+        while (L < kv.n && L < want.n && kv.v[L] == want.v[L]) L++;
+        cdump_truncate(L);
+        kv.n = L;
+        int n_new = want.n - L;
+        double t0 = now_s();
+        float *logits = feed_tokens(transformer, want.v + L, n_new, L);
+        iv_append(&kv, want.v + L, n_new);
+        if (sampler->temperature != 0)
+            for (int i = 0; i < n_new - 1; i++)
+                random_f32(&sampler->rng_state);
+        double t_prefill = now_s();
+
+        // the reply: sample, print, feed back; ends at <|im_end|> (sampled, not fed yet: the next
+        // turn's prefill starts with it), at -n tokens, or at the end of the context
+        int n_gen = 0;
+        while (1) {
+            cdump_record(kv.n - 1, logits);
+            int next = sample(sampler, logits);
+            if (next == (int)tokenizer->eos_token_id || next == (int)tokenizer->bos_token_id)
+                break;
+            printf("%s", decode(tokenizer, next));
+            fflush(stdout);
+            iv_push(&tn->reply, next);
+            if (kv.n >= seq_len) {
+                fprintf(stderr, "\n(context window full (-c %d): reply cut)", seq_len);
+                break;
+            }
+            int last = max_new_tokens > 0 && n_gen + 1 >= max_new_tokens;
+            logits = forward(transformer, next, kv.n, !last);
+            iv_push(&kv, next);
+            n_gen++;
+            if (last)
+                break;
+        }
+        printf("\n");
+        report_timing(n_new, t0, t_prefill, n_gen, now_s());
+        if (enable_thinking)
+            history_reply(tokenizer, &tn->reply, think_end, &tn->hist);
+        else
+            iv_append(&tn->hist, tn->reply.v, tn->reply.n);
+    }
+    cdump_write(&kv);
+    for (int i = 0; i < n_turns; i++) {
+        free(turns[i].prompt.v);
+        free(turns[i].reply.v);
+        free(turns[i].hist.v);
+    }
+    free(turns);
+    free(sys.v);
+    free(close.v);
+    free(kv.v);
+    free(want.v);
+    free(cdump.pos);
+    free(cdump.logits);
 }
 
 // ----------------------------------------------------------------------------
@@ -1999,11 +2194,13 @@ void error_usage() {
     fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1], default 0.9\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
-    fprintf(stderr, "  -c <int>    context window size, 0 (default) = max_seq_len\n");
+    fprintf(stderr, "  -c <int>    context window size, 0 (default) = max_seq_len; chat: holds the whole conversation,\n");
+    fprintf(stderr, "              when full the oldest turns are dropped (the system prompt is kept)\n");
     fprintf(stderr, "  -m <string> mode: generate|chat|tokenize|logits, default: chat\n");
     fprintf(stderr, "              tokenize: print the token ids of -i (raw text, no template)\n");
     fprintf(stderr, "              logits: write the logits at every position of -i to -o (binary)\n");
-    fprintf(stderr, "  -i <string> input prompt\n");
+    fprintf(stderr, "  -i <string> input prompt (chat: one turn, then exit; without -i, one turn per stdin line,\n");
+    fprintf(stderr, "              the conversation is kept until an empty line or EOF)\n");
     fprintf(stderr, "  -o <string> output file for -m logits\n");
     fprintf(stderr, "  -y <string> system prompt in chat mode, default is none\n");
     fprintf(stderr, "  -r <int>    reasoning mode, 0 (default) = no thinking, 1 = thinking\n");
@@ -2106,7 +2303,7 @@ int main(int argc, char *argv[]) {
     if (strcmp(mode, "generate") == 0) {
         generate(&transformer, &tokenizer, &sampler, prompt);
     } else if (strcmp(mode, "chat") == 0) {
-        chat(&transformer, &tokenizer, &sampler, prompt, system_prompt);
+        chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, enable_thinking);
     } else if (strcmp(mode, "logits") == 0) {
         dump_logits(&transformer, &tokenizer, prompt, out_path);
     } else {

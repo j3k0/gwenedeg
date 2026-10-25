@@ -156,12 +156,15 @@ typedef struct {
     float *hb2_b;   // (nb_max, hidden_dim)
     QuantizedTensor xq_b; // (nb_max, xs)
     QuantizedTensor hq_b; // (nb_max, hidden_dim)
-    float *att_b;   // (att_threads, att_rows * kv_mul * kv_len): attention scratch per OpenMP thread
+    float *att_b;   // (att_threads, att_rows * kv_mul * att_nb * ATT_P): attention scores scratch per OpenMP thread
     int att_rows;   // query rows per prefill attention work item
     int att_threads;
     float *rope_b;  // (nb_max, head_dim): RoPE cos / sin of each row's position (rope_row)
     float *rope;    // (head_dim,): the same for forward()'s position
     RqSync sync;    // phase counters of forward()'s parallel job (threads.h)
+    int att_nb;     // attention blocks of ATT_P positions in kv_len
+    float *att_part; // forward(): per (kv head, query head, block) partial results (ATT_PSTRIDE floats)
+    float *att_pb;  // forward_batch: the same per thread, att_rows * kv_mul vectors
     int dec_chunk, cls_chunk; // 16-row blocks per claim in forward()'s GEMVs / classifier
 } RunState;
 
@@ -536,6 +539,7 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
 
     memset(s, 0, sizeof(*s));
     s->kv_len = (p->seq_len + ATT_T - 1) / ATT_T * ATT_T;
+    s->att_nb = (s->kv_len + ATT_P - 1) / ATT_P;
     s->kv_size = (size_t)p->n_layers * s->kv_len * kv_dim;
     s->att_scale = 1.0f / sqrtf(p->head_dim);
     s->att_rows = ATT_NV_MAX / kv_mul < ATT_ROWS ? ATT_NV_MAX / kv_mul : ATT_ROWS;
@@ -564,10 +568,11 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
 #else
         s->att_threads = 1;
 #endif
-        s->att_b = calloc((size_t)s->att_threads * s->att_rows * kv_mul * s->kv_len, sizeof(float));
+        s->att_b = calloc((size_t)s->att_threads * s->att_rows * kv_mul * s->att_nb * ATT_P, sizeof(float));
+        s->att_pb = calloc((size_t)s->att_threads * s->att_rows * kv_mul * s->att_nb * ATT_PSTRIDE(p->head_dim), sizeof(float));
         s->rope_b = calloc(nb * p->head_dim, sizeof(float));
         if (!s->rope_b || !s->k_b || !s->v_b || !s->x_b || !s->xb_b || !s->q_b || !s->hb_b || !s->hb2_b || !s->xq_b.q || !s->xq_b.s ||
-            !s->hq_b.q || !s->hq_b.s || !s->att_b) {
+            !s->hq_b.q || !s->hq_b.s || !s->att_b || !s->att_pb) {
             fprintf(stderr, "malloc failed!\n");
             exit(EXIT_FAILURE);
         }
@@ -597,7 +602,8 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
     }
     s->k = calloc(kv_dim, sizeof(float));
     s->v = calloc(kv_dim, sizeof(float));
-    s->att = calloc((size_t)p->n_heads * s->kv_len, sizeof(float));
+    s->att = calloc((size_t)p->n_heads * s->att_nb * ATT_P, sizeof(float));
+    s->att_part = calloc((size_t)p->n_heads * s->att_nb * ATT_PSTRIDE(p->head_dim), sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
     s->rope = calloc(p->head_dim, sizeof(float));
     rq_sync_init(&s->sync, 8 * p->n_layers + 8, 8 * p->n_layers * p->n_kv_heads + 64);
@@ -605,7 +611,7 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
     s->value_cache = alloc_big(s->kv_size * sizeof(float));
 
     // ensure all mallocs went fine
-    if (!s->x || !s->xb || !s->hb || !s->hb2 || !s->q || !s->xq_corr || !s->hq_corr || !s->k || !s->v || !s->att || !s->logits || !s->rope || !s->key_cache || !s->value_cache) {
+    if (!s->x || !s->xb || !s->hb || !s->hb2 || !s->q || !s->xq_corr || !s->hq_corr || !s->k || !s->v || !s->att || !s->att_part || !s->logits || !s->rope || !s->key_cache || !s->value_cache) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
@@ -650,6 +656,8 @@ void free_run_state(RunState* s) {
     free(s->hq_b.q);
     free(s->hq_b.s);
     free(s->att_b);
+    free(s->att_pb);
+    free(s->att_part);
     free(s->rope_b);
     free(s->rope);
     rq_sync_free(&s->sync);
@@ -1428,10 +1436,11 @@ ATT_EXACT static inline float exp_att(float x) {
     return y;
 }
 
-ATT_EXACT static void attention_vec(const float *q, float *out, int n, const float *kt, const float *vt,
+ATT_EXACT static void attention_vec(const float *q, float *out, float *ml, int n, const float *kt, const float *vt,
                                     size_t ts, int hd, float scale, float *S) {
     // one query vector over positions 0..n-1 of one kv head: kt / vt = its tile 0 in the layer's
-    // K / V cache, ts = floats from one tile of this head to the next; S: n (rounded up to 16) floats
+    // K / V cache, ts = floats from one tile of this head to the next; S: n (rounded up to 16) floats.
+    // ml != NULL: one block's partial result (out unnormalized, ml[0] = max score, ml[1] = sum)
     int nt = (n + ATT_T - 1) / ATT_T;
     for (int tb = 0; tb < nt; tb++) {
         const float *k = kt + (size_t)tb * ts;
@@ -1468,6 +1477,10 @@ ATT_EXACT static void attention_vec(const float *q, float *out, int n, const flo
         for (int j = 0; j < w; j++)
             sum[j] = sum[j] + sum[j + w];
     float inv = 1.0f / sum[0];
+    if (ml) {
+        ml[0] = m;
+        ml[1] = sum[0];
+    }
     for (int i = 0; i < hd; i++)
         out[i] = 0.0f;
     for (int t = 0; t < n; t++) {
@@ -1476,19 +1489,84 @@ ATT_EXACT static void attention_vec(const float *q, float *out, int n, const flo
         for (int i = 0; i < hd; i++)
             out[i] = ATT_FMA(e, v[i], out[i]);
     }
+    if (!ml)
+        for (int i = 0; i < hd; i++)
+            out[i] = out[i] * inv;
+}
+
+ATT_EXACT static void att_combine(float *out, int nb, const float *part, size_t stride, int hd) {
+    // the attention of one query vector from its nb >= 1 block partial results (part + b * stride:
+    // o_b[hd], m_b, l_b, block order), see the definition in kernels_avx512.h
+    if (nb == 1) {
+        float inv = 1.0f / part[hd + 1];
+        for (int i = 0; i < hd; i++)
+            out[i] = part[i] * inv;
+        return;
+    }
+    float M = part[hd];
+    for (int b = 1; b < nb; b++)
+        if (part[b * stride + hd] > M)
+            M = part[b * stride + hd];
+    float L = 0.0f;
+    for (int i = 0; i < hd; i++)
+        out[i] = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        const float *o = part + b * stride;
+        float c = exp_att(o[hd] - M);
+        L = ATT_FMA(c, o[hd + 1], L);
+        for (int i = 0; i < hd; i++)
+            out[i] = ATT_FMA(c, o[i], out[i]);
+    }
+    float inv = 1.0f / L;
     for (int i = 0; i < hd; i++)
         out[i] = out[i] * inv;
 }
 
-static void attention_kv(int nv, const float *const *q, float *const *out, const int *np, const float *kt,
-                         const float *vt, size_t ts, int hd, float scale, float *S) {
-    // nv query vectors q[r] sharing one kv head, vector r over positions 0..np[r]-1, into out[r];
-    // S: scratch of nv * kv_len floats. Each vector's result does not depend on the others
+static void attention_part(int nv, const float *const *q, float *const *out, float *const *part, const int *np, int b0,
+                           int b1, const float *kt, const float *vt, size_t ts, int hd, float scale, float *S) {
+    // nv query vectors q[r] sharing one kv head (kt / vt: its tile 0), vector r over positions
+    // 0..np[r]-1. part NULL: the whole attention into out[r] (all np <= ATT_P). Else the partial
+    // results of the blocks b0..b1-1 of ATT_P positions that vector r reaches, block b at part[r] +
+    // b * ATT_PSTRIDE(hd): o (unnormalized), m (max score), l (sum of exponentials).
+    // S: scratch of nv * (b1 - b0) * ATT_P floats
 #ifdef RUNQ_ATT512
-    if (att512_ok(hd)) { att512_kv(nv, q, out, np, kt, vt, ts, hd, scale, S); return; }
+    if (att512_ok(hd)) { att512_kv(nv, q, out, part, np, b0, b1, kt, vt, ts, hd, scale, S); return; }
 #endif
+    for (int r = 0; r < nv; r++) {
+        if (!part) {
+            attention_vec(q[r], out[r], NULL, np[r], kt, vt, ts, hd, scale, S);
+            continue;
+        }
+        for (int b = b0; b < b1 && b * ATT_P < np[r]; b++) {
+            float *o = part[r] + (size_t)b * ATT_PSTRIDE(hd);
+            int n = np[r] - b * ATT_P < ATT_P ? np[r] - b * ATT_P : ATT_P;
+            size_t t0 = (size_t)(b * (ATT_P / ATT_T)) * ts;
+            attention_vec(q[r], o, o + hd, n, kt + t0, vt + t0, ts, hd, scale, S);
+        }
+    }
+}
+
+static void attention_kv(int nv, const float *const *q, float *const *out, const int *np, const float *kt,
+                         const float *vt, size_t ts, int hd, float scale, float *S, float *part) {
+    // nv query vectors q[r] sharing one kv head, vector r over positions 0..np[r]-1, into out[r]:
+    // per block of ATT_P positions the partial results, then their combination (one block: the
+    // attention directly). S: scratch of nv * (blocks of max np) * ATT_P floats; part: nv * (blocks of
+    // max np) * ATT_PSTRIDE(hd) floats. Each vector's result does not depend on the others
+    int nmax = 0;
     for (int r = 0; r < nv; r++)
-        attention_vec(q[r], out[r], np[r], kt, vt, ts, hd, scale, S);
+        nmax = np[r] > nmax ? np[r] : nmax;
+    if (nmax <= ATT_P) {
+        attention_part(nv, q, out, NULL, np, 0, 1, kt, vt, ts, hd, scale, S);
+        return;
+    }
+    int nbm = (nmax + ATT_P - 1) / ATT_P;
+    size_t st = ATT_PSTRIDE(hd);
+    float *pv[ATT_NV_MAX];
+    for (int r = 0; r < nv; r++)
+        pv[r] = part + (size_t)r * nbm * st;
+    attention_part(nv, q, NULL, pv, np, 0, nbm, kt, vt, ts, hd, scale, S);
+    for (int r = 0; r < nv; r++)
+        att_combine(out[r], (np[r] + ATT_P - 1) / ATT_P, pv[r], st, hd);
 }
 
 static inline size_t kv_tile(int t, int h, int n_kv, int hd) {
@@ -1557,9 +1635,10 @@ static inline QuantizedTensor qsub(QuantizedTensor *t, int i0) {
 typedef struct { Transformer *tr; int token, pos, compute_logits; } DecodeJob;
 
 // phases of a decode job: per layer 4 (qkv + attention, wo, w1 + w3, w2), the classifier, the KV
-// tile pre-fault every ATT_T positions; dependency counters: one per (layer, kv head)
+// tile pre-fault every ATT_T positions; dependency counters: per (layer, kv head) its qkv items
+// done, and its attention blocks done
 static int decode_phases(Config *p) { return 4 * p->n_layers + 2; }
-static int decode_counters(Config *p) { return p->n_layers * p->n_kv_heads; }
+static int decode_counters(Config *p) { return 2 * p->n_layers * p->n_kv_heads; }
 
 static void decode_norm(RunState *s, Config *p, TransformerWeights *w, int l, int resid) {
     // (x += xb,) rmsnorm with layer l's attention weights (l < n_layers) or the final ones (l ==
@@ -1592,7 +1671,8 @@ static void decode_worker(void *arg, int tid, int nt) {
     int kv_mul = nh / nkv; // integer multiplier of the kv sharing in multiquery
     int all_heads_dim = nh * hd, ff = s->ff_rows;
     int ng = kv_mul + 2; // qkv items per kv head: its kv_mul query heads, its key head, its value head
-    size_t ts = (size_t)nkv * ATT_T * hd;
+    int nb = (pos + 1 + ATT_P - 1) / ATT_P; // attention blocks (kernels_avx512.h): items per kv head
+    size_t ts = (size_t)nkv * ATT_T * hd, pst = ATT_PSTRIDE(hd);
 
     if (pos % ATT_T == 0) { // first position of a KV cache tile: pre-fault the tile (all layers)
         PH_BEGIN(2 * p->n_layers, 1)
@@ -1609,10 +1689,13 @@ static void decode_worker(void *arg, int tid, int nt) {
 
         // qkv matmuls for this position, then the attention, in one phase. Items 0 .. nkv * ng - 1:
         // per kv head g its query heads (QK-norm + RoPE), its key head (QK-norm + RoPE, cache store)
-        // and value head (cache store), counted in dependency counter g; then items for the
-        // attention of each kv head (its kv_mul query heads together, after the ng items of its
-        // group) + the quantization of their outputs for wo (into aq: xq is still being read)
-        PH_BEGIN(nkv * ng + nkv, 1)
+        // and value head (cache store), counted in dependency counter g; then per kv head nb items,
+        // one per block of ATT_P positions (its kv_mul query heads together, after the ng items of
+        // its group): with one block the attention itself, else the block's partial results, which
+        // the last of the nb items to finish combines (att_combine: the same definition as the
+        // prefill's attention_kv); then the quantization of the outputs for wo (into aq: xq may
+        // still be read)
+        PH_BEGIN(nkv * ng + nkv * nb, 1)
         for (int it = lo; it < hi; it++) {
             if (it < nkv * ng) {
                 int g = it / ng, r = it % ng;
@@ -1631,18 +1714,27 @@ static void decode_worker(void *arg, int tid, int nt) {
                 rq_count(S, l * nkv + g, 1);
                 continue;
             }
-            int g = it - nkv * ng;
+            int g = (it - nkv * ng) / nb, b = (it - nkv * ng) % nb;
             rq_wait_count(S, l * nkv + g, ng);
             const float *qv[ATT_NV_MAX];
-            float *ov[ATT_NV_MAX];
+            float *ov[ATT_NV_MAX], *pv[ATT_NV_MAX];
             int npv[ATT_NV_MAX];
+            float *part = s->att_part + (size_t)g * kv_mul * s->att_nb * pst; // vector r, block b: + (r * att_nb + b) * pst
             for (int r = 0; r < kv_mul; r++) {
                 qv[r] = s->q + (g * kv_mul + r) * hd;
                 ov[r] = s->xb + (g * kv_mul + r) * hd;
+                pv[r] = part + (size_t)r * s->att_nb * pst;
                 npv[r] = pos + 1;
             }
             size_t o = kv_tile(0, g, nkv, hd);
-            attention_kv(kv_mul, qv, ov, npv, kl + o, vl + o, ts, hd, s->att_scale, s->att + (size_t)g * kv_mul * s->kv_len);
+            attention_part(kv_mul, qv, ov, nb == 1 ? NULL : pv, npv, b, b + 1, kl + o, vl + o, ts, hd, s->att_scale,
+                           s->att + ((size_t)g * s->att_nb + b) * kv_mul * ATT_P);
+            if (nb > 1) { // the last block of this kv head to finish combines them
+                if (rq_count(S, (p->n_layers + l) * nkv + g, 1) < nb)
+                    continue;
+                for (int r = 0; r < kv_mul; r++)
+                    att_combine(ov[r], nb, pv[r], pst, hd);
+            }
             int i0 = g * kv_mul * hd;
             QuantizedTensor ag = qsub(&s->aq, i0);
             quantize(&ag, s->xb + i0, kv_mul * hd);
@@ -1825,13 +1917,14 @@ float *forward_batch(Transformer *transformer, int *tokens, int n, int pos0, int
                     ov[nv] = s->xb_b + (size_t)b * xs + h * hd;
                     npv[nv] = pos0 + b + 1;
                 }
+            int tid = 0;
 #ifdef _OPENMP
-            float *att = s->att_b + (size_t)omp_get_thread_num() * ar * kv_mul * s->kv_len;
-#else
-            float *att = s->att_b;
+            tid = omp_get_thread_num();
 #endif
+            float *att = s->att_b + (size_t)tid * ar * kv_mul * s->att_nb * ATT_P;
+            float *part = s->att_pb + (size_t)tid * ar * kv_mul * s->att_nb * ATT_PSTRIDE(hd);
             size_t o = kv_tile(0, g, p->n_kv_heads, hd);
-            attention_kv(nv, qv, ov, npv, kl + o, vl + o, ts, hd, s->att_scale, att);
+            attention_kv(nv, qv, ov, npv, kl + o, vl + o, ts, hd, s->att_scale, att, part);
         }
         // (then quantize the attention output rows for wo, in the same parallel region)
         #pragma omp for

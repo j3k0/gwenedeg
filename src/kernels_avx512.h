@@ -31,6 +31,10 @@
 // Attention constants, shared by the AVX-512 attention below and the generic C one in runq.c
 // (attention_vec): the same constants and operations give the same results
 #define ATT_T 16                       // positions per K/V cache tile
+#ifndef ATT_P
+#define ATT_P 256                      // positions per attention block (a multiple of ATT_T; see below)
+#endif
+#define ATT_PSTRIDE(hd) ((hd) + 16)    // floats per block partial result: o[hd], m, l (64-byte aligned)
 #define ATT_DC 32                      // dims per fma chain of a score (head_dim % ATT_DC == 0)
 #define ATT_EXP_MIN (-86.0f)           // exp argument clamp (2^n stays a normal float)
 #define ATT_LOG2E 1.44269504088896341f
@@ -694,26 +698,38 @@ static void kq512_gemm_n(int nj, const KQJob *job, const int8_t *xq, const float
  * ((tb * n_kv_heads + h) * 16 * head_dim) floats; inside, K is transposed (dim i, position j at
  * i * 16 + j), so one zmm holds dim i of 16 positions, and V is row-major (j * head_dim + i).
  *
- * Arithmetic, per query vector q (n positions), the definition of the attention:
+ * Arithmetic, per query vector q (n positions), the definition of the attention. The positions
+ * are split into blocks of ATT_P = 256 (a constant: it never depends on the thread count or the
+ * chunk size), block b = positions b * 256 .. min(n, (b + 1) * 256) - 1, nb = ceil(n / 256) blocks:
  *   s[t] = (sum over chunks c of ATT_DC = 32 dims, in order, of (fma chain over the dims i of c
  *          of q[i] * k[t][i], from 0)) * scale. (One 128-long chain: ~10% larger deviation of
  *          the logits from a double-precision attention; chunks of 32: as close as the old
  *          vectorized dot product with 16 partial sums)
- *   m = max of s[0..n); e[t] = exp_att(s[t] - m) (exp_att: Cephes-style expf, see att512_exp)
- *   sum: 16 partial sums (lane j: e[t] for t = j mod 16, t in order), then a fixed tree
- *        (lanes j + 8, then + 4, + 2, + 1); inv = 1 / sum (one division)
- *   out[i] = (fma chain over t = 0..n-1 of e[t] * v[t][i], from 0) * inv
+ *   per block b: m_b = max of its s[t]; e[t] = exp_att(s[t] - m_b) (exp_att: Cephes-style expf,
+ *        see att512_exp); l_b: 16 partial sums (lane j: e[t] for t = j mod 16, t in order), then a
+ *        fixed tree (lanes j + 8, then + 4, + 2, + 1); o_b[i] = fma chain over the block's t of
+ *        e[t] * v[t][i], from 0
+ *   nb = 1: out[i] = o_0[i] * inv, inv = 1 / l_0 (one division). (Up to 256 positions this is
+ *        exactly the Step 3b definition: same results as before for every prompt that short)
+ *   nb > 1: M = max of the m_b; c_b = exp_att(m_b - M); L = fma chain over b of c_b * l_b, from 0;
+ *        out[i] = (fma chain over b of c_b * o_b[i], from 0) * (1 / L)   (runq.c: att_combine)
+ * The blocks let decode split a long context over threads (flash-decoding: one work item per kv
+ * head and block, the last one to finish combines), with the same results as the prefill, which
+ * runs all blocks of a vector in one work item.
  * Every operation is rounded (explicit-rounding intrinsics, opaque to -Ofast's contraction and
  * reassociation; the C version is compiled with fp-contract=off, no-associative-math). The
  * results of a query vector do not depend on the other vectors processed with it, so decode
  * (2 vectors: the query heads of one kv head) and prefill (2 x ATT_ROWS vectors) agree.
  *
- * Kernel: groups of up to ATT512_NV = 12 query vectors of one kv head. Scores: register tile of
- * NV vectors x NT tiles (NV * NT <= 24 accumulators), the K tile loaded once per dim for all NV
- * vectors (q broadcast; no horizontal sums); scores stored per tile as [NV][16]. Softmax per
- * vector. V: register tile NV vectors x DW zmm of dims, the score of each vector broadcast per
- * position, V streamed once per group; a vector's positions beyond its own n (causal rows of a
- * block) are skipped, so the fma chain is exactly that of the decode path.
+ * Kernel: groups of up to ATT512_NV = 12 query vectors of one kv head, over a range of blocks.
+ * Scores: register tile of NV vectors x NT tiles (NV * NT <= 24 accumulators), the K tile loaded
+ * once per dim for all NV vectors (q broadcast; no horizontal sums); scores stored per tile as
+ * [NV][16]. Softmax per vector and block. V: register tile NV vectors x DW zmm of dims, the score
+ * of each vector broadcast per position, V streamed once per group (each pass of DW * 16 dims runs
+ * over all the blocks, the accumulators restarting at each block: one long stream; with one call
+ * per block, prefill attention at 3,000 tokens was ~27% slower, now ~10%); a vector's positions
+ * beyond its own n (causal rows of a block) are skipped, so the fma chain is exactly that of the
+ * decode path.
  */
 #if defined(__AVX512F__) && !defined(RUNQ_GENERIC)
 #define RUNQ_ATT512 1
@@ -801,38 +817,63 @@ void att512_qk(const int NV, const int NT, const float *qt, const float *kt, siz
     } while (0)
 
 static inline __attribute__((always_inline))
-void att512_pv(const int NV, const int DW, const float *s, int nmin, int nmax, const int *np, const float *vt,
-               size_t ts, int hd, const float *inv, float *const *out) {
-    // out[r][i] = (sum over t < np[r] of e[r][t] * v[t][i]) * inv[r], e in s as [tile][NV][16];
-    // DW zmm (16 * DW dims) per pass
+void att512_pv(const int NV, const int DW, const float *s, int nbk, const int *np, const float *vt, size_t ts, int hd,
+               const float *inv, float *const *out, int ob, size_t pst) {
+    // inv != NULL (nbk = 1): out[r][i] = (sum over t < np[r] of e[r][t] * v[t][i]) * inv[r], e in s
+    // as [tile][NV][16]. inv NULL: per block j < nbk of ATT_P positions the unnormalized sum over its
+    // positions t < np[r], into out[r] + (ob + j) * pst (blocks vector r reaches). DW zmm (16 * DW
+    // dims) per pass; the passes run over all the blocks (long V streams)
     for (int d0 = 0; d0 < hd; d0 += DW * 16) {
-        __m512 acc[ATT512_NV][8];
-        for (int r = 0; r < NV; r++)
-            for (int u = 0; u < DW; u++)
-                acc[r][u] = _mm512_setzero_ps();
-        int t = 0;
-        for (; t < nmin; t++)
-            ATT512_PV_STEP(1);
-        for (; t < nmax; t++) // causal tail: only the vectors that see position t
-            ATT512_PV_STEP(t < np[r]);
-        for (int r = 0; r < NV; r++) {
-            __m512 iv = _mm512_set1_ps(inv[r]);
-            for (int u = 0; u < DW; u++)
-                _mm512_storeu_ps(out[r] + d0 + u * 16, _mm512_mul_round_ps(acc[r][u], iv, ATT512_RND));
+        for (int j = 0; j < nbk; j++) {
+            int tb = j * ATT_P, nmin = tb + ATT_P, nmax = tb;
+            for (int r = 0; r < NV; r++) {
+                int e = np[r] < tb + ATT_P ? np[r] : tb + ATT_P;
+                nmin = e < nmin ? e : nmin;
+                nmax = e > nmax ? e : nmax;
+            }
+            if (inv) { nmin = np[0]; nmax = np[0]; for (int r = 1; r < NV; r++) { nmin = np[r] < nmin ? np[r] : nmin; nmax = np[r] > nmax ? np[r] : nmax; } }
+            __m512 acc[ATT512_NV][8];
+            for (int r = 0; r < NV; r++)
+                for (int u = 0; u < DW; u++)
+                    acc[r][u] = _mm512_setzero_ps();
+            int t = tb;
+            for (; t < nmin; t++)
+                ATT512_PV_STEP(1);
+            for (; t < nmax; t++) // causal tail: only the vectors that see position t
+                ATT512_PV_STEP(t < np[r]);
+            for (int r = 0; r < NV; r++) {
+                if (!inv) { // a block's partial result: unnormalized
+                    if (np[r] > tb)
+                        for (int u = 0; u < DW; u++)
+                            _mm512_storeu_ps(out[r] + (size_t)(ob + j) * pst + d0 + u * 16, acc[r][u]);
+                    continue;
+                }
+                __m512 iv = _mm512_set1_ps(inv[r]);
+                for (int u = 0; u < DW; u++)
+                    _mm512_storeu_ps(out[r] + d0 + u * 16, _mm512_mul_round_ps(acc[r][u], iv, ATT512_RND));
+            }
         }
     }
 }
 #undef ATT512_PV_STEP
 
-static void att512_group(int nv, const float *const *q, float *const *out, const int *np, const float *kt,
-                         const float *vt, size_t ts, int hd, float scale, float *s) {
-    // nv <= ATT512_NV query vectors of one kv head; s: scratch of nv * (max np rounded to 16) floats
-    int nmin = np[0], nmax = np[0];
-    for (int r = 1; r < nv; r++) {
-        nmin = np[r] < nmin ? np[r] : nmin;
-        nmax = np[r] > nmax ? np[r] : nmax;
+static void att512_group(int nv, const float *const *q, float *const *out, float *const *part, const int *np, int b0,
+                         int b1, const float *kt, const float *vt, size_t ts, int hd, float scale, float *s) {
+    // nv <= ATT512_NV query vectors of one kv head, vector r over positions 0..np[r]-1 (kt / vt: tile
+    // 0 of the head). part NULL: the attention into out[r] (all np <= ATT_P; b0 = 0). Else the
+    // partial results of blocks b0..b1-1 (ATT_P positions each): block b of vector r at part[r] + b *
+    // ATT_PSTRIDE(hd) (o[hd] unnormalized, m, l), for the blocks the vector reaches. s: scratch of
+    // nv * (positions in the blocks) floats. Scores, softmax per block, V: each over all the blocks
+    size_t pst = ATT_PSTRIDE(hd), o0 = (size_t)(b0 * (ATT_P / ATT_T)) * ts;
+    int npr[ATT512_NV], nmax = 0; // positions relative to block b0, at most to the end of block b1 - 1
+    for (int r = 0; r < nv; r++) {
+        int n = np[r] - b0 * ATT_P, e = (b1 - b0) * ATT_P;
+        npr[r] = n < 0 ? 0 : n < e ? n : e;
+        nmax = npr[r] > nmax ? npr[r] : nmax;
     }
-    int ntl = (nmax + ATT_T - 1) / ATT_T;
+    kt += o0;
+    vt += o0;
+    int ntl = (nmax + ATT_T - 1) / ATT_T, nbk = part ? (nmax + ATT_P - 1) / ATT_P : 1;
     float qt[ATT512_HDMAX * ATT512_NV] __attribute__((aligned(64)));
     for (int i = 0; i < hd; i++)
         for (int r = 0; r < nv; r++)
@@ -855,30 +896,42 @@ static void att512_group(int nv, const float *const *q, float *const *out, const
     #undef ATT512_QK_ANY
     #undef ATT512_QK
 
-    // softmax per vector (scores of vector r, tile tb at s + (tb * nv + r) * 16)
+    // softmax per vector and block (scores of vector r, tile tb at s + (tb * nv + r) * 16)
     float inv[ATT512_NV];
-    for (int r = 0; r < nv; r++) {
-        int n = np[r], nt = (n + ATT_T - 1) / ATT_T;
-        float *sr = s + r * ATT_T;
-        size_t st = (size_t)nv * ATT_T;
-        __mmask16 last = (__mmask16)(0xffffu >> (nt * ATT_T - n));
-        __m512 mx = _mm512_set1_ps(-FLT_MAX);
-        for (int tb = 0; tb < nt - 1; tb++)
-            mx = _mm512_max_ps(mx, _mm512_loadu_ps(sr + tb * st));
-        mx = _mm512_mask_max_ps(mx, last, mx, _mm512_loadu_ps(sr + (nt - 1) * st));
-        __m512 m = _mm512_set1_ps(_mm512_reduce_max_ps(mx)), sum = _mm512_setzero_ps();
-        for (int tb = 0; tb < nt; tb++) {
-            __m512 e = att512_exp(_mm512_sub_round_ps(_mm512_loadu_ps(sr + tb * st), m, ATT512_RND));
-            if (tb == nt - 1)
-                e = _mm512_maskz_mov_ps(last, e);
-            _mm512_storeu_ps(sr + tb * st, e);
-            sum = _mm512_add_round_ps(sum, e, ATT512_RND);
+    size_t st = (size_t)nv * ATT_T;
+    for (int r = 0; r < nv; r++)
+        for (int j = 0; j < nbk; j++) {
+            int n = npr[r] - j * ATT_P;
+            if (n <= 0)
+                break;
+            n = n < ATT_P || !part ? n : ATT_P;
+            int nt = (n + ATT_T - 1) / ATT_T;
+            float *sr = s + r * ATT_T + (size_t)j * (ATT_P / ATT_T) * st;
+            __mmask16 last = (__mmask16)(0xffffu >> (nt * ATT_T - n));
+            __m512 mx = _mm512_set1_ps(-FLT_MAX);
+            for (int tb = 0; tb < nt - 1; tb++)
+                mx = _mm512_max_ps(mx, _mm512_loadu_ps(sr + tb * st));
+            mx = _mm512_mask_max_ps(mx, last, mx, _mm512_loadu_ps(sr + (nt - 1) * st));
+            __m512 m = _mm512_set1_ps(_mm512_reduce_max_ps(mx)), sum = _mm512_setzero_ps();
+            for (int tb = 0; tb < nt; tb++) {
+                __m512 e = att512_exp(_mm512_sub_round_ps(_mm512_loadu_ps(sr + tb * st), m, ATT512_RND));
+                if (tb == nt - 1)
+                    e = _mm512_maskz_mov_ps(last, e);
+                _mm512_storeu_ps(sr + tb * st, e);
+                sum = _mm512_add_round_ps(sum, e, ATT512_RND);
+            }
+            float tot = att512_sum16(sum);
+            if (part) {
+                float *ml = part[r] + (size_t)(b0 + j) * pst + hd;
+                ml[0] = _mm_cvtss_f32(_mm512_castps512_ps128(m));
+                ml[1] = tot;
+            } else {
+                inv[r] = _mm_cvtss_f32(_mm_div_round_ss(_mm_set_ss(1.0f), _mm_set_ss(tot), ATT512_RND));
+            }
         }
-        inv[r] = _mm_cvtss_f32(_mm_div_round_ss(_mm_set_ss(1.0f), _mm_set_ss(att512_sum16(sum)), ATT512_RND));
-    }
 
     // weighted sum of V
-    #define ATT512_PV(V, D) case V: att512_pv(V, D, s, nmin, nmax, np, vt, ts, hd, inv, out); break;
+    #define ATT512_PV(V, D) case V: att512_pv(V, D, s, nbk, npr, vt, ts, hd, part ? NULL : inv, part ? part : out, b0, pst); break;
     switch (nv) {
         ATT512_PV(1, 8) ATT512_PV(2, 8) ATT512_PV(3, 4) ATT512_PV(4, 4) ATT512_PV(5, 4) ATT512_PV(6, 4)
         ATT512_PV(7, 2) ATT512_PV(8, 2) ATT512_PV(9, 2) ATT512_PV(10, 2) ATT512_PV(11, 2) ATT512_PV(12, 2)
@@ -889,12 +942,13 @@ static void att512_group(int nv, const float *const *q, float *const *out, const
 
 static inline int att512_ok(int hd) { return hd % 128 == 0 && hd <= ATT512_HDMAX; }
 
-static void att512_kv(int nv, const float *const *q, float *const *out, const int *np, const float *kt,
-                      const float *vt, size_t ts, int hd, float scale, float *s) {
-    // nv query vectors of one kv head (any nv), in groups of ATT512_NV; s: ATT512_NV * kv_len floats
+static void att512_kv(int nv, const float *const *q, float *const *out, float *const *part, const int *np, int b0,
+                      int b1, const float *kt, const float *vt, size_t ts, int hd, float scale, float *s) {
+    // nv query vectors of one kv head (any nv), in groups of ATT512_NV (att512_group); s: ATT512_NV *
+    // ATT_P floats
     for (int g = 0; g < nv; g += ATT512_NV) {
         int gn = nv - g < ATT512_NV ? nv - g : ATT512_NV;
-        att512_group(gn, q + g, out + g, np + g, kt, vt, ts, hd, scale, s);
+        att512_group(gn, q + g, out + g, part ? part + g : NULL, np + g, b0, b1, kt, vt, ts, hd, scale, s);
     }
 }
 

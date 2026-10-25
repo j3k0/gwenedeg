@@ -6,6 +6,10 @@ mynah-slm, plus perplexity. All numbers in the Results, Comparison and Quality s
 output of every run: [bench/results-2026-10-25.txt](bench/results-2026-10-25.txt). Earlier
 measurements are only in [History](#history-earlier-measurements) and are labelled there.
 
+The [Apple M1 Pro section](#apple-m1-pro-macos-neon) is a different machine and a different session
+(2026-10-25 14:56 UTC, commit `bb69e5f`) and is not comparable with the tables above (other CPU,
+Q4_K_M instead of Q8_0).
+
 ## Setup
 
 | | |
@@ -118,6 +122,50 @@ VNNI weights (~630 MB, ~55 ms to pack). mynah-slm reports a 0.14-0.15 s model lo
   23.6), 1 run Q4_K_M; ~65-90 s per run, so not repeated more.
 - mynah-slm decode is flat from 4 threads; its Q4_K_M (0.40 GB) is no faster than Q8_0 here, so it
   is compute-bound (~13 GB/s), not bandwidth-bound.
+
+## Apple M1 Pro (macOS, NEON)
+
+Experimental port, branch `mac-m1-pro`: `runq` built with Apple clang (`make`), NEON `sdot` kernels
+for the Q4_K / Q6_K matrices and for the attention (`src/kernels_neon.h`). Q8_0 still runs on the
+generic C kernels on arm64 (not ported: it would only help prefill, ~15-20% by estimate, and decode
+reads more bytes with it). One session, 2026-10-25 14:56-15:05 UTC, raw output:
+[bench/results-mac-m1-pro-2026-10-25.txt](bench/results-mac-m1-pro-2026-10-25.txt).
+
+| | |
+|---|---|
+| CPU | Apple M1 Pro, 8 performance + 2 efficiency cores, 32 GB, macOS 26.6.2 |
+| sharing | a desktop in use: 1-min load 3 before, 9.6 after the runs (iTerm, browser, ...) |
+| compiler | Apple clang 21.0.0, `-O3 -ffast-math -ffp-contract=on -mcpu=native` (`make`; no OpenMP, the pthread pool) |
+| model | `Qwen3-0.6B-Q4_K_M.gguf` (unsloth @ `50968a4`, 396,705,472 bytes), greedy, `-b 512`, `-c 4096` |
+| runq | `bb69e5f` (the numbers below do not depend on the docs commit on top of it) |
+
+Best of 3 runs (decode: 256 new tokens, the short bench prompt; prefill: `scripts/bench_prefill.sh`,
+chat-mode prompts of 451 and 1,500 tokens):
+
+| build, threads | prefill 451 tok | prefill 1,500 tok | decode |
+|---|---|---|---|
+| generic C kernels, 8 | 156 | 138 | 60 |
+| NEON, 4 | 724 | 547 | 160 |
+| NEON, 6 | 1,040 | 784 | 179 |
+| **NEON, 8** | **1,327** | **968** | **190** |
+| NEON, 10 (8 P + 2 E cores) | 1,332 | 982 | 171 |
+
+- NEON vs generic at 8 threads: prefill 8.5x (451 tokens) and 7.0x (1,500 tokens), decode 3.2x.
+  Both builds give bit-identical logits (`make test`'s kernels group, and a 688-position comparison
+  of all logits, prefill and token by token).
+- 8 threads (the performance cores) is the best setting, and the default here (min(12, nproc -
+  nproc/4) = 8 for 10 CPUs). The two efficiency cores add ~0-1% to prefill and cost ~10% of decode.
+- Run-to-run spread, 8 threads: 1-2% (prefill 451), 1% (decode); one 1,500-token run was disturbed
+  (278 vs 959-968 tok/s) and is not the reported best. The decode column of `bench_prefill.sh` (15
+  tokens) is lower than the 256-token one (164 vs 190 at 8 threads): different prompt and length.
+- Where the time goes (one profiled run, 8 threads, `-DRUNQ_PROFILE`, 1,500 tokens): GEMMs ~55%,
+  attention ~36%. The GEMMs run at ~47% of the `sdot` peak, limited by the exact float fold per group
+  (6 rounded operations per 8 `sdot`s), and register-tile shapes (1x6 to 4x3) changed them by less
+  than 4%. Decode falls from 190 to ~100 tok/s at 1,500 tokens: the fp32 KV cache then adds about
+  340 MB of reads per token to the ~400 MB of weights.
+- The oMLX figures the user reported on this Mac (`mlx-community/Qwen3-0.6B-4bit`, ~1,500 tok/s
+  prefill / ~150 tok/s decode) were not measured here and their prompt length and settings are
+  unknown, so no comparison is made; the same model needs `mlx_lm` on the same prompts for one.
 
 ## Quality
 
@@ -239,5 +287,3 @@ loads (+-20-30%). 8 threads unless noted; prefill in chat mode, `-c 4096`.
   vs 87-100 GB/s), i.e. more memory traffic from other tenants; decode is memory-bound. Startup is
   ~0.77 s vs ~0.45 s earlier, but the Step 3a binary (`64c0983`) measured the same 0.77-0.80 s in
   this session, so it is the machine state (memory pressure, swap in use), not a code change.
-- The user-reported Mac figures (~1,500 tok/s prefill / ~150 tok/s decode with oMLX on an Apple
-  Silicon Mac, model and quantization unknown) are other hardware and were not measured here.

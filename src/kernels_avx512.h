@@ -184,16 +184,40 @@ static int32_t *q8p_corr_buf(size_t n) {
     return buf;
 }
 
-static void q8p_gemm(float *out, int ldo, const int8_t *xq, const float *xs, int ldx, int nb,
-                     const uint8_t *wp, int k, int d) {
-    // out[b * ldo + i] = W[i, :] . x[b, :] for b < nb, i < d; W in Q8P layout (k % 64 == 0,
-    // d % 16 == 0), x rows at xq + b * ldx with scales xs + b * ldx / 64.
-    // Work items: (32-row weight tile, Q8P_NB activation rows), parallel; inside, the weight tile
-    // (32 x k bytes + scales, 34-102 KB) is reused from L1/L2 for every Q8P_C activation rows.
-    int ng = k / Q8P_GS, nblk = d / Q8P_ROWS;
+static int q8p_nb(int nb, int ntile) {
+    // activation rows per GEMM work item: Q8P_NB, halved (down to 4 * Q8P_C) while there are
+    // fewer than ~6 items per thread (e.g. wo / w2 / k / v: 32 tiles x 2 chunks at 128 rows), so
+    // 12 or 16 threads get balanced work. (Results do not depend on the partition)
+    int nt = 1, nbi = Q8P_NB;
+#ifdef _OPENMP
+    nt = omp_get_max_threads();
+#endif
+    while (nbi > 4 * Q8P_C && (long)ntile * ((nb + nbi - 1) / nbi) < 6L * nt)
+        nbi /= 2;
+    return nbi;
+}
+
+typedef struct { float *out; int ldo; const uint8_t *wp; int d; } Q8PJob;
+
+static void q8p_gemm_n(int nj, const Q8PJob *job, const int8_t *xq, const float *xs, int ldx, int nb, int k) {
+    // for each job j: job[j].out[b * ldo + i] = W_j[i, :] . x[b, :] for b < nb, i < d_j; all W_j
+    // in Q8P layout (k % 64 == 0, d_j % 16 == 0) on the same input rows x (at xq + b * ldx, scales
+    // xs + b * ldx / 64), in one parallel loop (e.g. q, k, v: one barrier instead of three).
+    // Work items: (32-row weight tile of some W_j, nbi activation rows), static schedule
+    // (contiguous items: a thread does all the chunks of a tile in a row; dynamic scheduling
+    // measured the same at 8-14 threads and does not prevent the 16-thread collapse); inside,
+    // the weight tile (32 x k bytes + scales, 34-102 KB) is reused from L1/L2 for every Q8P_C rows
+    int ng = k / Q8P_GS;
     size_t bstride = (size_t)ng * Q8P_GROUP, ldxs = (size_t)ldx / Q8P_GS;
     int32_t *corr = q8p_corr_buf((size_t)nb * ng);
-    int ntile = (nblk + Q8P_RB - 1) / Q8P_RB, nchunk = (nb + Q8P_NB - 1) / Q8P_NB;
+    int t0[9], ntile = 0;
+    if (nj > 8) { fprintf(stderr, "q8p_gemm_n: too many jobs\n"); exit(EXIT_FAILURE); }
+    for (int j = 0; j < nj; j++) {
+        t0[j] = ntile;
+        ntile += (job[j].d / Q8P_ROWS + Q8P_RB - 1) / Q8P_RB;
+    }
+    t0[nj] = ntile;
+    int nbi = q8p_nb(nb, ntile), nchunk = (nb + nbi - 1) / nbi;
     #pragma omp parallel
     {
         #pragma omp for schedule(static)
@@ -202,29 +226,35 @@ static void q8p_gemm(float *out, int ldo, const int8_t *xq, const float *xs, int
                 corr[(size_t)b * ng + g] = q8p_corr(xq + (size_t)b * ldx + g * Q8P_GS);
         #pragma omp for schedule(static)
         for (int it = 0; it < ntile * nchunk; it++) {
-            int t = it / nchunk, ch = it % nchunk;
-            int rb0 = t * Q8P_RB, rb = nblk - rb0 < Q8P_RB ? nblk - rb0 : Q8P_RB;
-            int b1 = (ch + 1) * Q8P_NB < nb ? (ch + 1) * Q8P_NB : nb;
-            const uint8_t *wt = wp + (size_t)rb0 * bstride;
-            for (int b = ch * Q8P_NB; b < b1; b += Q8P_C) {
+            int t = it / nchunk, ch = it % nchunk, j = 0;
+            while (t >= t0[j + 1]) j++;
+            int nblk = job[j].d / Q8P_ROWS, rb0 = (t - t0[j]) * Q8P_RB;
+            int rb = nblk - rb0 < Q8P_RB ? nblk - rb0 : Q8P_RB;
+            int b1 = (ch + 1) * nbi < nb ? (ch + 1) * nbi : nb;
+            const uint8_t *wt = job[j].wp + (size_t)rb0 * bstride;
+            for (int b = ch * nbi; b < b1; b += Q8P_C) {
                 int c = b1 - b < Q8P_C ? b1 - b : Q8P_C;
                 q8p_tile_any(rb, c, wt, bstride, ng, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
-                             corr + (size_t)b * ng, out + (size_t)b * ldo + (size_t)rb0 * Q8P_ROWS, ldo);
+                             corr + (size_t)b * ng, job[j].out + (size_t)b * job[j].ldo + (size_t)rb0 * Q8P_ROWS, job[j].ldo);
             }
         }
     }
 }
 
-static void q8p_gemv(float *out, const int8_t *xq, const float *xs, const uint8_t *wp, int k, int d) {
-    // out[i] = W[i, :] . x for i < d (decode). Memory-bound: each thread streams a contiguous
-    // range of 16-row blocks once; the activation row (k bytes) stays in L1
-    int ng = k / Q8P_GS, nblk = d / Q8P_ROWS;
-    size_t bstride = (size_t)ng * Q8P_GROUP;
-    int32_t *corr = q8p_corr_buf(ng);
-    for (int g = 0; g < ng; g++)
+static inline void q8p_gemv_corr(int32_t *corr, const int8_t *xq, int k) {
+    // the GEMV's activation corrections, one per 64-group (k / 64 values)
+    for (int g = 0; g < k / Q8P_GS; g++)
         corr[g] = q8p_corr(xq + g * Q8P_GS);
-    #pragma omp parallel for schedule(static)
-    for (int rb = 0; rb < nblk; rb++) {
+}
+
+static void q8p_gemv_rows(float *out, const int8_t *xq, const float *xs, const int32_t *corr, const uint8_t *wp,
+                          int k, int rb0, int rb1) {
+    // out[i] = W[i, :] . x for the rows i of the 16-row blocks rb0..rb1-1 (decode; no OpenMP here:
+    // called on disjoint ranges from inside one parallel region). Memory-bound: streams the
+    // blocks once; the activation row (k bytes) stays in L1
+    int ng = k / Q8P_GS;
+    size_t bstride = (size_t)ng * Q8P_GROUP;
+    for (int rb = rb0; rb < rb1; rb++) {
         const uint8_t *wb = wp + (size_t)rb * bstride;
         __m512 f = _mm512_setzero_ps();
         for (int g = 0; g < ng; g++) {

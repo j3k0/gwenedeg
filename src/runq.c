@@ -16,6 +16,8 @@
 #ifdef _OPENMP
     #include <omp.h>
 #endif
+// AVX-512 VNNI kernels (defines RUNQ_VNNI when built for AVX-512 VNNI without -DRUNQ_GENERIC)
+#include "kernels_avx512.h"
 
 // ----------------------------------------------------------------------------
 // Globals
@@ -65,6 +67,8 @@ typedef struct {
 typedef struct {
     int8_t *q;    // quantized values
     float *s; // scaling factors
+    uint8_t *p;   // weights only: the same matrix repacked for the VNNI kernels (Q8P layout,
+                  // see kernels_avx512.h), or NULL (generic kernels on q / s)
 } QuantizedTensor;
 
 typedef struct {
@@ -90,6 +94,9 @@ typedef struct {
     float *rms_final_weight; // (dim,)
     // (optional) classifier weights for the logits, on the last layer
     QuantizedTensor *wcls;
+    // VNNI build: one allocation holding all repacked matmul weights (QuantizedTensor.p)
+    uint8_t *packed;
+    size_t packed_size;
 } TransformerWeights;
 
 typedef struct {
@@ -253,6 +260,7 @@ QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each) {
         // map scale factors
         res[i].s = (float*)*ptr;
         *ptr = (float*)*ptr + size_each / GS;
+        res[i].p = NULL;
     }
     return res;
 }
@@ -291,6 +299,77 @@ void memory_map_weights(TransformerWeights *w, Config *p, void *ptr) {
     w->wcls = p->shared_classifier ? w->q_tokens : init_quantized_tensors(&ptr, 1, p->dim * p->vocab_size);
 }
 
+#ifdef RUNQ_VNNI
+#if defined _WIN32
+    #include <malloc.h> // _aligned_malloc
+#endif
+static void *alloc_big(size_t n) {
+    // large 64-byte aligned buffer (the repacked weights), page-aligned anonymous memory on
+    // Linux. No MADV_HUGEPAGE: no measurable decode gain here, and with THP defrag=madvise the
+    // faults can stall on compaction (seen for the KV cache: 2-3x slower prefill)
+#if defined _WIN32
+    return _aligned_malloc(n, 64);
+#else
+    void *p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+#endif
+}
+
+static void free_big(void *p, size_t n) {
+#if defined _WIN32
+    (void)n;
+    _aligned_free(p);
+#else
+    if (p) munmap(p, n);
+#endif
+}
+
+static void drop_mapped(const void *begin, const void *end) {
+    // release the pages of [begin, end) of the read-only checkpoint mapping (MAP_PRIVATE, never
+    // written, so a page touched again later is simply re-read from the page cache)
+#if !defined _WIN32 && defined MADV_DONTNEED
+    uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
+    uintptr_t a = (uintptr_t)begin & ~(pg - 1), b = ((uintptr_t)end + pg - 1) & ~(pg - 1);
+    madvise((void *)a, b - a, MADV_DONTNEED);
+#else
+    (void)begin; (void)end;
+#endif
+}
+
+void pack_weights(TransformerWeights *w, Config *p) {
+    // VNNI build: repack every matmul weight (7 per layer + the classifier) into the Q8P layout
+    // of kernels_avx512.h, in one allocation (the same size as the mapped Q8_0 data). The mapped
+    // pages of each tensor are dropped right after packing it, so the resident size stays about
+    // the same as without repacking (the token embedding is already dequantized at this point)
+    int L = p->n_layers, dim = p->dim, hid = p->hidden_dim;
+    int qd = p->n_heads * p->head_dim, kvd = p->n_kv_heads * p->head_dim;
+    struct { QuantizedTensor *t; int n, d, k; } m[] = {
+        { w->wq, L, qd, dim }, { w->wk, L, kvd, dim }, { w->wv, L, kvd, dim }, { w->wo, L, dim, qd },
+        { w->w1, L, hid, dim }, { w->w2, L, dim, hid }, { w->w3, L, hid, dim }, { w->wcls, 1, p->vocab_size, dim } };
+    int nm = sizeof(m) / sizeof(m[0]);
+    size_t total = 0;
+    for (int i = 0; i < nm; i++) {
+        if (GS != Q8P_GS || !q8p_ok(m[i].d, m[i].k)) {
+            fprintf(stderr, "warning: weights not packable for the VNNI kernels (GS %d, %d x %d), using the generic ones\n", GS, m[i].d, m[i].k);
+            return;
+        }
+        total += m[i].n * q8p_size(m[i].d, m[i].k);
+    }
+    w->packed = alloc_big(total);
+    if (!w->packed) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    w->packed_size = total;
+    size_t off = 0;
+    for (int i = 0; i < nm; i++)
+        for (int l = 0; l < m[i].n; l++) {
+            QuantizedTensor *t = m[i].t + l;
+            t->p = w->packed + off;
+            q8p_pack(t->p, t->q, t->s, m[i].d, m[i].k);
+            off += q8p_size(m[i].d, m[i].k);
+            drop_mapped(t->q, t->s + (size_t)m[i].d * m[i].k / GS);
+        }
+}
+#endif
+
 void read_checkpoint(char *checkpoint, Config *config, TransformerWeights* weights, float** data, ssize_t* file_size, int ctx_length) {
     FILE *file = fopen(checkpoint, "rb");
     if (!file) { fprintf(stderr, "Couldn't open checkpoint %s\n", checkpoint); exit(EXIT_FAILURE); }
@@ -320,6 +399,9 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights* weigh
 
     void *weights_ptr = ((char *)*data) + 256; // skip the header (256 bytes)
     memory_map_weights(weights, config, weights_ptr);
+#ifdef RUNQ_VNNI
+    pack_weights(weights, config);
+#endif
 }
 
 void build_transformer(Transformer *t, char *checkpoint_path, int ctx_length, int nb_max) {
@@ -341,6 +423,9 @@ void free_transformer(Transformer *t) {
     free(t->weights.w2);
     free(t->weights.w3);
     if(t->weights.wcls != t->weights.q_tokens) free(t->weights.wcls);
+#ifdef RUNQ_VNNI
+    free_big(t->weights.packed, t->weights.packed_size);
+#endif
     // close the memory mapping
     if (t->data != MAP_FAILED) munmap(t->data, t->file_size);
     // free the RunState buffers
@@ -402,6 +487,10 @@ void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
     // by far the most amount of time is spent inside this little function
     // inputs to this function are both quantized
 
+    if (n % GS != 0) { fprintf(stderr, "matmul: n=%d is not a multiple of GS=%d\n", n, GS); exit(EXIT_FAILURE); }
+#ifdef RUNQ_VNNI
+    if (w->p) { q8p_gemv(xout, x->q, x->s, w->p, n, d); return; }
+#endif
     #pragma omp parallel for
     for (int i = 0; i < d; i++) {
         int in = i * n;
@@ -452,7 +541,12 @@ void matmul_batch(float *out, int ldo, QuantizedTensor *x, int ldx, int nb, Quan
     // Each output is computed exactly as dot_q8() in matmul(), so the batched path matches the
     // sequential one bit for bit. Parallel over blocks of MB_ROWS output rows; each weight row is
     // loaded from memory once per call and reused for all nb activation rows from L1.
-    // Step 3 replaces the inner kernel (dot_q8_x4) with AVX-512 VNNI.
+    // The VNNI build uses q8p_gemm (kernels_avx512.h) on the repacked weights instead, with the
+    // same per-output arithmetic.
+    if (k % GS != 0 || ldx % GS != 0) { fprintf(stderr, "matmul_batch: k=%d / ldx=%d not multiples of GS=%d\n", k, ldx, GS); exit(EXIT_FAILURE); }
+#ifdef RUNQ_VNNI
+    if (w->p) { q8p_gemm(out, ldo, x->q, x->s, ldx, nb, w->p, k, d); return; }
+#endif
     int nblk = (d + MB_ROWS - 1) / MB_ROWS;
     #pragma omp parallel for schedule(static)
     for (int blk = 0; blk < nblk; blk++) {
@@ -617,7 +711,7 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
 
 static inline QuantizedTensor qrow(QuantizedTensor *t, int b, int ld) {
     // row b of a batch of quantized rows with row stride ld (a multiple of GS)
-    return (QuantizedTensor) { t->q + (size_t)b * ld, t->s + (size_t)b * ld / GS };
+    return (QuantizedTensor) { .q = t->q + (size_t)b * ld, .s = t->s + (size_t)b * ld / GS, .p = NULL };
 }
 
 enum { LOGITS_NONE = 0, LOGITS_LAST = 1, LOGITS_ALL = 2 };

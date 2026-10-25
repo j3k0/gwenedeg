@@ -8,7 +8,7 @@ CPPFLAGS += -D_FILE_OFFSET_BITS=64
 LDLIBS  += -lm
 
 SRC = src/runq.c
-HDR = src/unicode_tables.h
+HDR = src/unicode_tables.h src/kernels_avx512.h
 Q8  = models/Qwen3-0.6B-q8.bin
 
 .PHONY: all debug clean test bench bench-prefill models

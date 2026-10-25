@@ -119,6 +119,10 @@ GREEDY_CASES = [
     # kernels, which the AVX-512 ones match bit for bit)
     ("q4_chat", ["-m", "chat", "-n", "24", "-i", "What is the capital of Australia? Answer in one sentence."]),
     ("q4_generate", ["-m", "generate", "-n", "24", "-i", "Once upon a time, in a small village by the sea,"]),
+    # the other KV cache types (the default is f16): f32_generate is the fp32 cache's text (= the
+    # generate golden before Step 7b, which the fp32 cache still reproduces), bf16_generate the bf16's
+    ("f32_generate", ["-m", "generate", "-n", "40", "-k", "f32", "-i", "Once upon a time, in a small village by the sea,"]),
+    ("bf16_generate", ["-m", "generate", "-n", "40", "-k", "bf16", "-i", "Once upon a time, in a small village by the sea,"]),
 ]
 # seeded sampling (-t 0.8 -s 42): output must not depend on -b (chat advances the RNG once per
 # prompt token, as before batched prefill)
@@ -154,6 +158,13 @@ Q4_SEQ = [THREADS_PROMPT]
 Q4_BATCHED = [(THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH)]
 Q4_THREADS = [(BATCH_LONG, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH)]
 Q4_KERNELS = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH)]
+# KV cache types other than the default (f16, Step 7b), on the .bin (group kv): logits vs HF (-b 64 on
+# KV_LOGITS + pooled, the same thresholds; long2 past one attention block), batched vs sequential (en
+# -b 7, long2 -b 64), threads (long2 -b 64, 8 vs 3) and AVX-512 vs generic (en -b 1, long2 -b 64), bitwise
+KV_TYPES = ["f32", "bf16"]
+KV_LOGITS = [THREADS_PROMPT, "code"]
+KV_BATCHED = [(THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG3, BATCH)]
+KV_KERNELS = [(THREADS_PROMPT, SEQ), (BATCH_LONG3, BATCH)]
 GEN_THREADS = 4          # all generic-build runs (kernels/*, gguf_kernels/*, q4_kernels/*), in the
                          # background (results do not depend on the thread count)
 PREFETCH_JOBS = 3        # runq -m logits runs at OMP_NUM_THREADS in parallel (prefetch_all), next to the
@@ -236,7 +247,8 @@ def runq_tokenize(a, text, timing=False):
 
 
 def runq_logits_run(a, text, path, threads, chunk):
-    p = run([a.runq, a.model, "-c", CTX, "-m", "logits", "-b", str(chunk), "-i", text, "-o", path], threads=threads)
+    p = run([a.runq, a.model, "-c", CTX, "-m", "logits", "-b", str(chunk), "-i", text, "-o", path] + getattr(a, "extra", []),
+            threads=threads)
     if p.returncode != 0:
         raise RuntimeError(f"runq -m logits failed: {p.stderr.decode(errors='replace')[-500:]}")
 
@@ -279,7 +291,22 @@ def prefetch_all(a, tmp, only, fg, bg):
                 gen = argparse.Namespace(**{**vars(var), "runq": a.generic})
                 for name, chunk in cases:
                     sub(bg, gen, d, name, chunk, GEN_THREADS)
+    if a.generic and "kv" in only:
+        for kv in KV_TYPES:
+            gen = argparse.Namespace(**{**vars(a), "runq": a.generic, "extra": ["-k", kv]})
+            for name, chunk in KV_KERNELS:
+                sub(bg, gen, os.path.join(tmp, f"kv_{kv}", "generic"), name, chunk, GEN_THREADS)
     names = [n for n, _ in golden_prompts()]
+    if "kv" in only:
+        for kv in KV_TYPES:
+            v, d = argparse.Namespace(**{**vars(a), "extra": ["-k", kv]}), os.path.join(tmp, f"kv_{kv}")
+            sub(fg, v, d, BATCH_LONG3, SEQ)
+            for n in KV_LOGITS:
+                sub(fg, v, d, n, BATCH)
+            for n, c in KV_BATCHED + KV_KERNELS:
+                sub(fg, v, d, n, SEQ)
+                sub(fg, v, d, n, c)
+            sub(fg, v, d, BATCH_LONG3, BATCH, THREADS_LONG if nd != THREADS_LONG else 8)
     if "batched" in only:  # (the longest runs first: sequential, logits of every row)
         for n in (BATCH_LONG3, BATCH_LONG2):
             sub(fg, a, tmp, n, SEQ)
@@ -476,12 +503,12 @@ def test_logits(a, res, tmp, chunk=SEQ, prefix="logits", only=None, th=TH_Q8, su
             print(f"      {r[0]:<7} {r[1]:<3} {r[2]:.4f}    {r[3]:.5f}   {r[4]:.5f}   {r[5]:>2}/{r[1]:<4} {r[6]:.3f}")
 
 
-def test_logits_long(a, res, tmp):
+def test_logits_long(a, res, tmp, prefix="logits_long"):
     # positions past the first attention block (256): the block partial results and their
     # combination vs HF fp32 (golden/logits_long: every 4th position from 248 of long2), Q8_0 thresholds
     g = np.load(os.path.join(GOLDEN, "logits_long", f"{BATCH_LONG3}.npz"))
     text = dict(batched_prompts())[BATCH_LONG3]
-    tname = f"logits_long/{BATCH_LONG3}"
+    tname = f"{prefix}/{BATCH_LONG3}"
     if str(g["text"]) != text:
         res.report(False, tname, "the golden's text is not check.py's long2 prompt (make_golden.py --long)")
         return
@@ -995,6 +1022,35 @@ def test_q4(a, res, tmp):
         print("      q4_kernels skipped: no generic build (--generic / RUNQ_GENERIC)")
 
 
+# ----------------------------------------------------------------------------- KV cache types
+
+def test_kv(a, res, tmp):
+    """the KV cache types other than the default (-k f32, -k bf16; Step 7b): logits vs HF with the
+    Q8_0 thresholds, and the bitwise invariants (batched vs sequential, threads, AVX-512 vs generic)"""
+    texts = dict(batched_prompts())
+    n_a = int(os.environ["OMP_NUM_THREADS"])
+    n_b = THREADS_LONG if n_a != THREADS_LONG else 8
+    for kv in KV_TYPES:
+        v, d = argparse.Namespace(**{**vars(a), "extra": ["-k", kv]}), os.path.join(tmp, f"kv_{kv}")
+        os.makedirs(d, exist_ok=True)
+        test_logits(v, res, d, BATCH, f"kv_{kv}_logits", only=KV_LOGITS)
+        test_logits_long(v, res, d, f"kv_{kv}_logits_long")
+        for name, chunk in KV_BATCHED:
+            same, detail = same_files(logits_file(v, d, name, texts[name], SEQ), logits_file(v, d, name, texts[name], chunk))
+            res.report(same, f"kv_{kv}_batched/{name}_b{chunk}", f"-k {kv} -b {chunk} vs -b {SEQ}: {detail}")
+        same, detail = same_files(logits_file(v, d, BATCH_LONG3, texts[BATCH_LONG3], BATCH, threads=n_a),
+                                  logits_file(v, d, BATCH_LONG3, texts[BATCH_LONG3], BATCH, threads=n_b))
+        res.report(same, f"kv_{kv}_threads/bitwise_{BATCH_LONG3}_b{BATCH}", f"-k {kv}: OMP_NUM_THREADS={n_a} vs {n_b} {detail}")
+        if a.generic:
+            gen = argparse.Namespace(**{**vars(v), "runq": a.generic})
+            gd = os.path.join(d, "generic")
+            os.makedirs(gd, exist_ok=True)
+            for name, chunk in KV_KERNELS:
+                same, detail = same_files(logits_file(v, d, name, texts[name], chunk),
+                                          logits_file(gen, gd, name, texts[name], chunk, GEN_THREADS))
+                res.report(same, f"kv_{kv}_kernels/{name}_b{chunk}", f"-k {kv}, AVX-512 vs generic, -b {chunk}: {detail}")
+
+
 # ----------------------------------------------------------------------------- main
 
 def main():
@@ -1004,7 +1060,7 @@ def main():
     ap.add_argument("--generic", default="", help="generic-kernel build for the kernels test (empty: skip)")
     ap.add_argument("--gguf", default="", help="GGUF Q8_0 file for the gguf tests and greedy goldens (empty: skip)")
     ap.add_argument("--q4", default="", help="GGUF Q4_K_M file for the q4 tests and greedy goldens (empty: skip)")
-    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4",
+    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv",
                     help="comma-separated subset of tests to run")
     ap.add_argument("--update-greedy", action="store_true", help="regenerate the greedy goldens")
     ap.add_argument("--jobs", type=int, default=8, help="parallel runq processes for the tokenizer test")
@@ -1032,7 +1088,8 @@ def main():
                          ("greedy", lambda: test_greedy(a, res)),
                          ("chat", lambda: test_chat(a, res, tmp)),
                          ("gguf", lambda: test_gguf(a, res, tmp)),
-                         ("q4", lambda: test_q4(a, res, tmp))]:
+                         ("q4", lambda: test_q4(a, res, tmp)),
+                         ("kv", lambda: test_kv(a, res, tmp))]:
             if name in only:
                 t = time.time()
                 print(f"== {name}")

@@ -43,7 +43,7 @@ int prefill_chunk = PREFILL_CHUNK_DEFAULT;
 // KV cache element type (-k): fp32, bf16 or f16 (16-bit: half the bytes; layouts in kernels_avx512.h)
 enum { KV_F32 = 0, KV_BF16 = 1, KV_F16 = 2 };
 static const char *kv_type_name[] = { "f32", "bf16", "f16" };
-#define KV_TYPE_DEFAULT KV_F32
+#define KV_TYPE_DEFAULT KV_F16
 int kv_type = KV_TYPE_DEFAULT;
 
 double now_s(void);

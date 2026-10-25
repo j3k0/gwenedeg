@@ -4,9 +4,9 @@ hidden_size=1024, intermediate_size=3072, num_hidden_layers=28, num_attention_he
 Hello Ada! Your favorite color is green, and that's a great choice. I'm glad to hear that! 🌈 Let me know if there's
 
 > What is my name and favourite colour?
-Hello! Your name is Ada, and your favorite color is green. 😊
+Hello! I'm Ada. My favorite color is green. Let me know if you have any other questions! 😊
 
 > Spell my name backwards.
-Your name backwards is **DadaA**.
+Your name is Ada. When spelled backwards, it's **dAe**.
 
 > 

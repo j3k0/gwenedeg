@@ -36,10 +36,13 @@
  *   Q6P, SB = 3392 bytes (53 x 64): 212 bytes per row and super-block (file: 210, +1.0%)
  *     +0    float d[16]       d of row r as fp32 (exact; fp16 + 32 bytes of padding is no smaller)
  *     +64   int8 sc[16][16]   scales[j] of row r at 16 j + r
- *     +320  ql: per sub-block j 2 chunks c of 64 bytes (at 320 + 128 j + 64 c): lane r, byte b:
- *           low nibble = low 4 bits of q of column 16 j + 8 c + b, high nibble = column + 4
- *     +2368 qh: per sub-block j 64 bytes (at 2368 + 64 j): lane r, byte b, bits 2 t, 2 t + 1 =
- *           high 2 bits of q of column 16 j + 4 t + b (t < 4: the 4 steps of the sub-block)
+ *     +320  per sub-block j 192 bytes (at 320 + 192 j), in reading order (one sequential stream:
+ *           with the qh chunks in a separate region after all ql chunks, the GEMV got 13 instead
+ *           of ~31 GB/s on one thread, the hardware prefetchers lose track of two interleaved streams):
+ *       +0, +64   ql: 2 chunks c of 64 bytes: lane r, byte b: low nibble = low 4 bits of q of
+ *                 column 16 j + 8 c + b, high nibble = column + 4
+ *       +128      qh: 64 bytes: lane r, byte b, bits 2 t, 2 t + 1 = high 2 bits of q of column
+ *                 16 j + 4 t + b (t < 4: the 4 steps of the sub-block)
  *           (q of step t = low nibble | ((qh << 4 >> 2 t) & 0x30), shifts on 16-bit lanes)
  *
  * Activations: int8 xq, quantized in groups of 32 (GS = 32 for GGUF, as for Q8_0) with fp32 scales
@@ -202,9 +205,9 @@ static void kq_pack_blocks(int type, uint8_t *kp, const uint8_t *src, int nblk, 
                         const uint8_t *qj = q + 16 * j;
                         for (int c = 0; c < 2; c++)
                             for (int e = 0; e < 4; e++)
-                                o[320 + 128 * j + 64 * c + 4 * r + e] = (uint8_t)((qj[8 * c + e] & 15) | (qj[8 * c + 4 + e] & 15) << 4);
+                                o[320 + 192 * j + 64 * c + 4 * r + e] = (uint8_t)((qj[8 * c + e] & 15) | (qj[8 * c + 4 + e] & 15) << 4);
                         for (int e = 0; e < 4; e++)
-                            o[2368 + 64 * j + 4 * r + e] = (uint8_t)((qj[e] >> 4) | (qj[4 + e] >> 4) << 2 |
+                            o[448 + 192 * j + 4 * r + e] = (uint8_t)((qj[e] >> 4) | (qj[4 + e] >> 4) << 2 |
                                                                      (qj[8 + e] >> 4) << 4 | (qj[12 + e] >> 4) << 6);
                     }
                 }
@@ -232,8 +235,8 @@ static void kq_packed_row(int type, const uint8_t *kp, int row, int k, float *y)
             memcpy(&d, o + 4 * r, 4);
             for (int i = 0; i < QK_K; i++) {
                 int j = i / 16, w = i % 16;
-                int lo = (o[320 + 128 * j + 64 * (w / 8) + 4 * r + w % 4] >> (4 * (w % 8 / 4))) & 15;
-                int hi = (o[2368 + 64 * j + 4 * r + w % 4] >> (2 * (w / 4))) & 3;
+                int lo = (o[320 + 192 * j + 64 * (w / 8) + 4 * r + w % 4] >> (4 * (w % 8 / 4))) & 15;
+                int hi = (o[448 + 192 * j + 4 * r + w % 4] >> (2 * (w / 4))) & 3;
                 y[i] = d * (int8_t)o[64 + 16 * j + r] * ((lo | hi << 4) - 32);
             }
         }
@@ -320,7 +323,7 @@ KQ_EXACT static void q6p_dot(float *out, size_t ldo, const uint8_t *wb, int k, i
             int32_t sc[2][KQ_ROWS];
             for (int h = 0; h < 2; h++) {
                 int j = 2 * g8 + h;
-                const uint8_t *ql = o + 320 + 128 * j, *qh = o + 2368 + 64 * j;
+                const uint8_t *ql = o + 320 + 192 * j, *qh = ql + 128;
                 for (int r = 0; r < KQ_ROWS; r++) {
                     sc[h][r] = (int8_t)o[64 + 16 * j + r];
                     for (int t = 0; t < 4; t++)

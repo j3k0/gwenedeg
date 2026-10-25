@@ -432,7 +432,7 @@ static void kq6_gemv_rows(float *out, const int8_t *xq, const float *xs, const i
                     int j = 2 * g8 + h;
                     const int8_t *x = xq + 32 * g + 16 * h;
                     __m512i q[4];
-                    kq6_unpack4(o + 320 + 128 * j, o + 2368 + 64 * j, q);
+                    kq6_unpack4(o + 320 + 192 * j, o + 448 + 192 * j, q);
                     __m512i t0 = _mm512_set1_epi32(c16[2 * g + h]), t1 = _mm512_setzero_si512();
                     t0 = _mm512_dpbusd_epi32(t0, q[0], q8p_bcast4(x));
                     t1 = _mm512_dpbusd_epi32(t1, q[1], q8p_bcast4(x + 4));
@@ -485,7 +485,7 @@ static void kq_unpack_tile(int type, uint8_t *scr, const uint8_t *wp, int nblk, 
                     for (int h = 0; h < 2; h++) {
                         int j = 2 * g8 + h;
                         __m512i q[4];
-                        kq6_unpack4(o + 320 + 128 * j, o + 2368 + 64 * j, q);
+                        kq6_unpack4(o + 320 + 192 * j, o + 448 + 192 * j, q);
                         for (int t = 0; t < 4; t++)
                             _mm512_store_si512((void *)(dst + 256 * h + 64 * t), q[t]);
                         _mm512_store_si512((void *)(dst + 512 + 64 * h),

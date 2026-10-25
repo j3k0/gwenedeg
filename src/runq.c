@@ -20,6 +20,8 @@
 #include "kernels_avx512.h"
 // K-quants (GGUF Q4_K / Q6_K): block formats, repacked layouts, arithmetic, generic kernels
 #include "kquants.h"
+// phase synchronization and the parallel region of a decode step / prefill chunk
+#include "threads.h"
 
 // ----------------------------------------------------------------------------
 // Globals
@@ -155,6 +157,8 @@ typedef struct {
     int att_threads;
     float *rope_b;  // (nb_max, head_dim): RoPE cos / sin of each row's position (rope_row)
     float *rope;    // (head_dim,): the same for forward()'s position
+    RqSync sync;    // phase counters of forward()'s parallel job (threads.h)
+    int dec_chunk, cls_chunk; // 16-row blocks per claim in forward()'s GEMVs / classifier
 } RunState;
 
 // ----------------------------------------------------------------------------
@@ -586,6 +590,7 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
     s->att = calloc((size_t)p->n_heads * s->kv_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
     s->rope = calloc(p->head_dim, sizeof(float));
+    rq_sync_init(&s->sync, 8 * p->n_layers + 8);
     s->key_cache = alloc_big(s->kv_size * sizeof(float));
     s->value_cache = alloc_big(s->kv_size * sizeof(float));
 
@@ -632,6 +637,7 @@ void free_run_state(RunState* s) {
     free(s->att_b);
     free(s->rope_b);
     free(s->rope);
+    rq_sync_free(&s->sync);
 }
 
 // ----------------------------------------------------------------------------
@@ -1494,26 +1500,29 @@ static void swiglu(float *hb, const float *hb2, int n) {
         hb[i] *= hb2[i] * (1.0f / (1.0f + expf(fminf(-hb[i], 80.0f))));
 }
 
+static void kv_populate_one(RunState *s, Config *p, int pos0, int n, int it) {
+    // kv_populate's item it = (layer it / 2, K or V)
+#if !defined _WIN32 && defined MADV_POPULATE_WRITE
+    int kv_dim = p->n_kv_heads * p->head_dim, l = it / 2, kv = it % 2;
+    uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
+    // positions pos0.. of all heads: the tiles pos0 / ATT_T .. (pos0 + n - 1) / ATT_T
+    float *c = (kv ? s->value_cache : s->key_cache) + l * (uint64_t)s->kv_len * kv_dim;
+    uintptr_t a = (uintptr_t)(c + (size_t)(pos0 / ATT_T) * ATT_T * kv_dim) & ~(pg - 1);
+    uintptr_t e = (uintptr_t)(c + (size_t)((pos0 + n - 1) / ATT_T + 1) * ATT_T * kv_dim);
+    madvise((void *)a, e - a, MADV_POPULATE_WRITE);
+#else
+    (void)s; (void)p; (void)pos0; (void)n; (void)it;
+#endif
+}
+
 static void kv_populate(RunState *s, Config *p, int pos0, int n) {
     // Pre-fault the KV cache tiles of positions pos0..pos0+n-1 of every layer (anonymous memory,
     // untouched pages are not mapped yet), in parallel and one madvise per range instead of one page fault
     // per 4 KB. Otherwise these faults happen inside the K/V GEMMs, serialized in the kernel:
     // ~55 ms of a 451-token prefill (8 threads), vs ~7 ms here. Linux >= 5.14; errors ignored
-#if !defined _WIN32 && defined MADV_POPULATE_WRITE
-    int kv_dim = p->n_kv_heads * p->head_dim;
-    uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int l = 0; l < p->n_layers; l++)
-        for (int kv = 0; kv < 2; kv++) {
-            // positions pos0.. of all heads: the tiles pos0 / ATT_T .. (pos0 + n - 1) / ATT_T
-            float *c = (kv ? s->value_cache : s->key_cache) + l * (uint64_t)s->kv_len * kv_dim;
-            uintptr_t a = (uintptr_t)(c + (size_t)(pos0 / ATT_T) * ATT_T * kv_dim) & ~(pg - 1);
-            uintptr_t e = (uintptr_t)(c + (size_t)((pos0 + n - 1) / ATT_T + 1) * ATT_T * kv_dim);
-            madvise((void *)a, e - a, MADV_POPULATE_WRITE);
-        }
-#else
-    (void)s; (void)p; (void)pos0; (void)n;
-#endif
+    #pragma omp parallel for schedule(static)
+    for (int it = 0; it < 2 * p->n_layers; it++)
+        kv_populate_one(s, p, pos0, n, it);
 }
 
 static inline QuantizedTensor qsub(QuantizedTensor *t, int i0) {
@@ -1521,53 +1530,60 @@ static inline QuantizedTensor qsub(QuantizedTensor *t, int i0) {
     return (QuantizedTensor) { .q = t->q + i0, .s = t->s + i0 / GS, .p = NULL };
 }
 
-float *forward(Transformer *transformer, int token, int pos, int compute_logits) {
-    // compute_logits = 0 skips the final rmsnorm + classifier (prompt tokens whose
-    // logits are discarded) and returns NULL; the KV cache is filled either way.
-    // One parallel region for the whole token (was: one per matmul and for the attention, ~230
-    // fork/joins per token): per layer 7 barriers, the work split into items:
-    //   [single] residual + rmsnorm + quantize -> [for] q, k, v, one item per head, with its
-    //   QK-norm + RoPE and the K/V cache store -> [for] attention per kv head + quantize ->
-    //   [for] wo -> [single] residual + rmsnorm + quantize -> [for] w1 + w3 + SwiGLU + quantize per
-    //   ff_rows hidden rows -> [for] w2
-    // Every output is computed whole by one thread, by the same functions as before (same results)
+// Phases of a decode job (threads.h): PH_BEGIN(n, chunk) ... [PH_EPILOGUE ...] PH_END runs phase k_
+// with n items, claimed in ranges [lo, hi) of up to chunk items; the epilogue (if any) runs once, on
+// the thread finishing the last item, before the phase is published; every thread then waits for it
+#define PH_BEGIN(n_, chunk_) { RqIt it_ = rq_it(k_, (n_), (chunk_), tid); int lo, hi; \
+    while (rq_next(S, &it_, &lo, &hi)) {
+#define PH_EPILOGUE if (rq_finish(S, &it_, hi - lo)) {
+#define PH_END rq_publish(S, k_ + 1); } } rq_wait(S, ++k_); }
+#define PH_END_NOEPI PH_EPILOGUE PH_END
+
+typedef struct { Transformer *tr; int token, pos, compute_logits; } DecodeJob;
+
+static int decode_phases(Config *p) { return 7 * p->n_layers + 3; }
+
+static void decode_worker(void *arg, int tid, int nt) {
+    (void)nt;
+    DecodeJob *job = arg;
+    Transformer *transformer = job->tr;
     Config *p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
     RunState* s = &transformer->state;
+    RqSync *S = &s->sync;
+    int pos = job->pos, k_ = 0;
     int dim = p->dim, hd = p->head_dim, hidden = p->hidden_dim, nh = p->n_heads, nkv = p->n_kv_heads;
     int kv_dim = nkv * hd;
     int kv_mul = nh / nkv; // integer multiplier of the kv sharing in multiquery
     int all_heads_dim = nh * hd, ff = s->ff_rows;
     size_t ts = (size_t)nkv * ATT_T * hd;
 
-    // the token embedding into s->x
-    embed_row(s->x, w->q_tokens, token, dim);
-    rope_row(s->rope, hd, pos);
-    if (pos % ATT_T == 0)
-        kv_populate(s, p, pos, 1); // first position of a KV cache tile: pre-fault the tile (all layers)
+    if (pos % ATT_T == 0) { // first position of a KV cache tile: pre-fault the tile (all layers)
+        PH_BEGIN(2 * p->n_layers, 1)
+        for (int it = lo; it < hi; it++)
+            kv_populate_one(s, p, pos, 1, it);
+        PH_END_NOEPI
+    }
 
-    #pragma omp parallel
-    {
     // forward all the layers
     for (int l = 0; l < p->n_layers; l++) {
         uint64_t loff = l * (uint64_t)s->kv_len * kv_dim; // kv cache layer offset for convenience
         float *kl = s->key_cache + loff, *vl = s->value_cache + loff;
 
         // (residual connection of the previous layer's ffn,) attention rmsnorm, quantize
-        #pragma omp single
-        {
+        PH_BEGIN(1, 1)
             if (l > 0)
                 for (int i = 0; i < dim; i++)
                     s->x[i] += s->xb[i];
             rmsnorm(s->xb, s->x, w->rms_att_weight + l * dim, dim);
             quantize(&s->xq, s->xb, dim);
             matvec_prep(s->xq_corr, s->xq_xf, s->xq_c16, &s->xq, 0, dim);
-        }
+        PH_END_NOEPI
 
         // qkv matmuls for this position, one head per item: Q-RMSNorm + rotate each query head,
         // the same for each key head, then save key, value at this time step (pos) to our kv cache
-        #pragma omp for schedule(static)
-        for (int it = 0; it < nh + 2 * nkv; it++) {
+        PH_BEGIN(nh + 2 * nkv, 1)
+        for (int it = lo; it < hi; it++) {
             if (it < nh) {
                 matvec_rows(s->q, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->wq + l, dim, it * hd, (it + 1) * hd);
                 qk_norm_rope(s->q + it * hd, 1, w->q_norm_weights + l * hd, hd, s->rope);
@@ -1582,11 +1598,12 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
                 kv_store(NULL, vl, pos, h, nkv, hd, NULL, s->v + h * hd);
             }
         }
+        PH_END_NOEPI
 
         // multihead attention: per kv head, its kv_mul query heads together; then quantize
         // their outputs (kv_mul * hd values, whole quantization groups) for wo
-        #pragma omp for schedule(static)
-        for (int g = 0; g < nkv; g++) {
+        PH_BEGIN(nkv, 1)
+        for (int g = lo; g < hi; g++) {
             const float *qv[ATT_NV_MAX];
             float *ov[ATT_NV_MAX];
             int npv[ATT_NV_MAX];
@@ -1602,26 +1619,26 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
             quantize(&xg, s->xb + i0, kv_mul * hd);
             matvec_prep(s->xq_corr, s->xq_xf, s->xq_c16, &s->xq, i0, kv_mul * hd);
         }
+        PH_END_NOEPI
 
-        // final matmul to get the output of the attention
-        #pragma omp for schedule(static)
-        for (int i0 = 0; i0 < dim; i0 += 16)
-            matvec_rows(s->xb, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->wo + l, all_heads_dim, i0, i0 + 16);
+        // final matmul to get the output of the attention (16-row blocks)
+        PH_BEGIN(dim / 16, s->dec_chunk)
+            matvec_rows(s->xb, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->wo + l, all_heads_dim, lo * 16, hi * 16);
+        PH_END_NOEPI
 
         // residual connection back into s->x, ffn rmsnorm, quantize
-        #pragma omp single
-        {
+        PH_BEGIN(1, 1)
             for (int i = 0; i < dim; i++)
                 s->x[i] += s->xb[i];
             rmsnorm(s->xb, s->x, w->rms_ffn_weight + l * dim, dim);
             quantize(&s->xq, s->xb, dim);
             matvec_prep(s->xq_corr, s->xq_xf, s->xq_c16, &s->xq, 0, dim);
-        }
+        PH_END_NOEPI
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x)): per item,
         // ff rows of self.w1(x) and self.w3(x), the SwiGLU non-linearity and their quantization
-        #pragma omp for schedule(static)
-        for (int i0 = 0; i0 < hidden; i0 += ff) {
+        PH_BEGIN(hidden / ff, 1)
+        for (int i0 = lo * ff; i0 < hi * ff; i0 += ff) {
             matvec_rows(s->hb, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->w1 + l, dim, i0, i0 + ff);
             matvec_rows(s->hb2, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->w3 + l, dim, i0, i0 + ff);
             swiglu(s->hb + i0, s->hb2 + i0, ff);
@@ -1629,28 +1646,53 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
             quantize(&hg, s->hb + i0, ff);
             matvec_prep(s->hq_corr, s->hq_xf, s->hq_c16, &s->hq, i0, ff);
         }
+        PH_END_NOEPI
 
         // final matmul to get the output of the ffn (its residual: next layer, or below)
-        #pragma omp for schedule(static)
-        for (int i0 = 0; i0 < dim; i0 += 16)
-            matvec_rows(s->xb, &s->hq, s->hq_corr, s->hq_xf, s->hq_c16, w->w2 + l, hidden, i0, i0 + 16);
+        PH_BEGIN(dim / 16, s->dec_chunk)
+            matvec_rows(s->xb, &s->hq, s->hq_corr, s->hq_xf, s->hq_c16, w->w2 + l, hidden, lo * 16, hi * 16);
+        PH_END_NOEPI
     }
 
-    if (compute_logits) {
+    if (job->compute_logits) {
         // residual connection, final rmsnorm, classifier into logits
-        #pragma omp single
-        {
+        PH_BEGIN(1, 1)
             for (int i = 0; i < dim; i++)
                 s->x[i] += s->xb[i];
             rmsnorm(s->x, s->x, w->rms_final_weight, dim);
             quantize(&s->xq, s->x, dim);
             matvec_prep(s->xq_corr, s->xq_xf, s->xq_c16, &s->xq, 0, dim);
-        }
-        #pragma omp for schedule(static)
-        for (int i0 = 0; i0 < p->vocab_size; i0 += 16)
-            matvec_rows(s->logits, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->wcls, dim, i0, i0 + 16 < p->vocab_size ? i0 + 16 : p->vocab_size);
+        PH_END_NOEPI
+        int nblk = (p->vocab_size + 15) / 16;
+        PH_BEGIN(nblk, s->cls_chunk)
+            matvec_rows(s->logits, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->wcls, dim, lo * 16,
+                        hi * 16 < p->vocab_size ? hi * 16 : p->vocab_size);
+        PH_END_NOEPI
     }
-    } // omp parallel
+}
+
+float *forward(Transformer *transformer, int token, int pos, int compute_logits) {
+    // compute_logits = 0 skips the final rmsnorm + classifier (prompt tokens whose
+    // logits are discarded) and returns NULL; the KV cache is filled either way.
+    // One parallel job for the whole token (decode_worker), in phases (threads.h): per layer
+    //   residual + rmsnorm + quantize -> q, k, v, one item per head, with its QK-norm + RoPE and the
+    //   K/V cache store -> attention per kv head + quantize -> wo -> residual + rmsnorm + quantize
+    //   -> w1 + w3 + SwiGLU + quantize per ff_rows hidden rows -> w2
+    // Every output is computed whole by one thread, by the same functions as before (same results)
+    Config *p = &transformer->config;
+    RunState* s = &transformer->state;
+
+    // the token embedding into s->x
+    embed_row(s->x, transformer->weights.q_tokens, token, p->dim);
+    rope_row(s->rope, p->head_dim, pos);
+
+    int nt = rq_nthreads();
+    rq_begin(&s->sync, decode_phases(p), nt);
+    // GEMV ranges of 16-row blocks: ~4 per thread (dim / 16 = 64 blocks), the classifier ~8
+    s->dec_chunk = p->dim / 16 / (4 * nt) > 1 ? p->dim / 16 / (4 * nt) : 1;
+    s->cls_chunk = (p->vocab_size + 15) / 16 / (8 * nt) > 1 ? (p->vocab_size + 15) / 16 / (8 * nt) : 1;
+    DecodeJob job = { transformer, token, pos, compute_logits };
+    rq_parallel(decode_worker, &job);
     return compute_logits ? s->logits : NULL;
 }
 
@@ -3442,6 +3484,7 @@ int main(int argc, char *argv[]) {
         omp_set_num_threads(nt < 12 ? nt : 12);
     }
 #endif
+    rq_config();
 
     // build the Transformer via the model .bin file
     Transformer transformer;

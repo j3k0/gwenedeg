@@ -5,10 +5,10 @@ CC      = gcc
 CFLAGS  ?= -Ofast -fopenmp -march=native
 DBGFLAGS ?= -g -O0 -fopenmp
 CPPFLAGS += -D_FILE_OFFSET_BITS=64
-LDLIBS  += -lm
+LDLIBS  += -lm -lpthread
 
 SRC = src/runq.c
-HDR = src/unicode_tables.h src/unicode_nfc.h src/kernels_avx512.h src/kquants.h
+HDR = src/unicode_tables.h src/unicode_nfc.h src/kernels_avx512.h src/kquants.h src/threads.h
 Q8  = models/Qwen3-0.6B-q8.bin
 
 .PHONY: all debug generic clean test bench bench-prefill models

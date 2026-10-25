@@ -1806,7 +1806,7 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
     decode_norm(s, p, &transformer->weights, 0, 0); // layer 0's attention rmsnorm + quantize
 
     int nt = rq_nthreads();
-    rq_begin(&s->sync, decode_phases(p), decode_counters(p), nt);
+    rq_begin(&s->sync, decode_phases(p), decode_counters(p), nt, rq_spin_dec);
     // GEMV ranges of 16-row blocks: ~4 per thread (dim / 16 = 64 blocks), the classifier ~8
     s->dec_chunk = p->dim / 16 / (4 * nt) > 1 ? p->dim / 16 / (4 * nt) : 1;
     s->cls_chunk = (p->vocab_size + 15) / 16 / (8 * nt) > 1 ? (p->vocab_size + 15) / 16 / (8 * nt) : 1;
@@ -2082,7 +2082,7 @@ float *forward_batch(Transformer *transformer, int *tokens, int n, int pos0, int
         exit(EXIT_FAILURE);
     }
     PROF_START();
-    rq_begin(&s->sync, prefill_phases(p), p->n_layers * s->pf_nrb, rq_nthreads());
+    rq_begin(&s->sync, prefill_phases(p), p->n_layers * s->pf_nrb, rq_nthreads(), rq_spin_pf);
     PrefillJob job = { transformer, tokens, n, pos0, logits_mode, logits_out };
     rq_parallel(prefill_worker, &job);
     return logits_mode == LOGITS_LAST ? s->logits : logits_mode == LOGITS_ALL ? logits_out : NULL;

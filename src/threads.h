@@ -17,7 +17,7 @@
  * (rq_wait). So a phase ends when its *work* is done, not when every thread has arrived: a thread
  * preempted between phases holds nothing up (it finds the phases done when it runs again, and
  * catches up), only one preempted inside an item does, until it runs again. Waiting threads spin
- * (with pause) for RQ_SPIN rounds, then sleep on a futex (Linux; elsewhere they yield), so a stall
+ * (with pause) for a while (RQ_SPIN_DEC / RQ_SPIN_PF rounds), then sleep on a futex (Linux; elsewhere they yield), so a stall
  * frees their CPUs for the preempted thread and the other processes; the publisher wakes sleepers
  * only if there are any (no syscall in the common case).
  * Results do not depend on which thread runs an item (each output is computed whole by one thread,
@@ -71,10 +71,18 @@
 #define RQ_LOAD(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
 #define RQ_ADD(p, v) __atomic_fetch_add((p), (v), __ATOMIC_ACQ_REL)
 
-#ifndef RQ_SPIN
-#define RQ_SPIN 4000 // pause rounds before sleeping (Zen 4: ~10 ns per round + the load)
+// pause rounds before sleeping (Zen 4: ~28 ns per round): decode phases (~10-60 us apart; at 16
+// threads on the 16-vCPU VM, 1,000 rounds decoded ~10-20% faster than 4,000 and ~30% faster than
+// 100,000: sleeping waiters free the CPUs for a preempted thread), prefill phases (~1-2 ms; 4,000
+// prefilled ~5% faster than 1,000 at 8-12 threads), the pool's wait for the next job
+#ifndef RQ_SPIN_DEC
+#define RQ_SPIN_DEC 1000
 #endif
-static int rq_spin = RQ_SPIN;
+#ifndef RQ_SPIN_PF
+#define RQ_SPIN_PF 4000
+#endif
+#define RQ_SPIN_JOB 4000
+static int rq_spin_dec = RQ_SPIN_DEC, rq_spin_pf = RQ_SPIN_PF;
 static int rq_static = 0; // RUNQ_SYNC=static: fixed item ranges per thread (a plain barrier per phase)
 
 static void rq_sleep(int *word, int v) {
@@ -98,11 +106,11 @@ static void rq_wake(int *word) {
 #endif
 }
 
-static void rq_wait_ge(int *word, int target, int *sleepers) {
+static void rq_wait_ge(int *word, int target, int *sleepers, int spin) {
     // until *word >= target (a counter that only grows while anyone waits on it): spin, then sleep.
     // Sleepers register first and re-check (seq_cst both sides, see rq_store_wake), so a wake-up is
     // never lost
-    for (int i = 0; i < rq_spin; i++) {
+    for (int i = 0; i < spin; i++) {
         if (RQ_LOAD(word) >= target)
             return;
         rq_relax();
@@ -132,6 +140,7 @@ typedef struct {
     int *sleepers; // threads sleeping on ready (or on a dependency counter)
     int *cnt;      // dependency counters inside phases (reset by rq_begin)
     int ncnt;
+    int spin;      // pause rounds before a waiting thread sleeps (per job)
     uint64_t *own; // per (thread, phase): the thread's remaining item range, [tid * nph + k]
     int own_nt;    // threads own[] is sized for
     uint32_t epoch; // job number (16 bits): own[] words of older jobs are stale = the initial range
@@ -155,7 +164,7 @@ static void rq_sync_init(RqSync *s, int nph, int ncnt) {
 
 static void rq_sync_free(RqSync *s) { free(s->mem); free(s->own); s->mem = NULL; s->own = NULL; }
 
-static void rq_begin(RqSync *s, int nph, int ncnt, int nt) {
+static void rq_begin(RqSync *s, int nph, int ncnt, int nt, int spin) {
     // before a job (serial): reset the counters of phases 0..nph-1 and dependency counters 0..ncnt-1;
     // a new epoch invalidates every thread's ranges (all zero again after 65,535 jobs)
     if (nph > s->nph || ncnt > s->ncnt) { fprintf(stderr, "rq_begin: too many phases / counters\n"); exit(EXIT_FAILURE); }
@@ -175,6 +184,7 @@ static void rq_begin(RqSync *s, int nph, int ncnt, int nt) {
         s->epoch = 1;
     }
     s->nt = nt;
+    s->spin = spin;
 }
 
 // Items of a phase: thread t owns the range [t n / nt, (t + 1) n / nt) (in whole units of `unit`
@@ -265,7 +275,7 @@ static inline void rq_publish(RqSync *s, int nk) { rq_store_wake(s->ready, nk, s
 static inline void rq_wait(RqSync *s, int nk) {
     // until phases 0..nk-1 are complete
     if (RQ_LOAD(s->ready) >= nk) return;
-    rq_wait_ge(s->ready, nk, s->sleepers);
+    rq_wait_ge(s->ready, nk, s->sleepers, s->spin);
 }
 
 static inline int rq_count(RqSync *s, int i, int v) {
@@ -280,7 +290,7 @@ static inline int rq_count(RqSync *s, int i, int v) {
 static inline void rq_wait_count(RqSync *s, int i, int target) {
     // until dependency counter i (inside a phase) reaches target
     if (RQ_LOAD(&s->cnt[i]) >= target) return;
-    rq_wait_ge(&s->cnt[i], target, s->sleepers);
+    rq_wait_ge(&s->cnt[i], target, s->sleepers, s->spin);
 }
 
 // ----------------------------------------------------------------------------------- parallel region
@@ -338,7 +348,7 @@ static struct {
 static void *rq_pool_main(void *arg) {
     int tid = (int)(intptr_t)arg, my_gen = 0;
     for (;;) {
-        rq_wait_ge(&rq_pool.gen, my_gen + 1, &rq_pool.sleepers);
+        rq_wait_ge(&rq_pool.gen, my_gen + 1, &rq_pool.sleepers, RQ_SPIN_JOB);
         int s = __atomic_load_n(&rq_pool.state, __ATOMIC_ACQUIRE);
         int in = 0;
         while (!(s & 1))
@@ -372,7 +382,7 @@ static void rq_parallel(RqFn fn, void *ctx) {
     fn(ctx, 0, nt);
     int s = __atomic_or_fetch(&rq_pool.state, 1, __ATOMIC_SEQ_CST);
     if (s != 1) {
-        for (int i = 0; i < rq_spin && s != 1; i++) {
+        for (int i = 0; i < RQ_SPIN_JOB && s != 1; i++) {
             rq_relax();
             s = __atomic_load_n(&rq_pool.state, __ATOMIC_ACQUIRE);
         }
@@ -400,9 +410,13 @@ static inline int rq_nthreads(void) { return rq_threads(); }
 #endif
 
 static void rq_config(void) {
-    // tuning knobs from the environment (RUNQ_SPIN, RUNQ_SYNC=static)
+    // tuning knobs from the environment (RUNQ_SPIN=decode[,prefill], RUNQ_SYNC=static)
     const char *e = getenv("RUNQ_SPIN");
-    if (e) rq_spin = atoi(e);
+    if (e) {
+        rq_spin_dec = rq_spin_pf = atoi(e);
+        if (strchr(e, ','))
+            rq_spin_pf = atoi(strchr(e, ',') + 1);
+    }
     e = getenv("RUNQ_SYNC");
     if (e && !strcmp(e, "static")) rq_static = 1;
 #ifdef RUNQ_POOL

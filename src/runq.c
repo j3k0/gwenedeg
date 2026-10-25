@@ -64,7 +64,7 @@ typedef struct {
     int seq_len; // max sequence length
     int head_dim; // head dimension
     int shared_classifier; // 1 if wcls == p_tokens
-    int group_size; // quantization group size (export.py uses 64)
+    int group_size; // quantization group size (export.py uses 64; GGUF Q8_0: 32)
 } Config;
 
 typedef struct {
@@ -72,6 +72,8 @@ typedef struct {
     float *s; // scaling factors
     uint8_t *p;   // weights only: the same matrix repacked for the VNNI kernels (Q8P layout,
                   // see kernels_avx512.h), or NULL (generic kernels on q / s)
+    const uint8_t *b; // GGUF weights: the Q8_0 blocks in the file mapping (per 32 values an fp16
+                  // scale + 32 int8, Q8_0_BLOCK bytes), converted at load (prepare_weights); or NULL
 } QuantizedTensor;
 
 typedef struct {
@@ -96,9 +98,11 @@ typedef struct {
     float *rms_final_weight; // (dim,)
     // (optional) classifier weights for the logits, on the last layer
     QuantizedTensor *wcls;
-    // VNNI build: one allocation holding all repacked matmul weights (QuantizedTensor.p)
+    // one allocation holding the matmul weights converted at load (prepare_weights): VNNI build:
+    // repacked (QuantizedTensor.p); generic kernels on a GGUF file: q / s arrays; else NULL
     uint8_t *packed;
     size_t packed_size;
+    float *norms; // GGUF: the norm weights, copied in the .bin layout (NULL: .bin, in the mapping)
 } TransformerWeights;
 
 typedef struct {
@@ -143,12 +147,330 @@ typedef struct {
     float *rope;    // (head_dim,): the same for forward()'s position
 } RunState;
 
+// ----------------------------------------------------------------------------
+// GGUF files (llama.cpp's format, versions 2 and 3), read directly: hyperparameters and tokenizer
+// from the metadata, Q8_0 / F32 tensors from the mapped file. Layout (little-endian):
+//   "GGUF", u32 version, u64 n_tensors, u64 n_kv;
+//   n_kv x (string key, u32 value type, value); string = u64 length + bytes (no NUL); array =
+//     u32 element type, u64 count, the elements (no nested arrays here);
+//   n_tensors x (string name, u32 n_dims, u64 ne[n_dims], u32 ggml type, u64 offset);
+//   padding to general.alignment (default 32), then the tensor data, tensor i at data_off + offset.
+// ne[0] is the fastest dimension: a row-major (d, k) matrix has ne = { k, d }.
+// The file is untrusted input: every count, length and offset is checked against the file size
+// (gguf_take, overflow-safe) before use, counts before any allocation, and every tensor's data
+// range when its header is read; errors exit with a message naming the file.
+
+#define GGUF_MAGIC 0x46554747u // "GGUF"
+enum { GV_U8, GV_I8, GV_U16, GV_I16, GV_U32, GV_I32, GV_F32, GV_BOOL, GV_STR, GV_ARR, GV_U64, GV_I64, GV_F64, GV_N };
+static const uint8_t gv_size[GV_N] = { 1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8 }; // scalar value bytes
+enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q8_0 = 8 }; // tensor types (ggml numbering) used here
+#define Q8_0_BLOCK 34 // ggml block_q8_0: fp16 scale d, int8 qs[32]; value = qs[i] * d
+
+typedef struct { const char *key; uint64_t key_len, off, n; uint32_t type, arr_type; } GgufKV; // off: value / first element
+typedef struct { const char *name; uint64_t name_len, ne[4], off, size; uint32_t type, n_dims; } GgufTensor; // off: in file
+typedef struct {
+    const uint8_t *map; uint64_t size; const char *path; // the whole file, mapped read-only
+    uint32_t version;
+    uint64_t alignment, data_off;
+    GgufKV *kv; uint64_t n_kv;
+    GgufTensor *t; uint64_t n_t;
+} Gguf;
+
+static void gguf_fail(const Gguf *g, const char *fmt, const char *arg) {
+    fprintf(stderr, "GGUF %s: ", g->path);
+    fprintf(stderr, fmt, arg ? arg : "");
+    fprintf(stderr, "\n");
+    exit(EXIT_FAILURE);
+}
+
+static const uint8_t *gguf_take(const Gguf *g, uint64_t *pos, uint64_t n, const char *what) {
+    // n bytes at *pos (advanced past them), all inside the file, else a clean error
+    if (*pos > g->size || n > g->size - *pos) gguf_fail(g, "truncated or corrupt (%s runs past the end of the file)", what);
+    const uint8_t *p = g->map + *pos;
+    *pos += n;
+    return p;
+}
+
+static uint32_t gguf_u32(const Gguf *g, uint64_t *pos, const char *what) { uint32_t v; memcpy(&v, gguf_take(g, pos, 4, what), 4); return v; }
+static uint64_t gguf_u64(const Gguf *g, uint64_t *pos, const char *what) { uint64_t v; memcpy(&v, gguf_take(g, pos, 8, what), 8); return v; }
+
+static uint64_t gguf_str(const Gguf *g, uint64_t *pos, const char **s, const char *what) {
+    uint64_t n = gguf_u64(g, pos, what);
+    *s = (const char *)gguf_take(g, pos, n, what);
+    return n;
+}
+
+static int gguf_type_bytes(uint32_t type, uint64_t n, uint64_t ne0, uint64_t *bytes) {
+    // data size of n elements of a ggml type (rows of ne0, blocks never straddle a row); 0 if the
+    // type is unknown here (such a tensor cannot be used) or the shape does not fit its blocks.
+    // Block sizes / bytes from ggml.c (type_traits); the k-quants for Step 6b's Q4_K_M
+    static const struct { uint32_t type, blk, bytes; } tt[] = {
+        { 0, 1, 4 }, { 1, 1, 2 }, { 30, 1, 2 }, { 2, 32, 18 }, { 3, 32, 20 }, { 6, 32, 22 }, { 7, 32, 24 },
+        { 8, 32, 34 }, { 10, 256, 84 }, { 11, 256, 110 }, { 12, 256, 144 }, { 13, 256, 176 }, { 14, 256, 210 } };
+    for (size_t i = 0; i < sizeof(tt) / sizeof(tt[0]); i++)
+        if (tt[i].type == type) {
+            if (ne0 % tt[i].blk) return 0;
+            *bytes = n / tt[i].blk * tt[i].bytes; // n <= 2^56: no overflow
+            return 1;
+        }
+    return 0;
+}
+
+static void gguf_parse(Gguf *g) {
+    // header, metadata and tensor table of the mapped file g->map (g->size bytes)
+    uint64_t pos = 0;
+    char what[96];
+    if (gguf_u32(g, &pos, "header") != GGUF_MAGIC) gguf_fail(g, "not a GGUF file (bad magic)%s", NULL);
+    g->version = gguf_u32(g, &pos, "header");
+    if (g->version != 2 && g->version != 3) {
+        snprintf(what, sizeof(what), "%u", g->version);
+        gguf_fail(g, "unsupported GGUF version %s (need 2 or 3)", what);
+    }
+    g->n_t = gguf_u64(g, &pos, "header");
+    g->n_kv = gguf_u64(g, &pos, "header");
+    // every metadata entry takes >= 13 bytes and every tensor entry >= 32: counts the rest of the
+    // file cannot hold are corrupt (and must not size an allocation); models have hundreds
+    if (g->n_kv > (g->size - pos) / 13 || g->n_t > (g->size - pos) / 32 || g->n_kv > 65536 || g->n_t > 65536)
+        gguf_fail(g, "corrupt header (tensor / metadata counts too large)%s", NULL);
+    g->kv = calloc(g->n_kv + 1, sizeof(GgufKV));
+    g->t = calloc(g->n_t + 1, sizeof(GgufTensor));
+    if (!g->kv || !g->t) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+
+    g->alignment = 32;
+    for (uint64_t i = 0; i < g->n_kv; i++) {
+        GgufKV *kv = &g->kv[i];
+        snprintf(what, sizeof(what), "metadata entry %llu", (unsigned long long)i);
+        kv->key_len = gguf_str(g, &pos, &kv->key, what);
+        kv->type = gguf_u32(g, &pos, what);
+        kv->n = 1;
+        uint32_t et = kv->type;
+        if (kv->type == GV_ARR) {
+            et = kv->arr_type = gguf_u32(g, &pos, what);
+            kv->n = gguf_u64(g, &pos, what);
+        }
+        if (et >= GV_N || et == GV_ARR) gguf_fail(g, "corrupt metadata (bad value type in %s)", what);
+        kv->off = pos;
+        if (et == GV_STR) {
+            if (kv->n > (g->size - pos) / 8) gguf_fail(g, "truncated or corrupt (%s runs past the end of the file)", what);
+            for (uint64_t j = 0; j < kv->n; j++) {
+                const char *s;
+                gguf_str(g, &pos, &s, what);
+            }
+        } else {
+            if (kv->n > (g->size - pos) / gv_size[et]) gguf_fail(g, "truncated or corrupt (%s runs past the end of the file)", what);
+            gguf_take(g, &pos, kv->n * gv_size[et], what);
+        }
+        if (kv->key_len == 17 && !memcmp(kv->key, "general.alignment", 17)) {
+            uint32_t a = 0;
+            if (kv->type == GV_U32) memcpy(&a, g->map + kv->off, 4);
+            if (a == 0 || a > (1u << 16) || (a & (a - 1))) gguf_fail(g, "bad general.alignment (need a power of two <= 65536, u32)%s", NULL);
+            g->alignment = a;
+        }
+    }
+
+    for (uint64_t i = 0; i < g->n_t; i++) {
+        GgufTensor *t = &g->t[i];
+        snprintf(what, sizeof(what), "tensor entry %llu", (unsigned long long)i);
+        t->name_len = gguf_str(g, &pos, &t->name, what);
+        t->n_dims = gguf_u32(g, &pos, what);
+        if (t->n_dims < 1 || t->n_dims > 4) gguf_fail(g, "corrupt tensor table (bad dimension count in %s)", what);
+        uint64_t n = 1;
+        for (uint32_t d = 0; d < 4; d++) {
+            t->ne[d] = d < t->n_dims ? gguf_u64(g, &pos, what) : 1;
+            if (t->ne[d] == 0 || t->ne[d] > (1ull << 56) / n) gguf_fail(g, "corrupt tensor table (bad shape in %s)", what);
+            n *= t->ne[d];
+        }
+        t->type = gguf_u32(g, &pos, what);
+        t->off = gguf_u64(g, &pos, what);
+        if (!gguf_type_bytes(t->type, n, t->ne[0], &t->size))
+            t->size = UINT64_MAX; // unknown type or shape: unusable (checked if used, gguf_weight)
+    }
+    // the data section starts at the next multiple of the alignment
+    g->data_off = pos + (g->alignment - pos % g->alignment) % g->alignment;
+    if (g->data_off > g->size) gguf_fail(g, "truncated (no tensor data)%s", NULL);
+    for (uint64_t i = 0; i < g->n_t; i++) {
+        GgufTensor *t = &g->t[i];
+        if (t->off % g->alignment || t->off > g->size - g->data_off ||
+            (t->size != UINT64_MAX && t->size > g->size - g->data_off - t->off)) {
+            snprintf(what, sizeof(what), "%.*s", (int)(t->name_len < 64 ? t->name_len : 64), t->name);
+            gguf_fail(g, "truncated or corrupt (data of tensor '%s' misaligned or past the end of the file)", what);
+        }
+        t->off += g->data_off;
+        for (uint64_t j = 0; j < i; j++)
+            if (g->t[j].name_len == t->name_len && !memcmp(g->t[j].name, t->name, t->name_len)) {
+                snprintf(what, sizeof(what), "%.*s", (int)(t->name_len < 64 ? t->name_len : 64), t->name);
+                gguf_fail(g, "corrupt tensor table (duplicate tensor '%s')", what);
+            }
+    }
+}
+
+static const GgufKV *gguf_find(const Gguf *g, const char *key) {
+    size_t n = strlen(key);
+    for (uint64_t i = 0; i < g->n_kv; i++)
+        if (g->kv[i].key_len == n && !memcmp(g->kv[i].key, key, n))
+            return &g->kv[i];
+    return NULL;
+}
+
+static int gguf_get_int(const Gguf *g, const char *key, int64_t *v) {
+    // integer scalar metadata (any integer type), 0 if absent; a value of another type fails
+    const GgufKV *kv = gguf_find(g, key);
+    if (!kv) return 0;
+    const uint8_t *p = g->map + kv->off;
+    switch (kv->type) {
+        case GV_U8: *v = *p; break;
+        case GV_I8: *v = (int8_t)*p; break;
+        case GV_U16: { uint16_t x; memcpy(&x, p, 2); *v = x; break; }
+        case GV_I16: { int16_t x; memcpy(&x, p, 2); *v = x; break; }
+        case GV_U32: { uint32_t x; memcpy(&x, p, 4); *v = x; break; }
+        case GV_I32: { int32_t x; memcpy(&x, p, 4); *v = x; break; }
+        case GV_U64: { uint64_t x; memcpy(&x, p, 8); *v = x > INT64_MAX ? INT64_MAX : (int64_t)x; break; }
+        case GV_I64: memcpy(v, p, 8); break;
+        default: gguf_fail(g, "metadata %s is not an integer", key);
+    }
+    return 1;
+}
+
+static int gguf_get_float(const Gguf *g, const char *key, float *v) {
+    // f32 (or f64, rounded) scalar metadata, 0 if absent
+    const GgufKV *kv = gguf_find(g, key);
+    if (!kv) return 0;
+    if (kv->type == GV_F32) memcpy(v, g->map + kv->off, 4);
+    else if (kv->type == GV_F64) { double d; memcpy(&d, g->map + kv->off, 8); *v = (float)d; }
+    else gguf_fail(g, "metadata %s is not a float", key);
+    return 1;
+}
+
+static const char *gguf_get_str(const Gguf *g, const char *key, uint64_t *len) {
+    // string metadata (not NUL-terminated: *len bytes), NULL if absent
+    const GgufKV *kv = gguf_find(g, key);
+    if (!kv) return NULL;
+    if (kv->type != GV_STR) gguf_fail(g, "metadata %s is not a string", key);
+    uint64_t pos = kv->off;
+    const char *s;
+    *len = gguf_str(g, &pos, &s, key);
+    return s;
+}
+
+static const GgufKV *gguf_get_array(const Gguf *g, const char *key, uint32_t type) {
+    // array metadata with elements of this type, NULL if absent
+    const GgufKV *kv = gguf_find(g, key);
+    if (kv && (kv->type != GV_ARR || kv->arr_type != type)) gguf_fail(g, "metadata %s: unexpected type", key);
+    return kv;
+}
+
+static const GgufTensor *gguf_tensor(const Gguf *g, const char *name) {
+    size_t n = strlen(name);
+    for (uint64_t i = 0; i < g->n_t; i++)
+        if (g->t[i].name_len == n && !memcmp(g->t[i].name, name, n))
+            return &g->t[i];
+    return NULL;
+}
+
+static const uint8_t *gguf_weight(const Gguf *g, const char *name, uint32_t type, uint64_t ne0, uint64_t ne1) {
+    // the data of a required tensor of this type and shape ({ ne0 } if ne1 == 0, else { ne0, ne1 })
+    const GgufTensor *t = gguf_tensor(g, name);
+    if (!t) gguf_fail(g, "tensor %s not found", name);
+    int dims = ne1 ? 2 : 1;
+    if (t->type != type) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "tensor %%s has ggml type %u, need %u (%s)%s", t->type, type,
+                 type == GGML_Q8_0 ? "Q8_0" : type == GGML_F32 ? "F32" : "?", t->type == 12 || t->type == 14 ?
+                 "; K-quants (Q4_K_M) are not supported yet" : "");
+        gguf_fail(g, msg, name);
+    }
+    if (t->n_dims != (uint32_t)dims || t->ne[0] != ne0 || (ne1 && t->ne[1] != ne1)) {
+        char msg[200];
+        snprintf(msg, sizeof(msg), "tensor %%s has shape [%llu, %llu], need [%llu, %llu]", (unsigned long long)t->ne[0],
+                 (unsigned long long)(t->n_dims > 1 ? t->ne[1] : 0), (unsigned long long)ne0, (unsigned long long)ne1);
+        gguf_fail(g, msg, name);
+    }
+    if (t->size == UINT64_MAX) gguf_fail(g, "tensor %s: rows are not a whole number of blocks", name);
+    return g->map + t->off;
+}
+
+static void gguf_config(const Gguf *g, Config *c) {
+    // the hyperparameters from the metadata (llama.cpp's qwen3 keys), checked against what this
+    // engine implements: Qwen3 with RoPE theta 1e6 and RMSNorm eps 1e-6 (constants in rope_row /
+    // rmsnorm), Q8_0 weights
+    uint64_t n;
+    const char *arch = gguf_get_str(g, "general.architecture", &n);
+    if (!arch || n != 5 || memcmp(arch, "qwen3", 5)) {
+        char a[40];
+        snprintf(a, sizeof(a), "%.*s", arch ? (int)(n < 32 ? n : 32) : 6, arch ? arch : "(none)");
+        gguf_fail(g, "architecture '%s' is not supported (need qwen3)", a);
+    }
+    const char *keys[] = { "qwen3.block_count", "qwen3.embedding_length", "qwen3.feed_forward_length",
+                           "qwen3.attention.head_count", "qwen3.attention.head_count_kv", "qwen3.context_length",
+                           "qwen3.attention.key_length", "qwen3.attention.value_length" };
+    int64_t v[8];
+    for (int i = 0; i < 8; i++) {
+        if (!gguf_get_int(g, keys[i], &v[i])) {
+            if (i < 6) gguf_fail(g, "metadata %s missing", keys[i]);
+            v[i] = i == 6 ? v[1] / (v[3] ? v[3] : 1) : v[6]; // llama.cpp's defaults: dim / heads
+        }
+        if (v[i] < 1 || v[i] > (1 << 20)) gguf_fail(g, "metadata %s out of range", keys[i]);
+    }
+    float theta = 0, eps = 0;
+    if (!gguf_get_float(g, "qwen3.rope.freq_base", &theta) || theta != 1e6f)
+        gguf_fail(g, "qwen3.rope.freq_base must be 1e6 (the engine's RoPE)%s", NULL);
+    if (!gguf_get_float(g, "qwen3.attention.layer_norm_rms_epsilon", &eps) || eps != 1e-6f)
+        gguf_fail(g, "qwen3.attention.layer_norm_rms_epsilon must be 1e-6 (the engine's RMSNorm)%s", NULL);
+    const char *rs = gguf_get_str(g, "qwen3.rope.scaling.type", &n);
+    if (rs && !(n == 4 && !memcmp(rs, "none", 4))) gguf_fail(g, "RoPE scaling is not supported%s", NULL);
+    if (v[6] != v[7]) gguf_fail(g, "attention key_length != value_length is not supported%s", NULL);
+    if (v[3] % v[4]) gguf_fail(g, "head_count is not a multiple of head_count_kv%s", NULL);
+    const GgufTensor *emb = gguf_tensor(g, "token_embd.weight");
+    if (!emb || emb->n_dims != 2 || emb->ne[0] != (uint64_t)v[1] || emb->ne[1] > (1 << 24))
+        gguf_fail(g, "tensor token_embd.weight missing or not [embedding_length, vocab]%s", NULL);
+    memset(c, 0, sizeof(*c));
+    c->magic_number = GGUF_MAGIC;
+    c->version = (int)g->version;
+    c->n_layers = (int)v[0];
+    c->dim = (int)v[1];
+    c->hidden_dim = (int)v[2];
+    c->n_heads = (int)v[3];
+    c->n_kv_heads = (int)v[4];
+    c->seq_len = (int)v[5];
+    c->head_dim = (int)v[6];
+    c->vocab_size = (int)emb->ne[1];
+    c->shared_classifier = gguf_tensor(g, "output.weight") == NULL; // absent: tied to token_embd
+    c->group_size = 32; // Q8_0 blocks
+}
+
+static void gguf_open(Gguf *g, const char *path) {
+    // map and parse a GGUF file (-m tokenize; read_checkpoint parses its own mapping)
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "Couldn't open %s\n", path); exit(EXIT_FAILURE); }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    if (size < 24) { fprintf(stderr, "GGUF %s: file too small\n", path); exit(EXIT_FAILURE); }
+    void *map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fileno(f), 0);
+    fclose(f);
+    if (map == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
+    memset(g, 0, sizeof(*g));
+    g->map = map;
+    g->size = (uint64_t)size;
+    g->path = path;
+    gguf_parse(g);
+}
+
+static int file_is_gguf(const char *path) {
+    // the checkpoint format by magic: GGUF, else a qwen3.c .bin
+    FILE *f = fopen(path, "rb");
+    uint32_t magic = 0;
+    if (f && fread(&magic, 4, 1, f) != 1) magic = 0;
+    if (f) fclose(f);
+    return magic == GGUF_MAGIC;
+}
+
 typedef struct {
     Config config; // the hyperparameters of the architecture (the blueprint)
     TransformerWeights weights; // the weights of the model
     RunState state; // buffers for the "wave" of activations in the forward pass
     float *data; // memory mapped data pointer
     ssize_t file_size; // size of the checkpoint file in bytes
+    Gguf gguf; // GGUF checkpoint: the parsed file (gguf.map == NULL: .bin)
 } Transformer;
 
 #if defined _WIN32
@@ -319,11 +641,52 @@ void quantize(QuantizedTensor *qx, float *x, int n) {
     }
 }
 
+static float fp16_to_f32(uint16_t h) {
+    // IEEE half -> float, exact (every half value is a float)
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16, e = h >> 10 & 0x1f, m = h & 0x3ff, bits;
+    if (e == 0x1f) bits = sign | 0x7f800000u | m << 13; // inf / NaN
+    else if (e) bits = sign | (e + 112) << 23 | m << 13; // normal: exponent bias 15 -> 127
+    else if (m) { // subnormal: m * 2^-24, exact as a float
+        float f = (float)m * 5.9604644775390625e-8f;
+        memcpy(&bits, &f, 4);
+        bits |= sign;
+    } else bits = sign; // +-0
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
+static int q8_from_blocks(int8_t *q, float *s, const uint8_t *blk, size_t nblk) {
+    // nblk GGUF Q8_0 blocks -> 32 * nblk int8 values + nblk fp32 scales (exact); 0 if a scale is
+    // inf / NaN (a corrupt file)
+    int ok = 1;
+    for (size_t i = 0; i < nblk; i++, blk += Q8_0_BLOCK) {
+        uint16_t h;
+        memcpy(&h, blk, 2);
+        ok &= (h & 0x7c00) != 0x7c00;
+        s[i] = fp16_to_f32(h);
+        memcpy(q + 32 * i, blk + 2, 32);
+    }
+    return ok;
+}
+
 static void embed_row(float *x, const QuantizedTensor *t, int token, int dim) {
     // row `token` of the Q8_0 embedding table t, dequantized with upstream's dequantize()
     // expression, x[i] = q[i] * s[i / GS] (exact int8 -> float, one rounding): the same floats
-    // as the whole dequantized table upstream kept in memory
+    // as the whole dequantized table upstream kept in memory. GGUF: from its blocks, the same
+    // expression with the fp16 scale as a float (dim % 32 == 0, checked at load)
     size_t e0 = (size_t)token * dim;
+    if (t->b) {
+        const uint8_t *blk = t->b + e0 / 32 * Q8_0_BLOCK;
+        for (int g = 0; g < dim / 32; g++, blk += Q8_0_BLOCK) {
+            uint16_t h;
+            memcpy(&h, blk, 2);
+            float s = fp16_to_f32(h);
+            for (int i = 0; i < 32; i++)
+                x[g * 32 + i] = (int8_t)blk[2 + i] * s;
+        }
+        return;
+    }
     if (dim % GS == 0) {
         const int8_t *q = t->q + e0;
         const float *s = t->s + e0 / GS;
@@ -348,6 +711,7 @@ QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each) {
         res[i].s = (float*)*ptr;
         *ptr = (float*)*ptr + size_each / GS;
         res[i].p = NULL;
+        res[i].b = NULL;
     }
     return res;
 }
@@ -385,9 +749,52 @@ void memory_map_weights(TransformerWeights *w, Config *p, void *ptr) {
     w->wcls = p->shared_classifier ? w->q_tokens : init_quantized_tensors(&ptr, 1, p->dim * p->vocab_size);
 }
 
-static float *runq_data = NULL; // the checkpoint mapping (read_checkpoint), for read_at
+static QuantizedTensor *gguf_matrices(const Gguf *g, int n, const char *fmt, int d, int k) {
+    // n Q8_0 matrices (d, k) (fmt: name with the layer number, or a plain name for n = 1): their
+    // blocks in the mapping; q / s / p are set by prepare_weights
+    QuantizedTensor *res = calloc(n, sizeof(QuantizedTensor));
+    if (!res) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    for (int l = 0; l < n; l++) {
+        char name[96];
+        snprintf(name, sizeof(name), fmt, l);
+        res[l].b = gguf_weight(g, name, GGML_Q8_0, k, d);
+    }
+    return res;
+}
 
-#ifdef RUNQ_VNNI
+void gguf_map_weights(TransformerWeights *w, Config *p, const Gguf *g) {
+    // tensor names of llama.cpp's convert_hf_to_gguf.py for qwen3 (no Q/K row permutation: that
+    // is done for the llama architecture only; checked by the logits test against HF). ffn_gate /
+    // ffn_up / ffn_down are w1 / w3 / w2. The norm weights (F32) are copied into one buffer in the
+    // .bin layout, so that the forward pass indexes them as before
+    int L = p->n_layers, dim = p->dim, hd = p->head_dim, qd = p->n_heads * hd, kvd = p->n_kv_heads * hd;
+    size_t nn = (size_t)2 * L * dim + dim + (size_t)2 * L * hd;
+    float *f = w->norms = malloc(nn * sizeof(float));
+    if (!f) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    struct { float **dst; const char *fmt; int n, len; } nm[] = {
+        { &w->rms_att_weight, "blk.%d.attn_norm.weight", L, dim }, { &w->rms_ffn_weight, "blk.%d.ffn_norm.weight", L, dim },
+        { &w->rms_final_weight, "output_norm.weight", 1, dim }, { &w->q_norm_weights, "blk.%d.attn_q_norm.weight", L, hd },
+        { &w->k_norm_weights, "blk.%d.attn_k_norm.weight", L, hd } };
+    for (size_t i = 0; i < sizeof(nm) / sizeof(nm[0]); i++) {
+        *nm[i].dst = f;
+        for (int l = 0; l < nm[i].n; l++, f += nm[i].len) {
+            char name[96];
+            snprintf(name, sizeof(name), nm[i].fmt, l);
+            memcpy(f, gguf_weight(g, name, GGML_F32, nm[i].len, 0), nm[i].len * sizeof(float));
+        }
+    }
+    w->q_tokens = gguf_matrices(g, 1, "token_embd.weight", p->vocab_size, dim);
+    w->wq = gguf_matrices(g, L, "blk.%d.attn_q.weight", qd, dim);
+    w->wk = gguf_matrices(g, L, "blk.%d.attn_k.weight", kvd, dim);
+    w->wv = gguf_matrices(g, L, "blk.%d.attn_v.weight", kvd, dim);
+    w->wo = gguf_matrices(g, L, "blk.%d.attn_output.weight", dim, qd);
+    w->w1 = gguf_matrices(g, L, "blk.%d.ffn_gate.weight", p->hidden_dim, dim);
+    w->w2 = gguf_matrices(g, L, "blk.%d.ffn_down.weight", dim, p->hidden_dim);
+    w->w3 = gguf_matrices(g, L, "blk.%d.ffn_up.weight", p->hidden_dim, dim);
+    w->wcls = p->shared_classifier ? w->q_tokens : gguf_matrices(g, 1, "output.weight", p->vocab_size, dim);
+}
+
+static void *runq_data = NULL; // the checkpoint mapping (read_checkpoint), for read_at
 
 static void read_at(int fd, void *dst, size_t n, const void *mapped) {
     // n bytes of the checkpoint at the file offset of `mapped` (a pointer into its mapping) into
@@ -409,28 +816,44 @@ static void read_at(int fd, void *dst, size_t n, const void *mapped) {
         memcpy((char *)dst + done, (const char *)mapped + done, n - done);
 }
 
-void pack_weights(TransformerWeights *w, Config *p, int fd) {
-    // VNNI build: repack every matmul weight (7 per layer + the classifier) into the Q8P layout
-    // of kernels_avx512.h (group size GS: 64 or 32), in one allocation (the same size as the Q8_0 data with fp32 scales), all in one parallel
-    // loop over (matrix, block of rows) items. The source rows are read with pread (read_at), not
-    // through the mapping: only the norms and the token embedding rows looked up later (the
-    // classifier is shared with them) are ever mapped. The destination is pre-faulted in parallel
-    // (MADV_POPULATE_WRITE, 2 MB per call). Was: faults on both sides + one MADV_DONTNEED of the
-    // mapped source per tensor, ~90 ms; now ~25 ms (12 threads)
+void prepare_weights(TransformerWeights *w, Config *p, int fd) {
+    // Converts every matmul weight (7 per layer + the classifier) once at load, into one allocation,
+    // in one parallel loop over (matrix, block of rows) items:
+    //   VNNI build: repacked into the Q8P layout of kernels_avx512.h (group size GS: 64 for .bin,
+    //     32 for GGUF; the same size as the Q8_0 data with fp32 scales)
+    //   generic kernels on a GGUF file: its Q8_0 blocks (fp16 scale + 32 int8) into the q / s
+    //     arrays the .bin format has (fp16 -> fp32 is exact)
+    //   generic kernels on a .bin file: nothing to do, q / s are the mapping
+    // The source rows are read with pread (read_at), not through the mapping: only the norms and
+    // the token embedding rows looked up later (the classifier is shared with them) are ever
+    // mapped. The destination is pre-faulted in parallel (MADV_POPULATE_WRITE, 2 MB per call).
+    // Was: faults on both sides + one MADV_DONTNEED of the mapped source per tensor, ~90 ms; now
+    // ~25 ms (12 threads)
     int L = p->n_layers, dim = p->dim, hid = p->hidden_dim;
     int qd = p->n_heads * p->head_dim, kvd = p->n_kv_heads * p->head_dim;
     struct { QuantizedTensor *t; int n, d, k; } m[] = {
         { w->wq, L, qd, dim }, { w->wk, L, kvd, dim }, { w->wv, L, kvd, dim }, { w->wo, L, dim, qd },
         { w->w1, L, hid, dim }, { w->w2, L, dim, hid }, { w->w3, L, hid, dim }, { w->wcls, 1, p->vocab_size, dim } };
     int nm = sizeof(m) / sizeof(m[0]);
+    int gguf = w->wq[0].b != NULL, pack = 0;
+#ifdef RUNQ_VNNI
+    pack = 1;
+    for (int i = 0; i < nm && pack; i++)
+        if (!q8p_ok(m[i].d, m[i].k, GS)) {
+            fprintf(stderr, "warning: weights not packable for the VNNI kernels (GS %d, %d x %d), using the generic ones\n", GS, m[i].d, m[i].k);
+            pack = 0;
+        }
+#endif
+    if (!pack && !gguf)
+        return;
     size_t total = 0;
     int nt = 0, kmax = 0;
     for (int i = 0; i < nm; i++) {
-        if (!q8p_ok(m[i].d, m[i].k, GS)) {
-            fprintf(stderr, "warning: weights not packable for the VNNI kernels (GS %d, %d x %d), using the generic ones\n", GS, m[i].d, m[i].k);
-            return;
-        }
-        total += m[i].n * q8p_size(m[i].d, m[i].k, GS);
+        size_t sz = (size_t)m[i].d * m[i].k + (size_t)m[i].d * (m[i].k / GS) * sizeof(float);
+#ifdef RUNQ_VNNI
+        if (pack) sz = q8p_size(m[i].d, m[i].k, GS);
+#endif
+        total += m[i].n * ((sz + 63) / 64 * 64);
         nt += m[i].n;
         kmax = m[i].k > kmax ? m[i].k : kmax;
     }
@@ -447,23 +870,36 @@ void pack_weights(TransformerWeights *w, Config *p, int fd) {
     int j = 0;
     for (int i = 0; i < nm; i++)
         for (int l = 0; l < m[i].n; l++, j++) {
-            int bpi = 65536 / (Q8P_ROWS * m[i].k);
-            job[j].t = m[i].t + l;
+            // items of 16-row blocks (the VNNI blocks; the generic conversion uses the same split)
+            int bpi = 65536 / (16 * m[i].k);
+            QuantizedTensor *t = m[i].t + l;
+            size_t nq = (size_t)m[i].d * m[i].k, sz = nq + (size_t)m[i].d * (m[i].k / GS) * sizeof(float);
+            job[j].t = t;
             job[j].d = m[i].d;
             job[j].k = m[i].k;
             job[j].bpi = bpi > 0 ? bpi : 1;
             job[j].off = off;
             job[j].it0 = nit;
-            job[j].t->p = w->packed + off;
-            off += q8p_size(m[i].d, m[i].k, GS);
-            nit += (m[i].d / Q8P_ROWS + job[j].bpi - 1) / job[j].bpi;
+#ifdef RUNQ_VNNI
+            if (pack) {
+                t->p = w->packed + off;
+                sz = q8p_size(m[i].d, m[i].k, GS);
+            }
+#endif
+            if (!pack) { // generic kernels on GGUF: q / s arrays
+                t->q = (int8_t *)(w->packed + off);
+                t->s = (float *)(w->packed + off + nq); // (nq is a multiple of 16 * GS)
+            }
+            off += (sz + 63) / 64 * 64;
+            nit += ((m[i].d + 15) / 16 + job[j].bpi - 1) / job[j].bpi;
         }
     job[nt].it0 = nit;
-    size_t rows_max = 65536 / kmax > Q8P_ROWS ? 65536 / kmax : Q8P_ROWS;
-    rows_max = rows_max / Q8P_ROWS * Q8P_ROWS + Q8P_ROWS;
+    size_t rows_max = 65536 / kmax > 16 ? 65536 / kmax : 16;
+    rows_max = rows_max / 16 * 16 + 16;
     size_t pg_chunk = (size_t)2 << 20;
     long npg = (long)((total + pg_chunk - 1) / pg_chunk);
-    #pragma omp parallel
+    int bad = 0;
+    #pragma omp parallel reduction(|:bad)
     {
 #if !defined _WIN32 && defined MADV_POPULATE_WRITE
         #pragma omp for schedule(dynamic, 1)
@@ -472,31 +908,47 @@ void pack_weights(TransformerWeights *w, Config *p, int fd) {
             madvise(w->packed + a, e - a, MADV_POPULATE_WRITE); // (errors ignored: plain faults then)
         }
 #endif
+        // scratch: source rows (VNNI: q / s before packing; GGUF: the blocks)
         int8_t *qb = malloc(rows_max * kmax);
         float *sb = malloc(rows_max * (kmax / GS) * sizeof(float));
-        if (!qb || !sb) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+        uint8_t *bb = gguf ? malloc(rows_max * (kmax / 32) * Q8_0_BLOCK) : NULL;
+        if (!qb || !sb || (gguf && !bb)) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
         int jj = 0;
         #pragma omp for schedule(dynamic, 4)
         for (long it = 0; it < nit; it++) {
             while (it >= job[jj + 1].it0) jj++; // (items in order per thread)
             while (it < job[jj].it0) jj--;
             QuantizedTensor *t = job[jj].t;
-            int k = job[jj].k, ng = k / GS, nblk = job[jj].d / Q8P_ROWS;
+            int k = job[jj].k, ng = k / GS, nblk = (job[jj].d + 15) / 16; // (VNNI: d % 16 == 0)
             int rb0 = (int)(it - job[jj].it0) * job[jj].bpi;
             int nb = nblk - rb0 < job[jj].bpi ? nblk - rb0 : job[jj].bpi;
-            size_t r0 = (size_t)rb0 * Q8P_ROWS, nr = (size_t)nb * Q8P_ROWS;
-            read_at(fd, qb, nr * k, t->q + r0 * k);
-            read_at(fd, sb, nr * ng * sizeof(float), t->s + r0 * ng);
-            q8p_pack_blocks(t->p + (size_t)rb0 * ng * Q8P_GROUP(GS), qb, sb, nb, k, GS);
+            size_t r0 = (size_t)rb0 * 16, nr = (size_t)nb * 16;
+            if (r0 + nr > (size_t)job[jj].d) nr = job[jj].d - r0;
+            int8_t *q = pack ? qb : t->q + r0 * k;
+            float *s = pack ? sb : t->s + r0 * ng;
+            if (t->b) { // GGUF (GS == 32: one block per group)
+                read_at(fd, bb, nr * ng * Q8_0_BLOCK, t->b + r0 * ng * Q8_0_BLOCK);
+                bad |= !q8_from_blocks(q, s, bb, nr * ng);
+            } else {
+                read_at(fd, q, nr * k, t->q + r0 * k);
+                read_at(fd, s, nr * ng * sizeof(float), t->s + r0 * ng);
+            }
+#ifdef RUNQ_VNNI
+            if (pack)
+                q8p_pack_blocks(t->p + (size_t)rb0 * ng * Q8P_GROUP(GS), qb, sb, nb, k, GS);
+#endif
         }
         free(qb);
         free(sb);
+        free(bb);
     }
     free(job);
+    if (bad) { fprintf(stderr, "Corrupt checkpoint: a Q8_0 weight scale is inf or NaN\n"); exit(EXIT_FAILURE); }
 }
-#endif
 
-void read_checkpoint(char *checkpoint, Config *config, TransformerWeights* weights, float** data, ssize_t* file_size, int ctx_length) {
+void read_checkpoint(char *checkpoint, Config *config, TransformerWeights* weights, float** data, ssize_t* file_size, int ctx_length,
+                     Gguf *gguf) {
+    // a qwen3.c .bin checkpoint or a GGUF file (Q8_0), by magic; gguf->map stays NULL for a .bin
     FILE *file = fopen(checkpoint, "rb");
     if (!file) { fprintf(stderr, "Couldn't open checkpoint %s\n", checkpoint); exit(EXIT_FAILURE); }
 
@@ -507,33 +959,44 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights* weigh
         fseek(file, 0, SEEK_END); // move file pointer to end of file
         *file_size = ftell(file); // get the file size, in bytes
     #endif
+    if (*file_size < 256) { fprintf(stderr, "File %s is too small for a checkpoint\n", checkpoint); exit(EXIT_FAILURE); }
 
     *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, fileno(file), 0);
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
     runq_data = *data;
+    memset(gguf, 0, sizeof(*gguf));
+    memset(weights, 0, sizeof(*weights));
 
-    // checkpoint format is 256-byte header, and then the model weights
+    uint32_t magic;
+    memcpy(&magic, *data, 4);
+    if (magic == GGUF_MAGIC) {
+        gguf->map = (const uint8_t *)*data;
+        gguf->size = (uint64_t)*file_size;
+        gguf->path = checkpoint;
+        gguf_parse(gguf);
+        gguf_config(gguf, config);
+        GS = config->group_size;
+        gguf_map_weights(weights, config, gguf);
+    } else {
+        // checkpoint format is 256-byte header, and then the model weights
+        memcpy(config, *data, sizeof(Config));
+        if (config->magic_number != 0x616a6331) { fprintf(stderr, "File %s is not a qwen3.c checkpoint or a GGUF file\n", checkpoint); exit(EXIT_FAILURE); }
+        if (config->version != 1) { fprintf(stderr, "Checkpoint %s is version %d, need version 1\n", checkpoint, config->version); exit(EXIT_FAILURE); }
 
-    memcpy(config, *data, sizeof(Config));
-    if (config->magic_number != 0x616a6331) { fprintf(stderr, "File %s is not a qwen3.c checkpoint\n", checkpoint); exit(EXIT_FAILURE); }
-    if (config->version != 1) { fprintf(stderr, "Checkpoint %s is version %d, need version 1\n", checkpoint, config->version); exit(EXIT_FAILURE); }
+        GS = config->group_size; // set as global, as it will be used in many places
 
+        void *weights_ptr = ((char *)*data) + 256; // skip the header (256 bytes)
+        memory_map_weights(weights, config, weights_ptr);
+    }
     if (ctx_length != 0 && ctx_length <= config->seq_len)
         config->seq_len = ctx_length;
-
-    GS = config->group_size; // set as global, as it will be used in many places
-
-    void *weights_ptr = ((char *)*data) + 256; // skip the header (256 bytes)
-    memory_map_weights(weights, config, weights_ptr);
-#ifdef RUNQ_VNNI
-    pack_weights(weights, config, fileno(file));
-#endif
+    prepare_weights(weights, config, fileno(file));
     fclose(file);
 }
 
 void build_transformer(Transformer *t, char *checkpoint_path, int ctx_length, int nb_max) {
     // read in the Config and the Weights from the checkpoint
-    read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->data, &t->file_size, ctx_length);
+    read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->data, &t->file_size, ctx_length, &t->gguf);
     // allocate the RunState buffers (batched prefill buffers for nb_max rows if nb_max > 1)
     malloc_run_state(&t->state, &t->config, nb_max);
 }
@@ -549,9 +1012,10 @@ void free_transformer(Transformer *t) {
     free(t->weights.w2);
     free(t->weights.w3);
     if(t->weights.wcls != t->weights.q_tokens) free(t->weights.wcls);
-#ifdef RUNQ_VNNI
     free_big(t->weights.packed, t->weights.packed_size);
-#endif
+    free(t->weights.norms);
+    free(t->gguf.kv);
+    free(t->gguf.t);
     // close the memory mapping
     if (t->data != MAP_FAILED) munmap(t->data, t->file_size);
     // free the RunState buffers
@@ -1314,6 +1778,8 @@ static inline uint64_t bytes_hash(const unsigned char *s, int n) {
     return h;
 }
 
+void tokenizer_index(Tokenizer *t);
+
 int vocab_lookup(Tokenizer *t, const unsigned char *s, int n) {
     // id of the regular token with exactly these n bytes, or -1
     uint64_t h = bytes_hash(s, n);
@@ -1375,9 +1841,16 @@ void build_tokenizer(Tokenizer *t, char *checkpoint_path, int vocab_size, int en
     }
     free(buf);
     t->max_token_length = max_len;
+    tokenizer_index(t);
 
+    load_prompt_template(checkpoint_path, t->prompt_template, 0, enable_thinking);
+    load_prompt_template(checkpoint_path, t->system_prompt_template, 1, enable_thinking);
+}
+
+void tokenizer_index(Tokenizer *t) {
     // classify: single bytes, merge results (score > -1e6) and added tokens (the rest, len > 1;
     // export.py gives every token that no merge produces the score -1e6)
+    int vocab_size = t->vocab_size;
     for (int b = 0; b < 256; b++) t->byte_token[b] = -1;
     uint32_t cap = 1;
     while (cap < 2u * (uint32_t)vocab_size) cap <<= 1;
@@ -1418,9 +1891,168 @@ void build_tokenizer(Tokenizer *t, char *checkpoint_path, int vocab_size, int en
         for (; k > 0 && t->vocab_len[t->added[k - 1]] < t->vocab_len[id]; k--) t->added[k] = t->added[k - 1];
         t->added[k] = id;
     }
+}
 
-    load_prompt_template(checkpoint_path, t->prompt_template, 0, enable_thinking);
-    load_prompt_template(checkpoint_path, t->system_prompt_template, 1, enable_thinking);
+// Qwen3's chat template (tokenizer_config.json) rendered for one user message "%s", with and without
+// a system message "%s" and enable_thinking: the strings export.py writes into the .template* files
+// (byte-identical; make test compares the chat token ids of a .bin and a GGUF run). Used for GGUF
+// files, whose tokenizer.chat_template is Jinja (not interpreted here)
+#define QWEN3_TMPL_SYS "<|im_start|>system\n%s<|im_end|>\n"
+#define QWEN3_TMPL_USER "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n"
+#define QWEN3_TMPL_NOTHINK "<think>\n\n</think>\n\n"
+
+static int gpt2_byte(uint32_t cp) {
+    // GPT-2's bytes_to_unicode, inverted: the printable bytes ('!'..'~', 0xa1..0xac, 0xae..0xff)
+    // stand for themselves, the other 68 (0x00..0x20, 0x7f..0xa0, 0xad) for U+0100.. in byte order;
+    // -1 if cp is neither
+    if ((cp >= 0x21 && cp <= 0x7e) || (cp >= 0xa1 && cp <= 0xac) || (cp >= 0xae && cp <= 0xff)) return (int)cp;
+    if (cp < 0x100 || cp >= 0x100 + 68) return -1;
+    int n = (int)cp - 0x100;
+    return n <= 0x20 ? n : n < 33 + 34 ? 0x7f + (n - 33) : 0xad;
+}
+
+static inline uint32_t utf8_cp(const unsigned char *p, const unsigned char *end, int *len);
+
+static int gpt2_decode(const char *s, uint64_t n, char *out) {
+    // a token string in GPT-2's byte-level form -> its raw bytes (at most n); -1 if it is not one
+    const unsigned char *p = (const unsigned char *)s, *end = p + n;
+    int len = 0;
+    while (p < end) {
+        if (*p >= 0x21 && *p <= 0x7e) { out[len++] = (char)*p++; continue; } // printable ASCII: itself
+        int cl, b = gpt2_byte(utf8_cp(p, end, &cl)); // (invalid UTF-8: U+FFFD, not a byte)
+        if (b < 0) return -1;
+        out[len++] = (char)b;
+        p += cl;
+    }
+    return len;
+}
+
+void build_tokenizer_gguf(Tokenizer *t, const Gguf *g, int vocab_size, int enable_thinking) {
+    // The tokenizer from GGUF metadata (llama.cpp's "gpt2" model with the "qwen2" pre-tokenizer,
+    // which is what encode() implements):
+    //   tokenizer.ggml.tokens: token strings, in GPT-2's byte-to-unicode form for normal tokens
+    //     (decoded to raw bytes, as the .tokenizer file stores them), as is for added ones
+    //   tokenizer.ggml.token_type: 1 normal, 3 control and 4 user-defined = added tokens (HF's
+    //     added_tokens, matched in the raw text), 5 unused (llama.cpp's [PAD...] fillers up to the
+    //     embedding size: empty here, as the ids missing from the .tokenizer file)
+    //   tokenizer.ggml.merges: "left right" in rank order. Score of the token a merge of rank r
+    //     produces: -r (the .tokenizer file has -log(r + 1): the same order, so the same BPE);
+    //     the first merge counts if several give one token; a normal token of several bytes that
+    //     no merge produces gets -999999 (after all merges; Qwen3 has none). Checked: the tokens
+    //     decode to exactly the .tokenizer file's bytes and the merges equal tokenizer.json's
+    //   eos = tokenizer.ggml.eos_token_id; bos (generation also stops there) =
+    //     tokenizer.ggml.bos_token_id, else the token <|endoftext|> (Qwen's, as config.json), else eos
+    uint64_t n;
+    const char *model = gguf_get_str(g, "tokenizer.ggml.model", &n);
+    if (!model || n != 4 || memcmp(model, "gpt2", 4)) gguf_fail(g, "tokenizer.ggml.model must be gpt2 (byte-level BPE)%s", NULL);
+    const char *pre = gguf_get_str(g, "tokenizer.ggml.pre", &n);
+    if (!pre || n != 5 || memcmp(pre, "qwen2", 5)) gguf_fail(g, "tokenizer.ggml.pre must be qwen2 (the pre-tokenizer runq implements)%s", NULL);
+    const GgufKV *tk = gguf_get_array(g, "tokenizer.ggml.tokens", GV_STR);
+    const GgufKV *ty = gguf_get_array(g, "tokenizer.ggml.token_type", GV_I32);
+    const GgufKV *mg = gguf_get_array(g, "tokenizer.ggml.merges", GV_STR);
+    if (!tk || !mg) gguf_fail(g, "tokenizer.ggml.tokens / merges missing%s", NULL);
+    if (tk->n > (uint64_t)vocab_size) gguf_fail(g, "more tokens than embedding rows%s", NULL);
+    if (ty && ty->n != tk->n) gguf_fail(g, "tokenizer.ggml.token_type has the wrong length%s", NULL);
+
+    t->vocab_size = vocab_size;
+    t->vocab = malloc(vocab_size * sizeof(char *));
+    t->vocab_len = malloc(vocab_size * sizeof(int));
+    t->merge_scores = malloc(vocab_size * sizeof(float));
+    uint64_t pos = tk->off, bytes = 0;
+    for (uint64_t i = 0; i < tk->n; i++) { // (bounds checked by gguf_parse, again here)
+        const char *s;
+        bytes += gguf_str(g, &pos, &s, "tokenizer.ggml.tokens");
+    }
+    t->vocab_data = malloc(bytes + vocab_size);
+    if (!t->vocab || !t->vocab_len || !t->merge_scores || !t->vocab_data) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    char *dst = t->vocab_data;
+    unsigned int max_len = 0;
+    pos = tk->off;
+    for (int i = 0; i < vocab_size; i++) {
+        const char *s = "";
+        uint64_t sl = 0;
+        int32_t type = 1, len = 0;
+        if ((uint64_t)i < tk->n) {
+            sl = gguf_str(g, &pos, &s, "tokenizer.ggml.tokens");
+            if (sl > 65536) gguf_fail(g, "a token string is too long%s", NULL);
+            if (ty) memcpy(&type, g->map + ty->off + 4 * (uint64_t)i, 4);
+        } else {
+            type = 5;
+        }
+        if (type == 5) {
+            len = 0;
+        } else if (type == 3 || type == 4) { // added: raw text
+            len = (int)sl;
+            memcpy(dst, s, sl);
+        } else if ((len = gpt2_decode(s, sl, dst)) < 0) {
+            char id[24];
+            snprintf(id, sizeof(id), "%d", i);
+            gguf_fail(g, "token %s is not in GPT-2 byte-level form", id);
+        }
+        t->vocab[i] = dst;
+        t->vocab_len[i] = len;
+        t->merge_scores[i] = (type == 3 || type == 4) && len > 1 ? -1e6f : -999999.0f;
+        dst[len] = 0;
+        dst += len + 1;
+        if ((unsigned int)len > max_len) max_len = len;
+    }
+    t->max_token_length = max_len;
+    tokenizer_index(t);
+
+    // merge ranks -> scores of the tokens they produce: the merge strings located (serial walk),
+    // decoded and looked up in parallel (151k hash lookups, ~12 ms on one thread), then the scores
+    // set in rank order. A GPT-2 form character is 1-2 bytes, so a merge string longer than
+    // 2 * max_len + 1 cannot give a token (and the decoded bytes fit buf)
+    long nmg = (long)mg->n;
+    uint64_t *mo = malloc((nmg + 1) * sizeof(uint64_t));
+    int *mid = malloc((nmg + 1) * sizeof(int));
+    if (!mo || !mid) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    pos = mg->off;
+    for (long r = 0; r < nmg; r++) {
+        const char *s;
+        mo[r] = pos;
+        gguf_str(g, &pos, &s, "tokenizer.ggml.merges");
+    }
+    #pragma omp parallel
+    {
+        char *buf = malloc(2 * (size_t)max_len + 2);
+        if (!buf) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+        #pragma omp for schedule(static)
+        for (long r = 0; r < nmg; r++) {
+            uint64_t sl, p = mo[r];
+            memcpy(&sl, g->map + p, 8); // (in the file: checked by the walk above)
+            const char *s = (const char *)g->map + p + 8, *sp;
+            mid[r] = -1;
+            if (sl > 2 * (uint64_t)max_len + 1 || !(sp = memchr(s, ' ', sl))) continue;
+            int la = gpt2_decode(s, sp - s, buf), lb = la < 0 ? -1 : gpt2_decode(sp + 1, sl - (sp + 1 - s), buf + la);
+            mid[r] = la < 0 || lb < 0 ? -2 : vocab_lookup(t, (const unsigned char *)buf, la + lb);
+        }
+        free(buf);
+    }
+    for (long r = 0; r < nmg; r++) {
+        if (mid[r] == -2) gguf_fail(g, "a merge is not in GPT-2 byte-level form%s", NULL);
+        if (mid[r] >= 0 && t->merge_scores[mid[r]] == -999999.0f)
+            t->merge_scores[mid[r]] = -(float)r;
+    }
+    free(mo);
+    free(mid);
+
+    int64_t v;
+    if (!gguf_get_int(g, "tokenizer.ggml.eos_token_id", &v) || v < 0 || v >= vocab_size)
+        gguf_fail(g, "tokenizer.ggml.eos_token_id missing or out of range%s", NULL);
+    t->eos_token_id = (unsigned int)v;
+    t->bos_token_id = t->eos_token_id;
+    if (gguf_get_int(g, "tokenizer.ggml.bos_token_id", &v)) {
+        if (v < 0 || v >= vocab_size) gguf_fail(g, "tokenizer.ggml.bos_token_id out of range%s", NULL);
+        t->bos_token_id = (unsigned int)v;
+    } else {
+        for (int k = 0; k < t->n_added; k++)
+            if (t->vocab_len[t->added[k]] == 13 && !memcmp(t->vocab[t->added[k]], "<|endoftext|>", 13))
+                t->bos_token_id = t->added[k];
+    }
+
+    strcpy(t->prompt_template, enable_thinking ? QWEN3_TMPL_USER : QWEN3_TMPL_USER QWEN3_TMPL_NOTHINK);
+    strcpy(t->system_prompt_template, enable_thinking ? QWEN3_TMPL_SYS QWEN3_TMPL_USER : QWEN3_TMPL_SYS QWEN3_TMPL_USER QWEN3_TMPL_NOTHINK);
 }
 
 void free_tokenizer(Tokenizer *t) {
@@ -2510,7 +3142,8 @@ void dump_logits(Transformer *transformer, Tokenizer *tokenizer, char *text, cha
 
 void error_usage() {
     fprintf(stderr, "Usage:   runq <checkpoint> [options]\n");
-    fprintf(stderr, "Example: runq Qwen3-4B.bin -r 1\n");
+    fprintf(stderr, "         checkpoint: a qwen3.c .bin (with its .tokenizer / .template* files) or a GGUF file (Q8_0)\n");
+    fprintf(stderr, "Example: runq Qwen3-0.6B-Q8_0.gguf -c 4096 -r 1\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1], default 0.9\n");
@@ -2578,16 +3211,30 @@ int main(int argc, char *argv[]) {
 
     if (strcmp(mode, "tokenize") == 0) {
         // only the header is needed (vocab_size): skip mapping and dequantizing the weights
+        // (GGUF: the metadata, the tensor data stays unread)
         Config config;
-        FILE *file = fopen(checkpoint_path, "rb");
-        if (!file || fread(&config, sizeof(Config), 1, file) != 1 || config.magic_number != 0x616a6331) {
-            fprintf(stderr, "Couldn't read qwen3.c checkpoint header from %s\n", checkpoint_path);
-            exit(EXIT_FAILURE);
-        }
-        fclose(file);
         Tokenizer tokenizer;
+#ifdef _OPENMP
+        omp_set_num_threads(1); // (one light process: the tests run many in parallel)
+#endif
         double t0 = now_s();
-        build_tokenizer(&tokenizer, checkpoint_path, config.vocab_size, enable_thinking);
+        if (file_is_gguf(checkpoint_path)) {
+            Gguf g;
+            gguf_open(&g, checkpoint_path);
+            gguf_config(&g, &config);
+            build_tokenizer_gguf(&tokenizer, &g, config.vocab_size, enable_thinking);
+            munmap((void *)g.map, g.size);
+            free(g.kv);
+            free(g.t);
+        } else {
+            FILE *file = fopen(checkpoint_path, "rb");
+            if (!file || fread(&config, sizeof(Config), 1, file) != 1 || config.magic_number != 0x616a6331) {
+                fprintf(stderr, "Couldn't read qwen3.c checkpoint header from %s\n", checkpoint_path);
+                exit(EXIT_FAILURE);
+            }
+            fclose(file);
+            build_tokenizer(&tokenizer, checkpoint_path, config.vocab_size, enable_thinking);
+        }
         tokenize(&tokenizer, prompt, now_s() - t0);
         free_tokenizer(&tokenizer);
         return 0;
@@ -2609,9 +3256,12 @@ int main(int argc, char *argv[]) {
     Transformer transformer;
     build_transformer(&transformer, checkpoint_path, ctx_length, prefill_chunk);
 
-    // build the Tokenizer via the tokenizer .bin file
+    // build the Tokenizer via the tokenizer .bin file (GGUF: from its metadata)
     Tokenizer tokenizer;
-    build_tokenizer(&tokenizer, checkpoint_path, transformer.config.vocab_size, enable_thinking);
+    if (transformer.gguf.map)
+        build_tokenizer_gguf(&tokenizer, &transformer.gguf, transformer.config.vocab_size, enable_thinking);
+    else
+        build_tokenizer(&tokenizer, checkpoint_path, transformer.config.vocab_size, enable_thinking);
 
     // build the Sampler
     Sampler sampler;

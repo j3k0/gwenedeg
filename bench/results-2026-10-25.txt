@@ -1,0 +1,280 @@
+# Raw outputs of the 2026-10-25 benchmark session (BENCHMARKS.md), in run order.
+# runq @ d76e4cc (+ the ALL=1 option of the bench scripts), gcc 14.2.0, 16-vCPU AMD EPYC Genoa KVM VM,
+# shared with other users' services. "[load]" lines: /proc/loadavg before a block (waits of 30 s
+# while the 1-min load was > 6, up to 10 min); the load printed after a block includes our own threads.
+# "all:" columns: every run, prefill/decode tok/s (decode in bench_prefill.sh = only 15 tokens).
+# Bandwidth: /tmp/bwtest/bw (AVX-512 streaming read of a 1 GB buffer, best of 10 passes).
+# Perplexity text: bench/ppl_beagle_ch1.txt (sha256 6ac0515c1da2cfff7b1bbf09876b2b821950103583b3cf1d74170eb46a44fb2a).
+# Scratch paths /tmp/cwayn-bench/... no longer exist; the prompts come from scripts/bench_prefill.sh -P <len>.
+
+=== session start 2026-10-25T04:08:02+00:00, HEAD d76e4cc
+gcc (Debian 14.2.0-19) 14.2.0
+[load] 04:08:02 bandwidth: 2.10 3.85 3.39 3/2880 2663958 (waited 0s)
+threads=1 size=1024MB read BW=32.9 GB/s (sink 0)
+threads=4 size=1024MB read BW=71.2 GB/s (sink 0)
+threads=8 size=1024MB read BW=72.1 GB/s (sink 0)
+threads=12 size=1024MB read BW=89.4 GB/s (sink 0)
+--- bandwidth repeat
+threads=1 size=1024MB read BW=33.4 GB/s (sink 0)
+threads=4 size=1024MB read BW=48.9 GB/s (sink 0)
+threads=8 size=1024MB read BW=73.1 GB/s (sink 0)
+threads=12 size=1024MB read BW=102.4 GB/s (sink 0)
+threads=16 size=1024MB read BW=80.8 GB/s (sink 0)
+1.93 3.75 3.36 4/2895 2666459
+
+=== 1a. runq prefill grid: ALL=1 scripts/bench_prefill.sh -l 450 -b 512 -t '1 4 8 12' -r 3
+[load] 04:09:02 prefill-450: 2.34 3.57 3.32 5/2876 2674705 (waited 0s)
+prompt  threads chunk   prefill t/s  decode t/s   out
+451     1       512           299.3        36.2   yes  all: 296.5/35.6 296.7/36.2 299.3/35.8
+451     4       512          1050.9       124.8   yes  all: 1048.0/124.8 1050.9/120.7 1041.9/97.6
+451     8       512          1908.9       128.1   yes  all: 1908.9/121.8 1908.0/128.1 1884.2/123.0
+451     12      512          2758.1       137.0   yes  all: 2543.5/137.0 2521.5/135.6 2758.1/112.0
+2.97 3.64 3.34 5/2868 2678888
+
+=== 1a. runq prefill grid: ALL=1 scripts/bench_prefill.sh -l 1500 -b 512 -t '1 4 8 12' -r 3
+[load] 04:09:33 prefill-1500: 2.90 3.60 3.33 10/2898 2680629 (waited 0s)
+prompt  threads chunk   prefill t/s  decode t/s   out
+1500    1       512           220.1        25.2   yes  all: 220.1/25.2 218.8/24.1 219.4/23.8
+1500    4       512           816.4        78.9   yes  all: 791.5/78.9 809.8/65.8 816.4/50.4
+1500    8       512          1570.0        94.5   yes  all: 1462.4/94.5 1570.0/89.0 1547.7/60.9
+1500    12      512          1976.4       111.9   yes  all: 1557.2/78.0 1976.4/111.9 1971.0/94.8
+4.29 3.81 3.42 3/2860 2689399
+
+=== 1a. runq prefill grid: ALL=1 scripts/bench_prefill.sh -l 3000 -b 512 -t '1 4 8 12' -r 3
+[load] 04:10:20 prefill-3000: 4.29 3.81 3.42 4/2856 2689408 (waited 0s)
+prompt  threads chunk   prefill t/s  decode t/s   out
+3000    1       512           154.5        16.4   yes  all: 149.6/15.5 151.7/16.3 154.5/16.4
+3000    4       512           581.9        57.6   yes  all: 577.0/48.3 581.9/57.6 572.2/46.2
+3000    8       512          1103.0        86.7   yes  all: 1103.0/60.3 1091.7/82.3 1091.3/86.7
+3000    12      512          1531.2        71.3   yes  all: 1531.2/30.1 1456.5/71.3 1367.3/66.4
+6.95 4.50 3.69 4/2893 2707292
+
+=== 1b. chunk sweep: ALL=1 scripts/bench_prefill.sh -l 1500 -b '1 64 128 256 512' -t 8 -r 3
+[load] 04:12:18 chunk-sweep: 6.35 4.45 3.68 4/2857 2709716 > 6, waiting
+[load] 04:12:48 chunk-sweep: 4.92 4.28 3.65 3/2860 2714512 (waited 30s)
+prompt  threads chunk   prefill t/s  decode t/s   out
+1500    8       1             192.3       125.7   yes  all: 179.7/115.1 192.3/123.9 172.5/125.7
+1500    8       64           1323.4       122.7   yes  all: 1186.0/117.4 1189.7/122.7 1323.4/70.6
+1500    8       128          1386.2        95.8   yes  all: 1386.2/95.1 1380.3/95.8 1368.5/95.0
+1500    8       256          1496.4       117.3   yes  all: 1454.8/94.1 1476.0/117.3 1496.4/94.9
+1500    8       512          1543.5        94.3   yes  all: 1543.5/94.3 1529.2/90.4 1514.7/90.0
+6.78 4.91 3.90 3/2890 2723975
+
+=== 1c. decode: ALL=1 REPS=3 scripts/bench_qwen3c.sh models/Qwen3-0.6B-q8.bin 1 4 8 12 16
+[load] 04:13:52 decode: 5.88 4.78 3.87 4/2861 2725639 (waited 0s)
+threads   prefill t/s   decode t/s
+1               318.4         41.6  all: 316.4/41.6 318.4/41.1 315.8/41.0
+4               940.6        105.1  all: 881.6/105.1 940.6/102.2 922.0/95.8
+8              1564.2        136.6  all: 1439.1/121.6 1564.2/136.6 1462.5/136.6
+12             1827.0        140.3  all: 456.2/106.7 1827.0/133.6 1532.3/140.3
+16              226.3         19.9  all: 45.7/14.1 143.8/19.9 226.3/14.8
+14.02 7.29 4.82 2/2863 2746808
+
+=== 1c'. decode repeat (first run hit a load spike to 14): ALL=1 REPS=3 scripts/bench_qwen3c.sh models/Qwen3-0.6B-q8.bin 1 4 8 12 16
+[load] 04:17:57 decode-2: 4.00 5.63 4.55 3/2866 2772135 (waited 0s)
+threads   prefill t/s   decode t/s
+1               313.6         42.5  all: 309.4/40.3 313.6/42.1 312.8/42.5
+4               950.5        138.3  all: 866.2/102.1 935.4/138.3 950.5/103.7
+8              1413.3        148.1  all: 1093.0/120.9 1413.3/120.7 1354.4/148.1
+12             1909.6        163.9  all: 1783.1/163.9 1677.2/158.2 1909.6/159.7
+16               45.6         15.2  all: 18.4/8.4 45.6/14.5 17.0/15.2
+15.55 8.96 5.86 2/2887 2799589
+
+=== 1d. decode vs context: runq -c 4096 -t 0 -n 256 -i "$(scripts/bench_prefill.sh -P L)", best of 3 (generated t/s)
+[load] 04:20:37 decode-ctx: 9.79 8.31 5.77 4/2900 2807207 > 6, waiting
+[load] 04:21:07 decode-ctx: 6.66 7.69 5.64 3/2940 2812740 > 6, waiting
+[load] 04:21:37 decode-ctx: 4.99 7.19 5.54 3/2879 2818910 (waited 60s)
+prompt 1500 threads 8  gen:t/s  84:91.2 84:117.5 84:94.6
+prompt 1500 threads 12  gen:t/s  84:81.2 84:89.1 84:85.4
+prompt 3000 threads 8  gen:t/s  102:79.6 102:60.7 102:54.6
+prompt 3000 threads 12  gen:t/s  102:80.8 102:70.0 102:73.9
+9.98 8.18 5.95 3/2859 2827229
+
+=== 1e. startup: python3 tv.py ./runq models/Qwen3-0.6B-q8.bin -c 4096 -t 0 -n 1 -i 'Why is the sky blue?' (wall time + peak RSS; OMP_NUM_THREADS unset = 12; page cache warm), 5 runs
+[load] 04:22:55 startup: 7.36 7.72 5.87 4/2883 2832772 > 6, waiting
+[load] 04:23:25 startup: 5.55 7.23 5.77 11/2899 2838590 (waited 30s)
+wall 0.752 s  peak RSS 1361 MB  [timing] prompt: 18 tok in 0.012 s (1459.0 tok/s) | generated: 1 tok in 0.005 s (183.1 tok/s)
+wall 0.771 s  peak RSS 1361 MB  [timing] prompt: 18 tok in 0.013 s (1413.8 tok/s) | generated: 1 tok in 0.007 s (147.2 tok/s)
+wall 0.767 s  peak RSS 1361 MB  [timing] prompt: 18 tok in 0.014 s (1308.0 tok/s) | generated: 1 tok in 0.005 s (191.9 tok/s)
+wall 0.799 s  peak RSS 1361 MB  [timing] prompt: 18 tok in 0.028 s (632.0 tok/s) | generated: 1 tok in 0.008 s (122.7 tok/s)
+wall 0.770 s  peak RSS 1361 MB  [timing] prompt: 18 tok in 0.018 s (1028.4 tok/s) | generated: 1 tok in 0.010 s (104.3 tok/s)
+-- 8 threads:
+wall 0.757 s  peak RSS 1361 MB  [timing] prompt: 18 tok in 0.016 s (1098.8 tok/s) | generated: 1 tok in 0.009 s (111.0 tok/s)
+wall 0.766 s  peak RSS 1361 MB  [timing] prompt: 18 tok in 0.017 s (1061.6 tok/s) | generated: 1 tok in 0.009 s (111.1 tok/s)
+wall 0.782 s  peak RSS 1361 MB  [timing] prompt: 18 tok in 0.019 s (964.2 tok/s) | generated: 1 tok in 0.011 s (87.8 tok/s)
+-- tokenize only (no weights):
+wall 0.025 s  peak RSS 11 MB  
+-- no -c (full 40,960 context):
+wall 0.792 s  peak RSS 1361 MB  [timing] prompt: 18 tok in 0.015 s (1171.4 tok/s) | generated: 1 tok in 0.009 s (112.8 tok/s)
+5.16 7.09 5.74 2/2896 2839798
+
+=== 2a. upstream qwen3.c (87e08aa src/runq.c, gcc -Ofast -fopenmp -march=native -D_FILE_OFFSET_BITS=64 -lm): ALL=1 REPS=3 RUNQ=/tmp/.../runq-upstream scripts/bench_qwen3c.sh models/Qwen3-0.6B-q8.bin 1 4 8 12
+[load] 04:24:59 upstream: 7.50 7.31 5.92 10/2884 2857336 > 6, waiting
+[load] 04:25:29 upstream: 5.76 6.91 5.83 4/2884 2862466 (waited 30s)
+threads   prefill t/s   decode t/s
+1                22.5         21.4  all: 22.4/21.3 21.2/21.1 22.5/21.4
+4                71.8         70.9  all: 65.9/67.0 71.8/67.7 67.3/70.9
+8                98.7        101.4  all: 76.7/86.5 98.7/99.3 72.0/101.4
+12               80.4        105.5  all: 57.1/105.5 80.4/92.7 63.9/94.5
+8.24 6.88 5.90 3/2891 2878655
+
+=== 2b. mynah-slm cde1599 Q8_0: ALL=1 REPS=3 scripts/bench_mynah.sh models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf 4 8 12
+[load] 04:27:22 mynah-Q8_0: 6.85 6.64 5.84 4/2872 2881593 > 6, waiting
+[load] 04:27:52 mynah-Q8_0: 4.61 6.12 5.69 4/2869 2886103 (waited 30s)
+threads   prefill t/s   decode t/s
+4                52.6         33.8  all: 46.0/33.8 52.6/31.6 47.7/29.4
+8                57.5         33.6  all: 56.5/33.6 53.0/32.5 57.5/33.4
+12               53.8         34.5  all: 47.1/33.9 46.6/34.5 53.8/34.4
+5.99 6.20 5.75 3/2882 2903540
+
+=== 2b. mynah-slm cde1599 Q4_K_M: ALL=1 REPS=3 scripts/bench_mynah.sh models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf 4 8 12
+[load] 04:29:10 mynah-Q4_K_M: 5.99 6.20 5.75 4/2882 2903552 (waited 0s)
+threads   prefill t/s   decode t/s
+4                40.0         28.4  all: 40.0/28.4 35.0/27.5 36.6/27.9
+8                47.4         32.6  all: 47.4/32.2 42.7/31.5 45.7/32.6
+12               45.0         34.3  all: 45.0/34.3 37.7/32.9 40.8/32.7
+9.01 7.05 6.09 7/2890 2923046
+
+=== 2c. mynah-slm prefill on the 1,500-token bench_prefill prompt: mynah-slm run -m GGUF -p "$(scripts/bench_prefill.sh -P 1500)" --temp 0 -n 16 -t 8 --no-stream --think off --ctx 4096
+Q8_0 t8 run 1 (04:31, load ~6-9): [load 0.15s | prompt 1500 tok, prefill 17.2 tok/s | gen 16 tok, decode 22.5 tok/s | TTFT 87505 ms | 8 threads]
+[load] 04:32:31 mynah-1500: 12.93 9.34 7.04 3/2883 2948032 > 6, waiting
+[load] 04:33:01 mynah-1500: 8.50 8.62 6.87 4/2920 2952747 > 6, waiting
+[load] 04:33:31 mynah-1500: 5.93 7.98 6.71 2/2862 2957837 (waited 60s)
+Q8_0 t8: [load 0.15s | prompt 1500 tok, prefill 23.6 tok/s | gen 16 tok, decode 21.2 tok/s | TTFT 63743 ms | 8 threads]
+Q4_K_M t8: [load 0.14s | prompt 1500 tok, prefill 21.5 tok/s | gen 16 tok, decode 19.6 tok/s | TTFT 69996 ms | 8 threads]
+17.02 11.79 8.31 2/2854 2987021
+
+=== 3. perplexity: .venv/bin/python -I scripts/ppl.py TEXT --hf --runq -t 8  (TEXT = Voyage of the Beagle ch. I prefix, sha256 6ac0515c...)
+[load] 04:35:58 ppl-hf-runq: 13.93 11.36 8.22 3/2859 2989126 > 6, waiting
+[load] 04:36:28 ppl-hf-runq: 9.46 10.52 8.04 2/2907 2994686 > 6, waiting
+[load] 04:36:58 ppl-hf-runq: 7.15 9.85 7.90 2/2878 2999397 > 6, waiting
+[load] 04:37:28 ppl-hf-runq: 5.30 9.14 7.72 3/2886 3004745 (waited 90s)
+text /tmp/cwayn-bench/ppl/beagle_ch1_4k.txt: 17077 bytes, 4142 tokens (HF); full: 4141 predictions; win512: 8 windows, 4088 predictions
+engine                             protocol   pred      nll      ppl    time
+HF fp32                            full       4141  3.31677   27.571   44.0s
+HF fp32                            win512     4088  3.46524   31.984   10.3s
+Traceback (most recent call last):
+  File "/opt/projects/tools/cwayn/scripts/ppl.py", line 154, in <module>
+    main()
+    ~~~~^^
+  File "/opt/projects/tools/cwayn/scripts/ppl.py", line 140, in main
+    r = score(s) if kind == "hf" else score(s, tok.decode(s))
+                                      ~~~~~^^^^^^^^^^^^^^^^^^
+  File "/opt/projects/tools/cwayn/scripts/ppl.py", line 69, in score
+    logits = np.memmap(out, dtype=np.float32, mode="r", offset=8 + 4 * n, shape=(n, vocab))
+  File "/opt/projects/tools/cwayn/.venv/lib/python3.13/site-packages/numpy/_core/memmap.py", line 284, in __new__
+    bytes -= start
+OverflowError: Python integer 2517292224 out of bounds for int32
+7.63 8.99 7.76 4/2861 3016458
+
+--- (runq failed above on a script bug: int32 overflow in the memmap offset; fixed, runq only:) .venv/bin/python -I scripts/ppl.py TEXT --runq -t 8
+[load] 04:39:01 ppl-runq: 5.69 8.42 7.61 3/2892 3020840 (waited 0s)
+text /tmp/cwayn-bench/ppl/beagle_ch1_4k.txt: 17077 bytes, 4142 tokens (HF); full: 4141 predictions; win512: 8 windows, 4088 predictions
+engine                             protocol   pred      nll      ppl    time
+runq Q8_0                          full       4141  3.32522   27.805    8.9s
+runq Q8_0                          win512     4088  3.47217   32.206    9.7s
+7.00 8.50 7.66 4/2914 3025965
+
+--- .venv/bin/python -I scripts/ppl.py TEXT --mynah -t 8   (= Q8_0 and Q4_K_M GGUFs; mynah-slm ppl, f32 KV)
+[load] 04:39:39 ppl-mynah: 8.31 8.74 7.75 3/2867 3028144 > 6, waiting
+[load] 04:40:09 ppl-mynah: 7.29 8.44 7.68 7/2860 3033353 > 6, waiting
+[load] 04:40:39 ppl-mynah: 5.20 7.84 7.50 3/2858 3038373 (waited 60s)
+text /tmp/cwayn-bench/ppl/beagle_ch1_4k.txt: 17077 bytes, 4142 tokens (HF); full: 4141 predictions; win512: 8 windows, 4088 predictions
+engine                             protocol   pred      nll      ppl    time
+mynah-slm Qwen3-0.6B-Q8_0.gguf     full       4141  3.31709   27.580  206.4s
+mynah-slm Qwen3-0.6B-Q8_0.gguf     win512     4088  3.46694   32.039  125.1s
+mynah-slm Qwen3-0.6B-Q4_K_M.gguf   full       4141  3.36258   28.864  213.8s
+mynah-slm Qwen3-0.6B-Q4_K_M.gguf   win512     4088  3.53178   34.185  133.0s
+9.58 9.03 8.25 5/2893 3197270
+
+=== 4. repeat pass of all runq speed tables: scripts/bench_all.sh (REPS=3)
+[load] 04:52:47 bench_all: 5.93 8.13 7.98 4/2953 3206585 (waited 0s)
+runq d76e4cc, 16 CPUs, REPS=3
+
+## 1. prefill vs prompt length and threads (-b 512)
+[loadavg 04:52:47] 5.93 8.13 7.98 4/2948 3206595
+prompt  threads chunk   prefill t/s  decode t/s   out
+451     1       512           307.5        42.3   yes  all: 303.5/42.3 307.4/42.1 307.5/40.4
+451     4       512          1098.0       133.4   yes  all: 1098.0/66.5 1054.8/132.2 1079.5/133.4
+451     8       512          2058.1        96.5   yes  all: 1788.3/86.3 2058.1/96.5 1937.1/94.9
+451     12      512          1932.9        90.5   yes  all: 1701.0/90.5 1878.9/77.0 1932.9/70.8
+1500    1       512           221.6        29.9   yes  all: 221.6/28.1 221.2/29.9 221.2/29.9
+1500    4       512           826.2        94.0   yes  all: 826.2/47.7 795.8/94.0 809.7/71.0
+1500    8       512          1519.2       114.9   yes  all: 1504.4/114.9 1519.2/92.0 1454.8/89.4
+1500    12      512          1843.0       101.9   yes  all: 1615.7/82.4 1843.0/101.9 1807.8/77.5
+3000    1       512           156.6        20.7   yes  all: 156.4/19.8 156.6/19.8 156.6/20.7
+3000    4       512           579.3        64.2   yes  all: 579.3/64.2 575.6/61.2 572.5/64.2
+3000    8       512          1131.7        82.8   yes  all: 1068.4/82.8 1131.7/81.5 1113.9/78.1
+3000    12      512          1386.8        86.4   yes  all: 1333.2/59.9 1149.7/86.4 1386.8/61.2
+
+## 2. chunk-size sweep (1,500 tokens, 8 threads)
+[loadavg 04:55:25] 8.29 7.75 7.84 2/2939 3244239
+prompt  threads chunk   prefill t/s  decode t/s   out
+1500    8       1             184.8       129.5   yes  all: 167.2/114.7 145.8/127.4 184.8/129.5
+1500    8       64           1273.0       116.8   yes  all: 1273.0/116.8 1237.1/102.9 1269.4/113.8
+1500    8       128          1370.2       107.4   yes  all: 1370.2/107.4 1153.8/69.6 1045.0/71.8
+1500    8       256          1299.4       138.4   yes  all: 1102.1/85.9 1242.1/138.4 1299.4/80.0
+1500    8       512          1494.9        92.3   yes  all: 1430.9/71.5 1327.1/83.7 1494.9/92.3
+
+## 3. decode vs threads (bench_qwen3c.sh, 256 new tokens)
+[loadavg 04:56:18] 10.28 8.33 8.03 8/2907 3257042
+threads   prefill t/s   decode t/s
+1               326.2         46.6  all: 326.2/43.9 309.1/46.6 324.6/46.0
+4               925.9        100.2  all: 909.6/75.5 916.0/96.5 925.9/100.2
+8              1464.4        136.5  all: 1295.2/109.7 1464.4/135.7 1416.8/136.5
+12             1933.5        169.8  all: 1933.5/169.8 1051.0/128.6 1849.8/156.5
+16              266.7          9.0  all: 71.1/7.6 68.6/5.4 266.7/9.0
+
+## 4. decode after a long prompt (-n 256; generated tokens:t/s per run)
+[loadavg 04:58:55] 19.15 12.36 9.55 4/2933 3296696
+prompt 1500  threads 8   decode t/s    84.1  all: 84:77.6 84:84.1 84:70.3
+prompt 1500  threads 12  decode t/s    97.0  all: 84:96.8 84:97.0 84:77.9
+prompt 3000  threads 8   decode t/s    84.1  all: 102:77.9 102:84.1 102:83.6
+prompt 3000  threads 12  decode t/s    73.4  all: 102:73.4 102:65.3 102:64.9
+
+[loadavg 04:59:38] 17.39 12.82 9.84 7/2918 3306753
+
+=== bandwidth, end of session
+[load] 04:59:48 bw-end: 15.33 12.53 9.77 4/2912 3308337 > 6, waiting
+[load] 05:00:18 bw-end: 11.29 11.83 9.63 4/2905 3314345 > 6, waiting
+[load] 05:00:48 bw-end: 8.47 11.09 9.45 4/2931 3319804 > 6, waiting
+[load] 05:01:18 bw-end: 7.34 10.56 9.33 2/2939 3325898 > 6, waiting
+[load] 05:01:48 bw-end: 6.89 10.13 9.22 11/2949 3331871 > 6, waiting
+[load] 05:02:18 bw-end: 5.54 9.49 9.04 8/2897 3341414 (waited 150s)
+threads=1 size=1024MB read BW=34.8 GB/s (sink 0)
+threads=4 size=1024MB read BW=68.7 GB/s (sink 0)
+threads=8 size=1024MB read BW=60.0 GB/s (sink 0)
+threads=12 size=1024MB read BW=85.7 GB/s (sink 0)
+threads=8 size=1024MB read BW=61.9 GB/s (sink 0)
+threads=12 size=1024MB read BW=114.8 GB/s (sink 0)
+5.54 9.49 9.04 4/2892 3342181
+=== session end 2026-10-25T05:02:20+00:00
+
+=== 3b. logits vs HF: tests/run_tests.sh -v --only logits (OMP_NUM_THREADS=8), summary lines
+PASS  logits/en  n=15 cos pos0 0.8316, pos1+ mean 0.99824 min 0.99521 | top1 13/15 | top5 0.907
+PASS  logits/code  n=24 cos pos0 0.8323, pos1+ mean 0.99929 min 0.99832 | top1 22/24 | top5 0.958
+PASS  logits/zh  n=15 cos pos0 0.9064, pos1+ mean 0.99961 min 0.99942 | top1 14/15 | top5 0.920
+PASS  logits/chat  n=15 cos pos0 0.8967, pos1+ mean 0.99879 min 0.99599 | top1 13/15 | top5 0.933
+PASS  logits/count  n=15 cos pos0 0.8653, pos1+ mean 0.99945 min 0.99916 | top1 14/15 | top5 0.893
+PASS  logits/top1_pooled  76/84 = 0.905 (min 0.85)
+      prompt  n   cos pos0  cos mean  cos min   top1    top5
+      en      15  0.8316    0.99824   0.99521   13/15   0.907
+      code    24  0.8323    0.99929   0.99832   22/24   0.958
+      zh      15  0.9064    0.99961   0.99942   14/15   0.920
+      chat    15  0.8967    0.99879   0.99599   13/15   0.933
+      count   15  0.8653    0.99945   0.99916   14/15   0.893
+PASS  logits_batched/en  n=15 cos pos0 0.8316, pos1+ mean 0.99824 min 0.99521 | top1 13/15 | top5 0.907
+PASS  logits_batched/code  n=24 cos pos0 0.8323, pos1+ mean 0.99929 min 0.99832 | top1 22/24 | top5 0.958
+PASS  logits_batched/zh  n=15 cos pos0 0.9064, pos1+ mean 0.99961 min 0.99942 | top1 14/15 | top5 0.920
+PASS  logits_batched/chat  n=15 cos pos0 0.8967, pos1+ mean 0.99879 min 0.99599 | top1 13/15 | top5 0.933
+PASS  logits_batched/count  n=15 cos pos0 0.8653, pos1+ mean 0.99945 min 0.99916 | top1 14/15 | top5 0.893
+PASS  logits_batched/top1_pooled  76/84 = 0.905 (min 0.85)
+      prompt  n   cos pos0  cos mean  cos min   top1    top5
+      en      15  0.8316    0.99824   0.99521   13/15   0.907
+      code    24  0.8323    0.99929   0.99832   22/24   0.958
+      zh      15  0.9064    0.99961   0.99942   14/15   0.920
+      chat    15  0.8967    0.99879   0.99599   13/15   0.933
+      count   15  0.8653    0.99945   0.99916   14/15   0.893
+Summary: 14 passed, 0 failed, 0 xfail, 0 xpass, 5.2 s (OMP_NUM_THREADS=8)
+PASS  logits/cos_pooled  mean cos over 79 positions (pos >= 1) = 0.99910 (min 0.997)
+PASS  logits_batched/cos_pooled  mean cos over 79 positions (pos >= 1) = 0.99910 (min 0.997)

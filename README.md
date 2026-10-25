@@ -17,12 +17,13 @@ make                                  # -> ./runq  (make debug -> ./runq-debug, 
 make test                             # regression suite, ~25 s (tests/README.md)
 make bench                            # thread sweep, prefill/decode tok/s (scripts/bench_qwen3c.sh)
 make bench-prefill                    # prefill tok/s vs prompt length and -b (scripts/bench_prefill.sh)
+scripts/bench_all.sh                  # all runq speed tables of BENCHMARKS.md (~8 min)
 scripts/fetch_mynah.sh                # optional reference engine, then scripts/bench_mynah.sh
 ```
 
 Threads: without `OMP_NUM_THREADS`, runq uses min(12, nproc - nproc/4) threads (12 on the 16-vCPU
 dev box: ~30% faster prefill than 8, decode about the same). Never all CPUs on a shared machine:
-16 threads on 16 vCPUs collapse (see benchmarks below). Always pass `-c` (context size): without
+16 threads on 16 vCPUs collapse (see BENCHMARKS.md). Always pass `-c` (context size): without
 it the KV cache is sized for the full 40,960-token context, about 9 GB of address space.
 
 ## Models (`scripts/download_models.py --list`)
@@ -66,63 +67,17 @@ Revisions are pinned. Each file is verified by sha256 (LFS files) or git blob sh
 
 ## Benchmarks
 
-### cwayn `runq` (2026-10-25, Step 3b: attention, threading; 16-vCPU EPYC Genoa VM, shared, load 3-12)
+Full tables, methodology and baselines: [BENCHMARKS.md](BENCHMARKS.md) (one session, 2026-10-25,
+`d76e4cc`, 16-vCPU EPYC Genoa VM, shared). Headline, Q8_0, greedy, best of 6-9 runs:
 
-Prefill tok/s (`scripts/bench_prefill.sh -l "450 1500" -b "64 128 256 512" -t "8 12" -r 2`: chat,
-greedy, `-c 4096 -n 16`; 3,000 tokens: best of 2), Step 3a binary -> now, same session:
+| threads | prefill 451 / 1,500 / 3,000 tokens | decode tok/s |
+|---|---|---|
+| 8 | 2,058 / 1,570 / 1,132 tok/s | 148 |
+| 12 (default) | 2,758 / 1,976 / 1,531 tok/s | 170 |
 
-| prompt tokens | threads | Step 3a (`-b 128` / `256`) | now `-b 128` | `-b 256` | `-b 512` (default) |
-|---|---|---|---|---|---|
-| 451 | 8 | 1,182 / 1,206 | 1,831 | 1,941 | **1,983** |
-| 451 | 12 | 1,513 / 1,716 | 2,527 | 2,424 | **2,569** |
-| 1,500 | 8 | 533 / 547 | 1,329 | 1,479 | **1,481** |
-| 1,500 | 12 | 775 / 772 | 1,804 | 1,940 | **2,018** |
-| 3,000 | 8 | - / 276 | | 1,062 | **1,067** |
-| 3,000 | 12 | - / 388 | | 1,437 | **1,551** |
-
-Decode tok/s (`scripts/bench_qwen3c.sh`, 256 new tokens, best of 2-4, old/new interleaved; the
-box was busy, runs vary by up to +-30%):
-
-| threads | 4 | 8 | 12 | 16 |
-|---|---|---|---|---|
-| Step 3a | 115.6 | 125.4 (150.7) | 137.5 (141.8) | 14.7 |
-| now | **139.8** | **183.6** (194.7) | **158.7** (184.9) | 22.3 |
-
-(in brackets: an earlier, quieter session the same day)
-
-- Attention (prefill): AVX-512, ~670 GFLOPS at 8 threads at 1,500 and 3,000 tokens (was ~126):
-  1,500 tokens 2.0 -> 0.39 s. Profile (`-DRUNQ_PROFILE`, 8 threads, `-b 512`): 451 tokens GEMMs
-  67%, attention 19%, rest 14%; 1,500 tokens GEMMs 50%, attention 40%; 3,000 tokens attention 57%.
-- Decode: one parallel region per token instead of ~230 fork/joins: ~120 GB/s effective at 8
-  threads (0.63 GB of weights per token), so the Step 3a "bandwidth limit" (~92 GB/s) was mostly
-  synchronization overhead.
-- GEMM unchanged: ~2.5 TOPS int8 at 8 threads.
-- 16 threads still collapse, unfixable on this shared VM with spin barriers (passive wait,
-  `GOMP_SPINCOUNT`, `OMP_PROC_BIND`, dynamic scheduling tried: 9-54 tok/s decode; prefill 451
-  tokens 109 -> 221 at `-b 128`, 544 at `-b 512`, vs 2,569 at 12), hence the default of 12 threads.
-- History: Step 3a (VNNI kernels): prefill 451 / 1,500 tokens at 8 threads 287 / 233 -> 1,179 / 541,
-  decode 121 -> 139. Step 2 (batched prefill, generic C GEMM): 125 / 81 (token by token) -> 289 /
-  231. Details in TODO.md.
-
-### qwen3.c and mynah-slm (2026-10-24, before cwayn's changes; greedy, 256 new tokens, best of 3)
-
-Decode tok/s:
-
-| threads | qwen3.c Q8_0 | mynah-slm Q8_0 | mynah-slm Q4_K_M |
-|---|---|---|---|
-| 1 | 21.5 | 17.3 | 14.3 |
-| 4 | 68 | 32.5 | 30.0 |
-| 8 | **~100** | 35.5 | 34.4 |
-| 12 | ~95 | 34.8 | 34.5 |
-| 16 | **~11** (collapse) | 30.3 | 30.4 |
-
-- qwen3.c at 16 threads collapses. This is not VM throttling (0% steal time), but OpenMP
-  spin-barrier oversubscription: with every vCPU spinning, any other process preempting one
-  thread stalls all of them at every barrier (hundreds per token). `OMP_WAIT_POLICY=passive`
-  is worse at every thread count (~20 tok/s). (For qwen3.c, 8 threads was the best setting.)
-- mynah-slm `--fast` (int8 activations) made no measurable difference here.
-- With mynah-slm, Q4_K_M is no faster than Q8_0 on this CPU.
-- Greedy Q8_0 output is identical from qwen3.c and mynah-slm (cross-check of both engines).
+Same session: upstream qwen3.c decodes at 101 / 106 tok/s (8 / 12 threads) with ~99 tok/s token-by-token
+prefill; mynah-slm at ~34 (Q8_0 and Q4_K_M). Perplexity vs HF fp32: runq Q8_0 +0.8%, Q4_K_M +4.7%.
+`scripts/bench_all.sh` reruns the runq tables (~8 min).
 
 ## Known limitations of qwen3.c
 

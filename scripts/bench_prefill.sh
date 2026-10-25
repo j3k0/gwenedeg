@@ -10,7 +10,8 @@
 # so runs are reproducible. Column "out" checks that each run's generated text equals that of
 # the first chunk size in the list (batched prefill must not change the output).
 # Defaults take ~2.5 min, mostly the -b 1 runs at 1,500 tokens; -r 1 -b "1 512" ~30 s.
-# Env: RUNQ=binary (default ./runq). Check /proc/loadavg first: the machine may be shared.
+# Env: RUNQ=binary (default ./runq); ALL=1 adds a column with every run's prefill/decode t/s
+# (run-to-run spread). Check /proc/loadavg first: the machine may be shared.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RUNQ="${RUNQ:-$ROOT/runq}"
@@ -68,7 +69,7 @@ for len in $LENS; do
   for t in $THREADS; do
     ref=""
     for b in $CHUNKS; do
-      best_p=0; best_d=0; same=yes; n=0
+      best_p=0; best_d=0; same=yes; n=0; all=""
       for _ in $(seq "$REPS"); do
         out=$(OMP_NUM_THREADS=$t "$RUNQ" "$MODEL" -c 4096 -t 0 -n 16 -b "$b" -i "$prompt" 2>"$ERR") || { cat "$ERR" >&2; exit 1; }
         line=$(grep '\[timing\]' "$ERR")
@@ -77,10 +78,12 @@ for len in $LENS; do
         d=$(sed -E 's/.*generated: [0-9]+ tok in [0-9.]+ s \(([0-9.]+) tok\/s\).*/\1/' <<<"$line")
         best_p=$(awk -v a="$best_p" -v b="$p" 'BEGIN{print (b>a)?b:a}')
         best_d=$(awk -v a="$best_d" -v b="$d" 'BEGIN{print (b>a)?b:a}')
+        all+=" $p/$d"
         [ -z "$ref" ] && ref=$out
         [ "$out" == "$ref" ] || same=NO
       done
-      printf "%-7s %-7s %-6s %12s %11s %5s\n" "$n" "$t" "$b" "$best_p" "$best_d" "$same"
+      printf "%-7s %-7s %-6s %12s %11s %5s" "$n" "$t" "$b" "$best_p" "$best_d" "$same"
+      if [ -n "${ALL:-}" ]; then echo "  all:$all"; else echo; fi
     done
   done
 done

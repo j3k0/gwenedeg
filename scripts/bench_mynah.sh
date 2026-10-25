@@ -3,7 +3,8 @@
 # Usage: scripts/bench_mynah.sh [model.gguf] [threads...]
 #   default model: models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf, threads: 1 2 4 8 12 16
 # Env: N=new tokens per run (256), REPS=runs per thread count, best kept (3),
-#      EXTRA="--fast" etc. extra flags passed to `mynah-slm run`
+#      EXTRA="--fast" etc. extra flags passed to `mynah-slm run`,
+#      ALL=1 adds a column with every run's prefill/decode t/s (run-to-run spread)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/third_party/mynah-slm/mynah-slm"
@@ -17,7 +18,7 @@ cat "$MODEL" > /dev/null   # warm the page cache
 
 printf "%-8s %12s %12s\n" threads "prefill t/s" "decode t/s"
 for t in "${THREADS[@]}"; do
-  best_d=0; best_p=0
+  best_d=0; best_p=0; all=""
   for _ in $(seq "$REPS"); do
     # shellcheck disable=SC2086
     line=$("$BIN" run -m "$MODEL" -p "$PROMPT" --temp 0 -n "$N" -t "$t" --no-stream --think off $EXTRA 2>&1 >/dev/null | grep 'decode')
@@ -25,6 +26,8 @@ for t in "${THREADS[@]}"; do
     d=$(sed -E 's/.*decode ([0-9.]+) tok\/s.*/\1/' <<<"$line")
     best_d=$(awk -v a="$best_d" -v b="$d" 'BEGIN{print (b>a)?b:a}')
     best_p=$(awk -v a="$best_p" -v b="$p" 'BEGIN{print (b>a)?b:a}')
+    all+=" $p/$d"
   done
-  printf "%-8s %12s %12s\n" "$t" "$best_p" "$best_d"
+  printf "%-8s %12s %12s" "$t" "$best_p" "$best_d"
+  if [ -n "${ALL:-}" ]; then echo "  all:$all"; else echo; fi
 done

@@ -73,6 +73,8 @@ Measured 2026-10-24 (Q8_0 engine at the commit adding this suite, unchanged from
 Since the SwiGLU NaN fix (2026-10-25, see `../TODO.md` Known bugs; it changed the last layer of
 `zh` and `chat`): zh top-5 0.893, chat cos mean 0.99891, pooled cos mean 0.99910; the rest is
 unchanged. The batched path gives exactly the same numbers.
+Since the Step 3b attention (pooled numbers unchanged, per-prompt values moved slightly, e.g. en
+top-5 0.907, code top-1 22/24): current per-prompt table in `../BENCHMARKS.md` (Quality).
 
 Thresholds (`tests/check.py`): per prompt cos mean >= 0.995, every position >= 1 cos >= 0.98,
 pos 0 cos >= 0.75, top-1 >= 0.75, top-5 >= 0.75; pooled cos mean >= 0.997, pooled top-1 >= 0.85.

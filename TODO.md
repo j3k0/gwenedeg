@@ -220,7 +220,10 @@ Found by the tests.
   private copies of x); finer q / k / v items at 12 threads (32 heads over 12 threads: 3 vs 2.67)
 - [ ] Prefill rest (14% at 451 tokens): norm / quantize / SwiGLU loops as separate parallel
   regions per phase; SwiGLU's `expf` (libmvec) is ~4%
-- [ ] Perplexity comparison Q4_K_M vs Q8_0 (small text sample)
+- [x] Perplexity comparison Q4_K_M vs Q8_0 (2026-10-25, `scripts/ppl.py`, BENCHMARKS.md): Voyage of
+  the Beagle ch. I, 4,142 tokens, one sequence (= `mynah-slm ppl`): HF fp32 27.571, mynah-slm Q8_0
+  27.580 (+0.03%), runq Q8_0 27.805 (+0.85%: int8 activations, group 64), mynah-slm Q4_K_M 28.864
+  (+4.7%); 512-token windows: 31.984 / 32.039 / 32.206 / 34.185 (+6.9% for Q4_K_M)
 - [ ] GGUF loading (Q8_0 / Q4_K_M) without the Python export step
 - [ ] Faster sampling (top-p currently sorts the whole vocab)
 - [ ] Startup ~0.45 s per process (~55 ms of it the VNNI weight repacking), mostly page faults for the dequantized embedding table (~620 MB

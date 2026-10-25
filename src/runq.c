@@ -1626,6 +1626,12 @@ static inline QuantizedTensor qsub(QuantizedTensor *t, int i0) {
 // the thread finishing the last item, before the phase is published; every thread then waits for it
 #define PH_BEGIN(n_, chunk_) PH_BEGIN_U(n_, chunk_, 1)
 #define PH_BEGIN_DYN(n_, chunk_) PH_BEGIN_U(n_, chunk_, 0) // one shared counter, items in order
+// (Items that wait on a dependency counter inside a phase need the shared counter: every item they
+// depend on is claimed before them, by a running thread. With per-thread ranges and stealing, all
+// threads can end up waiting in stolen items whose dependencies sit unclaimed in their own ranges:
+// an intermediate version deadlocked that way at 4 threads.) Decode uses the shared counter
+// everywhere (short phases: per-thread ranges and the victim scan at the end of each phase decoded
+// ~20-40% slower at 8-12 threads); prefill uses per-thread ranges for the GEMMs and per-row phases
 #define PH_BEGIN_U(n_, chunk_, unit_) { RqIt it_ = rq_it(k_, (n_), (chunk_), (unit_), tid); int lo, hi; \
     while (rq_next(S, &it_, &lo, &hi)) {
 #define PH_EPILOGUE if (rq_finish(S, &it_, hi - lo)) {
@@ -1675,7 +1681,7 @@ static void decode_worker(void *arg, int tid, int nt) {
     size_t ts = (size_t)nkv * ATT_T * hd, pst = ATT_PSTRIDE(hd);
 
     if (pos % ATT_T == 0) { // first position of a KV cache tile: pre-fault the tile (all layers)
-        PH_BEGIN(2 * p->n_layers, 1)
+        PH_BEGIN_DYN(2 * p->n_layers, 1)
         for (int it = lo; it < hi; it++)
             kv_populate_one(s, p, pos, 1, it);
         PH_END_NOEPI
@@ -1744,7 +1750,7 @@ static void decode_worker(void *arg, int tid, int nt) {
 
         // final matmul to get the output of the attention (16-row blocks); epilogue: residual
         // connection back into s->x, ffn rmsnorm, quantize
-        PH_BEGIN(dim / 16, s->dec_chunk)
+        PH_BEGIN_DYN(dim / 16, s->dec_chunk)
             matvec_rows(s->xb, &s->aq, s->aq_corr, s->aq_xf, s->aq_c16, w->wo + l, all_heads_dim, lo * 16, hi * 16);
         PH_EPILOGUE
             for (int i = 0; i < dim; i++)
@@ -1756,7 +1762,7 @@ static void decode_worker(void *arg, int tid, int nt) {
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x)): per item,
         // ff rows of self.w1(x) and self.w3(x), the SwiGLU non-linearity and their quantization
-        PH_BEGIN(hidden / ff, 1)
+        PH_BEGIN_DYN(hidden / ff, 1)
         for (int i0 = lo * ff; i0 < hi * ff; i0 += ff) {
             matvec_rows(s->hb, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->w1 + l, dim, i0, i0 + ff);
             matvec_rows(s->hb2, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->w3 + l, dim, i0, i0 + ff);
@@ -1769,7 +1775,7 @@ static void decode_worker(void *arg, int tid, int nt) {
 
         // final matmul to get the output of the ffn; epilogue: its residual, then the next layer's
         // attention rmsnorm + quantize (or the final rmsnorm for the classifier; none without logits)
-        PH_BEGIN(dim / 16, s->dec_chunk)
+        PH_BEGIN_DYN(dim / 16, s->dec_chunk)
             matvec_rows(s->xb, &s->hq, s->hq_corr, s->hq_xf, s->hq_c16, w->w2 + l, hidden, lo * 16, hi * 16);
         PH_EPILOGUE
             if (l + 1 < p->n_layers || job->compute_logits)
@@ -1779,7 +1785,7 @@ static void decode_worker(void *arg, int tid, int nt) {
 
     if (job->compute_logits) { // classifier into logits
         int nblk = (p->vocab_size + 15) / 16;
-        PH_BEGIN(nblk, s->cls_chunk)
+        PH_BEGIN_DYN(nblk, s->cls_chunk)
             matvec_rows(s->logits, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->wcls, dim, lo * 16,
                         hi * 16 < p->vocab_size ? hi * 16 : p->vocab_size);
         PH_END_NOEPI

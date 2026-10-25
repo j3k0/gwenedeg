@@ -71,12 +71,13 @@
 #define RQ_LOAD(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
 #define RQ_ADD(p, v) __atomic_fetch_add((p), (v), __ATOMIC_ACQ_REL)
 
-// pause rounds before sleeping (Zen 4: ~28 ns per round): decode phases (~10-60 us apart; at 16
-// threads on the 16-vCPU VM, 1,000 rounds decoded ~10-20% faster than 4,000 and ~30% faster than
-// 100,000: sleeping waiters free the CPUs for a preempted thread), prefill phases (~1-2 ms; 4,000
-// prefilled ~5% faster than 1,000 at 8-12 threads), the pool's wait for the next job
+// pause rounds before sleeping (Zen 4: ~28 ns per round, so 4,000 ~ 110 us): decode phases (~10-60
+// us apart; 16-vCPU VM, best of 6: 1,000 rounds decoded ~30% slower at 8 threads, sleeping and waking
+// too often; 30,000 ~15-20% slower at 12-16 threads, the spinning waiters keep CPUs from a preempted
+// thread), prefill phases (~1-2 ms; 4,000 ~5% faster than 1,000 at 8-12 threads), the pool's wait
+// for the next job
 #ifndef RQ_SPIN_DEC
-#define RQ_SPIN_DEC 1000
+#define RQ_SPIN_DEC 4000
 #endif
 #ifndef RQ_SPIN_PF
 #define RQ_SPIN_PF 4000

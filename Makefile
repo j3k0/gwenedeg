@@ -11,7 +11,7 @@ SRC = src/runq.c
 HDR = src/unicode_tables.h src/kernels_avx512.h
 Q8  = models/Qwen3-0.6B-q8.bin
 
-.PHONY: all debug clean test bench bench-prefill models
+.PHONY: all debug generic clean test bench bench-prefill models
 
 all: runq
 
@@ -21,12 +21,20 @@ runq: $(SRC) $(HDR)
 runq-debug: $(SRC) $(HDR)
 	$(CC) $(DBGFLAGS) $(CPPFLAGS) $< $(LDLIBS) -o $@
 
+# Same flags, but the generic C kernels instead of the AVX-512 VNNI ones (kernels_avx512.h);
+# `make test` checks that both give bit-identical logits. (On a CPU without AVX-512 VNNI,
+# plain `make` already builds the generic kernels: the selection is at compile time.)
+runq-generic: $(SRC) $(HDR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DRUNQ_GENERIC $< $(LDLIBS) -o $@
+
 debug: runq-debug
 
-clean:
-	rm -f runq runq-debug
+generic: runq-generic
 
-test: runq
+clean:
+	rm -f runq runq-debug runq-generic
+
+test: runq runq-generic
 	@if [ -f tests/run_tests.sh ]; then bash tests/run_tests.sh; else echo "no tests yet"; fi
 
 bench: runq

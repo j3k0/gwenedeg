@@ -1,5 +1,6 @@
 /runq
 /runq-debug
+/runq-generic
 /models/
 /.venv/
 /logs/

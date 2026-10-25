@@ -8,6 +8,8 @@ Tests (see tests/README.md):
              sequential path (-b 1) and batched prefill (-b 64), same thresholds
   batched    batched logits (-b 7, -b 64) vs sequential (-b 1): near-exact (bit-identical now)
   threads    logits bit-identical for 1 vs N OpenMP threads (sequential and batched)
+  kernels    logits bit-identical for the AVX-512 VNNI kernels (runq) and the generic C ones
+             (runq-generic, -DRUNQ_GENERIC): GEMV (-b 1) and GEMM (-b 7, -b 64) paths
   greedy     runq -t 0 output vs our own golden text  (tests/golden/greedy/*.txt), with the
              default batched prefill (and -b 5 once); seeded -t 0.8 chat equal for -b 1 and 5
 
@@ -82,6 +84,10 @@ GREEDY_CASES = [
 SEEDED_ARGS = ["-m", "chat", "-n", "40", "-t", "0.8", "-s", "42", "-c", CTX, "-i", "Tell me about cats."]
 SEEDED_CHUNKS = [1, 5]  # token by token vs 2 chunks (-b 64 runs the same code)
 THREADS_PROMPT = "en"
+# VNNI vs generic kernels: (prompt, -b). -b 1: GEMV (decode path, incl. the classifier);
+# -b 7 on en (15 tokens): GEMM tiles of 6 + 1 rows, last chunk 1 row; -b 64 on all (86 tokens,
+# chunks 64 + 22): tiles of 6 + 4 rows, LOGITS_ALL classifier GEMM
+KERNEL_CASES = [(BATCH_LONG, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH)]
 
 
 class Results:
@@ -322,6 +328,31 @@ def test_threads(a, res, tmp):
         res.report(same, tname, detail)
 
 
+# ----------------------------------------------------------------------------- kernels
+
+def test_kernels(a, res, tmp):
+    if not a.generic:
+        print("      skipped: no generic build (--generic / RUNQ_GENERIC)")
+        return
+    texts = dict(batched_prompts())
+    gen = argparse.Namespace(**{**vars(a), "runq": a.generic})
+    gtmp = os.path.join(tmp, "generic")
+    os.makedirs(gtmp, exist_ok=True)
+    for name, chunk in KERNEL_CASES:
+        pv = logits_file(a, tmp, name, texts[name], chunk)    # VNNI build (shared cache)
+        pg = logits_file(gen, gtmp, name, texts[name], chunk)
+        with open(pv, "rb") as fv, open(pg, "rb") as fg:
+            same = fv.read() == fg.read()
+        n = len(read_logits(pv)[0])
+        detail = f"{name} (n={n}) -b {chunk}: " + ("bit-identical" if same else "DIFFER")
+        if not same:
+            xv, xg = read_logits(pv)[1], read_logits(pg)[1]
+            if xv.shape == xg.shape:
+                d = np.abs(xv.astype(np.float64) - xg)
+                detail += f" (max abs diff {d.max():.3g} at pos {int(d.max(axis=1).argmax())})"
+        res.report(same, f"kernels/{name}_b{chunk}", detail)
+
+
 # ----------------------------------------------------------------------------- greedy
 
 def greedy_output(a, args):
@@ -380,7 +411,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--runq", default=os.path.join(ROOT, "runq"))
     ap.add_argument("--model", default=os.path.join(ROOT, "models", "Qwen3-0.6B-q8.bin"))
-    ap.add_argument("--only", default="tokenizer,logits,batched,threads,greedy",
+    ap.add_argument("--generic", default="", help="generic-kernel build for the kernels test (empty: skip)")
+    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy",
                     help="comma-separated subset of tests to run")
     ap.add_argument("--update-greedy", action="store_true", help="regenerate the greedy goldens")
     ap.add_argument("--jobs", type=int, default=8, help="parallel runq processes for the tokenizer test")
@@ -399,6 +431,7 @@ def main():
                                              test_logits(a, res, tmp, BATCH, "logits_batched"))),
                          ("batched", lambda: test_batched(a, res, tmp)),
                          ("threads", lambda: test_threads(a, res, tmp)),
+                         ("kernels", lambda: test_kernels(a, res, tmp)),
                          ("greedy", lambda: test_greedy(a, res))]:
             if name in only:
                 t = time.time()

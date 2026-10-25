@@ -3616,7 +3616,7 @@ void error_usage() {
     fprintf(stderr, "  -n <int>    max new tokens per response, 0 (default) = unlimited\n");
     fprintf(stderr, "  -b <int>    prefill chunk size (batched prompt processing), default %d, max %d;\n", PREFILL_CHUNK_DEFAULT, B_MAX);
     fprintf(stderr, "              0 or 1 = one token at a time\n");
-    fprintf(stderr, "Threads: OMP_NUM_THREADS, default min(12, nproc - nproc/4) (all CPUs collapse on a busy machine)\n");
+    fprintf(stderr, "Threads: OMP_NUM_THREADS, default nproc - nproc/8\n");
     exit(EXIT_FAILURE);
 }
 
@@ -3693,15 +3693,16 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    // threads: OMP_NUM_THREADS, else the default: not all CPUs. With OpenMP's spin barriers all of
-    // them collapsed on a shared machine (any other process preempting one thread stalled the
-    // others at every barrier, ~200 per token: 16 threads ~20 tok/s decode on the 16-vCPU dev VM)
+    // threads: OMP_NUM_THREADS, else the default nproc - nproc/8 (14 of 16 vCPUs). Measured on the
+    // shared 16-vCPU dev VM (~3 CPUs busy with other work; Step 7a): decode 12 ~ 14 > 16 threads
+    // (memory-bound: 12 already saturate the bandwidth), prefill 14 > 16 > 12 (~2,580 / ~2,290-2,500 /
+    // ~2,420 tok/s at 439 tokens). All 16 work too (the phases tolerate a preempted thread; with
+    // OpenMP's barriers they collapsed to ~2-20 tok/s), just not faster with other processes running
     if (rq_env_threads()) {
         rq_set_threads(rq_env_threads());
     } else {
         int np = rq_ncpu();
-        int nt = np > 4 ? np - np / 4 : np;
-        rq_set_threads(nt < 12 ? nt : 12);
+        rq_set_threads(np - np / 8);
     }
     rq_config();
 

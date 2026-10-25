@@ -2,7 +2,7 @@
 # Benchmark ./runq (src/runq.c) decode/prefill speed across thread counts.
 # Usage: scripts/bench_qwen3c.sh [model.bin] [threads...]
 #   default model: models/Qwen3-0.6B-q8.bin, default threads: 1 2 4 8 12
-#   (16 threads collapses: OpenMP spin-barrier oversubscription, see README)
+#   (16 threads on the 16-vCPU VM: no collapse since Step 7a, but not faster than 12-14 with other load)
 # Env: N=new tokens per run (256), REPS=runs per thread count, best kept (3), RUNQ=binary,
 #      ALL=1 adds a column with every run's prefill/decode t/s (run-to-run spread)
 set -euo pipefail

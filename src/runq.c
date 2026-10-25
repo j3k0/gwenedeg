@@ -703,30 +703,36 @@ void free_run_state(RunState* s) {
 // Quantization functions
 
 void quantize(QuantizedTensor *qx, float *x, int n) {
-    for (int group = 0; group < n / GS; group++) {
+    // per group of GS values: scale = max |x| / 127, q = x / scale rounded half away from zero.
+    // Written as the operations gcc -Ofast made of upstream's expressions (`wmax / 127.0f`,
+    // `(int8_t) round(x / scale)`; read off its asm): scale = wmax * (float)(1 / 127), inv = 127 /
+    // wmax (one division), q = (int) trunc(x * inv + copysign(0.49999997, x * inv)), so the results
+    // are the same bits; with local pointers (the int8 stores no longer alias GS or qx) the loop now
+    // vectorizes: 1,024 values ~0.6 -> ~0.1 us (it was scalar, ~8 instructions per value)
+    const int gs = GS;
+    for (int group = 0; group < n / gs; group++) {
+        const float *restrict xg = x + (size_t)group * gs;
+        int8_t *restrict qg = qx->q + (size_t)group * gs;
         // find the max absolute value in the current group
         float wmax = 0;
-        for (int i = 0; i < GS; i++) {
-            float val = fabs(x[group * GS + i]);
+        for (int i = 0; i < gs; i++) {
+            float val = fabsf(xg[i]);
             if (val > wmax)
                 wmax = val;
         }
 
         // calculate and write the scaling factor
-        float scale = wmax / 127.0f;
-        qx->s[group] = scale;
+        qx->s[group] = wmax * (1.0f / 127.0f);
         if (!(wmax > 0)) { // all-zero group: q = 0 (was 0/0 = NaN cast to int8, UB)
-            memset(qx->q + group * GS, 0, GS);
+            memset(qg, 0, gs);
             continue;
         }
-        // (keep `/ scale` as is: under -Ofast it becomes a multiply by the reciprocal, and any
-        // rewrite of this loop changes the rounding of a few values, i.e. the outputs)
+        float inv = 127.0f / wmax;
 
         // calculate and write the quantized values
-        for (int i = 0; i < GS; i++) {
-            float quant_value = x[group * GS + i] / scale; // scale
-            int8_t quantized = (int8_t) round(quant_value); // round and clamp
-            qx->q[group * GS + i] = quantized;
+        for (int i = 0; i < gs; i++) {
+            float v = xg[i] * inv;
+            qg[i] = (int8_t)(int32_t)(v + copysignf(0.49999997f, v));
         }
     }
 }

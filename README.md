@@ -16,7 +16,7 @@ G=models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf
 
 The GGUF file is all runq needs: weights, hyperparameters, tokenizer (from its metadata) and the
 chat templates (built in). The Q4_K_M GGUF (`scripts/download_models.py q4km`, 397 MB) works the same
-way. Which file to use (measured 2026-10-25 on the 16-vCPU dev box, TODO.md Steps 6a, 6b-1, 6b-2, 7a):
+way. Which file to use (measured 2026-10-25 on the 16-vCPU dev box, TODO.md Steps 6a, 6b-1, 6b-2, 7a, 7b):
 
 | | Q8_0 GGUF (639 MB) | Q4_K_M GGUF (397 MB) | Q8_0 .bin (export) |
 |---|---|---|---|
@@ -24,6 +24,7 @@ way. Which file to use (measured 2026-10-25 on the 16-vCPU dev box, TODO.md Step
 | logits vs HF: pooled 1-cos, top-1 (84 positions) | **6.1e-4, 79** | 1.6e-2, 69 | 9.0e-4, 76 |
 | prefill 451 tokens, 8 / 12 threads | 1,870 / 2,540 tok/s | 1,670 / 2,140 | **1,960 / 2,690** |
 | decode, 8 / 12 threads (best of a noisy shared box; Step 7a) | ~190 / ~210 tok/s | **~280 / ~350** | ~200 / ~250 |
+| decode after a 3,000-token prompt, 8 / 12 threads (Step 7b) | ~130 / ~150 tok/s | **~160 / ~180** | |
 | peak RSS, startup (12 threads) | ~670 MB, 0.15 s | **~410 MB, 0.12 s** | ~625 MB, 0.13 s |
 
 - Quality first, and prompt-heavy work (long documents, many short answers): the **Q8_0 GGUF**. It is
@@ -80,14 +81,24 @@ printf 'My name is Ada.\nWhat is my name?\n' | ./runq models/Qwen3-0.6B-q8.bin -
   that reaches the end of the context is cut; a single message that does not fit is skipped.
 - `-n` limits each answer; `-y` sets the system prompt for the whole conversation.
 
+KV cache: `-k f16` (the default since Step 7b), `-k bf16` or `-k f32`. The 16-bit caches take half the
+memory (28 layers x 2 x 1,024 values per position: 115 KB instead of 229 KB; 0.47 instead of 0.94 GB at
+`-c 4096`; peak RSS after 3,000 tokens ~1.15 instead of ~1.37 GB for the Q8_0 GGUF, ~0.89 instead of ~1.23
+for Q4_K_M) and decode long contexts faster (3,000 tokens, Q4_K_M, 8 threads: ~160 vs ~136 tok/s, ~100
+before Step 7b). f16 is as close to the fp32 model as the f32 cache (KL divergence from HF fp32 +0.2%,
+within the noise); bf16 is a bit further (+2.6%: |K| reaches ~500, and bf16 keeps 8 significant bits to
+f16's 11) and prefills long prompts ~3% faster. All three pass the same logits thresholds; the attention
+arithmetic is fp32 on the exactly converted values (TODO.md Step 7b).
+
 Threads: without `OMP_NUM_THREADS`, runq uses nproc - nproc/8 threads (14 on the 16-vCPU dev box).
 Decode is memory-bound: 12-14 threads saturate the bandwidth there (~190-210 tok/s Q8_0 GGUF,
 ~280-350 Q4_K_M), 8 give ~90% of it; prefill scales to 14 (~2,580 tok/s at 439 tokens vs ~2,400 at 12).
 All CPUs work too since Step 7a (16 of 16 vCPUs: decode ~140-170 tok/s with other processes running;
 with OpenMP barriers it collapsed to ~2-20), but are not faster on a busy machine. Long prompts: decode
-splits each kv head's attention over threads per 256 positions (3,000 tokens at 12 threads: ~70 ->
-~100 tok/s). Always pass `-c` (context size): without it the KV cache is sized for the full
-40,960-token context, about 9 GB of address space.
+splits each kv head's attention over threads per 256 positions (3,000 tokens at 12 threads, Q8_0 GGUF:
+~70 -> ~100 tok/s in Step 7a, ~150 since Step 7b's cache layout and f16). Pass `-c` (context size):
+without it the KV cache is sized for the full 40,960-token context, 4.7 GB of address space (9.4 GB with
+`-k f32`), touched only as far as the conversation goes.
 
 ## Models (`scripts/download_models.py --list`)
 
@@ -123,6 +134,9 @@ float folds in the GEMM), decode ~5% (the packed weights are ~6% larger: fp32 sc
   others (16 threads on 16 vCPUs used to collapse); 4 phases per decoded layer (113 sync points per
   token, was 198 OpenMP barriers); the attention defined over blocks of 256 positions, decode splitting
   long contexts over threads per block (same results for decode, prefill and any thread count);
+  KV cache types (`-k f16|bf16|f32`, Step 7b): 16-bit caches rounded to nearest even at the store and
+  converted exactly at the load (the fp32 attention arithmetic unchanged), in blocks of 256 positions
+  with each kv head's tiles contiguous; the activation quantizer vectorized (same results);
   SwiGLU NaN fix (`-Ofast` expf overflow, it did corrupt some last-layer activations);
   a rewritten tokenizer matching HF (added tokens, Qwen2 pre-tokenizer regex, byte-level BPE
   with a hash map and a merge heap; ~1 ms for 2,000 tokens) with HF's NFC normalizer (quick check
@@ -150,7 +164,7 @@ float folds in the GEMM), decode ~5% (the packed weights are ~6% larger: fp32 sc
   Q6P) and the generic kernels; the arithmetic of a K-quant matmul output is defined there.
 - `src/kernels_avx512.h`: the AVX-512 VNNI Q8_0 GEMM / GEMV (group size 64 or 32) and the weight
   repacking, the Q4_K / Q6_K GEMV / GEMM on the Q4P / Q6P layouts, and the fp32 attention with the KV
-  cache layout (layouts, arithmetic and bit-identity argument in its comments).
+  cache layouts (fp32 / bf16 / f16; layouts, arithmetic and bit-identity argument in its comments).
 - `src/threads.h`: the thread pool and the phase synchronization (design and measurements in its
   header comment; OpenMP's parallel region instead with `-DRUNQ_NO_POOL` and on Windows).
 - `src/unicode_tables.h`: \p{L}/\p{N}/\s ranges for the pre-tokenizer, generated by
@@ -183,7 +197,10 @@ prefill; mynah-slm at ~34 (Q8_0 and Q4_K_M). Perplexity vs HF fp32: runq Q8_0 +0
 table under Quick start and TODO.md. Step 7a (threading, not in BENCHMARKS.md yet; same box, later
 session, interleaved with the Step 6b-2 binary, best / median of 8): decode Q8_0 GGUF 8 / 12 / 16 threads
 192 / 168, 210 / 182, ~140-170 / ~115-160 tok/s (before: 198 / 137, 179 / 118, collapse); prefill
-within ~5% at 8-14 threads, no collapse at 16 (TODO.md Step 7a).
+within ~5% at 8-14 threads, no collapse at 16 (TODO.md Step 7a). Step 7b (KV cache, not in BENCHMARKS.md yet;
+interleaved with the Step 7a binary, best of 5, load 8-13), Q8_0 GGUF / Q4_K_M, f16 cache: decode after a
+3,000-token prompt 8 threads 90 -> 128 / 103 -> 158 tok/s, 12 threads 114 -> 147 / 120 -> 180; after 1,500
+tokens 8 threads 130 -> 164 / 153 -> 220; prefill 450 / 1,500 / 3,000 tokens within -0..+7% (TODO.md Step 7b).
 `scripts/bench_all.sh` reruns the runq tables (~8 min).
 
 ## Known limitations

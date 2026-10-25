@@ -16,6 +16,9 @@ the 16 vCPUs no longer collapse (decode ~140-170 tok/s, was ~2-20; prefill ~2,30
 tokens, was ~100-600); decode 8 / 12 threads ~190 / ~210 tok/s best (Q8_0 GGUF; Q4_K_M ~280 / ~350),
 ~+20-50% median; long contexts split per 256-position block (3,000 tokens, 12 threads: ~70 -> ~100
 tok/s). Default threads nproc - nproc/8 (14 here).
+KV cache (Step 7b): f16 by default (`-k f16|bf16|f32`): half the memory, as accurate as fp32 (KL from HF
++0.2%); with the new cache layout decode after 3,000 tokens 90 -> 128 tok/s (Q8_0 GGUF, 8 threads; Q4_K_M
+103 -> 158), prefill unchanged within -0..+7%.
 
 Status: `[ ]` todo · `[~]` in progress · `[x]` done
 
@@ -767,6 +770,143 @@ items (one per kv head), idle threads at 12+ and slow at long contexts.
   the blocks for balance (one item per (row block, kv head, block range)) and the remaining ~10% block
   overhead; decode at 4 threads is per-thread-bandwidth bound
 
+## Step 7b: 16-bit KV cache, long-context attention, prefill rest
+Before (Step 7a): fp32 KV cache, 229 KB per position (28 layers x K, V x 1,024 floats): after 3,000 tokens
+decode reads ~0.7 GB of KV per token, more than the Q4_K_M weights (0.4 GB): decode after a 2,988-token
+prompt ~86 tok/s at 8 threads (Q8_0 GGUF) vs ~190 at short contexts; prefill at 1,500-3,000 tokens
+40-57% attention; prefill "rest" ~12% at 451 tokens.
+- [x] KV cache type `-k f32|bf16|f16` (option (i) of the plan: the stored values change, the attention
+  arithmetic does not). Store: round to nearest even from the fp32 K / V rows (`f32_bf16`, `f32_f16`:
+  integer / exact float operations in C, the same in every build; equal to `vcvtneps2bf16` /
+  `vcvtps2ph` for every non-denormal input, checked over all 2^32 floats; f16 saturates at 65504
+  instead of rounding to inf, measured |K| <= ~500, |V| <= ~100). Load: exact conversion, then the
+  fp32 operations of the Step 3b / 7a definition. bf16 tiles pair dims (K: dims 2p, 2p + 1 of a
+  position in one dword; V: dims 32c + l and 32c + 16 + l), so one 64-byte load gives two zmm of fp32
+  by a shift and a mask; f16 tiles keep the fp32 layout and load with `vcvtph2ps`. The generic C
+  attention converts each (kv head, block) to fp32 tiles once per call (`kv_block_f32`: `bf16_f32`,
+  `fp16_to_f32`), then runs unchanged (~1.1x the fp32 time; converting per vector and tile was 1.8x).
+  All invariants hold per type: batched == sequential, any thread count, AVX-512 == generic (tests
+  below; also checked on a 1,500-token prompt at -b 1 / 7 / 64 / 512, 3 / 8 / 12 / 16 threads). -k f32
+  is bit-identical to Step 7a (30 logits files: 3 models, -b 1 / 64 / 512, both builds)
+- [x] Option (ii) (`vdpbf16ps`) not done: prefill attention is compute-bound (below), so 2x the dot
+  product rate is the one big lever left, but it needs q and the softmax weights rounded to bf16 too
+  (bf16 K alone already costs +2.6% KL, mostly from K: |K| ~500), and the instruction's rounding /
+  denormal behaviour (two FMAs per pair, DAZ / FTZ, odd pair first per Intel's pseudocode) would have
+  to be emulated in C and verified against this AMD core, with no guarantee for other CPUs
+- [x] Accuracy, KL(HF fp32 || runq) per token (scratch script, Q8_0 GGUF, 13 pieces of ~3,500 tokens:
+  Voyage of the Beagle ch. I, node.js `stream.md` / `fs.md` docs; 45.6k tokens, positions up to 3,500):
+  f32 0.001745 mean, **f16 +0.2%** (7 pieces higher, 5 lower: noise), **bf16 +2.6%** (10 higher, 2 equal,
+  1 lower), V only in bf16 +0.7%, K only in bf16 +4.4% (5 pieces), Step 7a's arithmetic change (the
+  256-position blocks) +0.1% for scale. Top-1 agreement with HF 0.9758 / 0.9754 / 0.9761 (f32 / bf16 /
+  f16, 24.5k tokens incl. the legal text). A legal text
+  (AGPL-3.0, much repetition) is chaotic: any rounding change, f32 variants included, moves its pieces by
+  +-1-10%, so it is left out of these numbers. Logits vs HF (`make test` thresholds unchanged, all met):
+
+  | pooled cos (pos >= 1) / top-1 | f32 | bf16 | f16 |
+  |---|---|---|---|
+  | .bin Q8_0, 5 prompts (-b 64) | 0.99910 / 76 | 0.99900 / 76 | 0.99905 / 75 |
+  | .bin, long2 positions 248-296: cos mean, min | 0.99927, 0.99791 | 0.99909, 0.99525 | 0.99921, 0.99695 |
+  | GGUF Q8_0, 5 prompts | 0.99939 / 79 | 0.99940 / 79 | 0.99937 / 78 |
+  | Q4_K_M vs HF / vs the Q4 reference | 0.98402 / 0.99954 | 0.98440 / 0.99960 | 0.98412 / 0.99959 |
+
+- [x] Perplexity (`scripts/ppl.py bench/ppl_beagle_ch1.txt -t 8 --runq-model ...`, full / 512-windows;
+  f32 = Step 7a, which moved the .bin from 27.805 to 27.720 and the GGUFs by +0.03 / +0.12% vs Step 6):
+
+  | | f32 | bf16 | f16 |
+  |---|---|---|---|
+  | Q8_0 GGUF | 27.630 / 32.058 | 27.547 / 32.018 (-0.30 / -0.12%) | 27.602 / 32.025 (-0.10 / -0.10%) |
+  | Q4_K_M | 28.945 / 34.166 | 28.963 / 34.231 (+0.06 / +0.19%) | 28.947 / 34.198 (+0.01 / +0.09%) |
+  | .bin Q8_0 | 27.720 / 32.208 | 27.788 / 32.197 (+0.25 / -0.03%) | 27.807 / 32.160 (+0.31 / -0.15%) |
+
+  On 4,142 tokens any rounding change moves these by ~0.1-0.3% either way (the Step 7a blocks: -0.3%
+  for the .bin), so they cannot resolve the KV types; paired per-token NLL over 49k tokens (Beagle +
+  AGPL + stream.md, 14 pieces): bf16 vs f32 +0.11% +-0.08 (95%), one AGPL piece +1.7%
+- [x] Default: **f16**. bf16 misses the "< 0.1%" bar (+0.11% perplexity on 49k tokens, +2.6% KL,
+  consistently), f16 is within the noise of f32 everywhere, and both 16-bit types give the same memory
+  and decode gains. f16 costs ~0-4% of prefill attention for `vcvtph2ps` (bf16's shift / mask ~0) and
+  1-3% of a 1,500-3,000-token prefill. Greedy goldens: 7 texts flip with f16 (`chat_system`, `generate`,
+  `gguf_generate`, `q4_generate`, the two seeded ones, the multi-turn transcript; all read fine, and
+  the Q8_0 GGUF already answered "I'm Ada" in turn 2 with f32) and were regenerated; `-k f32` reproduces
+  every old golden exactly (checked; `f32_generate` keeps one), `bf16_generate` is new
+- [x] Memory: KV cache at `-c 4096` 0.94 GB (f32) -> 0.47 GB (bf16 / f16), address space, touched as
+  used; default `-c` 0 = 40,960 positions: 9.4 -> 4.7 GB of address space (unchanged default: nothing is
+  resident until used, and `-c` is still the right knob). Peak RSS (12 threads, 128 generated tokens):
+  short prompt Q8_0 GGUF ~780 MB, Q4_K_M ~520 MB for every type (2 MB transparent huge pages of the first
+  block per layer); after a 3,000-token prompt Q8_0 GGUF 1,373 (f32, = Step 7a) -> 1,150 MB (bf16, f16),
+  Q4_K_M 1,228 -> 892 MB
+- [x] KV cache layout: blocks of ATT_P = 256 positions, in a block each kv head's 16 tiles contiguous
+  (were: tile-major, the 8 heads' tiles alternating). With 4-8 KB tiles, every tile of a head was a new
+  page 32-64 KB further on, the hardware prefetchers restarted per tile. Measured first with one range
+  per head (2 MB per head and layer at -c 4096): decode after 3,000 tokens (Q8_0 GGUF, 8 threads) f32 82
+  -> 95, f16 101 -> 131 tok/s (best of 3, same session), prefill +3-5%; but its pre-fault took ~2x as
+  long (8 ranges per layer, no huge pages: +8 ms at 451 tokens). Per block of 256 the positions of all
+  heads are contiguous, pre-faulted as before, and the decode gain stays (f16, 3,000 tokens, 8 / 12
+  threads: 112 / 149 vs 139 / 121 best, 110 / 136 vs 110 / 121 median: noise). kv_len is rounded up to
+  whole blocks. Same arithmetic (bit-identical)
+- [x] bf16 scores: converting both halves of a pair at once spilled registers (prefill attention +15%
+  over fp32); loading the 64-byte pair per dim, as the fp32 loop does: -2%
+- [x] Prefill attention at long prompts (8 threads, 1,500 tokens, -DRUNQ_PROFILE): compute-bound, not
+  bandwidth-bound: 1 -> 8 threads 3.05 -> 0.438 s (6.96x), the same for bf16 (half the bytes); ~590
+  GFLOPS (66% of the ~900 FMA peak), PV ~710 GFLOPS (79%, 42% of the time), scores + softmax ~500 (the
+  exp only ~3%: a scratch build without it). The block overhead is ~4-5% now (ATT_P 4,096 scratch build
+  at 3,000 tokens: 1.62-1.64 vs 1.69 s fp32; Step 7a's ~10% was measured before its V-pass rework). Rows
+  per item: 12 rows (24 vectors, register tiles 24 x 1 / DW 1): 66 vs 48 ms at 451 tokens, 2.24 vs 1.58 s
+  at 3,000: worse; 6 kept. Attention at 3,000 tokens: 1,674 -> 1,558 ms (f32, the layout), 1,654 (f16)
+- [x] Prefill rest. `quantize()` was scalar: its int8 stores aliased `GS` and `qx` (reloaded per value,
+  no vectorization), ~8 instructions per value, 0.6 us per 1,024 values; the same operations (the ones
+  -Ofast made of upstream's expressions: scale = wmax * (float)(1/127), x * (127 / wmax), round half away
+  as trunc(v + copysign(0.49999997, v))) with local pointers vectorize: 0.21 us; outputs byte-identical
+  (30 logits files vs the Step 7a binaries, 1.2e9 random values incl. ties vs the old code). Fusing w1 +
+  w3 + SwiGLU + quantize into one GEMM phase (epilogue per (32-column group, 64-row chunk) item): slower
+  (79-81 ms vs 63-64 + 9-10 at 451 tokens: scattered partial-line writes of hq / scales / corrections
+  across rows; bigger column groups unbalance the threads), reverted. The rest is memory traffic, not
+  arithmetic: a 451-token norm phase ~0.3 ms vs ~60 us of compute per thread (the rows were written by
+  other cores' GEMM tiles). SwiGLU's `expf` (libmvec): 1.1 of 1.5 us per 3,072-value row, ~0.75% of a
+  451-token prefill: a polynomial would save ~0.4% and change the numerics: not done. 16-bit stores
+  branch-free (vectorized V rows). Rest (norm + swiglu + rope / K/V store) at 451 / 1,500 / 3,000 tokens:
+  28 / 92 / 181 -> 27 / 76 / 156 ms
+- [x] Results (2026-10-25, the shared 16-vCPU VM, load 8-13 throughout (other tenants); chat mode, greedy,
+  -n 128, `-c 4096`, interleaved with the Step 7a binary `dd47f07`, best / median of 5; prompts of 451 /
+  1,500 / 3,000 tokens from `bench_prefill.sh -P`):
+
+  | Q8_0 GGUF | prefill 451 / 1,500 / 3,000, 8 threads | 12 threads | decode after 451 / 1,500 / 3,000, 8 threads | 12 threads |
+  |---|---|---|---|---|
+  | Step 7a | 1,873 / 1,426 / 1,029 | 2,403 / 1,938 / 1,383 | 178 / 130 / 90 | 161 / 140 / 114 |
+  | -k f32 | 1,870 / 1,440 / 1,069 | 2,588 / 1,996 / 1,475 | 194 / 146 / 132 | 197 / 143 / 134 |
+  | -k bf16 | 1,828 / 1,446 / 1,058 | 2,568 / 2,010 / 1,491 | 207 / 162 / 136 | 244 / 181 / 158 |
+  | -k f16 (default) | 1,869 / 1,425 / 1,028 | 2,591 / 1,949 / 1,434 | 194 / 164 / 128 | 243 / 177 / 147 |
+
+  | Q4_K_M | prefill 451 / 1,500 / 3,000, 8 threads | 12 threads | decode after 451 / 1,500 / 3,000, 8 threads | 12 threads |
+  |---|---|---|---|---|
+  | Step 7a | 1,666 / 1,288 / 980 | 2,214 / 1,786 / 1,340 | 233 / 153 / 103 | 233 / 169 / 120 |
+  | -k f32 | 1,664 / 1,327 / 1,005 | 2,302 / 1,816 / 1,394 | 246 / 168 / 136 | 292 / 191 / 158 |
+  | -k bf16 | 1,635 / 1,314 / 996 | 2,306 / 1,809 / 1,390 | 276 / 219 / 167 | 306 / 240 / 193 |
+  | -k f16 (default) | 1,671 / 1,297 / 972 | 2,346 / 1,827 / 1,364 | 273 / 220 / 158 | 299 / 227 / 180 |
+
+  Medians (decode, 3,000 tokens, 8 threads): Q8_0 87 -> 113 / 129 / 127, Q4_K_M 91 -> 122 / 160 / 148
+  (f32 / bf16 / f16). The layout gives most of the f32 gain; the 16-bit cache adds ~5-20% (more for
+  Q4_K_M, whose weights are the smaller part). Prefill (f16): within +-1% at 8 threads, +1-8% at 12
+- [x] Profile (`-DRUNQ_PROFILE`, Q8_0 GGUF, 8 threads, -b 512, min of 3 per phase; Step 7a -> f16):
+  451 tokens 0.241 -> 0.246 s: GEMMs 68% (qkv 19.1, wo 9.3, w1+w3 26.4, w2 13.0), attention 20.7%,
+  norm+quant+resid 4.1, swiglu+quant 4.5, qk-norm+rope+kv 2.4; 1,500 tokens 1.060 -> 1.048 s: attention
+  41.5%, GEMMs 51%, rest 7.3%; 3,000 tokens 2.94 -> 2.90 s (f32 2.78): attention 57.0%, GEMMs 37.5%,
+  rest 5.3%
+- [x] Tests (`make test` 300 checks, ~25 s on the busy box at load 9-14; was 278 / ~19-26 s):
+  everything runs on the f16 default (incl. `chat/long_context*`: decode at 16 threads past one block
+  vs prefill and the generic build); new group `kv` for -k f32 and -k bf16 (.bin): logits vs HF on en,
+  code (+ pooled) and long2 (past 256), batched (en -b 7, long2 -b 64) and threads (long2 -b 64, 8 vs 3)
+  bitwise, AVX-512 vs generic (en -b 1, long2 -b 64) bitwise; greedy `f32_generate`, `bf16_generate`
+- [x] Sanitizers (scratch builds): ASan + UBSan (`-O1 -g -fsanitize=address,undefined`, AVX-512 and
+  generic) and ThreadSanitizer (no `-fopenmp`: the pool runs everything), 22 runs each: per KV type
+  logits at -b 64 / 7 / 1 / 512 on a 310-token prompt (2 blocks) at 8 / 3 / 16 / 8 threads (Q8_0 GGUF,
+  Q4_K_M), generate at -b 13 / 12 threads, chat with context full (-c 160, 6 turns, .bin, -b 7); chat -r 1
+  -t 0.8 (Q4_K_M): no reports
+- Notes / open: f16's `vcvtph2ps` is the remaining cost of the default (bf16's conversion is ~free but
+  less accurate); a mixed cache (K f16, V bf16: V's rounding is harmless, +0.7% KL) would halve it.
+  Decode after 3,000 tokens now moves 130-180 GB/s effective (Q8_0 GGUF: f16 1.0 GB per token at 128
+  tok/s, f32 1.36 GB at 132), above the 72-130 GB/s of Step 3a's read test: the bandwidth limit of this VM
+  needs re-measuring before deciding what bounds long-context decode
+
 ## Known bugs
 Found by the tests.
 - [x] Tokenizer: no NFC normalizer (HF's tokenizer.json normalizer is NFC); the input was assumed
@@ -795,18 +935,28 @@ Found by the tests.
 - [x] Step 6b-2: AVX-512 kernels for Q4_K / Q6_K (GEMV at the bandwidth limit, GEMM ~1.17x Q8_0's): done, see above
 - [x] Step 7a: threading (phase sync on a thread pool, 113 sync points per decode step, no 16-thread
   collapse, attention blocks of 256 positions with the decode split over them): done, see above
-- Step 7b: bf16 KV cache, prefill rest (see the Step 7a notes)
+- [x] Step 7b: 16-bit KV cache (f16 default, bf16, f32), cache layout per (block, head), quantizer
+  vectorized, prefill attention / rest analysed: done, see above
+
+All steps of the plan are done; further work: Later / ideas.
 
 ## Later / ideas
 - [x] 16-thread collapse: phase synchronization that waits for the work, not for every thread, on a
   thread pool, spin then futex (Step 7a)
-- [ ] Attention: bf16 K/V cache with `vdpbf16ps` (half the bytes, 2x the FMA rate; changes the
-  numerics, the logits vs HF test decides): Step 7b. The split over positions for decode: done (Step
-  7a, blocks of 256); ~670 GFLOPS now, FMA peak ~900
+- [x] 16-bit K/V cache (Step 7b: f16 default, bf16; the arithmetic stays fp32 on converted values).
+  The split over positions for decode: done (Step 7a, blocks of 256)
+- [ ] Prefill attention with `vdpbf16ps` (2x the dot-product rate; prefill attention is compute-bound at
+  ~590-710 GFLOPS of ~900): needs q and the softmax weights in bf16 (accuracy: the logits vs HF test and
+  KL would decide; bf16 K alone is +2.6% KL) and a C twin of the instruction's exact rounding verified
+  on the target CPUs (Step 7b notes)
+- [ ] KV cache K f16 + V bf16 (halves the f16 conversion cost of the default; V's bf16 rounding +0.7% KL)
+- [ ] Decode at long contexts: re-measure the VM's bandwidth limit, then decide whether the bandwidth or
+  the attention items (8 kv heads x blocks, after the qkv items) bound it (Step 7b notes)
 - [x] Decode: fewer barriers (Step 7a: 4 phases per layer, epilogues instead of `single` sections);
   q / k / v items at 12 threads: shared-counter claims of single heads, no idle tail
-- [ ] Prefill rest (14% at 451 tokens): norm / quantize / SwiGLU loops as separate parallel
-  regions per phase; SwiGLU's `expf` (libmvec) is ~4%
+- [x] Prefill rest (Step 7b): the quantizer vectorized (same results); the phases are memory-traffic
+  bound (rows written by other cores), a fused SwiGLU epilogue was slower; SwiGLU's `expf` is ~0.75%
+  of a 451-token prefill (not ~4%: that was the whole phase): left. ~11% at 451 tokens, 5% at 3,000
 - [x] Perplexity comparison Q4_K_M vs Q8_0 (2026-10-25, `scripts/ppl.py`, BENCHMARKS.md): Voyage of
   the Beagle ch. I, 4,142 tokens, one sequence (= `mynah-slm ppl`): HF fp32 27.571, mynah-slm Q8_0
   27.580 (+0.03%), runq Q8_0 27.805 (+0.85%: int8 activations, group 64), mynah-slm Q4_K_M 28.864

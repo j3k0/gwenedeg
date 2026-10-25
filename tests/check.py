@@ -28,6 +28,9 @@ Tests (see tests/README.md):
              dequantized Q4_K_M weights; tight), batched vs sequential, threads and the AVX-512
              K-quant kernels (GEMV, GEMM over several chunks) vs the generic ones bitwise; its greedy
              goldens (q4_*) run in the greedy group
+  kv         the KV cache types other than the default f16 (-k f32, -k bf16): logits vs HF (en, code,
+             long2), batched vs sequential, threads and AVX-512 vs generic bitwise; their greedy goldens
+             (f32_generate, bf16_generate) run in the greedy group
 
 Logits metrics, per position, over U = (fixed 4096-id vocab subset) + (HF top-64 ids):
   cos   cosine similarity of runq vs HF logits on U

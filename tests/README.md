@@ -1,8 +1,8 @@
 # Tests
 
 `make test` (or `tests/run_tests.sh`) builds `./runq` and `./runq-generic` if needed (in parallel)
-and runs everything in about 23-26 s on the 16-vCPU dev box (277 checks; the box is shared, so the time
-varies). Every `-m logits` run the selected groups need starts up front, 3 at a time, the generic
+and runs everything in about 25 s on the 16-vCPU dev box (300 checks; the box is shared, so the time
+varies: ~25 s at load 9-14). Every `-m logits` run the selected groups need starts up front, 3 at a time, the generic
 build's at 4 threads in the background (`prefetch_all` in `check.py`); the tests then read the
 files in their usual order. Greedy and chat cases run 3 at a time (their outputs do not depend on
 the thread count or the timing). It needs `models/Qwen3-0.6B-q8.bin`, plus numpy
@@ -16,7 +16,7 @@ scratch venv) only for the Q4_K_M goldens.
 ```sh
 tests/run_tests.sh                    # all tests, OMP_NUM_THREADS=8 unless set
 tests/run_tests.sh -v                 # + per-position logits metrics and a summary table
-tests/run_tests.sh --only logits      # subset: tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4
+tests/run_tests.sh --only logits      # subset: tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv
 GGUF=other.gguf tests/run_tests.sh    # the gguf group on another Q8_0 GGUF file (GGUF= skips it)
 Q4= tests/run_tests.sh                # without the Q4_K_M group
 RUNQ=/path/to/other-binary tests/run_tests.sh   # test another build (no make; kernels test skipped)
@@ -93,6 +93,8 @@ All hooks work the same on a GGUF file (tokenizer and templates from the file an
 | `q4_kernels/en_b1`, `en_b7`, `all_b7`, `all_b64` | Q4_K_M logits byte-identical for `./runq` (AVX-512 VNNI K-quant GEMV / GEMM, `src/kernels_avx512.h`) and `./runq-generic` (`q4p_dot` / `q6p_dot`, the definition in `src/kquants.h`): GEMV incl. the Q6_K classifier (`-b 1`), GEMM tiles of 6 + 1 rows (Q4_K) / 4 + 3 (Q6_K) and a 1-row chunk (`en -b 7`), 13 chunks (`all -b 7`), 2 chunks with tiles 6 + 4 / 4 + 2 and the all-rows classifier GEMM (`all -b 64`). The generic runs go in the background at 4 threads (the slow part: ~1 s per 86 tokens with all-rows logits) | `./runq-generic` |
 | `greedy/q4_chat`, `greedy/q4_generate` | exact stdout of `-t 0 -n 24` chat / generate on the Q4_K_M file | `golden/greedy/q4_*.txt` |
 | `chat/multiturn`, `chat/thinking`, `chat/context_full` | multi-turn runs with `RUNQ_CHAT_DUMP`: (1) the decoded KV cache equals the expected chat-template rendering, built in Python from the user lines and the replies on stdout (ChatML, `<|im_end|>\n` after every message, the empty think block before each answer with `-r 0`; with `-r 1` earlier answers without their reasoning, as HF's template renders them); (2) re-encoding that text gives the same ids (piecewise encoding == whole-string encoding); (3) every sampled logits vector is **bit-identical** to the same row of a fresh `-m logits` run on the whole conversation (incremental prefill at `pos0 > 0` and decode vs one batched prefill from 0). `thinking`: `-r 1`, 2 turns, turn 1's reasoning dropped (re-prefill of its answer). `context_full`: `-c 160 -n 30 -y ...`, 6 turns: the oldest turns are dropped (stderr `[context] full`), the system prompt kept | |
+| `kv_f32_*`, `kv_bf16_*` | the KV cache types other than the default f16 (Step 7b), on the .bin with `-k f32` / `-k bf16`: `kv_*_logits/{en,code}` + pooled vs HF fp32 (`-b 64`, the Q8_0 thresholds), `kv_*_logits_long/long2` (positions 248..296, past one attention block), `kv_*_batched/en_b7`, `long2_b64` vs `-b 1`, `kv_*_threads/bitwise_long2_b64` (8 vs 3 threads), `kv_*_kernels/en_b1`, `long2_b64` (AVX-512 vs generic), all bitwise | `golden/logits*`, other runs |
+| `greedy/f32_generate`, `greedy/bf16_generate` | exact stdout of `generate` (the `generate` prompt) with `-k f32` (the text the default gave before Step 7b) and `-k bf16` | `golden/greedy/{f32,bf16}_generate.txt` |
 | `chat/long_context`, `chat/long_context_generic` | the same checks on a 411-token conversation (a 374-token system prompt, `-n 12`) decoded at OMP_NUM_THREADS=16: the reply's positions are past one attention block, so decode splits each kv head's attention over threads per block and combines (Step 7a); its sampled logits equal the batched prefill's (`-m logits`, 8 threads) bit for bit, and the generic build's run (4 threads: C attention, generic kernels) gives the same cache ids and logits file | `-m logits`, `./runq-generic` |
 
 Logits metrics, per position, over the union of a fixed 4096-id vocab subset and HF's top-64 ids:
@@ -219,6 +221,19 @@ goldens, the greedy goldens) gives the same bits as before. Past it: `logits_lon
 (scratch builds): the combination without the rescale (c_b = 1) fails `logits_long/long2` (cos mean
 0.397) and `chat/long_context`; a sum of the l_b without fma in the generic build only fails
 `kernels/long2_b64` (max |diff| 0.54) and `chat/long_context_generic`.
+
+KV cache types (Step 7b): the default is the f16 cache (`-k f16`), so every test above runs on it; the
+greedy and seeded goldens were regenerated for it (7 texts changed, all read fine) and `-k f32` still
+reproduces every earlier golden exactly (checked once; `greedy/f32_generate` keeps one). The logits
+thresholds are the same for all three types (measured, `../TODO.md` Step 7b: pooled cos .bin f32 / bf16 /
+f16 0.99910 / 0.99900 / 0.99905, long2 cos mean 0.99927 / 0.99909 / 0.99921). The 16-bit caches round at
+the store (integer operations in C, the same in both builds) and convert exactly at the load, so the
+AVX-512 and generic attentions still compute the same fp32 operations: `kernels/*` and `kv_*_kernels/*`
+are bitwise.
+
+Sanitizers (Step 7b, scratch builds): ASan + UBSan (AVX-512 and generic) and ThreadSanitizer (no OpenMP),
+22 runs each over the three KV types (logits at -b 1 / 7 / 64 / 512 on a 2-block prompt, 3 / 8 / 16
+threads, Q8_0 GGUF and Q4_K_M, generate, chat with context full, chat -r 1 -t 0.8): no reports.
 
 Sanitizers (Step 7a, scratch builds, not in `make test`): ASan + UBSan (`-O1 -g -fsanitize=address,undefined`,
 AVX-512 and generic) and ThreadSanitizer (`-O1 -g -fsanitize=thread`, built without `-fopenmp`, so the

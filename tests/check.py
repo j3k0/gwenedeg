@@ -3,6 +3,7 @@
 
 Tests (see tests/README.md):
   tokenizer  runq -m tokenize vs HF ids              (tests/golden/tokenizer.json)
+             + NFC around invalid UTF-8 (token bytes vs unicodedata on the valid runs)
              + encode speed (~2,000 tokens, one 30,000-byte chunk), from runq's stderr timing
   logits     runq -m logits vs HF fp32 logits         (tests/golden/logits/*.npz)
              sequential path (-b 1) and batched prefill (-b 64), same thresholds
@@ -48,6 +49,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 
 import numpy as np
 
@@ -212,6 +214,29 @@ def test_tokenizer(a, res):
         res.report(ok, f"tokenizer/{c['name']}", detail, c.get("xfail"))
         if not ok and c.get("xfail") and a.verbose:
             print("      " + detail)
+
+    # invalid UTF-8 (no HF reference: a Python str cannot hold it). runq's rule: each invalid byte
+    # is kept as is and the NFC normalizer does not reorder or compose across it (it acts like
+    # U+FFFD, a starter that composes with nothing); the concatenated token bytes must be the
+    # valid runs NFC-normalized separately, with the invalid bytes in between
+    def nfc_runs(b):
+        out, cur = b"", ""
+        for ch in b.decode("utf-8", "surrogateescape") + "\udc00":  # one escape per invalid byte
+            if "\udc00" <= ch <= "\udcff":
+                out += unicodedata.normalize("NFC", cur).encode() + bytes([ord(ch) - 0xdc00] if ch > "\udc00" else [])
+                cur = ""
+            else:
+                cur += ch
+        return out
+    vocab = load_vocab(a.model)
+    bad = []
+    for b in [b"cafe\xff\xcc\x81 e\xcc\x81\xff", b"q\xcc\x87\xcc\xa3\xc0\xafa\xcc\x8a\x80\xcc\x81",
+              b"\xed\xa0\x80\xcc\x81\xe2\x84\xab\xfe", b"\xe1\x84\x80\xff\xe1\x85\xa1 \xe1\x84\x80\xe1\x85\xa1\xe2\x82",
+              b"\xf0\x9d\x85\xa0\xf8\xcc\xa3\xcc\x87 <|im_end|>\xcc\x81\xc3", b"\xe2\x82\xe0\xa4\x95\xe0\xa4\xbc\xf4\x90\x80\x80"]:
+        got = b"".join(vocab[i] for i in runq_tokenize(a, b))
+        if got != nfc_runs(b):
+            bad.append(f"{b!r}: runq {got!r} want {nfc_runs(b)!r}")
+    res.report(not bad, "tokenizer/nfc_invalid_utf8", "\n      ".join(bad))
 
     # speed: ~2,000 tokens of varied text (the short golden cases, repeated), and one long
     # pre-tokenizer chunk (no spaces); the encode time is measured inside runq, without the load

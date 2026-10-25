@@ -14,7 +14,9 @@ RUNQ=./runq RUNQ_GENERIC=./runq-generic tests/run_tests.sh   # ... with the kern
 tests/run_tests.sh --update-greedy    # regenerate the greedy goldens (incl. the chat transcript)
 .venv/bin/python tests/make_golden.py # regenerate the HF goldens (tokenizer + logits, ~15 s)
 .venv/bin/python tests/make_golden.py --tokenizer-only   # only golden/tokenizer.json (~2 s)
-.venv/bin/python tests/fuzz_tokenizer.py                 # on-demand tokenizer fuzz vs HF (~6 s)
+.venv/bin/python tests/fuzz_tokenizer.py                 # on-demand tokenizer fuzz vs HF (~12 s)
+.venv/bin/python tests/fuzz_tokenizer.py --nfc-all       # exhaustive NFC normalizer check vs HF (~8 s)
+.venv/bin/python tools/gen_unicode_tables.py --check-hf  # HF's NFC data vs Unicode 15.1 (~1 s)
 ```
 
 Exit status is non-zero if any test fails. XFAIL = known engine bug, reported but not failing;
@@ -39,7 +41,8 @@ XPASS = an XFAIL case now passes (remove its mark in `make_golden.py`).
 
 | test | what | golden |
 |---|---|---|
-| `tokenizer/*` | runq ids == HF `encode(text, add_special_tokens=False)` for 69 strings: ASCII, whitespace runs of 1-8 chars before words/punctuation/digits/newlines, trailing whitespace, `\r\n`/`\r`, tab/space indentation, digits (long numbers, mixed with letters, non-ASCII digits), punctuation runs, contractions (any case, `'ſ`), C/Python code, NBSP, ideographic and other Unicode spaces, U+001C/zero-width (not `\s`), control chars, emoji (ZWJ, flags, skin tones, keycaps), rare CJK (Ext. B-I), Arabic, Hindi, Korean, Russian, Greek etc., math, two 3,000-char strings without spaces, added tokens (adjacent to text, back to back, partial ones), 1-char strings. 2 XFAIL: NFC normalization (not implemented) | `golden/tokenizer.json` |
+| `tokenizer/*` | runq ids == HF `encode(text, add_special_tokens=False)` for 81 strings: ASCII, whitespace runs of 1-8 chars before words/punctuation/digits/newlines, trailing whitespace, `\r\n`/`\r`, tab/space indentation, digits (long numbers, mixed with letters, non-ASCII digits), punctuation runs, contractions (any case, `'ſ`), C/Python code, NBSP, ideographic and other Unicode spaces, U+001C/zero-width (not `\s`), control chars, emoji (ZWJ, flags, skin tones, keycaps), rare CJK (Ext. B-I), Arabic, Hindi, Korean, Russian, Greek etc., math, two 3,000-char strings without spaces, added tokens (adjacent to text, back to back, partial ones), 1-char strings; NFC (`nfc_*`, 13): decomposed Latin, marks in non-canonical order and blocked ones, Hangul jamo (L+V, L+V+T, LV+T), decomposed Vietnamese and Greek, singletons (U+212B, U+2126, U+2000, CJK compatibility), composition exclusions (U+0958, U+FB2C, U+1D160), 600-mark runs, expansion (more tokens than input bytes), marks right after added tokens (normalized separately, as in HF), marks HF's older Unicode data treats as ccc 0 (`nfc_hf_compat`) | `golden/tokenizer.json` |
+| `tokenizer/nfc_invalid_utf8` | 6 strings with invalid UTF-8 next to marks, Hangul jamo and expanding characters: the concatenated token bytes equal the valid runs NFC-normalized separately with the invalid bytes kept in between (runq's rule, no HF reference: see the fuzz section) | Python `unicodedata` |
 | `tokenizer/speed_*` | encode time inside runq (stderr line) < 100 ms for ~2,000 tokens of the golden texts and for one 30,000-byte chunk (no spaces); measured ~0.3-1.3 ms and ~5-13 ms | |
 | `logits/<prompt>` | runq Q8_0 logits vs HF fp32 for 5 prompts (en, code, zh, chat template, counting), 15-24 tokens; ids must match HF first | `golden/logits/*.npz` |
 | `logits/cos_pooled`, `logits/top1_pooled` | the same metrics pooled over all prompts | |
@@ -166,12 +169,33 @@ Known engine bugs found by these tests are listed in `../TODO.md` ("Known bugs")
 
 ## Tokenizer fuzz test (on demand, not in `make test`)
 
-`.venv/bin/python tests/fuzz_tokenizer.py [-n 2000] [--seed 1] [--jobs 8] [--show 5] [--no-files]`
+`.venv/bin/python tests/fuzz_tokenizer.py [-n 5000] [--seed 1] [--jobs 8] [--show 5] [--no-files]`
 compares `runq -m tokenize` with the HF tokenizer on `-n` random strings (a mix of the character
-classes of the goldens, added tokens and broken ones, and random code points from all planes)
-plus real text (repo docs/sources, the HF model README and LICENSE, split at 64 KiB for argv).
-Strings are NFC-normalized first (runq has no normalizer) and contain no NUL. It prints the
-mismatch rate, minimizes the first `--show` mismatches (delta debugging) and exits 1 on any.
-Result 2026-10-25: seed 1, 2,013 cases (232k HF tokens), and seed 2, 5,013 cases (492k tokens):
-0 mismatches. Sanity check: a scratch build with `\s+(?!\S)` disabled gives 27% mismatches,
-minimized to `'  k'` and `'\t\t4'`.
+classes of the goldens, added tokens and broken ones, random code points from all planes, and
+for the normalizer: marks in random order, Hangul jamo runs, NFD/NFKD words, NFC_QC=No characters,
+long mark runs; about half the strings are not NFC) plus real text (repo docs/sources, the HF
+model README and LICENSE, split at 64 KiB for argv), as is and in NFD. Strings contain no NUL.
+Besides the ids it checks the normalized text directly: the concatenated token bytes must equal
+HF's NFC normalizer output. It prints the mismatch rate, minimizes the first `--show` mismatches
+(delta debugging) and exits 1 on any.
+Result (Step 5, 2026-10-25): seeds 1 and 2, 5,028 cases each (~2,400 not NFC, 1.25M HF tokens):
+0 mismatches, normalized text identical. Sanity checks: a scratch build with `\s+(?!\S)` disabled
+gives 27% mismatches, minimized to `'  k'` and `'\t\t4'`; one ignoring NFC blocking 12%, minimized
+to `'a\u0367\u0308'`.
+
+`--nfc-all` checks the normalizer alone (tokens -> bytes) against HF's NFC normalizer and Python's
+`unicodedata.normalize('NFC')`: every code point alone (1,112,062, all but surrogates, NUL and
+`\n`), all 850,084 ordered pairs of combining marks after a base, 11,322 composition cases (NFD of
+every decomposable character, plus marks; every composition pair, with a mark in between), all
+13,167 Hangul L+V / LV+T / L+V+T cases, and 20 x `-n` random strings; joined with `\n` into 64 KiB
+arguments. Result: 0 differences from HF; from `unicodedata` only on strings with a code point of
+the HF compatibility overrides (64,176 mark pairs, 5 compositions, ~2.5% of the random strings).
+HF tokenizers 0.21.4 normalizes with Unicode 9.0 data (`unicode-normalization-alignments` 0.1.12):
+108 combining marks added later are ccc 0 for it and U+11938 does not decompose
+(`tools/gen_unicode_tables.py --check-hf` verifies this list); `src/unicode_nfc.h` applies the same
+overrides, and a scratch build with the pure 15.1 tables (`--nfc --unicode-only`) gives exactly the
+opposite (0 differences from `unicodedata`, the same counts from HF).
+
+Invalid UTF-8 has no HF reference (a Python str cannot hold it). runq keeps every invalid byte
+(byte-level fallback, as before) and its normalizer does not reorder or compose across one (each
+acts like U+FFFD, a starter composing with nothing); `tokenizer/nfc_invalid_utf8` tests that.

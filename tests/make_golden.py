@@ -115,15 +115,33 @@ TOKENIZER_CASES = [
     ("special_in_ws", "  <|im_start|>  user \n<think>\n\n</think>\n\n"),
     ("nfc_decomposed", "cafe\u0301 n\u0303"),
     ("nfc_singleton", "a\u2000b \u212b \u2126 \uf900"),  # NFC maps these to U+2002, U+00C5, U+03A9, U+8C48
+    # added in Step 5 (NFC normalizer)
+    ("nfc_latin", "e\u0301 A\u030a E\u0301cole A\u030angstro\u0308m vs \u00c5ngstr\u00f6m, u\u0308\u0304 n\u0303o\u0302"),
+    ("nfc_mark_order", "q\u0307\u0323 q\u0323\u0307 s\u0307\u0323 d\u0323\u0307 a\u0301\u0316 x\u0300\u0315\u0301 "
+                       "\u1ea1\u0302 o\u031b\u0301\u0323 a\u0305\u0301 e\u0301\u0301 \u1100\u0301\u1161"),  # blocked: same ccc, starter
+    ("nfc_hangul_jamo", "\u1112\u1161\u11ab\u1100\u116e\u11a8 \u1100\u1161 \uac00\u11a8 \u1100\u1100\u1161 "
+                        "\u1161\u11a8 \u1100\u1161\u11a8\u11a8 \uac00\u11a7 \ud55c\u1100\u1161"),
+    ("nfc_vietnamese", "Tie\u0302\u0301ng Vie\u0323\u0302t co\u0301 da\u0302\u0301u: Nguye\u0302\u0303n, "
+                       "ngu\u031bo\u031b\u0300i, \u0111u\u031bo\u031b\u0323c, pho\u031b\u0309, a\u0306\u0323"),
+    ("nfc_singletons", "\u212b \u2126 \u212a \u2000\u2001x \uf900\uf901\ufa10 \U0002f800 a\u0340\u0341 "
+                       "\u0374\u037e\u0387 \u1fef \u1f71 \u0344"),
+    ("nfc_exclusions", "\u0958\u0959 \u0915\u093c\u0916\u093c \u095f \ufb1d \ufb2c \u2adc \U0001d15e\U0001d160 "
+                       "\u0f73\u0f71\u0f72"),
+    ("nfc_greek", "\u0391\u0301\u03b8\u03b7\u0342\u03bd\u03b1\u03b9 \u03b9\u0308\u0301 \u03c5\u0308\u0301 "
+                  "\u03b1\u0313\u0301\u0345 \u03bb\u03bf\u0301\u03b3\u03bf\u03c2 \u03ca\u0301 \u03b5\u0301"),
+    ("nfc_long_marks", "a" + "\u0301\u0316\u0334" * 200 + " e" + "\u0307" * 40 + "\u0323" * 40 + " z\u0301\u0300"
+                       + " o" + "\u0301\u0300\u0316\u0317\u0334" * 20),  # stable order within one ccc
+    ("nfc_expansion", "\U0001d160" * 50 + " \u0958" * 20),  # more tokens than input bytes
+    ("nfc_special_adjacent", "<|im_start|>\u0301e\u0301<|im_end|>\u0301 cafe<|im_end|>\u0301 \u1100<think>\u1161"
+                             "</think>\u11a8 a<|endoftext|>\u030a"),
+    ("nfc_mixed", "Plain ASCII text first, then a decomposed word: re\u0301sume\u0301, and more plain text "
+                  "after it; \u4e2d\u6587 \uac00\u11a8 \u00e9\u0301 \u212b."),
+    ("nfc_hf_compat", "a\u1df6\u0301 a\u0301\u1df6 \U00011935\U00011930 x\u0d3b\u0323"),  # HF's Unicode 9.0 data
 ]
 
 # Known runq tokenizer limitations (TODO.md): reported as XFAIL, do not fail the suite.
-TOKENIZER_XFAIL = {
-    "nfc_decomposed": ("runq has no NFC normalizer (input assumed NFC): HF composes "
-                       "e + U+0301 into U+00E9 first"),
-    "nfc_singleton": ("runq has no NFC normalizer (input assumed NFC): HF maps singletons "
-                      "like U+2000 EN QUAD to U+2002 EN SPACE"),
-}
+# (none since Step 5: the two NFC cases above pass)
+TOKENIZER_XFAIL = {}
 
 LOGITS_PROMPTS = [
     ("en", "The quick brown fox jumps over the lazy dog. The capital of France is"),

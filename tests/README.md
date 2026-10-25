@@ -1,7 +1,7 @@
 # Tests
 
 `make test` (or `tests/run_tests.sh`) builds `./runq` if needed and runs everything in about
-15 s on the 16-vCPU dev box. It needs `models/Qwen3-0.6B-q8.bin`, plus numpy (`.venv/bin/python`
+8 s on the 16-vCPU dev box. It needs `models/Qwen3-0.6B-q8.bin`, plus numpy (`.venv/bin/python`
 if present, else the system `python3`). Torch is only needed to regenerate the HF goldens.
 
 ```sh
@@ -11,6 +11,8 @@ tests/run_tests.sh --only logits      # subset: tokenizer,logits,threads,greedy
 RUNQ=/path/to/other-binary tests/run_tests.sh   # test another build (no make)
 tests/run_tests.sh --update-greedy    # regenerate the greedy goldens
 .venv/bin/python tests/make_golden.py # regenerate the HF goldens (tokenizer + logits, ~15 s)
+.venv/bin/python tests/make_golden.py --tokenizer-only   # only golden/tokenizer.json (~2 s)
+.venv/bin/python tests/fuzz_tokenizer.py                 # on-demand tokenizer fuzz vs HF (~6 s)
 ```
 
 Exit status is non-zero if any test fails. XFAIL = known engine bug, reported but not failing;
@@ -18,7 +20,9 @@ XPASS = an XFAIL case now passes (remove its mark in `make_golden.py`).
 
 ## Engine hooks (`src/runq.c`)
 
-- `-m tokenize -i TEXT`: token ids of the raw text (no chat template), space-separated.
+- `-m tokenize -i TEXT`: token ids of the raw text (no chat template), space-separated on stdout.
+  Only the checkpoint header and the tokenizer are loaded (no weights). stderr gets
+  `[tokenize] B bytes -> N tokens, encode X ms, tokenizer load Y ms` (encode time only).
 - `-m logits -i TEXT -o FILE`: feeds the tokens one at a time (`forward_sequential`) and writes
   `int32 n, int32 vocab, int32 ids[n], float32 logits[n][vocab]` (row i = logits after token i).
   `dump_logits()` is where a batched-prefill path will plug in for the same comparison.
@@ -27,7 +31,8 @@ XPASS = an XFAIL case now passes (remove its mark in `make_golden.py`).
 
 | test | what | golden |
 |---|---|---|
-| `tokenizer/*` | runq ids == HF `encode(text, add_special_tokens=False)` for 27 strings: ASCII, whitespace runs, tabs/newlines, digits, punctuation, contractions, C/Python code, French/German/Chinese/Japanese, emoji, a long word, URL, special tokens (`<\|im_start\|>`, `<think>`), stray `<`/`>`, 1-char strings | `golden/tokenizer.json` |
+| `tokenizer/*` | runq ids == HF `encode(text, add_special_tokens=False)` for 69 strings: ASCII, whitespace runs of 1-8 chars before words/punctuation/digits/newlines, trailing whitespace, `\r\n`/`\r`, tab/space indentation, digits (long numbers, mixed with letters, non-ASCII digits), punctuation runs, contractions (any case, `'ſ`), C/Python code, NBSP, ideographic and other Unicode spaces, U+001C/zero-width (not `\s`), control chars, emoji (ZWJ, flags, skin tones, keycaps), rare CJK (Ext. B-I), Arabic, Hindi, Korean, Russian, Greek etc., math, two 3,000-char strings without spaces, added tokens (adjacent to text, back to back, partial ones), 1-char strings. 2 XFAIL: NFC normalization (not implemented) | `golden/tokenizer.json` |
+| `tokenizer/speed_*` | encode time inside runq (stderr line) < 100 ms for ~2,000 tokens of the golden texts and for one 30,000-byte chunk (no spaces); measured ~0.3-1.3 ms and ~5-13 ms | |
 | `logits/<prompt>` | runq Q8_0 logits vs HF fp32 for 5 prompts (en, code, zh, chat template, counting), 15-24 tokens; ids must match HF first | `golden/logits/*.npz` |
 | `logits/cos_pooled`, `logits/top1_pooled` | the same metrics pooled over all prompts | |
 | `threads/bitwise` | logits file for `en` is byte-identical with OMP_NUM_THREADS=8 and 1 | |
@@ -77,7 +82,20 @@ bit-identical for any thread count (verified 1 vs 8).
 
 `make_golden.py` documents the formats. HF reference: `Qwen3ForCausalLM` from
 `models/Qwen3-0.6B` in float32 on CPU (eager attention), one forward pass per prompt,
-transformers 4.53.0 / torch 2.7.0; regenerating gives byte-identical files. Total size ~0.7 MB.
-The logits prompts avoid multi-space indentation because of the tokenizer bug below.
+transformers 4.53.0 / torch 2.7.0; regenerating gives byte-identical files. Total size ~0.75 MB.
+The logits prompts avoid multi-space indentation (written when runq still had no pre-tokenizer;
+kept so the logits goldens stay unchanged).
 
 Known engine bugs found by these tests are listed in `../TODO.md` ("Known bugs").
+
+## Tokenizer fuzz test (on demand, not in `make test`)
+
+`.venv/bin/python tests/fuzz_tokenizer.py [-n 2000] [--seed 1] [--jobs 8] [--show 5] [--no-files]`
+compares `runq -m tokenize` with the HF tokenizer on `-n` random strings (a mix of the character
+classes of the goldens, added tokens and broken ones, and random code points from all planes)
+plus real text (repo docs/sources, the HF model README and LICENSE, split at 64 KiB for argv).
+Strings are NFC-normalized first (runq has no normalizer) and contain no NUL. It prints the
+mismatch rate, minimizes the first `--show` mismatches (delta debugging) and exits 1 on any.
+Result 2026-10-25: seed 1, 2,013 cases (232k HF tokens), and seed 2, 5,013 cases (492k tokens):
+0 mismatches. Sanity check: a scratch build with `\s+(?!\S)` disabled gives 27% mismatches,
+minimized to `'  k'` and `'\t\t4'`.

@@ -3,6 +3,7 @@
 
 Tests (see tests/README.md):
   tokenizer  runq -m tokenize vs HF ids              (tests/golden/tokenizer.json)
+             + encode speed (~2,000 tokens, one 30,000-byte chunk), from runq's stderr timing
   logits     runq -m logits vs HF fp32 logits         (tests/golden/logits/*.npz)
   threads    logits bit-identical for 1 vs N OpenMP threads
   greedy     runq -t 0 output vs our own golden text  (tests/golden/greedy/*.txt)
@@ -53,6 +54,7 @@ COS_ALL_MIN = 0.997    # all prompts pooled, mean over positions >= 1
 TOP5_MIN = 0.75        # per prompt, mean overlap
 
 CTX = "4096"
+TOKENIZE_MAX_MS = 100.0  # encode time limit for the speed checks (measured ~1 ms and ~13 ms)
 GREEDY_CASES = [
     # name, extra args (all run with -t 0 -c 4096 -s 1)
     ("chat", ["-m", "chat", "-n", "40", "-i", "What is the capital of Australia? Answer in one sentence."]),
@@ -92,11 +94,17 @@ def run(cmd, threads=None, **kw):
     return subprocess.run(cmd, env=env, capture_output=True, **kw)
 
 
-def runq_tokenize(a, text):
+def runq_tokenize(a, text, timing=False):
     p = run([a.runq, a.model, "-c", "64", "-m", "tokenize", "-i", text], threads=1)
     if p.returncode != 0:
         raise RuntimeError(f"runq -m tokenize failed: {p.stderr.decode(errors='replace')[-500:]}")
-    return [int(x) for x in p.stdout.split()]
+    ids = [int(x) for x in p.stdout.split()]
+    if not timing:
+        return ids
+    # stderr: "[tokenize] B bytes -> N tokens, encode X ms, tokenizer load Y ms"
+    line = [l for l in p.stderr.decode().splitlines() if l.startswith("[tokenize]")][-1]
+    f = line.replace(",", " ").split()
+    return ids, float(f[f.index("encode") + 1]), float(f[f.index("load") + 1])
 
 
 def runq_logits(a, text, path, threads=None):
@@ -136,6 +144,22 @@ def test_tokenizer(a, res):
         res.report(ok, f"tokenizer/{c['name']}", detail, c.get("xfail"))
         if not ok and c.get("xfail") and a.verbose:
             print("      " + detail)
+
+    # speed: ~2,000 tokens of varied text (the short golden cases, repeated), and one long
+    # pre-tokenizer chunk (no spaces); the encode time is measured inside runq, without the load
+    pool = [c for c in cases if len(c["text"]) < 1000 and not c.get("xfail")]
+    parts, n = [], 0
+    while n < 2000:
+        for c in pool:
+            parts.append(c["text"])
+            n += len(c["ids"])
+            if n >= 2000:
+                break
+    for name, text in [("speed_2k", "\n".join(parts)), ("speed_long_chunk", "Supercalifragilistic" * 1500)]:
+        ids, ms, load_ms = runq_tokenize(a, text, timing=True)
+        res.report(ms < TOKENIZE_MAX_MS, f"tokenizer/{name}",
+                   f"{len(text.encode())} bytes -> {len(ids)} tokens: encode {ms:.2f} ms "
+                   f"(max {TOKENIZE_MAX_MS:.0f}), tokenizer load {load_ms:.1f} ms")
 
 
 # ----------------------------------------------------------------------------- logits

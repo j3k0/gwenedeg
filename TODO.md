@@ -28,6 +28,27 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
 - [x] Tests pass; measure prefill gain: 8 threads, 443-token chat prompt 99.4 -> 117.7 tok/s
   (+18%, best of 3); bench prompt (short) 91.8 -> 121.2 tok/s; decode unchanged (~105)
 
+## Step 1b: tokenizer (blocks long-prompt benchmarks)
+Encoding was O(n² · vocab): 109 tokens took 24 s and 217 tokens 104 s, because of a linear `strcmp` scan of 151,936 entries per lookup.
+- [x] Hash-map vocab lookup (open addressing, 2^19 slots); BPE per chunk with a heap of merge
+  candidates, O(k log k). Merge priority = the `.tokenizer` scores (tiktoken style: any adjacent
+  pair whose concatenation is a token, best score first): verified identical to HF's
+  `model.merges` BPE on all 151,643 vocab strings + 300k random token concatenations, so no
+  extra merges file is needed
+- [x] Qwen2 pre-tokenizer regex split, hand-written (`pretok_next`), with \p{L}/\p{N}/\s tables
+  (`src/unicode_tables.h` from `tools/gen_unicode_tables.py`, Unicode 15.1, 807 ranges; `\s` =
+  White_Space as in HF's Oniguruma). Added tokens are split out first (leftmost-longest), as in HF.
+  The 5 XFAIL cases pass
+- [x] Byte fallback: BPE starts from the 256 single-byte tokens, so nothing is ever dropped
+  (invalid UTF-8 too); the stdout warning is gone
+- [x] Tokenizer goldens 27 -> 69 cases (2 XFAIL: no NFC normalizer, see Known bugs);
+  `tests/fuzz_tokenizer.py`: 2,000 random strings + 13 real files (seed 1) and 5,000 (seed 2),
+  0 mismatches vs HF
+- [x] Target met: 2,000 tokens encode in 0.3-1.3 ms (README text); before: 28 tokens 0.74 s,
+  109 tokens 11.0 s on the same text (217 / 2,000 tokens not re-measured: ~1 min / hours).
+  A 30,000-byte chunk without spaces: ~5-13 ms. Tokenizer load ~8-20 ms. `-m tokenize` no
+  longer loads the weights, so the tokenizer tests take 0.2 s and `make test` ~8 s
+
 ## Step 2: batched prefill
 - [ ] `forward_batch(tokens, n, pos)`: chunked (32 to 128 tokens), activations as matrices
 - [ ] Batched quantize, GEMM (generic C first), per-row RMSNorm, QK-norm and RoPE, causal attention inside the chunk, KV cache writes
@@ -43,16 +64,15 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
 
 ## Known bugs
 Found by the Step 0b tests; not fixed yet.
-- [ ] Tokenizer: no pre-tokenizer (Qwen's split regex), BPE merges run over the whole text.
-  A whitespace run before a word is merged whole, while HF splits the last space off onto the
-  word (`"   leading"`, indented code, `"a\t\tc"`). Tests: XFAIL `tokenizer/{leading_spaces,
-  multi_spaces,tabs,code_c,code_python}`. Encoding is also O(n^2 * vocab) (linear `str_lookup`).
+- [ ] Tokenizer: no NFC normalizer (HF's tokenizer.json normalizer is NFC); the input is assumed
+  to be NFC already. Decomposed text (`e` + U+0301) and NFC singletons (U+2000 -> U+2002,
+  U+212B -> U+00C5, CJK compatibility ideographs) tokenize differently from HF. Tests: XFAIL
+  `tokenizer/{nfc_decomposed,nfc_singleton}`; the fuzzer only generates NFC strings.
 - [ ] SwiGLU `1/(1+expf(-x))` under `-Ofast` (finite-math): `expf` overflow gives NaN. Not seen in
   the shipped int8 path yet, but a scratch build with float activations got whole NaN logits
   rows; clamping the exponent fixed it. Risk for the Step 2/3 kernels (the logits test checks
   for NaN).
-- [ ] Minor: `quantize()` divides by a zero scale on an all-zero group (NaN cast to int8 is UB);
-  `encode()` prints its unknown-character warning to stdout and leaves an uninitialized token.
+- [ ] Minor: `quantize()` divides by a zero scale on an all-zero group (NaN cast to int8 is UB).
 
 ## Later / ideas
 - [ ] Chat history: stop resetting to position 0 every turn (keep the KV cache across turns)

@@ -473,9 +473,26 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
 
 // ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
+//
+// cwayn rewrite, matching HF tokenizers on Qwen2/Qwen3's tokenizer.json:
+//   1. added tokens (<|im_start|>, <think>, ...) are split out first, leftmost-longest match
+//   2. normalizer (NFC): NOT implemented, the input is assumed to be NFC already
+//   3. pre-tokenizer: Qwen2's split regex, hand-written in pretok_next(), with the Unicode
+//      classes \p{L}, \p{N}, \s from unicode_tables.h (tools/gen_unicode_tables.py)
+//   4. byte-level BPE inside each chunk, starting from the single-byte tokens
+// Merge order: the .tokenizer file (third_party/qwen3.c/export.py) has one score per token,
+// -log(rank + 1) of the merge producing it, and no merge pairs. bpe_chunk() merges any adjacent
+// pair whose concatenation is a vocab token, best score first, leftmost on ties (tiktoken
+// style). Verified against HF's BPE with tokenizer.json's model.merges: identical on all
+// 151,643 vocab strings and 300k random token concatenations (no pre-tokenizer), since Qwen's
+// merge list is the tiktoken-consistent one: one merge per token, in id order, each the split
+// tiktoken-style BPE itself produces from the lower-ranked tokens.
+
+#include "unicode_tables.h"
 
 typedef struct {
-    char **vocab;
+    char **vocab;           // token bytes, NUL-terminated (the token for byte 0x00 reads as "")
+    int *vocab_len;         // byte length of each token
     float *merge_scores;
     int vocab_size;
     unsigned int max_token_length;
@@ -483,6 +500,14 @@ typedef struct {
     unsigned int eos_token_id;
     char prompt_template[1024];
     char system_prompt_template[1024];
+    char *vocab_data;       // one buffer holding all the vocab strings
+    int32_t *hash_ids;      // open-addressing hash map: token bytes -> id (-1 = empty slot);
+    uint32_t *hash_tags;    // regular tokens only (no added tokens), so BPE never produces those
+    uint32_t hash_mask;
+    int byte_token[256];    // token id of each single byte
+    int *added;             // added tokens (special or not), longest first
+    int n_added;
+    unsigned char added_first[256]; // 1 if some added token starts with this byte
 } Tokenizer;
 
 void load_prompt_template(char *checkpoint_path, char *out_template, int with_system_prompt, int enable_thinking) {
@@ -501,151 +526,360 @@ void load_prompt_template(char *checkpoint_path, char *out_template, int with_sy
     fclose(file);
 }
 
+static inline uint64_t bytes_hash(const unsigned char *s, int n) {
+    uint64_t h = 1469598103934665603ull; // FNV-1a, then a murmur3 finalizer for the low bits
+    for (int i = 0; i < n; i++) { h ^= s[i]; h *= 1099511628211ull; }
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdull; h ^= h >> 33;
+    return h;
+}
+
+int vocab_lookup(Tokenizer *t, const unsigned char *s, int n) {
+    // id of the regular token with exactly these n bytes, or -1
+    uint64_t h = bytes_hash(s, n);
+    uint32_t tag = (uint32_t)(h >> 32);
+    for (uint32_t i = (uint32_t)h & t->hash_mask;; i = (i + 1) & t->hash_mask) {
+        int id = t->hash_ids[i];
+        if (id < 0) return -1;
+        if (t->hash_tags[i] == tag && t->vocab_len[id] == n && !memcmp(t->vocab[id], s, n)) return id;
+    }
+}
+
 void build_tokenizer(Tokenizer *t, char *checkpoint_path, int vocab_size, int enable_thinking) {
     char tokenizer_path[1024];
 
     strcpy(tokenizer_path, checkpoint_path);
     strcat(tokenizer_path, ".tokenizer");
 
-    t->vocab_size = vocab_size;
-    // malloc space to hold the scores and the strings
-    t->vocab = (char **)malloc(vocab_size * sizeof(char *));
-    t->merge_scores = (float *)malloc(vocab_size * sizeof(float));
-
-    // read in the file
+    // read the whole file: header (max_token_length, bos, eos), then per token
+    // float score, int32 length, bytes; tokens missing at the end (padding ids) are empty
     FILE *file = fopen(tokenizer_path, "rb");
     if (!file) { fprintf(stderr, "Couldn't load tokenizer model %s\n", tokenizer_path); exit(EXIT_FAILURE); }
-    fread(&t->max_token_length, sizeof(int), 1, file);
-    fread(&t->bos_token_id, sizeof(int), 1, file);
-    fread(&t->eos_token_id, sizeof(int), 1, file);
-
-    int len;
-
-    for (int i = 0; i < vocab_size; i++) {
-        if (fread(t->merge_scores + i, sizeof(float), 1, file) != 1) {
-            t->vocab[i] = (char *)malloc(1);
-            t->vocab[i][0] = 0; // add the string terminating token
-        } else {
-            fread(&len, sizeof(int), 1, file);
-            t->vocab[i] = (char *)malloc(len + 1);
-            fread(t->vocab[i], 1, len, file);
-            t->vocab[i][len] = 0; // add the string terminating token
-        }
+    fseek(file, 0, SEEK_END);
+    long fsize = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    unsigned char *buf = malloc(fsize > 0 ? fsize : 1);
+    if (fsize < 12 || fread(buf, 1, fsize, file) != (size_t)fsize) {
+        fprintf(stderr, "Couldn't read tokenizer model %s\n", tokenizer_path); exit(EXIT_FAILURE);
     }
     fclose(file);
+    memcpy(&t->max_token_length, buf, 4);
+    memcpy(&t->bos_token_id, buf + 4, 4);
+    memcpy(&t->eos_token_id, buf + 8, 4);
+
+    t->vocab_size = vocab_size;
+    t->vocab = malloc(vocab_size * sizeof(char *));
+    t->vocab_len = malloc(vocab_size * sizeof(int));
+    t->merge_scores = malloc(vocab_size * sizeof(float));
+    t->vocab_data = malloc(fsize + vocab_size); // string bytes + one NUL per token
+    if (!t->vocab || !t->vocab_len || !t->merge_scores || !t->vocab_data) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    long off = 12;
+    char *dst = t->vocab_data;
+    unsigned int max_len = 0;
+    for (int i = 0; i < vocab_size; i++) {
+        int32_t len = 0;
+        float score = -1e6f;
+        if (off + 8 <= fsize) {
+            memcpy(&score, buf + off, 4);
+            memcpy(&len, buf + off + 4, 4);
+            if (len < 0 || off + 8 + len > fsize) { fprintf(stderr, "Corrupt tokenizer model %s\n", tokenizer_path); exit(EXIT_FAILURE); }
+            memcpy(dst, buf + off + 8, len);
+            off += 8 + len;
+        }
+        t->vocab[i] = dst;
+        t->vocab_len[i] = len;
+        t->merge_scores[i] = score;
+        dst[len] = 0;
+        dst += len + 1;
+        if ((unsigned int)len > max_len) max_len = len;
+    }
+    free(buf);
+    t->max_token_length = max_len;
+
+    // classify: single bytes, merge results (score > -1e6) and added tokens (the rest, len > 1;
+    // export.py gives every token that no merge produces the score -1e6)
+    for (int b = 0; b < 256; b++) t->byte_token[b] = -1;
+    uint32_t cap = 1;
+    while (cap < 2u * (uint32_t)vocab_size) cap <<= 1;
+    t->hash_mask = cap - 1;
+    t->hash_ids = malloc(cap * sizeof(int32_t));
+    t->hash_tags = malloc(cap * sizeof(uint32_t));
+    t->added = malloc(vocab_size * sizeof(int));
+    if (!t->hash_ids || !t->hash_tags || !t->added) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    memset(t->hash_ids, 0xff, cap * sizeof(int32_t));
+    t->n_added = 0;
+    memset(t->added_first, 0, sizeof(t->added_first));
+    for (int i = 0; i < vocab_size; i++) {
+        int len = t->vocab_len[i];
+        const unsigned char *s = (const unsigned char *)t->vocab[i];
+        if (len == 0) continue;
+        if (len > 1 && t->merge_scores[i] <= -1e6f) {
+            t->added[t->n_added++] = i;
+            t->added_first[s[0]] = 1;
+            continue;
+        }
+        if (len == 1 && t->byte_token[s[0]] < 0) t->byte_token[s[0]] = i;
+        uint64_t h = bytes_hash(s, len);
+        uint32_t j = (uint32_t)h & t->hash_mask;
+        int dup = 0;
+        for (; t->hash_ids[j] >= 0; j = (j + 1) & t->hash_mask) {
+            int o = t->hash_ids[j];
+            if (t->vocab_len[o] == len && !memcmp(t->vocab[o], s, len)) { dup = 1; break; } // keep the first
+        }
+        if (dup) continue;
+        t->hash_ids[j] = i;
+        t->hash_tags[j] = (uint32_t)(h >> 32);
+    }
+    for (int b = 0; b < 256; b++) {
+        if (t->byte_token[b] < 0) { fprintf(stderr, "Tokenizer has no token for byte 0x%02x (not byte-level BPE?)\n", b); exit(EXIT_FAILURE); }
+    }
+    for (int i = 1; i < t->n_added; i++) { // longest first (insertion sort, ~26 entries), stable
+        int id = t->added[i], k = i;
+        for (; k > 0 && t->vocab_len[t->added[k - 1]] < t->vocab_len[id]; k--) t->added[k] = t->added[k - 1];
+        t->added[k] = id;
+    }
 
     load_prompt_template(checkpoint_path, t->prompt_template, 0, enable_thinking);
     load_prompt_template(checkpoint_path, t->system_prompt_template, 1, enable_thinking);
 }
 
 void free_tokenizer(Tokenizer *t) {
-    for (int i = 0; i < t->vocab_size; i++) { free(t->vocab[i]); }
     free(t->vocab);
+    free(t->vocab_len);
+    free(t->vocab_data);
     free(t->merge_scores);
+    free(t->hash_ids);
+    free(t->hash_tags);
+    free(t->added);
 }
 
 char *decode(Tokenizer *t, int token) {
+    // raw token bytes; a code point split over several tokens comes out whole once all are printed
     return t->vocab[token];
 }
 
-int str_lookup(char *str, char **vocab, int vocab_size) {
-    // find a match for str in vocab, return its index or -1 if not found
-    for (int i = 0; i < vocab_size; i++)
-        if (!strcmp(str, vocab[i]))
-            return i;
+// --- pre-tokenizer: Qwen2's Split regex (tokenizer.json, behavior Isolated)
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 
+typedef struct { uint32_t cp; int len; int cls; } UChar;
+
+static inline int ucls(uint32_t cp) {
+    if (cp < 0x80) {
+        if ((cp | 0x20) >= 'a' && (cp | 0x20) <= 'z') return UCLS_L;
+        if (cp >= '0' && cp <= '9') return UCLS_N;
+        if (cp == ' ' || (cp >= '\t' && cp <= '\r')) return UCLS_WS;
+        return UCLS_OTHER;
+    }
+    int lo = 0, hi = UCLS_NRANGES - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1;
+        if (cp < ucls_lo[mid]) hi = mid - 1;
+        else if (cp > (ucls_hi_cls[mid] & 0xffffff)) lo = mid + 1;
+        else return ucls_hi_cls[mid] >> 24;
+    }
+    return UCLS_OTHER;
+}
+
+static inline UChar uchar_at(const unsigned char *p, const unsigned char *end) {
+    // decode one UTF-8 code point; an invalid byte counts as one "other" character
+    UChar c = { p[0], 1, UCLS_OTHER };
+    unsigned char b = p[0];
+    if (b < 0x80) { c.cls = ucls(b); return c; }
+    int n = b >= 0xf0 ? (b <= 0xf4 ? 4 : 0) : b >= 0xe0 ? 3 : b >= 0xc2 ? 2 : 0;
+    if (n == 0 || end - p < n) { c.cp = 0xfffd; return c; }
+    uint32_t cp = b & (0x7f >> n);
+    for (int i = 1; i < n; i++) {
+        if ((p[i] & 0xc0) != 0x80) { c.cp = 0xfffd; return c; }
+        cp = (cp << 6) | (p[i] & 0x3f);
+    }
+    if ((n == 3 && (cp < 0x800 || (cp >= 0xd800 && cp <= 0xdfff))) || (n == 4 && (cp < 0x10000 || cp > 0x10ffff))) {
+        c.cp = 0xfffd; return c;
+    }
+    c.cp = cp; c.len = n; c.cls = ucls(cp);
+    return c;
+}
+
+static inline const unsigned char *skip_class(const unsigned char *p, const unsigned char *end, int cls) {
+    while (p < end) {
+        UChar c = uchar_at(p, end);
+        if (c.cls != cls) break;
+        p += c.len;
+    }
+    return p;
+}
+
+static inline int ascii_lower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+
+static int contraction_len(const unsigned char *p, const unsigned char *end) {
+    // bytes matched by (?i:s|t|re|ve|m|ll|d) after the apostrophe, 0 if none. Case folding is
+    // Unicode's: U+017F LATIN SMALL LETTER LONG S also matches 's' (checked against HF)
+    if (p >= end) return 0;
+    int c0 = ascii_lower(p[0]), c1 = p + 1 < end ? ascii_lower(p[1]) : 0;
+    if (c0 == 's' || c0 == 't' || c0 == 'm' || c0 == 'd') return 1;
+    if (p[0] == 0xc5 && c1 == 0xbf) return 2;
+    if (((c0 == 'r' || c0 == 'v') && c1 == 'e') || (c0 == 'l' && c1 == 'l')) return 2;
+    return 0;
+}
+
+static const unsigned char *pretok_next(const unsigned char *p, const unsigned char *end) {
+    // end of the regex match starting at p (p < end); every character matches some alternative
+    UChar c = uchar_at(p, end);
+    const unsigned char *q = p + c.len;
+    int crlf = c.cp == '\r' || c.cp == '\n';
+    // (?i:'s|'t|'re|'ve|'m|'ll|'d)
+    if (c.cp == '\'') {
+        int n = contraction_len(q, end);
+        if (n) return q + n;
+    }
+    // [^\r\n\p{L}\p{N}]?\p{L}+
+    if (c.cls == UCLS_L) return skip_class(q, end, UCLS_L);
+    if (c.cls != UCLS_N && !crlf && q < end && uchar_at(q, end).cls == UCLS_L) return skip_class(q, end, UCLS_L);
+    // \p{N}: one digit at a time
+    if (c.cls == UCLS_N) return q;
+    // ' ?[^\s\p{L}\p{N}]+[\r\n]*' (only ASCII space as the optional prefix)
+    const unsigned char *r = c.cp == ' ' ? q : p;
+    if (r < end && uchar_at(r, end).cls == UCLS_OTHER) {
+        r = skip_class(r, end, UCLS_OTHER);
+        while (r < end && (*r == '\r' || *r == '\n')) r++;
+        return r;
+    }
+    // c is whitespace. \s*[\r\n]+ : the whitespace run up to its last CR/LF, if any;
+    // else \s+(?!\S) : the run minus its last character if a non-space follows (that last
+    // space then starts the next chunk, e.g. " word"); else \s+ : the run (1 char, or at the end)
+    const unsigned char *last_nl = NULL, *last_start = p;
+    r = p;
+    while (r < end) {
+        UChar w = uchar_at(r, end);
+        if (w.cls != UCLS_WS) break;
+        if (w.cp == '\r' || w.cp == '\n') last_nl = r + w.len;
+        last_start = r;
+        r += w.len;
+    }
+    if (last_nl) return last_nl;
+    if (r == end || last_start == p) return r;
+    return last_start;
+}
+
+// --- byte-level BPE inside one pre-tokenizer chunk
+
+typedef struct { float score; int pos, len, id; } BpeCand; // merge candidate: symbol at pos + next one
+
+typedef struct {
+    int *len, *tok, *prev; // per byte offset: symbol length (0 = not a symbol start), token id, previous symbol
+    BpeCand *heap;
+    int cap;
+} BpeScratch;
+
+static inline int cand_before(const BpeCand *a, const BpeCand *b) {
+    return a->score > b->score || (a->score == b->score && a->pos < b->pos);
+}
+
+static void heap_push(BpeCand *h, int *n, BpeCand c) {
+    int i = (*n)++;
+    while (i > 0) {
+        int p = (i - 1) >> 1;
+        if (!cand_before(&c, &h[p])) break;
+        h[i] = h[p];
+        i = p;
+    }
+    h[i] = c;
+}
+
+static BpeCand heap_pop(BpeCand *h, int *n) {
+    BpeCand top = h[0], last = h[--(*n)];
+    int i = 0;
+    for (;;) {
+        int l = 2 * i + 1, r = l + 1;
+        if (l >= *n) break;
+        int m = (r < *n && cand_before(&h[r], &h[l])) ? r : l;
+        if (!cand_before(&h[m], &last)) break;
+        h[i] = h[m];
+        i = m;
+    }
+    if (*n > 0) h[i] = last;
+    return top;
+}
+
+static inline void bpe_push(Tokenizer *t, const unsigned char *chunk, BpeScratch *s, int *nh, int a, int b) {
+    // symbols a and b are adjacent, so their concatenation is chunk[a .. a + len)
+    int len = s->len[a] + s->len[b];
+    if ((unsigned int)len > t->max_token_length) return;
+    int id = vocab_lookup(t, chunk + a, len);
+    if (id < 0) return;
+    BpeCand c = { t->merge_scores[id], a, len, id };
+    heap_push(s->heap, nh, c);
+}
+
+static void bpe_chunk(Tokenizer *t, const unsigned char *chunk, int n, BpeScratch *s, int *tokens, int *n_tokens) {
+    if (n == 1) { tokens[(*n_tokens)++] = t->byte_token[chunk[0]]; return; }
+    for (int i = 0; i < n; i++) {
+        s->len[i] = 1;
+        s->tok[i] = t->byte_token[chunk[i]];
+        s->prev[i] = i - 1;
+    }
+    int nh = 0;
+    for (int i = 0; i + 1 < n; i++) bpe_push(t, chunk, s, &nh, i, i + 1);
+    while (nh > 0) {
+        BpeCand c = heap_pop(s->heap, &nh);
+        int i = c.pos;
+        if (s->len[i] == 0) continue; // symbol merged into its left neighbour since
+        int j = i + s->len[i];
+        if (j >= n || s->len[i] + s->len[j] != c.len) continue; // stale: the pair changed
+        s->tok[i] = c.id;
+        s->len[i] = c.len;
+        s->len[j] = 0;
+        int k = i + c.len;
+        if (k < n) s->prev[k] = i;
+        if (i > 0) bpe_push(t, chunk, s, &nh, s->prev[i], i);
+        if (k < n) bpe_push(t, chunk, s, &nh, i, k);
+    }
+    for (int i = 0; i < n; i += s->len[i]) tokens[(*n_tokens)++] = s->tok[i];
+}
+
+static void encode_segment(Tokenizer *t, const unsigned char *p, const unsigned char *end, BpeScratch *s, int *tokens, int *n_tokens) {
+    // text between added tokens: pre-tokenize, then BPE each chunk
+    while (p < end) {
+        const unsigned char *q = pretok_next(p, end);
+        bpe_chunk(t, p, (int)(q - p), s, tokens, n_tokens);
+        p = q;
+    }
+}
+
+static int match_added(Tokenizer *t, const unsigned char *p, const unsigned char *end, int *len) {
+    // longest added token starting at p (t->added is sorted longest first), or -1
+    for (int k = 0; k < t->n_added; k++) {
+        int id = t->added[k], n = t->vocab_len[id];
+        if (n <= end - p && !memcmp(p, t->vocab[id], n)) { *len = n; return id; }
+    }
     return -1;
 }
 
 void encode(Tokenizer *t, char *text, int *tokens, int *n_tokens) {
-    // encode the string text (input) into an upper-bound preallocated tokens[] array
+    // encode the string text (input) into an upper-bound preallocated tokens[] array:
+    // at most one token per byte, so strlen(text) ints are enough
+    const unsigned char *s = (const unsigned char *)text, *end = s + strlen(text);
+    int n = (int)(end - s);
+    BpeScratch sc;
+    sc.cap = n > 0 ? n : 1;
+    sc.len = malloc(3 * (size_t)sc.cap * sizeof(int));
+    sc.tok = sc.len + sc.cap;
+    sc.prev = sc.tok + sc.cap;
+    sc.heap = malloc(3 * (size_t)sc.cap * sizeof(BpeCand)); // n-1 initial pairs + 2 per merge
+    if (!sc.len || !sc.heap) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
 
-    // create a temporary buffer that will store merge candidates of always two consecutive tokens
-    // *2 for concat, +1 for null terminator +2 for UTF8 (in case max_token_length is 1)
-    char *str_buffer = malloc((t->max_token_length*2 +1 +2) * sizeof(char));
-    char special_token[64 + 1];
-
-    // start at 0 tokens
     *n_tokens = 0;
-
-    // process the raw (UTF-8) byte sequence of the input string
-    for (char *c = text; *c != 0; c++) {
-        int id, found_special_token = 0;
-
-        // set the buffer to the current byte
-        str_buffer[0] = *c;
-        str_buffer[1] = 0;
-
-        // special tokens begin with < and end with >. If we find a substring beginning with <
-        // and ending with > and there's a token in the vocab for it, use that instead of parsing into
-        // shorter tokens
-        if (*c == '<') {
-          int end_of_token_pos = -1;
-          found_special_token = 0;
-          for (int k = 0; *c != 0 && k < 64; k++) {
-              if (c[k] == '>') {
-                  end_of_token_pos = k;
-                  break;
-              }
-          }
-
-          if (end_of_token_pos != -1) {
-              strncpy(special_token, c, end_of_token_pos + 1);
-              special_token[end_of_token_pos + 1] = 0;
-
-              id = str_lookup(special_token, t->vocab, t->vocab_size);
-              if (id != -1) {
-                  c += end_of_token_pos;
-                  found_special_token = 1;
-              }
-          }
-        }
-
-        // not a special token, just look up the single character
-        if (!found_special_token)
-            id = str_lookup(str_buffer, t->vocab, t->vocab_size);
-
-        if (id != -1) {
-            // we found this codepoint in vocab, add it as a token
-            tokens[(*n_tokens)++] = id;
-        } else {
-            printf("Warning: unknown character code point %d in input, skipping.\n", *str_buffer);
-            (*n_tokens)++;
-        }
+    const unsigned char *seg = s;
+    for (const unsigned char *p = s; p < end;) {
+        int len, id = t->added_first[*p] ? match_added(t, p, end, &len) : -1;
+        if (id < 0) { p++; continue; }
+        encode_segment(t, seg, p, &sc, tokens, n_tokens);
+        tokens[(*n_tokens)++] = id;
+        p += len;
+        seg = p;
     }
+    encode_segment(t, seg, end, &sc, tokens, n_tokens);
 
-    // merge the best consecutive pair each iteration
-    while (1) {
-        float best_score = -1e10;
-        int best_id = -1;
-        int best_idx = -1;
-
-        for (int i = 0; i < (*n_tokens - 1); i++) {
-            // check if we can merge the pair (tokens[i], tokens[i+1])
-            sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i + 1]]);
-            int id = str_lookup(str_buffer, t->vocab, t->vocab_size);
-
-            if (id != -1 && t->merge_scores[id] > best_score) {
-                // this merge pair exists in vocab! record its score and position
-                best_score = t->merge_scores[id];
-                best_id = id;
-                best_idx = i;
-            }
-        }
-
-        if (best_idx == -1)
-            break; // we couldn't find any more pairs to merge, so we're done
-
-        // merge the consecutive pair (best_idx, best_idx+1) into new token best_id
-        tokens[best_idx] = best_id;
-        // delete token at position best_idx+1, shift the entire sequence back 1
-        for (int i = best_idx + 1; i < (*n_tokens - 1); i++)
-            tokens[i] = tokens[i + 1];
-
-        (*n_tokens)--; // token length decreased
-    }
-
-    free(str_buffer);
+    free(sc.len);
+    free(sc.heap);
 }
 
 // ----------------------------------------------------------------------------
@@ -965,14 +1199,19 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
 // ----------------------------------------------------------------------------
 // test hooks (cwayn patch): -m tokenize, -m logits (see tests/)
 
-void tokenize(Tokenizer *tokenizer, char *text) {
-    // encode the raw text (no chat template), print the token ids space-separated
+void tokenize(Tokenizer *tokenizer, char *text, double t_load) {
+    // encode the raw text (no chat template), print the token ids space-separated on stdout;
+    // timings on stderr (encode only, and the tokenizer load before it)
     int n_tokens = 0;
     int *tokens = (int *)malloc((strlen(text) + 3) * sizeof(int));
+    double t0 = now_s();
     encode(tokenizer, text, tokens, &n_tokens);
+    double t_enc = now_s() - t0;
     for (int i = 0; i < n_tokens; i++)
         printf(i ? " %d" : "%d", tokens[i]);
     printf("\n");
+    fprintf(stderr, "[tokenize] %zu bytes -> %d tokens, encode %.3f ms, tokenizer load %.1f ms\n",
+            strlen(text), n_tokens, t_enc * 1e3, t_load * 1e3);
     free(tokens);
 }
 
@@ -1074,6 +1313,23 @@ int main(int argc, char *argv[]) {
     if ((strcmp(mode, "tokenize") == 0 || strcmp(mode, "logits") == 0) && !prompt) { error_usage(); }
     if (strcmp(mode, "logits") == 0 && !out_path) { error_usage(); }
 
+    if (strcmp(mode, "tokenize") == 0) {
+        // only the header is needed (vocab_size): skip mapping and dequantizing the weights
+        Config config;
+        FILE *file = fopen(checkpoint_path, "rb");
+        if (!file || fread(&config, sizeof(Config), 1, file) != 1 || config.magic_number != 0x616a6331) {
+            fprintf(stderr, "Couldn't read qwen3.c checkpoint header from %s\n", checkpoint_path);
+            exit(EXIT_FAILURE);
+        }
+        fclose(file);
+        Tokenizer tokenizer;
+        double t0 = now_s();
+        build_tokenizer(&tokenizer, checkpoint_path, config.vocab_size, enable_thinking);
+        tokenize(&tokenizer, prompt, now_s() - t0);
+        free_tokenizer(&tokenizer);
+        return 0;
+    }
+
     // build the Transformer via the model .bin file
     Transformer transformer;
     build_transformer(&transformer, checkpoint_path, ctx_length);
@@ -1094,8 +1350,6 @@ int main(int argc, char *argv[]) {
         generate(&transformer, &tokenizer, &sampler, prompt);
     } else if (strcmp(mode, "chat") == 0) {
         chat(&transformer, &tokenizer, &sampler, prompt, system_prompt);
-    } else if (strcmp(mode, "tokenize") == 0) {
-        tokenize(&tokenizer, prompt);
     } else if (strcmp(mode, "logits") == 0) {
         dump_logits(&transformer, &tokenizer, prompt, out_path);
     } else {

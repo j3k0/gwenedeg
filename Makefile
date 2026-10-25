@@ -8,16 +8,17 @@ CPPFLAGS += -D_FILE_OFFSET_BITS=64
 LDLIBS  += -lm
 
 SRC = src/runq.c
+HDR = src/unicode_tables.h
 Q8  = models/Qwen3-0.6B-q8.bin
 
 .PHONY: all debug clean test bench models
 
 all: runq
 
-runq: $(SRC)
+runq: $(SRC) $(HDR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LDLIBS) -o $@
 
-runq-debug: $(SRC)
+runq-debug: $(SRC) $(HDR)
 	$(CC) $(DBGFLAGS) $(CPPFLAGS) $< $(LDLIBS) -o $@
 
 debug: runq-debug

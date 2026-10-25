@@ -6,15 +6,26 @@ The engine is `src/runq.c`, derived from qwen3.c. Roadmap and status: [TODO.md](
 ## Quick start
 
 ```sh
-scripts/download_models.py            # Qwen/Qwen3-0.6B (bf16) + Q4_K_M GGUF, pinned + checksummed
-scripts/setup_venv.sh                 # .venv with CPU torch, for the exporter only
-scripts/export_q8.sh                  # -> models/Qwen3-0.6B-q8.bin (Q8_0, ~630 MB)
-# (or: make models, which runs download + export if the .bin is missing)
+scripts/download_models.py q8gguf     # Qwen3-0.6B-Q8_0.gguf (639 MB), pinned + checksummed
 make                                  # -> ./runq  (make debug -> ./runq-debug, make generic -> ./runq-generic)
 
-./runq models/Qwen3-0.6B-q8.bin -c 4096                     # interactive chat
-./runq models/Qwen3-0.6B-q8.bin -c 4096 -t 0 -n 200 -i "Why is the sky blue?"
-make test                             # regression suite, ~15 s (tests/README.md)
+G=models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf
+./runq $G -c 4096                     # interactive chat
+./runq $G -c 4096 -t 0 -n 200 -i "Why is the sky blue?"
+```
+
+The GGUF file is all runq needs: weights, hyperparameters, tokenizer (from its metadata) and the
+chat templates (built in). Alternatively, qwen3.c's own format, exported from the HF weights (needs
+the Python venv; the tests use both):
+
+```sh
+scripts/download_models.py            # default sets: Qwen/Qwen3-0.6B (bf16), Q4_K_M and Q8_0 GGUFs
+scripts/setup_venv.sh                 # .venv with CPU torch, for the exporter (and the test goldens)
+scripts/export_q8.sh                  # -> models/Qwen3-0.6B-q8.bin (Q8_0, ~630 MB) + .tokenizer + .template*
+# (or: make models, which runs download + export if the .bin is missing)
+./runq models/Qwen3-0.6B-q8.bin -c 4096
+
+make test                             # regression suite, ~25 s (tests/README.md)
 make bench                            # thread sweep, prefill/decode tok/s (scripts/bench_qwen3c.sh)
 make bench-prefill                    # prefill tok/s vs prompt length and -b (scripts/bench_prefill.sh)
 scripts/bench_all.sh                  # all runq speed tables of BENCHMARKS.md (~8 min)
@@ -58,11 +69,17 @@ it the KV cache is sized for the full 40,960-token context, about 9 GB of addres
 
 | set | source | file(s) |
 |---|---|---|
-| `hf` | `Qwen/Qwen3-0.6B` @ `c1899de` | bf16 safetensors + tokenizer (input for the Q8_0 export) |
-| `q4km` | `unsloth/Qwen3-0.6B-GGUF` @ `50968a4` | `Qwen3-0.6B-Q4_K_M.gguf` (imatrix) |
-| `q8gguf` | `unsloth/Qwen3-0.6B-GGUF` @ `50968a4` | `Qwen3-0.6B-Q8_0.gguf` |
+| `hf` | `Qwen/Qwen3-0.6B` @ `c1899de` | bf16 safetensors + tokenizer (input for the .bin export, HF test goldens) |
+| `q4km` | `unsloth/Qwen3-0.6B-GGUF` @ `50968a4` | `Qwen3-0.6B-Q4_K_M.gguf` (imatrix; not loadable by runq yet) |
+| `q8gguf` | `unsloth/Qwen3-0.6B-GGUF` @ `50968a4` | `Qwen3-0.6B-Q8_0.gguf` (runq loads it directly) |
 
 Revisions are pinned. Each file is verified by sha256 (LFS files) or git blob sha1 (small files).
+
+GGUF vs .bin: both Q8_0. The GGUF has 32-weight groups with fp16 scales (fp32 once loaded,
+exactly), the .bin 64-weight groups with fp32 scales; runq quantizes the activations to int8 in
+groups of the same size. The GGUF is closer to HF: perplexity +0.19% vs +0.85% over fp32, logits
+pooled 1-cos 6.1e-4 vs 9.0e-4 (TODO.md, Step 6a). Prefill is ~4-8% slower (twice as many
+float folds in the GEMM), decode ~5% (the packed weights are ~6% larger: fp32 scales per 32).
 
 ## Layout and third-party code
 
@@ -86,10 +103,16 @@ Revisions are pinned. Each file is verified by sha256 (LFS files) or git blob sh
   token embedding rows dequantized at lookup from the Q8_0 table (upstream kept a 622 MB float
   copy) and the weight repacking done from `pread` in one parallel loop: startup ~0.5 -> ~0.06 s,
   peak RSS 1.36 -> ~0.63-0.74 GB;
-  test hooks `-m tokenize`, `-m logits -o <file>` and `RUNQ_CHAT_DUMP` (see `tests/README.md`).
-- `src/kernels_avx512.h`: the AVX-512 VNNI Q8_0 GEMM / GEMV and the weight repacking, and the
-  fp32 attention with the KV cache layout (layouts, arithmetic and bit-identity argument in its
-  comments).
+  test hooks `-m tokenize`, `-m logits -o <file>` and `RUNQ_CHAT_DUMP` (see `tests/README.md`);
+  GGUF Q8_0 loading (format detected by magic): a bounds-checked GGUF v2/v3 reader (every
+  count, length and offset validated; corrupt files give a clean error), the hyperparameters from
+  the `qwen3.*` metadata, the tensors by llama.cpp name, the Q8_0 blocks (group 32, fp16 scales)
+  converted at load for the VNNI kernels (generalized to group size 32 or 64) or the generic ones,
+  the tokenizer from `tokenizer.ggml.*` (GPT-2 byte-level tokens, merge ranks as scores), Qwen3's
+  chat templates built in (identical to the exporter's `.template*` files).
+- `src/kernels_avx512.h`: the AVX-512 VNNI Q8_0 GEMM / GEMV (group size 64 or 32) and the weight
+  repacking, and the fp32 attention with the KV cache layout (layouts, arithmetic and bit-identity
+  argument in its comments).
 - `src/unicode_tables.h`: \p{L}/\p{N}/\s ranges for the pre-tokenizer, generated by
   `tools/gen_unicode_tables.py` (Python's unicodedata, Unicode 15.1).
 - `src/unicode_nfc.h`: NFC tables (combining classes, decompositions, compositions, quick check),
@@ -97,8 +120,8 @@ Revisions are pinned. Each file is verified by sha256 (LFS files) or git blob sh
   tokenizers' older (9.0) normalization data (108 newer marks ccc 0, U+11938); see TODO.md Step 5.
 - `third_party/qwen3.c/`: pristine https://github.com/adriancable/qwen3.c @ `55643ff`
   (2025-07-05), kept for diffs (`diff -u third_party/qwen3.c/runq.c src/runq.c`). Only its
-  `export.py`/`model.py` are used, by `scripts/export_q8.sh`. qwen3.c itself started from
-  Andrej Karpathy's llama2.c.
+  `export.py`/`model.py` are used, by `scripts/export_q8.sh` (the .bin path; GGUF needs neither).
+  qwen3.c itself started from Andrej Karpathy's llama2.c.
 - `third_party/mynah-slm/`: not committed. `scripts/fetch_mynah.sh` clones
   https://github.com/mynah-org/mynah-slm @ `cde1599` (2026-09-22) and builds it (needs
   `libopenblas-dev`). Reference and benchmarks only.
@@ -114,9 +137,13 @@ Full tables, methodology and baselines: [BENCHMARKS.md](BENCHMARKS.md) (one sess
 | 12 (default) | 2,758 / 1,976 / 1,531 tok/s | 170 |
 
 Same session: upstream qwen3.c decodes at 101 / 106 tok/s (8 / 12 threads) with ~99 tok/s token-by-token
-prefill; mynah-slm at ~34 (Q8_0 and Q4_K_M). Perplexity vs HF fp32: runq Q8_0 +0.8%, Q4_K_M +4.7%.
+prefill; mynah-slm at ~34 (Q8_0 and Q4_K_M). Perplexity vs HF fp32: runq Q8_0 +0.8%, Q4_K_M +4.7%
+(mynah-slm); runq on the Q8_0 GGUF +0.19% (TODO.md Step 6a, measured later).
 `scripts/bench_all.sh` reruns the runq tables (~8 min).
 
-## Known limitations of qwen3.c
+## Known limitations
 
-- Q8_0 only; there is no GGUF loader.
+- Q8_0 only (.bin or GGUF): the GGUF loader does not read K-quants (Q4_K_M) yet (Step 6b).
+- GGUF: Qwen3 (`general.architecture` qwen3, RoPE theta 1e6, RMSNorm eps 1e-6) with the gpt2 /
+  qwen2 tokenizer only; `tokenizer.chat_template` (Jinja) is not interpreted, Qwen3's templates
+  are built in.

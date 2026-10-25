@@ -6,6 +6,8 @@ Target: prefill several hundred to 1000+ tok/s; decode limited by memory bandwid
 Now (Step 3b, 8 threads, -b 512): prefill ~1,980 tok/s (451-token prompt), ~1,480 (1,500 tokens),
 ~1,070 (3,000 tokens); decode ~180-195. 12 threads (the default): prefill ~2,570 / ~2,020 / ~1,550.
 Startup (Step 4): ~0.06 s per process, peak RSS ~0.63-0.74 GB; chat keeps the conversation.
+GGUF (Step 6a): `./runq Qwen3-0.6B-Q8_0.gguf` directly (no export, no side files); closer to HF than
+the .bin (perplexity +0.19% vs +0.85%), prefill ~4-8% slower.
 
 Status: `[ ]` todo · `[~]` in progress · `[x]` done
 
@@ -309,6 +311,134 @@ Before (Step 3a, 8 threads, -b 128): 451 tokens: GEMMs 43%, attention 42%, rest 
   0.62-0.81 -> 0.62-0.76 ms, README+TODO 32 KB 3.7-4.1 ms both); NFD input +0.1-0.4 ms per 20 KB.
   `make test` ~23 s on the busy box (84 tokenizer checks, 0.4 s)
 
+## Step 6a: load GGUF Q8_0 models directly
+`models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (unsloth, GGUF v3, 310 tensors, 32 metadata entries, no
+`general.alignment`, no `output.weight`, no bos id) works like the .bin: chat, generate, `-m logits`,
+`-m tokenize`; the format is detected by magic.
+- [x] Reader (`gguf_parse`, ~300 lines with the config and lookups): v2 / v3 header, metadata (all
+  value types; string arrays walked; nested arrays rejected), tensor table, alignment (default 32,
+  power of two), data offset. Untrusted input: every read goes through `gguf_take` (overflow-safe
+  bounds check); counts checked against the remaining bytes (and <= 65,536 entries) before
+  allocating; tensor shapes (1-4 dims, product < 2^56), data size by ggml type (block sizes incl.
+  the k-quants), offset alignment and range; duplicate names rejected; strings never assumed
+  NUL-terminated. Errors name the file and the entry and exit 1. The file is mapped; tensor data
+  is read only where used
+- [x] Config from `qwen3.*` (block_count, embedding_length, feed_forward_length, head_count(_kv),
+  key/value_length, context_length) and checked against the engine: architecture qwen3, RoPE
+  freq_base == 1e6 and rms epsilon == 1e-6 (the constants in `rope_row` / `rmsnorm`; making them
+  parameters could change -Ofast code generation of the .bin path), key_length == value_length,
+  heads % kv heads, no RoPE scaling; vocab = rows of `token_embd.weight`; tied classifier when
+  `output.weight` is absent. The engine's shape checks (`malloc_run_state`) as before
+- [x] Tensors by llama.cpp name: `token_embd`, `blk.N.attn_{q,k,v,output}`, `attn_{q,k}_norm`,
+  `attn_norm`, `ffn_norm`, `ffn_gate` = w1, `ffn_up` = w3, `ffn_down` = w2, `output_norm`,
+  `output` (optional); type (Q8_0 matrices, F32 norms) and shape checked (ne[0] is the fastest
+  dimension: a (d, k) matrix is { k, d }, the .bin's row-major layout). No Q/K row permutation: the
+  converter permutes for the llama architecture only, and the logits match HF (below). Norms copied
+  into one buffer in the .bin layout (forward pass unchanged); embedding rows dequantized from the
+  blocks at lookup (`q * d`, d the fp16 scale as a float: the values ggml computes)
+- [x] Kernels for group size 32 without requantizing: `kernels_avx512.h` takes the group size as a
+  parameter (Q8P block of 16 rows x 32 = 512 bytes + 16 fp32 scales = 576 bytes per group; GEMM
+  tile and GEMV instantiated for 64 and 32; activation correction per 32 bytes with a 256-bit sum);
+  the generic kernels already had a run-time GS. `prepare_weights` (was `pack_weights`) converts
+  the Q8_0 blocks once at load, fp16 -> fp32 exact (`fp16_to_f32`, subnormals too), in the same
+  parallel pread loop: VNNI build into Q8P with GS 32, generic build into the .bin's q / s arrays;
+  inf / NaN scales rejected. Activations quantized in groups of 32 (GS). Same float fold per group
+  (`val + (ws * xs) * isum`). Checked: the .bin path's logits files byte-identical to the previous
+  binary (VNNI and generic, -b 1 / 7 / 64, 73 tokens) and all .bin tests unchanged; GGUF: VNNI ==
+  generic == batched (-b 7 / 64) == sequential, 1 / 3 / 8 threads, all byte-identical
+- [x] Tokenizer from the metadata (`build_tokenizer_gguf`; gpt2 model + qwen2 pre-tokenizer
+  required): normal tokens decoded from GPT-2's byte-to-unicode form to raw bytes, control (3) and
+  user-defined (4) tokens = the 26 added tokens (raw text), unused (5: 267 `[PAD...]` fillers up to
+  151,936) empty as the ids missing from the .tokenizer file; merge of rank r -> score -r for the
+  token it produces (the .tokenizer's -log(r + 1) has the same order: same BPE); eos from the file,
+  bos (absent) = `<|endoftext|>` as config.json (generation stops at both, as with the .bin).
+  Checked (scratch Python with the `gguf` package): all 151,936 tokens decode to exactly the
+  .tokenizer bytes, the merges equal tokenizer.json's, merge r produces token 256 + r (so scores
+  from the rank and from the id coincide), no normal multi-byte token without a merge. Tokenizer
+  goldens: all 84 checks pass on the GGUF tokenizer; `fuzz_tokenizer.py --model <gguf>` seeds 1 and
+  2 (5,030 cases each, 1.28M HF tokens): 0 mismatches; `--nfc-all`: 0 differences. Load ~30-48 ms
+  on one thread, ~20-37 at 12 (.bin ~15-25 ms): decoding 151,936 tokens, 151k hash inserts and 151k
+  merge lookups (parallel outside `-m tokenize`, which stays single-threaded: the tests and the
+  fuzzer run many at once). The fuzzer takes ~20 s instead of ~12
+- [x] Chat templates: the 4 Qwen3 renderings built in (`QWEN3_TMPL_*`), byte-identical to the
+  exporter's `.template*` files (test `gguf_template/*`: same chat token ids as the .bin run for
+  -r 0 / 1, with and without -y). The file's `tokenizer.chat_template` (Jinja) is not used
+- [x] Accuracy vs HF fp32 (`tests/run_tests.sh -v --only logits,gguf`; batched == sequential):
+
+  | prompt | n | cos pos 0 .bin / GGUF | cos mean .bin / GGUF | cos min .bin / GGUF | top-1 .bin / GGUF | top-5 .bin / GGUF |
+  |---|---|---|---|---|---|---|
+  | en | 15 | 0.8316 / 0.9188 | 0.99824 / 0.99876 | 0.99521 / 0.99769 | 13 / 14 | 0.907 / 0.947 |
+  | code | 24 | 0.8323 / 0.9804 | 0.99929 / 0.99951 | 0.99832 / 0.99899 | 22 / 23 | 0.958 / 0.967 |
+  | zh | 15 | 0.9064 / 0.9763 | 0.99961 / 0.99972 | 0.99942 / 0.99921 | 14 / 14 | 0.920 / 0.907 |
+  | chat | 15 | 0.8967 / 0.9670 | 0.99879 / 0.99936 | 0.99599 / 0.99764 | 13 / 14 | 0.933 / 0.933 |
+  | count | 15 | 0.8653 / 0.9385 | 0.99945 / 0.99950 | 0.99916 / 0.99926 | 14 / 14 | 0.893 / 0.933 |
+  | pooled | 84 | | 0.99910 / 0.99939 | | 76 / 79 | |
+
+  Pooled 1-cos 9.0e-4 -> 6.1e-4 (-32%), top-1 76 -> 79 / 84, and position 0 (the massive-activation
+  token) much better: a ~6500 value costs less precision in a 32-group than in a 64-group
+- [x] Perplexity (`scripts/ppl.py bench/ppl_beagle_ch1.txt -t 8 --runq-model ...`, new option; the
+  .bin run reproduces BENCHMARKS.md exactly): runq GGUF Q8_0 full **27.623** (+0.19% vs HF fp32
+  27.571), win512 32.040 (+0.18% vs 31.984); runq .bin 27.805 (+0.85%) / 32.206 (+0.69%); mynah-slm
+  Q8_0 (fp32 activations) 27.580 / 32.039. Group 32 with fp16 scales removes ~80% of runq's gap to
+  HF; the rest is the int8 activations
+- [x] mynah-slm cross-check (`mynah-slm run -m <gguf> --temp 0 -n 64 -t 8` vs `runq <gguf> -t 0 -n 64`,
+  chat with thinking off on both, and `--raw` vs `-m generate`): 4 of 6 chat prompts identical
+  (capital of Australia, hash table, primes > 100, translation; the .bin gives the same 4), 2 diverge
+  after ~21 characters (sky blue: "due to" vs "because of"; haiku line 2). Raw generation: "The
+  three laws of thermodynamics are" identical over all 64 tokens, "Once upon a time..." for 154
+  characters; the .bin leaves both after 23-33 characters. (Exact match not expected: mynah-slm
+  keeps the activations in float)
+- [x] Speed (same session, 2026-10-25, load 2-9, best of 6; prefill `bench_prefill.sh -m ... -b 512`,
+  decode `bench_qwen3c.sh`, 256 tokens, best and median of 15 over two sessions):
+
+  | | .bin | GGUF |
+  |---|---|---|
+  | prefill 451 tokens, 8 / 12 threads | 1,980 / 2,661 tok/s | 1,832 / 2,559 (-7.5% / -3.8%) |
+  | prefill 1,500 tokens, 8 / 12 threads | 1,526 / 2,102 tok/s | 1,461 / 2,005 (-4.3% / -4.6%) |
+  | decode 8 threads, best / median | 197 / 142 tok/s | 187 / 137 |
+  | decode 12 threads, best / median | 180 / 153 tok/s | 194 / 151 |
+  | process wall, `-n 1 -i hi`, 12 / 8 threads (median of 9, x2) | 0.110-0.114 / 0.129-0.133 s | 0.129-0.141 / 0.152-0.154 s |
+  | peak RSS | 620-632 MB | 667-679 MB |
+  | `-m tokenize` (wall, RSS) | 23 ms, 11 MB | 48 ms, 17 MB |
+  | generic build: wall, RSS (12 threads) | 0.115 s, 736 MB | 0.164 s, 666 MB |
+
+  Prefill: the float fold runs once per 32 instead of 64 weights (in the GEMM, 8 instead of 16
+  `vpdpbusd` per fold: ceiling ~80% instead of ~89% of the int8 peak). Decode: the packed weights
+  are 670 vs 633 MB (fp32 scale per 32 weights: 1.125 vs 1.0625 bytes per weight), so up to ~6%
+  slower at the bandwidth limit; not resolvable on the shared box (run-to-run +-30%). Startup +15-30
+  ms (tokenizer from the metadata), RSS +47 MB (the larger packed weights + ~6 MB of mapped
+  metadata). The generic build converts the GGUF into anonymous memory instead of mapping the
+  weights: lower RSS than the .bin there
+- [x] Robustness: ASan+UBSan builds (VNNI and generic, `-O1`): GGUF chat (multi-turn, -r 1, -y),
+  generate at -b 1 / 7 / 512, logits, tokenize: no reports (it found one bug before the commit: the
+  .bin path's `QuantizedTensor.b` left uninitialized by `init_quantized_tensors`, harmless only
+  because fresh malloc memory was zero). A scratch harness (151 corrupted / truncated files x
+  tokenize and generate, both sanitizer builds): magic, version, counts (huge, off by one, 0), key /
+  string / array lengths, value types (unknown, nested array, wrong type), array counts, invalid
+  token / merge strings, every config key out of range or unsupported, tensor dims, shapes, types
+  (F16, Q4_K, unknown), offsets (huge, misaligned, past the end, overlapping), duplicate and
+  missing tensors, NaN / inf weight scales, truncation at 22 offsets from 0 to size - 1, 60
+  random byte flips: 61 runs fine (data-area flips), 241 clean errors, 0 crashes or sanitizer
+  reports
+- [x] Tests (`make test` 238 checks, ~25 s on the busy box, was ~21 s): `gguf/*` group (tokenizer
+  goldens, logits vs HF at -b 64 on 5 prompts and -b 1 on 2, batched vs sequential and threads 8 vs
+  3 bitwise, VNNI vs generic on -b 1 / 7 / 64, the templates) and greedy goldens `gguf_chat`,
+  `gguf_generate`; skipped if the GGUF file is missing. `scripts/download_models.py` now fetches
+  the Q8_0 GGUF by default
+- Notes for Step 6b (Q4_K_M, `Qwen3-0.6B-Q4_K_M.gguf`, 397 MB): tensor types: Q4_K for attn_q /
+  attn_k / attn_output / ffn_gate / ffn_up (all 28 layers) and attn_v / ffn_down in 14 layers; Q6_K
+  for attn_v / ffn_down in the other 14 and for `token_embd` (the tied classifier, 151,936 x 1024);
+  norms F32. Q4_K: super-blocks of 256 (144 bytes: fp16 d, fp16 dmin, 12 bytes of 6-bit scales and
+  mins for 8 sub-blocks of 32, 128 bytes of nibbles), w = d * sc * q - dmin * m. Q6_K: 256 (210
+  bytes: 4 low + 2 high bits per value, 16 int8 scales per 16 values, fp16 d), w = d * sc * (q - 32).
+  Kernels: keep the 4 / 6-bit data packed (decode is bandwidth-bound: ~0.40 vs 0.67 GB per token)
+  and unpack to u8 in registers for `vpdpbusd` (u8 x s8 fits: q in 0..15 / 0..63); the offsets
+  (dmin * m, -32) go through the activation group sums, as the +128 of Q8P does now; per sub-block
+  int32 sums folded with d * sc (activation groups of 32, plus sums per 16 for Q6_K). Requantizing
+  to Q8_0 at load would be simpler but loses accuracy and the bandwidth gain. Embedding rows: Q6_K
+  row dequantized at lookup. mynah-slm's Q4_K_M perplexity is +4.7% over fp32, so the point would
+  be decode speed and RAM
+
 ## Known bugs
 Found by the tests.
 - [x] Tokenizer: no NFC normalizer (HF's tokenizer.json normalizer is NFC); the input was assumed
@@ -332,7 +462,8 @@ Found by the tests.
 ## Plan for the remaining items (in order)
 - [x] Step 4 (usability): chat history across turns, faster sampling, startup (embedding rows from the Q8_0 table): done, see above
 - [x] Step 5: NFC normalizer in the tokenizer: done, see above
-- Step 6: GGUF loading (Q8_0 first, then Q4_K_M)
+- [x] Step 6a: GGUF Q8_0 loading (no export step, no side files): done, see above
+- Step 6b: GGUF Q4_K_M (Q4_K / Q6_K kernels, see the notes in Step 6a)
 - Step 7: performance leftovers (decode barriers / attention split, bf16 KV cache, 16-thread barriers, prefill rest)
 
 ## Later / ideas
@@ -348,5 +479,6 @@ Found by the tests.
 - [x] Perplexity comparison Q4_K_M vs Q8_0 (2026-10-25, `scripts/ppl.py`, BENCHMARKS.md): Voyage of
   the Beagle ch. I, 4,142 tokens, one sequence (= `mynah-slm ppl`): HF fp32 27.571, mynah-slm Q8_0
   27.580 (+0.03%), runq Q8_0 27.805 (+0.85%: int8 activations, group 64), mynah-slm Q4_K_M 28.864
-  (+4.7%); 512-token windows: 31.984 / 32.039 / 32.206 / 34.185 (+6.9% for Q4_K_M)
-- [ ] GGUF loading (Q8_0 / Q4_K_M) without the Python export step
+  (+4.7%); 512-token windows: 31.984 / 32.039 / 32.206 / 34.185 (+6.9% for Q4_K_M). Step 6a: runq
+  on the Q8_0 GGUF (group 32) 27.623 (+0.19%), windows 32.040 (+0.18%)
+- [x] GGUF loading without the Python export step: Q8_0 done (Step 6a); Q4_K_M is Step 6b

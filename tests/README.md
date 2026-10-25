@@ -1,20 +1,25 @@
 # Tests
 
 `make test` (or `tests/run_tests.sh`) builds `./runq` and `./runq-generic` if needed (in parallel)
-and runs everything in about 15 s on the 16-vCPU dev box (~45 runq processes at ~0.06 s startup
-each since Step 4, was ~0.45 s; the box is shared, so the time varies). It needs `models/Qwen3-0.6B-q8.bin`, plus numpy (`.venv/bin/python`
-if present, else the system `python3`). Torch is only needed to regenerate the HF goldens.
+and runs everything in about 25 s on the 16-vCPU dev box (238 checks; ~20 s without the GGUF group;
+the box is shared, so the time varies). It needs `models/Qwen3-0.6B-q8.bin`, plus numpy
+(`.venv/bin/python` if present, else the system `python3`); the `gguf` group and the `gguf_*` greedy
+goldens also `models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (`scripts/download_models.py q8gguf`;
+skipped with a note if it is missing, `GGUF=` to skip). Torch is only needed to regenerate the HF
+goldens.
 
 ```sh
 tests/run_tests.sh                    # all tests, OMP_NUM_THREADS=8 unless set
 tests/run_tests.sh -v                 # + per-position logits metrics and a summary table
-tests/run_tests.sh --only logits      # subset: tokenizer,logits,batched,threads,kernels,greedy,chat
+tests/run_tests.sh --only logits      # subset: tokenizer,logits,batched,threads,kernels,greedy,chat,gguf
+GGUF=other.gguf tests/run_tests.sh    # the gguf group on another Q8_0 GGUF file (GGUF= skips it)
 RUNQ=/path/to/other-binary tests/run_tests.sh   # test another build (no make; kernels test skipped)
 RUNQ=./runq RUNQ_GENERIC=./runq-generic tests/run_tests.sh   # ... with the kernels test
 tests/run_tests.sh --update-greedy    # regenerate the greedy goldens (incl. the chat transcript)
 .venv/bin/python tests/make_golden.py # regenerate the HF goldens (tokenizer + logits, ~15 s)
 .venv/bin/python tests/make_golden.py --tokenizer-only   # only golden/tokenizer.json (~2 s)
 .venv/bin/python tests/fuzz_tokenizer.py                 # on-demand tokenizer fuzz vs HF (~12 s)
+.venv/bin/python tests/fuzz_tokenizer.py --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf   # GGUF tokenizer (~20 s)
 .venv/bin/python tests/fuzz_tokenizer.py --nfc-all       # exhaustive NFC normalizer check vs HF (~8 s)
 .venv/bin/python tools/gen_unicode_tables.py --check-hf  # HF's NFC data vs Unicode 15.1 (~1 s)
 ```
@@ -24,9 +29,12 @@ XPASS = an XFAIL case now passes (remove its mark in `make_golden.py`).
 
 ## Engine hooks (`src/runq.c`)
 
+All hooks work the same on a GGUF file (tokenizer and templates from the file and built in).
+
 - `-m tokenize -i TEXT`: token ids of the raw text (no chat template), space-separated on stdout.
-  Only the checkpoint header and the tokenizer are loaded (no weights). stderr gets
-  `[tokenize] B bytes -> N tokens, encode X ms, tokenizer load Y ms` (encode time only).
+  Only the checkpoint header and the tokenizer are loaded (no weights; GGUF: the metadata), on one
+  thread. stderr gets `[tokenize] B bytes -> N tokens, encode X ms, tokenizer load Y ms` (encode
+  time only).
 - `-m logits -i TEXT -o FILE [-b N]`: writes `int32 n, int32 vocab, int32 ids[n],
   float32 logits[n][vocab]` (row i = logits after token i). `-b 1` feeds the tokens one at a
   time through `forward()` (`forward_sequential`); `-b N > 1` (default 512) uses the batched
@@ -56,6 +64,11 @@ XPASS = an XFAIL case now passes (remove its mark in `make_golden.py`).
 | `greedy/seeded_chat`, `greedy/seeded_generate` | exact stdout of seeded sampling: the `-b 1` run of `seeded_chunks` (`-t 0.8 -p 0.9 -s 42`) and generate at `-t 1.5 -p 0.95 -s 7` (~1-2k top-p candidates per token, nuclei up to ~100 tokens); goldens written by the binary before the top-p heap / vectorized argmax (Step 4), which give the same tokens | `golden/greedy/seeded_*.txt` |
 | `chat/multiturn_golden` | exact stdout of a 3-turn chat piped on stdin (`-t 0 -n 32`) | `golden/greedy/chat_multiturn.txt` |
 | `chat/multiturn_memory` | the turn-2 reply to "What is my name and favourite colour?" mentions `Ada` and `green` (told in turn 1) | |
+| `gguf_tokenizer/*` | the same 84 tokenizer checks on the tokenizer runq builds from the GGUF metadata (token bytes for `nfc_invalid_utf8` from the .bin's `.tokenizer`: identical) | `golden/tokenizer.json` |
+| `gguf_logits/{en,code}`, `gguf_logits_batched/*` | logits vs HF fp32 on the GGUF Q8_0 file, same thresholds: sequential (`-b 1`) on en and code, batched (`-b 64`) on all 5 prompts, pooled metrics | `golden/logits/*.npz` |
+| `gguf_batched/*`, `gguf_threads/bitwise_b7`, `gguf_kernels/*` | GGUF (group size 32 kernels), byte-identical logits: `-b 7` / `-b 64` vs `-b 1` (en, code), OMP_NUM_THREADS 8 vs 3 (en `-b 7`), VNNI vs generic on en `-b 1` (GEMV), en `-b 7` (GEMM 6 + 1 rows), all `-b 64` (2 chunks, 6 + 4 row tiles, all-rows classifier) | sequential / other build |
+| `gguf_template/*` | the built-in chat templates (GGUF) give the same chat token ids as the .bin's `.template*` side files, `-r 0` / `-r 1`, with and without `-y`, and decode to the side file text | `.template*` files |
+| `greedy/gguf_chat`, `greedy/gguf_generate` | exact stdout of `-t 0` chat / generate on the GGUF file (same prompts as `chat`, `generate`) | `golden/greedy/gguf_*.txt` |
 | `chat/multiturn`, `chat/thinking`, `chat/context_full` | multi-turn runs with `RUNQ_CHAT_DUMP`: (1) the decoded KV cache equals the expected chat-template rendering, built in Python from the user lines and the replies on stdout (ChatML, `<|im_end|>\n` after every message, the empty think block before each answer with `-r 0`; with `-r 1` earlier answers without their reasoning, as HF's template renders them); (2) re-encoding that text gives the same ids (piecewise encoding == whole-string encoding); (3) every sampled logits vector is **bit-identical** to the same row of a fresh `-m logits` run on the whole conversation (incremental prefill at `pos0 > 0` and decode vs one batched prefill from 0). `thinking`: `-r 1`, 2 turns, turn 1's reasoning dropped (re-prefill of its answer). `context_full`: `-c 160 -n 30 -y ...`, 6 turns: the oldest turns are dropped (stderr `[context] full`), the system prompt kept | |
 
 Logits metrics, per position, over the union of a fixed 4096-id vocab subset and HF's top-64 ids:
@@ -86,6 +99,9 @@ Since the SwiGLU NaN fix (2026-10-25, see `../TODO.md` Known bugs; it changed th
 unchanged. The batched path gives exactly the same numbers.
 Since the Step 3b attention (pooled numbers unchanged, per-prompt values moved slightly, e.g. en
 top-5 0.907, code top-1 22/24): current per-prompt table in `../BENCHMARKS.md` (Quality).
+The GGUF Q8_0 file (Step 6a, group 32 with fp16 scales) is closer to HF under the same thresholds:
+pooled cos mean 0.99939 (1-cos 6.1e-4 vs 9.0e-4), top-1 79/84, pos 0 cos 0.92-0.98 (per-prompt table
+in `../TODO.md`, Step 6a).
 
 Thresholds (`tests/check.py`): per prompt cos mean >= 0.995, every position >= 1 cos >= 0.98,
 pos 0 cos >= 0.75, top-1 >= 0.75, top-5 >= 0.75; pooled cos mean >= 0.997, pooled top-1 >= 0.85.
@@ -179,7 +195,9 @@ Besides the ids it checks the normalized text directly: the concatenated token b
 HF's NFC normalizer output. It prints the mismatch rate, minimizes the first `--show` mismatches
 (delta debugging) and exits 1 on any.
 Result (Step 5, 2026-10-25): seeds 1 and 2, 5,028 cases each (~2,400 not NFC, 1.25M HF tokens):
-0 mismatches, normalized text identical. Sanity checks: a scratch build with `\s+(?!\S)` disabled
+0 mismatches, normalized text identical. GGUF tokenizer (Step 6a, `--model <gguf>`; `--vocab` = the
+.bin whose `.tokenizer` gives the token bytes): seeds 1 and 2, 5,030 cases each, 1.28M HF tokens: 0
+mismatches; `--nfc-all`: 0 differences. Sanity checks: a scratch build with `\s+(?!\S)` disabled
 gives 27% mismatches, minimized to `'  k'` and `'\t\t4'`; one ignoring NFC blocking 12%, minimized
 to `'a\u0367\u0308'`.
 

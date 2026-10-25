@@ -4,7 +4,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-python3 -m venv .venv
+"${PYTHON:-python3}" -m venv .venv   # (PYTHON=python3.12: numpy 2.3 needs Python >= 3.11)
 .venv/bin/pip install -q --upgrade pip
 .venv/bin/pip install -q --index-url https://download.pytorch.org/whl/cpu torch==2.7.0
 .venv/bin/pip install -q transformers==4.53.0 numpy==2.3.1 Jinja2==3.1.6 safetensors

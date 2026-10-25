@@ -18,6 +18,8 @@
 #endif
 // AVX-512 VNNI kernels (defines RUNQ_VNNI when built for AVX-512 VNNI without -DRUNQ_GENERIC)
 #include "kernels_avx512.h"
+// NEON K-quant kernels (AArch64 with the dot product extension; defines RUNQ_NEON, RUNQ_KQX)
+#include "kernels_neon.h"
 // K-quants (GGUF Q4_K / Q6_K): block formats, repacked layouts, arithmetic, generic kernels
 #include "kquants.h"
 // phase synchronization and the parallel region of a decode step / prefill chunk
@@ -587,9 +589,9 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
             s->bq_c16 = calloc(nb * (s->xs / 16) + 1, sizeof(int32_t));
             s->bh_c16 = calloc(nb * (p->hidden_dim / 16) + 1, sizeof(int32_t));
             if (!s->bq_xf || !s->bh_xf || !s->bq_c16 || !s->bh_c16) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
-#ifdef RUNQ_VNNI
+#ifdef RUNQ_KQX
             int kmax = p->hidden_dim > s->xs ? p->hidden_dim : s->xs;
-            s->kq_scr_bytes = (KQ512_SCRATCH(kmax) + 63) / 64 * 64;
+            s->kq_scr_bytes = (KQX_SCRATCH(kmax) + 63) / 64 * 64;
             s->kq_scr = aligned_alloc(64, s->kq_scr_bytes * s->att_threads);
             if (!s->kq_scr) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
 #endif
@@ -1197,7 +1199,7 @@ void softmax(float *x, int size) {
 // Q8_0 dot product of one weight row with one quantized activation row (n values, n/GS groups):
 // exact int32 sum per group of GS, then accumulated in float, group by group in order.
 // Shared by matmul (GEMV) and matmul_batch (GEMM) so both give bit-identical results.
-static inline float dot_q8(const int8_t *wq, const float *ws, const int8_t *xq, const float *xs, int n) {
+static inline float dot_q8(const int8_t *wq, const float *ws, const int8_t *xq, const float *xs, int n) { RQ_FP_EXACT
     float val = 0;
     for (int j = 0; j <= n - GS; j += GS) {
         int32_t ival = 0;
@@ -1217,10 +1219,14 @@ static inline float dot_q8(const int8_t *wq, const float *ws, const int8_t *xq, 
 static inline void matvec_prep(int32_t *corr, float *xf, int32_t *c16, QuantizedTensor *x, int i0, int n) {
 #ifdef RUNQ_VNNI
     q8p_gemv_corr(corr + i0 / GS, x->q + i0, n, GS);
-    if (c16)
-        kq512_c16(c16 + i0 / 16, x->q + i0, n);
 #else
-    (void)corr; (void)c16;
+    (void)corr;
+#endif
+#ifdef RUNQ_KQX
+    if (c16)
+        kqx_c16(c16 + i0 / 16, x->q + i0, n);
+#else
+    (void)c16;
 #endif
     if (xf)
         kq_act_prep(xf + i0 / GS, x->q + i0, x->s + i0 / GS, n);
@@ -1230,8 +1236,8 @@ static inline void matvec_rows(float *xout, QuantizedTensor *x, const int32_t *c
                                QuantizedTensor *w, int n, int i0, int i1) {
     // xout[i] = W (d,n) row i . x (n,) for i0 <= i < i1 (multiples of 16, as the VNNI blocks)
     if (w->kp) { // Q4_K / Q6_K, 16-row blocks (kquants.h; AVX-512: kernels_avx512.h)
-#ifdef RUNQ_VNNI
-        kq512_gemv_rows(w->type, xout, x->q, x->s, xf, c16, w->kp, n, i0 / KQ_ROWS, i1 / KQ_ROWS);
+#ifdef RUNQ_KQX
+        kqx_gemv_rows(w->type, xout, x->q, x->s, xf, c16, w->kp, n, i0 / KQ_ROWS, i1 / KQ_ROWS);
 #else
         (void)c16;
         for (int i = i0; i < i1; i += KQ_ROWS)
@@ -1265,7 +1271,7 @@ static inline void matvec_rows(float *xout, QuantizedTensor *x, const int32_t *c
 // 4-12 KB here) stays in L1 while all nb activation rows stream past it
 #define MB_ROWS 4
 
-NO_FP_CONTRACT static inline void dot_q8_x4(float *o, const int8_t *w0, const float *s0, int k, const int8_t *xq, const float *xs) {
+NO_FP_CONTRACT static inline void dot_q8_x4(float *o, const int8_t *w0, const float *s0, int k, const int8_t *xq, const float *xs) { RQ_FP_EXACT
     // o[r] = dot_q8(row r of the 4 consecutive W rows at w0, x) for r < 4: each activation value
     // is loaded once for 4 rows (~35% faster than 4 dot_q8 calls). Per output, the same
     // arithmetic in the same order as dot_q8 (see NO_FP_CONTRACT)
@@ -1316,8 +1322,11 @@ static void gemm_plan(Gemm *g, int nj, const MatJob *job, QuantizedTensor *x, in
     for (int j = 0; j < nj; j++) {
         g->job[j] = job[j];
         g->tiled[j] = 0;
+#ifdef RUNQ_KQX
+        g->tiled[j] = job[j].w->kp != NULL;
+#endif
 #ifdef RUNQ_VNNI
-        g->tiled[j] = job[j].w->kp || job[j].w->p;
+        g->tiled[j] |= job[j].w->p != NULL;
 #endif
         all_tiled &= g->tiled[j];
         if (g->tiled[j])
@@ -1325,9 +1334,9 @@ static void gemm_plan(Gemm *g, int nj, const MatJob *job, QuantizedTensor *x, in
     }
     g->nbi = nb;
     g->nchunk = 1;
-#ifdef RUNQ_VNNI
+#if defined RUNQ_VNNI || defined RUNQ_KQX
     if (ntile) {
-        g->nbi = q8p_nb(nb, ntile, nt);
+        g->nbi = kqx_nb(nb, ntile, nt);
         g->nchunk = (nb + g->nbi - 1) / g->nbi;
     }
 #endif
@@ -1349,13 +1358,18 @@ NO_FP_CONTRACT static void gemm_item(const Gemm *g, int it, uint8_t *scr, const 
     const MatJob *jb = &g->job[j];
     QuantizedTensor *w = jb->w, *x = g->x;
     int i = it - g->it0[j], k = g->k, ldx = g->ldx, nb = g->nb;
-#ifdef RUNQ_VNNI
+#if defined RUNQ_VNNI || defined RUNQ_KQX
     if (g->tiled[j]) {
         int t = i / g->nchunk, ch = i % g->nchunk;
-        if (w->kp)
-            kq512_gemm_item(jb->out, jb->ldo, w->kp, w->type, jb->d, t, ch, g->nbi, x->q, x->s, ldx, nb, k, g->xf, g->c16, scr, last);
-        else
-            q8p_gemm_item(jb->out, jb->ldo, w->p, jb->d, t, ch, g->nbi, x->q, x->s, ldx, nb, k, GS, g->corr);
+#ifdef RUNQ_KQX
+        if (w->kp) {
+            kqx_gemm_item(jb->out, jb->ldo, w->kp, w->type, jb->d, t, ch, g->nbi, x->q, x->s, ldx, nb, k, g->xf, g->c16, scr, last);
+            return;
+        }
+#endif
+#ifdef RUNQ_VNNI
+        q8p_gemm_item(jb->out, jb->ldo, w->p, jb->d, t, ch, g->nbi, x->q, x->s, ldx, nb, k, GS, g->corr);
+#endif
         return;
     }
 #endif
@@ -1433,7 +1447,7 @@ static void qk_norm_rope(float *v, int n_heads, const float *norm_w, int head_di
     #define ATT_FMA(a, b, c) ((a) * (b) + (c)) // no fast FMA: rounds differently from AVX-512 builds
 #endif
 
-ATT_EXACT static inline float exp_att(float x) {
+ATT_EXACT static inline float exp_att(float x) { RQ_FP_EXACT
     // the expf of the attention softmax (x <= 0), operation for operation as att512_exp
     x = x > ATT_EXP_MIN ? x : ATT_EXP_MIN;
     float n = rintf(x * ATT_LOG2E);
@@ -1495,7 +1509,7 @@ static inline uint16_t f32_bf16(float f) {
 }
 
 ATT_EXACT static void attention_vec(const float *q, float *out, float *ml, int n, const float *kt, const float *vt,
-                                    size_t ts, int hd, float scale, float *S) {
+                                    size_t ts, int hd, float scale, float *S) { RQ_FP_EXACT
     // one query vector over positions 0..n-1 (n <= ATT_P: one block) of one kv head: kt / vt = its fp32
     // tile 0 of the block (layout in kernels_avx512.h), ts = floats from one tile to the next (ATT_T *
     // head_dim: a block's tiles are contiguous); S: n (rounded up to 16) floats.
@@ -1553,7 +1567,7 @@ ATT_EXACT static void attention_vec(const float *q, float *out, float *ml, int n
             out[i] = out[i] * inv;
 }
 
-ATT_EXACT static void att_combine(float *out, int nb, const float *part, size_t stride, int hd) {
+ATT_EXACT static void att_combine(float *out, int nb, const float *part, size_t stride, int hd) { RQ_FP_EXACT
     // the attention of one query vector from its nb >= 1 block partial results (part + b * stride:
     // o_b[hd], m_b, l_b, block order), see the definition in kernels_avx512.h
     if (nb == 1) {
@@ -1610,6 +1624,9 @@ static void attention_part(int kvt, int nv, const float *const *q, float *const 
     // S: scratch of nv * (b1 - b0) * ATT_P floats
 #ifdef RUNQ_ATT512
     if (att512_ok(hd)) { att512_kv(kvt, nv, q, out, part, np, b0, b1, kt, vt, bs, hd, scale, S); return; }
+#endif
+#ifdef RUNQ_ATTNEON
+    if (kvt == KV_F32 && attn_ok(hd)) { attn_kv(nv, q, out, part, np, b0, b1, kt, vt, bs, hd, scale, S); return; }
 #endif
     // generic C: per block of ATT_P positions (a 16-bit cache converted to fp32 once, for all the
     // vectors), attention_vec per vector

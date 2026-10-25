@@ -1019,7 +1019,7 @@ def test_q4(a, res, tmp):
         for name, chunk in Q4_KERNELS:
             pv = logits_file(q4, qtmp, name, texts[name], chunk)
             same, detail = same_files(pv, logits_file(gen, gentmp, name, texts[name], chunk, GEN_THREADS))
-            res.report(same, f"q4_kernels/{name}_b{chunk}", f"AVX-512 kernels vs generic ({GEN_THREADS} threads), "
+            res.report(same, f"q4_kernels/{name}_b{chunk}", f"SIMD (AVX-512 / NEON) kernels vs generic ({GEN_THREADS} threads), "
                        f"{name} (n={len(read_logits(pv)[0])}) -b {chunk}: {detail}")
     else:
         print("      q4_kernels skipped: no generic build (--generic / RUNQ_GENERIC)")
@@ -1051,7 +1051,7 @@ def test_kv(a, res, tmp):
             for name, chunk in KV_KERNELS:
                 same, detail = same_files(logits_file(v, d, name, texts[name], chunk),
                                           logits_file(gen, gd, name, texts[name], chunk, GEN_THREADS))
-                res.report(same, f"kv_{kv}_kernels/{name}_b{chunk}", f"-k {kv}, AVX-512 vs generic, -b {chunk}: {detail}")
+                res.report(same, f"kv_{kv}_kernels/{name}_b{chunk}", f"-k {kv}, SIMD (AVX-512 / NEON) vs generic, -b {chunk}: {detail}")
 
 
 # ----------------------------------------------------------------------------- main

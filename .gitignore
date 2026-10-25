@@ -8,3 +8,5 @@
 __pycache__/
 *.part
 *.o
+/runq-debug.dSYM/
+/tests/kernels/kq_neon_test

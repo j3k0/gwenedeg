@@ -18,8 +18,8 @@
  * (rq_wait). So a phase ends when its *work* is done, not when every thread has arrived: a thread
  * preempted between phases holds nothing up (it finds the phases done when it runs again, and
  * catches up), only one preempted inside an item does, until it runs again. Waiting threads spin
- * (with pause) for a while (RQ_SPIN_DEC / RQ_SPIN_PF rounds), then sleep on a futex (Linux;
- * elsewhere they yield), so a stall frees their CPUs for the preempted thread and the other
+ * (with pause) for a while (RQ_SPIN_DEC / RQ_SPIN_PF rounds), then sleep on a futex (Linux; macOS
+ * 14.4+: os_sync_wait_on_address; elsewhere they yield), so a stall frees their CPUs for the preempted thread and the other
  * processes; the publisher wakes sleepers only if there are any (no syscall in the common case).
  * Results do not depend on which thread runs an item (each output is computed whole by one thread,
  * as with the static schedules before), so any thread count and any interleaving give the same bits.
@@ -45,6 +45,8 @@
 #if defined(__x86_64__) || defined(__i386__)
     #include <immintrin.h>
     #define rq_relax() _mm_pause()
+#elif defined(__aarch64__)
+    #define rq_relax() __asm__ __volatile__("isb" ::: "memory") // (yield is a nop on Apple cores)
 #else
     #define rq_relax() ((void)0)
 #endif
@@ -56,6 +58,11 @@
     #define RQ_FUTEX 1
 #elif defined(_WIN32)
     #include <windows.h>
+#elif defined(__APPLE__) && __has_include(<os/os_sync_wait_on_address.h>) && \
+      defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && __MAC_OS_X_VERSION_MIN_REQUIRED >= 140400
+    #include <os/os_sync_wait_on_address.h> // (deployment target macOS 14.4+: the futex equivalent)
+    #include <unistd.h>
+    #define RQ_OSSYNC 1
 #else
     #include <sched.h>
     #include <unistd.h>
@@ -93,6 +100,8 @@ static void rq_sleep(int *word, int v) {
     // until *word (probably) differs from v
 #ifdef RQ_FUTEX
     syscall(SYS_futex, word, FUTEX_WAIT_PRIVATE, v, NULL, NULL, 0);
+#elif defined(RQ_OSSYNC)
+    os_sync_wait_on_address(word, (uint64_t)(uint32_t)v, sizeof(int), OS_SYNC_WAIT_ON_ADDRESS_NONE);
 #elif defined(_WIN32)
     (void)word; (void)v;
     SwitchToThread();
@@ -105,6 +114,8 @@ static void rq_sleep(int *word, int v) {
 static void rq_wake(int *word) {
 #ifdef RQ_FUTEX
     syscall(SYS_futex, word, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+#elif defined(RQ_OSSYNC)
+    os_sync_wake_by_address_all(word, sizeof(int), OS_SYNC_WAKE_BY_ADDRESS_NONE);
 #else
     (void)word;
 #endif

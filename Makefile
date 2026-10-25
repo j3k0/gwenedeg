@@ -1,17 +1,29 @@
 # cwayn: Qwen3-0.6B inference in C (engine: src/runq.c, derived from qwen3.c)
 
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+# macOS (Apple clang): no OpenMP needed (threads.h's pthread pool; OpenMP is only used with
+# -DRUNQ_NO_POOL), -O3 -ffast-math = gcc's -Ofast (deprecated in clang). -ffp-contract=on after it:
+# -ffast-math's fp-contract=fast is also a backend option that fuses a * b + c into an FMA across
+# statements and functions whatever the source says, so the exact functions (RQ_FP_EXACT, the
+# arithmetic definitions of kquants.h / the attention) would round differently in each build
+CC      = clang
+CFLAGS  ?= -O3 -ffast-math -ffp-contract=on -Wno-overriding-option -mcpu=native
+DBGFLAGS ?= -g -O0
+else
 CC      = gcc
 # Same flags as upstream qwen3.c's `openmp` target.
 CFLAGS  ?= -Ofast -fopenmp -march=native
 DBGFLAGS ?= -g -O0 -fopenmp
+endif
 CPPFLAGS += -D_FILE_OFFSET_BITS=64
 LDLIBS  += -lm -lpthread
 
 SRC = src/runq.c
-HDR = src/unicode_tables.h src/unicode_nfc.h src/kernels_avx512.h src/kquants.h src/threads.h
+HDR = src/unicode_tables.h src/unicode_nfc.h src/kernels_avx512.h src/kernels_neon.h src/kquants.h src/threads.h
 Q8  = models/Qwen3-0.6B-q8.bin
 
-.PHONY: all debug generic clean test bench bench-prefill models
+.PHONY: all debug generic clean test bench bench-prefill models kq-neon-test
 
 all: runq
 
@@ -29,10 +41,14 @@ runq-generic: $(SRC) $(HDR)
 
 debug: runq-debug
 
+# NEON K-quant kernels (kernels_neon.h) vs the generic ones, on random blocks: bit-identical
+kq-neon-test: tests/kernels/kq_neon_test.c src/kernels_neon.h src/kquants.h
+	$(CC) $(CFLAGS) $< -o tests/kernels/kq_neon_test && tests/kernels/kq_neon_test
+
 generic: runq-generic
 
 clean:
-	rm -f runq runq-debug runq-generic
+	rm -rf runq runq-debug runq-generic runq-debug.dSYM tests/kernels/kq_neon_test
 
 # (run_tests.sh builds runq and runq-generic itself, in parallel)
 test:

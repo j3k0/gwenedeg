@@ -594,6 +594,14 @@ static void kq512_gemm_item(float *out, int ldo, const uint8_t *kp, int type, in
     }
 }
 
+// the K-quant SIMD kernel interface of runq.c (kernels_neon.h implements the same on AArch64)
+#define RUNQ_KQX 1
+#define kqx_c16 kq512_c16
+#define kqx_gemv_rows kq512_gemv_rows
+#define kqx_gemm_item kq512_gemm_item
+#define KQX_SCRATCH KQ512_SCRATCH
+#define kqx_nb q8p_nb
+
 #endif // AVX-512 VNNI
 
 /* ---------------------------------------------------------------------------------------------

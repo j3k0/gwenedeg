@@ -78,6 +78,19 @@
 #include <stdint.h>
 #include <string.h>
 
+// clang has no per-function optimize attribute: the exact functions (the generic kernels here, the
+// attention and Q8_0 dot products in runq.c, the NEON kernels) start their body with RQ_FP_EXACT, which
+// turns off FP contraction and reassociation for that body (-ffast-math otherwise fuses a * b + c into
+// an FMA and vectorizes the in-order float folds). gcc: the KQ_EXACT / ATT_EXACT / NO_FP_CONTRACT
+// attributes do this
+#ifndef RQ_FP_EXACT
+#if defined(__clang__)
+    #define RQ_FP_EXACT _Pragma("clang fp contract(off) reassociate(off)")
+#else
+    #define RQ_FP_EXACT
+#endif
+#endif
+
 #define QK_K 256
 #define Q4_K_BLOCK 144
 #define Q6_K_BLOCK 210
@@ -262,7 +275,7 @@ static void kq_act_prep(float *xf, const int8_t *xq, const float *xs, int n) {
 #endif
 
 KQ_EXACT static void q4p_dot(float *out, size_t ldo, const uint8_t *wb, int k, int nc, const int8_t *xq, size_t ldx,
-                             const float *xs, size_t ldxs, const float *xf, size_t ldxf) {
+                             const float *xs, size_t ldxs, const float *xf, size_t ldxf) { RQ_FP_EXACT
     // out[c * ldo + r] = row r of the 16-row Q4P block wb . activation row c (c < nc <= KQ_NC; row c
     // at xq + c * ldx, its group scales at xs + c * ldxs, its group sums at xf + c * ldxf)
     float val[KQ_NC][KQ_ROWS];
@@ -309,7 +322,7 @@ KQ_EXACT static void q4p_dot(float *out, size_t ldo, const uint8_t *wb, int k, i
 }
 
 KQ_EXACT static void q6p_dot(float *out, size_t ldo, const uint8_t *wb, int k, int nc, const int8_t *xq, size_t ldx,
-                             const float *xs, size_t ldxs) {
+                             const float *xs, size_t ldxs) { RQ_FP_EXACT
     // the same for a Q6P block (no xf: the -32 is applied in int32)
     float val[KQ_NC][KQ_ROWS];
     memset(val, 0, sizeof(val));

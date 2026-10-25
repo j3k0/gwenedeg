@@ -6,8 +6,8 @@ Every file is checked: LFS files by sha256, small files by their git blob sha1.
 Interrupted downloads resume from the partial .part file.
 
 Usage:
-    scripts/download_models.py                 # default sets: hf q4km
-    scripts/download_models.py hf q4km q8gguf  # pick sets explicitly
+    scripts/download_models.py                 # default sets: hf q4km q8gguf
+    scripts/download_models.py q8gguf          # pick sets explicitly (runq loads this GGUF directly)
     scripts/download_models.py --list
 
 Files go to models/<set-dir>/ (override with --dest or $CWAYN_MODELS).
@@ -44,12 +44,13 @@ SETS = {
     "q4km": ("unsloth/Qwen3-0.6B-GGUF", "50968a4468ef4233ed78cd7c3de230dd1d61a56b", "Qwen3-0.6B-GGUF", [
         ("Qwen3-0.6B-Q4_K_M.gguf", 396705472, "sha256", "ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a"),
     ]),
-    # Q8_0 GGUF from the same repo, for quality/speed comparisons with GGUF-based engines.
+    # Q8_0 GGUF from the same repo: runq loads it directly (no export step); also used by the tests
+    # and for comparisons with GGUF-based engines.
     "q8gguf": ("unsloth/Qwen3-0.6B-GGUF", "50968a4468ef4233ed78cd7c3de230dd1d61a56b", "Qwen3-0.6B-GGUF", [
         ("Qwen3-0.6B-Q8_0.gguf", 639447744, "sha256", "e150ed544dfe6016930c026a93913a5e3184181ebfe6ab2223ae01dd0491784c"),
     ]),
 }
-DEFAULT_SETS = ["hf", "q4km"]
+DEFAULT_SETS = ["hf", "q4km", "q8gguf"]
 CHUNK = 1 << 20
 
 

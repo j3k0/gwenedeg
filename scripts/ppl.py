@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Perplexity of a text under HF fp32, runq (Q8_0) and mynah-slm (GGUF), same token ids.
 
-Usage: .venv/bin/python scripts/ppl.py TEXT [--hf] [--runq] [--mynah GGUF ...] [-w 512] [-t 8]
+Usage: .venv/bin/python scripts/ppl.py TEXT [--hf] [--runq] [--runq-model M ...] [--mynah GGUF ...] [-w 512] [-t 8]
   (no engine flag = all: --hf --runq and mynah-slm on the Q8_0 and Q4_K_M GGUFs if built)
+  --runq-model: checkpoints for runq (.bin or GGUF; repeatable; default the Q8_0 .bin), implies --runq
 
 Two protocols, both teacher-forced, raw text (no chat template, no BOS: Qwen3 has none):
   full   the whole text as one sequence, every token after the first scored (N-1 predictions).
@@ -53,13 +54,13 @@ def hf_engine(threads):
     return score
 
 
-def runq_engine(tmp, threads, binary):
+def runq_engine(tmp, threads, binary, model):
     env = dict(os.environ, OMP_NUM_THREADS=str(threads))
 
     def score(ids, text):
         out = os.path.join(tmp, "logits.bin")
         ctx = max(64, len(ids) + 16)
-        subprocess.run([binary, Q8BIN, "-c", str(ctx), "-m", "logits", "-i", text, "-o", out],
+        subprocess.run([binary, model, "-c", str(ctx), "-m", "logits", "-i", text, "-o", out],
                        check=True, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         n, vocab = (int(v) for v in np.fromfile(out, dtype=np.int32, count=2))
         got = np.fromfile(out, dtype=np.int32, count=n, offset=8)
@@ -101,12 +102,15 @@ def main():
     ap.add_argument("text")
     ap.add_argument("--hf", action="store_true")
     ap.add_argument("--runq", action="store_true")
+    ap.add_argument("--runq-model", action="append", metavar="M", help="runq checkpoint (.bin or GGUF), repeatable")
     ap.add_argument("--mynah", nargs="*", metavar="GGUF")
     ap.add_argument("-w", "--window", type=int, default=512)
     ap.add_argument("-t", "--threads", type=int, default=8)
     ap.add_argument("--runq-bin", default=os.path.join(ROOT, "runq"))
     ap.add_argument("--no-full", action="store_true", help="only the windowed protocol")
     a = ap.parse_args()
+    if a.runq_model:
+        a.runq = True
     if not (a.hf or a.runq or a.mynah is not None):
         a.hf = a.runq = True
         a.mynah = [] if os.access(MYNAH, os.X_OK) else None
@@ -126,8 +130,8 @@ def main():
     engines = []
     if a.hf:
         engines.append(("HF fp32", "hf", hf_engine(a.threads)))
-    if a.runq:
-        engines.append(("runq Q8_0", "runq", runq_engine(tmp, a.threads, a.runq_bin)))
+    for m in (a.runq_model or [Q8BIN]) if a.runq else []:
+        engines.append((f"runq {os.path.basename(m)}", "runq", runq_engine(tmp, a.threads, a.runq_bin, m)))
     for g in a.mynah or []:
         engines.append((f"mynah-slm {os.path.basename(g)}", "mynah", mynah_engine(tmp, a.threads, g)))
     try:

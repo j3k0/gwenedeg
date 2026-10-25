@@ -11,7 +11,8 @@ Tests (see tests/README.md):
   kernels    logits bit-identical for the AVX-512 kernels (runq: VNNI GEMM/GEMV, attention) and the
              generic C ones (runq-generic, -DRUNQ_GENERIC): GEMV (-b 1) and GEMM (-b 7, -b 64) paths
   greedy     runq -t 0 output vs our own golden text  (tests/golden/greedy/*.txt), with the
-             default batched prefill (and -b 5 once); seeded -t 0.8 chat equal for -b 1 and 5
+             default batched prefill (and -b 5 once); seeded -t 0.8 chat equal for -b 1 and 5;
+             seeded sampling goldens (chat -t 0.8 -p 0.9, generate -t 1.5 -p 0.95)
   chat       multi-turn chat from piped stdin (-t 0): transcript golden, memory across turns, and the
              KV cache conversation (RUNQ_CHAT_DUMP) == the chat-template rendering, its logits
              bit-identical to a fresh -m logits run on it; also -r 1 (reasoning dropped from the
@@ -89,6 +90,10 @@ GREEDY_CASES = [
 # prompt token, as before batched prefill)
 SEEDED_ARGS = ["-m", "chat", "-n", "40", "-t", "0.8", "-s", "42", "-c", CTX, "-i", "Tell me about cats."]
 SEEDED_CHUNKS = [1, 5]  # token by token vs 2 chunks (-b 64 runs the same code)
+# seeded sampling goldens (golden/greedy/<name>.txt): the -b 1 run of SEEDED_ARGS, and generate at a
+# high temperature (~1-2k top-p candidates per token, nuclei of up to ~100 tokens)
+SEEDED_GEN_ARGS = ["-m", "generate", "-n", "40", "-t", "1.5", "-p", "0.95", "-s", "7", "-c", CTX,
+                   "-i", "Once upon a time, in a small village by the sea,"]
 THREADS_PROMPT = "en"
 # VNNI vs generic kernels: (prompt, -b). -b 1 on en: GEMV (decode path, incl. the classifier);
 # -b 7 on en (15 tokens): GEMM tiles of 6 + 1 rows, last chunk 1 row; -b 64 on all (86 tokens,
@@ -425,19 +430,38 @@ def test_greedy(a, res):
                        f"      --- golden ---\n{want}\n      --- runq ---\n{got}\n"
                        f"      (if the numerics changed on purpose and logits/* pass: "
                        f"tests/run_tests.sh --update-greedy)")
-    if a.update_greedy:
-        return
     outs = {}
-    for chunk in SEEDED_CHUNKS:
+    for chunk in SEEDED_CHUNKS[:1] if a.update_greedy else SEEDED_CHUNKS:
         p = run([a.runq, a.model, "-b", str(chunk)] + SEEDED_ARGS)
         if p.returncode != 0:
             raise RuntimeError(f"runq failed: {p.stderr.decode(errors='replace')[-500:]}")
         outs[chunk] = p.stdout
     ref = outs[SEEDED_CHUNKS[0]]
-    bad = [c for c in SEEDED_CHUNKS if outs[c] != ref]
-    res.report(not bad, "greedy/seeded_chunks",
-               f"chat -t 0.8 -s 42, -b {'/'.join(map(str, SEEDED_CHUNKS))}: " +
-               ("identical" if not bad else f"-b {bad} differ from -b {SEEDED_CHUNKS[0]}"))
+    if not a.update_greedy:
+        bad = [c for c in SEEDED_CHUNKS if outs[c] != ref]
+        res.report(not bad, "greedy/seeded_chunks",
+                   f"chat -t 0.8 -s 42, -b {'/'.join(map(str, SEEDED_CHUNKS))}: " +
+                   ("identical" if not bad else f"-b {bad} differ from -b {SEEDED_CHUNKS[0]}"))
+    p = run([a.runq, a.model] + SEEDED_GEN_ARGS)
+    if p.returncode != 0:
+        raise RuntimeError(f"runq failed: {p.stderr.decode(errors='replace')[-500:]}")
+    for name, out, what in [("seeded_chat", ref, "chat -t 0.8 -p 0.9 -s 42"),
+                            ("seeded_generate", p.stdout, "generate -t 1.5 -p 0.95 -s 7")]:
+        path = os.path.join(d, name + ".txt")
+        got = out.decode("utf-8", errors="replace")
+        if a.update_greedy:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(got)
+            print(f"UPDATED greedy/{name} -> {os.path.relpath(path, ROOT)}")
+            continue
+        want = open(path, encoding="utf-8", newline="").read() if os.path.exists(path) else None
+        if got == want:
+            res.report(True, f"greedy/{name}", what)
+        else:
+            i = first_diff(got, want or "")
+            res.report(False, f"greedy/{name}", f"{what}: " + ("no golden; run tests/run_tests.sh --update-greedy"
+                       if want is None else f"REGRESSION (sampling): differs at char {i}: golden "
+                       f"{want[i:i + 20]!r} vs runq {got[i:i + 20]!r}\n      --- runq ---\n{got}"))
 
 
 # ----------------------------------------------------------------------------- chat (multi-turn)

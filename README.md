@@ -80,6 +80,8 @@ Revisions are pinned. Each file is verified by sha256 (LFS files) or git blob sh
   a rewritten tokenizer matching HF (added tokens, Qwen2 pre-tokenizer regex, byte-level BPE
   with a hash map and a merge heap; ~1 ms for 2,000 tokens; input assumed NFC);
   multi-turn chat with the conversation in the KV cache (see Chat above);
+  faster sampling (top-p: vectorized candidate scan + a heap popped only for the nucleus; argmax
+  vectorized; same tokens for the same seed);
   test hooks `-m tokenize`, `-m logits -o <file>` and `RUNQ_CHAT_DUMP` (see `tests/README.md`).
 - `src/kernels_avx512.h`: the AVX-512 VNNI Q8_0 GEMM / GEMV and the weight repacking, and the
   fp32 attention with the KV cache layout (layouts, arithmetic and bit-identity argument in its

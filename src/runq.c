@@ -1602,16 +1602,25 @@ typedef struct {
 } Sampler;
 
 int sample_argmax(float *probabilities, int n) {
-    // return the index that has the highest probability
-    int max_i = 0;
+    // return the index that has the highest probability: the first one holding the maximum (as the
+    // original scalar loop with a strict >). Two passes that vectorize, the maximum (exact in any
+    // order) and the search for its first occurrence: ~125 -> ~20 us per token on 151,936 logits
     float max_p = probabilities[0];
-    for (int i = 1; i < n; i++) {
-        if (probabilities[i] > max_p) {
-            max_i = i;
-            max_p = probabilities[i];
-        }
+    for (int i = 1; i < n; i++)
+        max_p = probabilities[i] > max_p ? probabilities[i] : max_p;
+    int i = 0;
+#if defined(__AVX512F__) && !defined(RUNQ_GENERIC)
+    __m512 m = _mm512_set1_ps(max_p);
+    for (; i + 16 <= n; i += 16) {
+        __mmask16 k = _mm512_cmp_ps_mask(_mm512_loadu_ps(probabilities + i), m, _CMP_EQ_OQ);
+        if (k)
+            return i + __builtin_ctz(k);
     }
-    return max_i;
+#endif
+    for (; i < n; i++)
+        if (probabilities[i] == max_p)
+            return i;
+    return 0;
 }
 
 int sample_mult(float *probabilities, int n, float coin) {
@@ -1626,12 +1635,62 @@ int sample_mult(float *probabilities, int n, float coin) {
     return n - 1; // in case of rounding errors
 }
 
-int compare(const void *a, const void *b) {
-    ProbIndex *a_ = (ProbIndex *) a;
-    ProbIndex *b_ = (ProbIndex *) b;
-    if (a_->prob > b_->prob) return -1;
-    if (a_->prob < b_->prob) return 1;
-    return 0;
+static inline int topp_before(const ProbIndex *a, const ProbIndex *b) {
+    // nucleus order: higher probability first, lower index first on ties. (The old code sorted the
+    // candidates, collected in index order, with qsort on the probability only: glibc's qsort is a
+    // stable merge sort at these sizes (checked on glibc 2.41), so ties came out by index too)
+    return a->prob > b->prob || (a->prob == b->prob && a->index < b->index);
+}
+
+static void topp_sift_down(ProbIndex *h, int n, int i) {
+    // max-heap (topp_before order) of h[0..n): restore the heap property below i
+    ProbIndex x = h[i];
+    for (;;) {
+        int l = 2 * i + 1;
+        if (l >= n) break;
+        int m = l + 1 < n && topp_before(&h[l + 1], &h[l]) ? l + 1 : l;
+        if (!topp_before(&h[m], &x)) break;
+        h[i] = h[m];
+        i = m;
+    }
+    h[i] = x;
+}
+
+static int topp_candidates(const float *p, int n, float cutoff, ProbIndex *out) {
+    // the (prob, index) of every p[i] >= cutoff, in index order; returns their count. They are few
+    // (median ~40 of 151,936 at -t 0.8 -p 0.9), so the scan looks for blocks holding any
+    int n0 = 0, i = 0;
+#if defined(__AVX512F__) && !defined(RUNQ_GENERIC)
+    __m512 c = _mm512_set1_ps(cutoff);
+    for (; i + 16 <= n; i += 16) // one compare per 16 values, then the set bits
+        for (__mmask16 m = _mm512_cmp_ps_mask(_mm512_loadu_ps(p + i), c, _CMP_GE_OQ); m; m &= m - 1) {
+            int j = i + __builtin_ctz(m);
+            out[n0].index = j;
+            out[n0].prob = p[j];
+            n0++;
+        }
+#else
+    for (; i + 64 <= n; i += 64) { // blocks of 64: their max in a loop gcc vectorizes, then a scan
+        float m = p[i];
+        for (int j = 1; j < 64; j++)
+            m = p[i + j] > m ? p[i + j] : m;
+        if (!(m >= cutoff))
+            continue;
+        for (int j = i; j < i + 64; j++)
+            if (p[j] >= cutoff) {
+                out[n0].index = j;
+                out[n0].prob = p[j];
+                n0++;
+            }
+    }
+#endif
+    for (; i < n; i++)
+        if (p[i] >= cutoff) {
+            out[n0].index = i;
+            out[n0].prob = p[i];
+            n0++;
+        }
+    return n0;
 }
 
 int sample_topp(float *probabilities, int n, float topp, ProbIndex *probindex, float coin) {
@@ -1639,26 +1698,27 @@ int sample_topp(float *probabilities, int n, float topp, ProbIndex *probindex, f
     // tokens that exceed probability topp. This way we never sample tokens that
     // have very low probabilities and are less likely to go "off the rails".
     // coin is a random number in [0, 1), usually from random_f32()
-
-    int n0 = 0;
-    // quicksort indices in descending order of probabilities
-    // values smaller than (1 - topp) / (n - 1) cannot be part of the result
-    // so for efficiency we crop these out as candidates before sorting
+    // Values smaller than (1 - topp) / (n - 1) cannot be part of the result, so only the others
+    // are candidates. They are not sorted (was: qsort, ~5 ms at -t 2 with ~44k candidates): a
+    // max-heap of them is popped only until the nucleus is complete (heapify O(n0), then
+    // O(log n0) per nucleus token). The same order (topp_before), the same sums in the same order,
+    // so the same token for the same coin as the old full sort.
     const float cutoff = (1.0f - topp) / (n - 1);
-    for (int i = 0; i < n; i++) {
-        if (probabilities[i] >= cutoff) {
-            probindex[n0].index = i;
-            probindex[n0].prob = probabilities[i];
-            n0++;
-        }
-    }
-    qsort(probindex, n0, sizeof(ProbIndex), compare);
+    int n0 = topp_candidates(probabilities, n, cutoff, probindex);
+    for (int i = n0 / 2 - 1; i >= 0; i--)
+        topp_sift_down(probindex, n0, i);
 
-    // truncate the list where cumulative probability exceeds topp
+    // pop the candidates in order (the i-th one lands at probindex[n0 - 1 - i]) until the
+    // cumulative probability exceeds topp
     float cumulative_prob = 0;
     int last_idx = n0 - 1; // in case of rounding errors consider all elements
     for (int i = 0; i < n0; i++) {
-        cumulative_prob += probindex[i].prob;
+        int h = n0 - i; // heap size
+        ProbIndex top = probindex[0];
+        probindex[0] = probindex[h - 1];
+        probindex[h - 1] = top;
+        topp_sift_down(probindex, h - 1, 0);
+        cumulative_prob += top.prob;
         if (cumulative_prob > topp) {
             last_idx = i;
             break; // we've exceeded topp by including last_idx
@@ -1669,11 +1729,11 @@ int sample_topp(float *probabilities, int n, float topp, ProbIndex *probindex, f
     float r = coin * cumulative_prob;
     float cdf = 0;
     for (int i = 0; i <= last_idx; i++) {
-        cdf += probindex[i].prob;
+        cdf += probindex[n0 - 1 - i].prob;
         if (r < cdf)
-            return probindex[i].index;
+            return probindex[n0 - 1 - i].index;
     }
-    return probindex[last_idx].index; // in case of rounding errors
+    return probindex[n0 - 1 - last_idx].index; // in case of rounding errors
 }
 
 void build_sampler(Sampler *sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {

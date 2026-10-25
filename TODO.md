@@ -215,6 +215,28 @@ Before (Step 3a, 8 threads, -b 128): 451 tokens: GEMMs 43%, attention 42%, rest 
   `\n` after `<|im_end|>` missing. `-b 1` / `7` / `512`: same transcripts. ASan+UBSan: multi-turn
   with `-c 256` (cut replies, dropped turns, a skipped message), `-r 1`, `-b 1/7/512`: clean (one
   `memcpy(NULL, ..., 0)` in the new code fixed)
+- [x] Faster sampling. The "sorts the whole vocab" premise was off: top-p already kept only the
+  candidates with p >= (1 - p) / (n - 1) (llama2.c), median ~40 of 151,936 at -t 0.8 -p 0.9 (max
+  ~1,300; ~44k at -t 2). The cost was the scalar candidate scan (~90 us), qsort (up to 5 ms at -t 2)
+  and, at -t 0, a scalar argmax (~125 us). Now: candidate scan one AVX-512 compare per 16 values
+  (generic build: blocks of 64 with a vectorized max), a max-heap of the candidates popped only until
+  the nucleus is complete (O(n0 + K log n0)), argmax as a vectorized max + first-occurrence search.
+  Identical results: same order (prob desc, index asc on ties: the old qsort is glibc's stable merge
+  sort at these sizes, checked on glibc 2.41; ties do occur in nuclei at -t 2, and a reversed tie
+  order changes the output), same sums in the same order. Checked: 120 seeded runs (12 seeds x
+  -t/-p 0.8/0.9, 1.0/0.95, 1.5/0.5, 0.6/0.99, 2.0/0.9, chat and generate, 80 tokens) byte-identical
+  to the old binary, also the generic build; a harness on 112 real logits vectors x 10 coins per
+  setting: same tokens; argmax vs the old loop on those + 200k random arrays with ties / signed
+  zeros. Per call (harness, hot cache): top-p part 102 -> 13 us (-t 0.8 -p 0.9), 141 -> 23
+  (1.0/0.95), 283 -> 49 (1.5/0.5), 5,066 -> 1,530 (2.0/0.9). In the engine (decode, 8 or 12
+  threads; logits cold, written by the classifier threads): -t 0 126 -> 21 us per token, -t 0.8
+  -p 0.9 ~220-270 -> ~130, -t 1 -p 0.9 ~320 -> ~150, i.e. ~0.1 ms of ~5.3 ms per token (~+2% decode
+  at ~190 tok/s; end-to-end tok/s on the shared box, load 4-11, varied by +-20% and could not
+  resolve it). The rest at -t > 0 is the temperature scale and the softmax (~110 us cold, ~80 hot),
+  which gcc already vectorizes (libmvec 16-wide `expf`, vector max / sum / scale); making it
+  faster would mean splitting the exp pass over threads with the sum kept in gcc's exact order: not
+  done. Tests: seeded goldens `greedy/seeded_chat` (-t 0.8 -p 0.9) and `greedy/seeded_generate`
+  (-t 1.5 -p 0.95), generated with the old binary
 
 ## Known bugs
 Found by the tests.
@@ -256,6 +278,5 @@ Found by the tests.
   27.580 (+0.03%), runq Q8_0 27.805 (+0.85%: int8 activations, group 64), mynah-slm Q4_K_M 28.864
   (+4.7%); 512-token windows: 31.984 / 32.039 / 32.206 / 34.185 (+6.9% for Q4_K_M)
 - [ ] GGUF loading (Q8_0 / Q4_K_M) without the Python export step
-- [ ] Faster sampling (top-p currently sorts the whole vocab)
 - [ ] Startup ~0.45 s per process (~55 ms of it the VNNI weight repacking), mostly page faults for the dequantized embedding table (~620 MB
   of floats; parallelizing the dequantize didn't help): look up rows from the Q8_0 table instead

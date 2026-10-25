@@ -157,7 +157,7 @@ typedef struct {
 
 // ----------------------------------------------------------------------------
 // GGUF files (llama.cpp's format, versions 2 and 3), read directly: hyperparameters and tokenizer
-// from the metadata, Q8_0 / F32 tensors from the mapped file. Layout (little-endian):
+// from the metadata, Q8_0 / Q4_K / Q6_K / F32 tensors from the mapped file. Layout (little-endian):
 //   "GGUF", u32 version, u64 n_tensors, u64 n_kv;
 //   n_kv x (string key, u32 value type, value); string = u64 length + bytes (no NUL); array =
 //     u32 element type, u64 count, the elements (no nested arrays here);
@@ -399,7 +399,7 @@ static const uint8_t *gguf_weight(const Gguf *g, const char *name, uint32_t type
 static void gguf_config(const Gguf *g, Config *c) {
     // the hyperparameters from the metadata (llama.cpp's qwen3 keys), checked against what this
     // engine implements: Qwen3 with RoPE theta 1e6 and RMSNorm eps 1e-6 (constants in rope_row /
-    // rmsnorm), Q8_0 weights
+    // rmsnorm); Q8_0 / Q4_K / Q6_K weights (gguf_matrices)
     uint64_t n;
     const char *arch = gguf_get_str(g, "general.architecture", &n);
     if (!arch || n != 5 || memcmp(arch, "qwen3", 5)) {
@@ -988,7 +988,7 @@ void prepare_weights(TransformerWeights *w, Config *p, int fd) {
 
 void read_checkpoint(char *checkpoint, Config *config, TransformerWeights* weights, float** data, ssize_t* file_size, int ctx_length,
                      Gguf *gguf) {
-    // a qwen3.c .bin checkpoint or a GGUF file (Q8_0), by magic; gguf->map stays NULL for a .bin
+    // a qwen3.c .bin checkpoint or a GGUF file (Q8_0, Q4_K_M), by magic; gguf->map stays NULL for a .bin
     FILE *file = fopen(checkpoint, "rb");
     if (!file) { fprintf(stderr, "Couldn't open checkpoint %s\n", checkpoint); exit(EXIT_FAILURE); }
 

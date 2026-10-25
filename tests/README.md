@@ -1,23 +1,28 @@
 # Tests
 
 `make test` (or `tests/run_tests.sh`) builds `./runq` and `./runq-generic` if needed (in parallel)
-and runs everything in about 25 s on the 16-vCPU dev box (238 checks; ~20 s without the GGUF group;
-the box is shared, so the time varies). It needs `models/Qwen3-0.6B-q8.bin`, plus numpy
+and runs everything in about 30 s on the 16-vCPU dev box (265 checks; ~20 s without the GGUF and Q4
+groups; the box is shared, so the time varies). It needs `models/Qwen3-0.6B-q8.bin`, plus numpy
 (`.venv/bin/python` if present, else the system `python3`); the `gguf` group and the `gguf_*` greedy
 goldens also `models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (`scripts/download_models.py q8gguf`;
-skipped with a note if it is missing, `GGUF=` to skip). Torch is only needed to regenerate the HF
-goldens.
+skipped with a note if it is missing, `GGUF=` to skip), the `q4` group and the `q4_*` greedy goldens
+`models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf` (`scripts/download_models.py q4km`; `Q4=` to skip).
+Torch is only needed to regenerate the HF goldens, the `gguf` package (`pip install gguf`, e.g. in a
+scratch venv) only for the Q4_K_M goldens.
 
 ```sh
 tests/run_tests.sh                    # all tests, OMP_NUM_THREADS=8 unless set
 tests/run_tests.sh -v                 # + per-position logits metrics and a summary table
-tests/run_tests.sh --only logits      # subset: tokenizer,logits,batched,threads,kernels,greedy,chat,gguf
+tests/run_tests.sh --only logits      # subset: tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4
 GGUF=other.gguf tests/run_tests.sh    # the gguf group on another Q8_0 GGUF file (GGUF= skips it)
+Q4= tests/run_tests.sh                # without the Q4_K_M group
 RUNQ=/path/to/other-binary tests/run_tests.sh   # test another build (no make; kernels test skipped)
 RUNQ=./runq RUNQ_GENERIC=./runq-generic tests/run_tests.sh   # ... with the kernels test
 tests/run_tests.sh --update-greedy    # regenerate the greedy goldens (incl. the chat transcript)
 .venv/bin/python tests/make_golden.py # regenerate the HF goldens (tokenizer + logits, ~15 s)
 .venv/bin/python tests/make_golden.py --tokenizer-only   # only golden/tokenizer.json (~2 s)
+.venv/bin/python tests/make_golden.py --q4ref --gguf-py DIR   # only golden/logits_q4 (~20 s; DIR holds the gguf package)
+python3 tests/make_dequant_golden.py  # golden/dequant/q4_k_m.npz (needs numpy + gguf, no torch; ~1 s)
 .venv/bin/python tests/fuzz_tokenizer.py                 # on-demand tokenizer fuzz vs HF (~12 s)
 .venv/bin/python tests/fuzz_tokenizer.py --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf   # GGUF tokenizer (~20 s)
 .venv/bin/python tests/fuzz_tokenizer.py --nfc-all       # exhaustive NFC normalizer check vs HF (~8 s)
@@ -45,6 +50,11 @@ All hooks work the same on a GGUF file (tokenizer and templates from the file an
   (`int32 n, int32 vocab, int32 pos[n], float32 logits[n][vocab]`: every logits vector chat
   sampled from, `pos` = position of the token that produced it; records of positions that a
   re-prefill overwrote are dropped, so they always match the final cache).
+- `-m dequant -i NAME[:ROW0[:NROWS]] -o FILE` (GGUF only): rows of the matrix NAME (llama.cpp tensor
+  name, e.g. `blk.0.attn_q.weight`, `token_embd.weight`) dequantized from the file's blocks (the
+  embedding lookup's code) and, for Q4_K / Q6_K, also from the repacked Q4P / Q6P weights the
+  matmul kernels read. `int32 nrows, ncols, npacked, float32 blocks[nrows][ncols]`, then
+  `float32 repacked[nrows][ncols]` if npacked is 1.
 ## What is checked
 
 | test | what | golden |
@@ -69,6 +79,11 @@ All hooks work the same on a GGUF file (tokenizer and templates from the file an
 | `gguf_batched/*`, `gguf_threads/bitwise_b7`, `gguf_kernels/*` | GGUF (group size 32 kernels), byte-identical logits: `-b 7` / `-b 64` vs `-b 1` (en, code), OMP_NUM_THREADS 8 vs 3 (en `-b 7`), VNNI vs generic on en `-b 1` (GEMV), en `-b 7` (GEMM 6 + 1 rows), all `-b 64` (2 chunks, 6 + 4 row tiles, all-rows classifier) | sequential / other build |
 | `gguf_template/*` | the built-in chat templates (GGUF) give the same chat token ids as the .bin's `.template*` side files, `-r 0` / `-r 1`, with and without `-y`, and decode to the side file text | `.template*` files |
 | `greedy/gguf_chat`, `greedy/gguf_generate` | exact stdout of `-t 0` chat / generate on the GGUF file (same prompts as `chat`, `generate`) | `golden/greedy/gguf_*.txt` |
+| `q4_dequant/*` | Q4_K_M: 2 rows each of blk.0.attn_q, blk.3.ffn_down (Q4_K, 1024 / 3072 columns), blk.0.attn_v, blk.27.ffn_down, token_embd (Q6_K), across a 16-row block boundary, `-m dequant`: from the blocks and from the repacked layout, both bit-identical to gguf-py's `dequantize` | `golden/dequant/q4_k_m.npz` |
+| `q4_logits_batched/*` | Q4_K_M logits vs HF fp32 (-b 64, 5 prompts, pooled), loose Q4 thresholds (below) | `golden/logits/*.npz` |
+| `q4_ref_batched/*`, `q4_ref/en` | Q4_K_M logits vs the Q4 reference: HF fp32 with the GGUF's weights dequantized by gguf-py (-b 64 on 5 prompts + pooled; -b 1 on en), tight thresholds | `golden/logits_q4/*.npz` |
+| `q4_batched/en_b7`, `_b64`, `q4_threads/bitwise_b7`, `q4_kernels/en_b1`, `en_b7` | Q4_K_M byte-identical logits: -b 7 / 64 vs -b 1, OMP_NUM_THREADS 8 vs 3, `./runq` vs `./runq-generic` (both on the generic K-quant kernels until Step 6b-2) | sequential / other build |
+| `greedy/q4_chat`, `greedy/q4_generate` | exact stdout of `-t 0 -n 24` chat / generate on the Q4_K_M file | `golden/greedy/q4_*.txt` |
 | `chat/multiturn`, `chat/thinking`, `chat/context_full` | multi-turn runs with `RUNQ_CHAT_DUMP`: (1) the decoded KV cache equals the expected chat-template rendering, built in Python from the user lines and the replies on stdout (ChatML, `<|im_end|>\n` after every message, the empty think block before each answer with `-r 0`; with `-r 1` earlier answers without their reasoning, as HF's template renders them); (2) re-encoding that text gives the same ids (piecewise encoding == whole-string encoding); (3) every sampled logits vector is **bit-identical** to the same row of a fresh `-m logits` run on the whole conversation (incremental prefill at `pos0 > 0` and decode vs one batched prefill from 0). `thinking`: `-r 1`, 2 turns, turn 1's reasoning dropped (re-prefill of its answer). `context_full`: `-c 160 -n 30 -y ...`, 6 turns: the oldest turns are dropped (stderr `[context] full`), the system prompt kept | |
 
 Logits metrics, per position, over the union of a fixed 4096-id vocab subset and HF's top-64 ids:
@@ -103,9 +118,21 @@ The GGUF Q8_0 file (Step 6a, group 32 with fp16 scales) is closer to HF under th
 pooled cos mean 0.99939 (1-cos 6.1e-4 vs 9.0e-4), top-1 79/84, pos 0 cos 0.92-0.98 (per-prompt table
 in `../TODO.md`, Step 6a).
 
+Q4_K_M (Step 6b-1; per-prompt table in `../TODO.md`): vs HF, pooled cos 0.98402 (1-cos 1.6e-2, ~25x
+Q8_0), top-1 69/84, per-prompt cos mean 0.967-0.992, every position >= 0.940, pos 0 0.35-0.46. That
+is the 4-bit weights' own error: HF fp32 with the GGUF's weights dequantized (the "Q4 reference",
+`make_golden.py --q4ref`) gives pooled cos 0.98459, top-1 67/84 against HF. runq vs the Q4 reference:
+pooled cos 0.99954 (1-cos 4.6e-4), top-1 81/84, cos mean >= 0.99883, min >= 0.99677, pos 0 >= 0.9977:
+the int8 activations only, the Q8_0-vs-HF level. So the HF comparison is a loose sanity bound and the
+reference comparison the sensitive one.
+
 Thresholds (`tests/check.py`): per prompt cos mean >= 0.995, every position >= 1 cos >= 0.98,
 pos 0 cos >= 0.75, top-1 >= 0.75, top-5 >= 0.75; pooled cos mean >= 0.997, pooled top-1 >= 0.85.
 Logits must be finite. That is about 3x the baseline error (1 - cos) for means, 5x per position.
+Q4_K_M vs HF (`TH_Q4_HF`, ~2x its baseline error): cos mean >= 0.94, every position >= 0.85, pos 0 >=
+0.10, top-1 and top-5 >= 0.5, pooled cos >= 0.97, pooled top-1 >= 0.65. Q4_K_M vs the Q4 reference
+(`TH_Q4_REF`, as Q8_0 vs HF, ~3-5x): cos mean >= 0.995, every position >= 0.98, pos 0 >= 0.99, top-1
+and top-5 >= 0.75, pooled cos >= 0.998, pooled top-1 >= 0.9.
 
 Sanity check by deliberate breakage (scratch builds, not committed), all caught:
 
@@ -116,6 +143,17 @@ Sanity check by deliberate breakage (scratch builds, not committed), all caught:
 | matmul skips its last 64-group | | 0.81 .. 0.96 | 0.76 |
 | no QK-norm / KV written at pos+1 / V read from t-1 / no final norm / attention scale 1/d / rmsnorm eps 1e-2 | | < 0.71 | < 0.16 |
 | activation quantizer truncates instead of rounding (precision loss only) | 0.99713 | en 0.99432 fails, others pass | 0.94 |
+
+Q4_K_M breakage (scratch builds, generic kernels, `--only q4`): all 13 structural kernel bugs fail
+all 15 Q4 logits checks, vs HF and vs the reference: nibble order swapped, Q4_K scale / min swapped,
+wrong Q4_K sub-block scale (j ^ 1), Q4_K min term dropped or from the neighbour group, one value per
+Q4_K / Q6_K sub-block dropped (the mildest: pooled cos vs HF 0.719), Q6_K without its -32, Q6_K both
+halves with one scale, Q6_K qh crumbs reversed, Q6_K d of the next row; also two decoder bugs
+(get_scale_min_k4's high bits, the Q6_K qh shift), which fail `q4_dequant/*` too. Precision-level
+changes pass the logits checks (d * sc or d rounded to bf16 in a fold: pooled cos vs the reference
+0.99943 / 0.99954; a -31 instead of -32 in 1 of 16 Q6_K sub-blocks: 0.99921; baseline 0.99954); the
+bf16 ones flip `greedy/q4_generate`. Kernel rounding deviations are the job of `q4_kernels/*` (bitwise)
+once Step 6b-2 adds AVX-512 kernels.
 
 Thread invariance: matmul/matmul_batch (generic and VNNI) parallelize over output rows and attention over
 (kv head, block of query rows) items; each query vector's result does not depend on the other
@@ -180,6 +218,11 @@ goldens flip a token (`chat_system`, `generate`: both texts read fine) and were 
 transformers 4.53.0 / torch 2.7.0; regenerating gives byte-identical files. Total size ~0.75 MB.
 The logits prompts avoid multi-space indentation (written when runq still had no pre-tokenizer;
 kept so the logits goldens stay unchanged).
+`golden/logits_q4/*.npz` (`make_golden.py --q4ref`, same prompts, format and vocab subset): the same HF
+model with every weight replaced by the Q4_K_M GGUF's tensor (`token_embd` -> embed_tokens, tied
+lm_head; norms F32 as stored) dequantized by gguf-py 0.19.0; regenerating gives byte-identical files.
+`golden/dequant/q4_k_m.npz` (`make_dequant_golden.py`, 43 KB): tensor names, first rows, the rows by
+`gguf.quants.dequantize` (float32) and their types.
 
 Known engine bugs found by these tests are listed in `../TODO.md` ("Known bugs").
 

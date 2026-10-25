@@ -8,6 +8,8 @@ Now (Step 3b, 8 threads, -b 512): prefill ~1,980 tok/s (451-token prompt), ~1,48
 Startup (Step 4): ~0.06 s per process, peak RSS ~0.63-0.74 GB; chat keeps the conversation.
 GGUF (Step 6a): `./runq Qwen3-0.6B-Q8_0.gguf` directly (no export, no side files); closer to HF than
 the .bin (perplexity +0.19% vs +0.85%), prefill ~4-8% slower.
+Q4_K_M (Step 6b-1): `./runq Qwen3-0.6B-Q4_K_M.gguf` works (perplexity +4.9% vs HF, mynah-slm +4.7%),
+with generic kernels so far (prefill ~170-230 tok/s, decode ~55-75); AVX-512 kernels: Step 6b-2.
 
 Status: `[ ]` todo · `[~]` in progress · `[x]` done
 
@@ -439,6 +441,150 @@ Before (Step 3a, 8 threads, -b 128): 451 tokens: GEMMs 43%, attention 42%, rest 
   row dequantized at lookup. mynah-slm's Q4_K_M perplexity is +4.7% over fp32, so the point would
   be decode speed and RAM
 
+## Step 6b-1: GGUF Q4_K_M, correct (loader, repacked layouts, generic kernels, tests)
+`models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf` (unsloth, imatrix, 397 MB) works like the Q8_0 files:
+chat, generate, `-m logits`, `-m tokenize`. Generic C kernels in every build for now (speed: Step 6b-2).
+- [x] Tensor types (gguf-py): Q4_K for attn_q / attn_k / attn_output / ffn_gate / ffn_up in all 28
+  layers and attn_v / ffn_down in layers 3 4 6 7 9 10 12 13 15 16 18 19 21 22; Q6_K for attn_v /
+  ffn_down in layers 0 1 2 5 8 11 14 17 20 23-27 and `token_embd` (= the tied classifier); norms F32.
+  381.7M Q4_K + 214.3M Q6_K values. Block formats checked against ggml-common.h / ggml-quants.c
+  (written out in `src/kquants.h`'s header comment, incl. Q4_K's nibble order and Q6_K's ql / qh
+  interleaving)
+- [x] Loader: type per tensor (`gguf_matrices`): every matrix role may be Q8_0, Q4_K or Q6_K (attn_v /
+  ffn_down mix Q4_K and Q6_K across layers, and the fused q / k / v GEMM mixes them within a layer:
+  `matmul_batch_n` sends the K-quant jobs to `kq_gemm_n`, the Q8_0 ones as before), norms F32, any
+  other type a clean error naming tensor and type; K-quants need rows % 16 and columns % 256 (block
+  sizes already checked by the reader); fp16 d / dmin inf / NaN rejected at load (every block, in the
+  parallel conversion). The Q8_0 / .bin paths are byte-identical (logits files of the previous
+  binaries, both builds, -b 1 / 7 / 64, .bin and Q8_0 GGUF; all existing goldens unchanged)
+- [x] Repacked layouts Q4P / Q6P (`src/kquants.h`, built at load by `kq_pack_blocks` in the parallel
+  pread loop of `prepare_weights`, both builds): 16 rows interleaved per 256-column super-block, so a
+  zmm's 16 dword lanes hold 16 rows' 4-value chunks once unpacked (vpdpbusd u8 operand), the 4 / 6-bit
+  data kept packed: Q4P 2368 bytes per 16 rows x 256 (fp16 d / dmin, 6-bit sc / m unpacked to bytes,
+  per sub-block 4 x 64 bytes of nibbles: low = step 2c, high = step 2c + 1), Q6P 3392 bytes (fp32 d:
+  fills what would be padding, int8 scales, ql nibbles as Q4P, qh: 4 crumbs per byte = the 4 steps of
+  a sub-block). 148 / 212 bytes per row and super-block vs 144 / 210 in the file (+2.8% / +1.0%; the
+  unpacked sc / m bytes avoid decoding get_scale_min_k4 across lanes). Bytes per decoded token (all
+  matmul weights incl. the classifier): **398.1 MB** vs 390.5 MB of tensor data in the file (+2.0%)
+  and 670.5 MB for the Q8_0 GGUF (Q8P): 0.59x. Load 0.28 -> 0.11 s once the repacking wrote every byte
+  once from the file bytes (was: per-value decode + read-modify-write); peak RSS 418 MB (Q8_0 GGUF 667)
+- [x] Arithmetic (defined once, `src/kquants.h` header comment; the generic `q4p_dot` / `q6p_dot`
+  follow it, compiled without contraction / reassociation, and 6b-2's AVX-512 kernels must too):
+  activations int8 per 32 (the same quantized row for every matrix it feeds), plus per group
+  xf = xs * (float) sum(xq) (`kq_act_prep`). Per output row, groups in order, every op rounded:
+  Q4_K: isum = sum q * xq (int32 exact), ds = d * sc, dm = dmin * m (exact in fp32),
+  val = val + ((ds * xs) * (float) isum - dm * xf); Q6_K: t_j = sum q * xq - 32 * sum xq per 16
+  (int32 exact), I = sc_j0 * t_j0 + sc_j1 * t_j1 (exact, |I| < 2^24), val = val + (d * xs) * (float) I.
+  All float operands are per row (lanes) or per group (broadcast): no horizontal operation. Q4_K's
+  mins and Q6_K's -32 go through the activation sums exactly
+- [x] Activation grouping: groups of 32 for Q6_K too (two weight scales per group, combined in int32):
+  the fused q / k / v with mixed types needs one quantization of the row, and 16-groups would double
+  the float folds; no accuracy cost measurable at this level (runq vs the Q4-weight reference below
+  is as close as Q8_0 vs HF)
+- [x] Embedding rows (Q6_K) dequantized at lookup from the file's blocks with ggml's expressions
+  (`kq_dequant_row`; d * sc and (d * sc) * q are exact in fp32, so the values are bit-identical to
+  ggml / gguf-py whatever the compiler contracts)
+- [x] Dequantization check (`-m dequant -i NAME:ROW0:N -o FILE`, new hook: rows from the blocks and
+  from the repacked layout): `tests/make_dequant_golden.py` (needs `pip install gguf`) wrote 2 rows of
+  blk.0.attn_q, blk.3.ffn_down (Q4_K, 1024 / 3072 columns), blk.0.attn_v, blk.27.ffn_down, token_embd
+  (Q6_K) by gguf-py (43 KB); all **bit-identical**, both sources
+- [x] Accuracy (`tests/run_tests.sh -v --only q4`; -b 64 == -b 1). The Q4_K_M weights alone are ~25x
+  the Q8_0 error: an fp32 HF model with the GGUF's weights dequantized by gguf-py ("Q4 reference",
+  new golden `tests/golden/logits_q4`, `make_golden.py --q4ref`) is as far from HF (pooled cos 0.98459,
+  top-1 67/84) as runq. runq vs that reference is at the Q8_0-vs-HF level (int8 activations only):
+
+  | prompt | n | vs HF: cos pos 0 | cos mean | cos min | top-1 | top-5 | vs Q4 ref: cos pos 0 | cos mean | cos min | top-1 | top-5 |
+  |---|---|---|---|---|---|---|---|---|---|---|---|
+  | en | 15 | 0.3609 | 0.96701 | 0.93967 | 13 | 0.720 | 0.9981 | 0.99883 | 0.99677 | 14 | 0.987 |
+  | code | 24 | 0.3609 | 0.98676 | 0.96326 | 18 | 0.842 | 0.9985 | 0.99974 | 0.99943 | 23 | 0.983 |
+  | zh | 15 | 0.4518 | 0.99174 | 0.98791 | 14 | 0.760 | 0.9994 | 0.99980 | 0.99971 | 14 | 0.947 |
+  | chat | 15 | 0.4595 | 0.98174 | 0.94176 | 11 | 0.733 | 0.9990 | 0.99949 | 0.99784 | 15 | 0.947 |
+  | count | 15 | 0.3549 | 0.99109 | 0.98384 | 13 | 0.840 | 0.9977 | 0.99973 | 0.99948 | 15 | 0.973 |
+  | pooled | 84 | | 0.98402 (1-cos 1.6e-2) | | 69 | | | 0.99954 (1-cos 4.6e-4) | | 81 | |
+
+  (Q8_0 GGUF vs HF: pooled 1-cos 6.1e-4, top-1 79.) Position 0 (the massive-activation token) is
+  where 4-bit weights hurt most (cos 0.36-0.46 vs HF, the reference too). Thresholds: vs HF loose
+  sanity bounds, ~2x the baseline error (cos mean >= 0.94, every pos >= 0.85, pos 0 >= 0.10, top-1 /
+  top-5 >= 0.5, pooled cos >= 0.97, top-1 >= 0.65); vs the reference as for Q8_0 vs HF (~3-5x:
+  cos mean >= 0.995, pos >= 0.98, pos 0 >= 0.99, top-1 / top-5 >= 0.75, pooled cos >= 0.998, top-1 >= 0.9)
+- [x] Calibration by breakage (scratch builds, generic kernels; `tests/run_tests.sh --only q4`): all
+  13 structural breakages fail every q4 logits check (14 of 14 batched + the sequential one): wrong
+  nibble order, Q4_K scale / min swapped, wrong Q4_K sub-block scale (j ^ 1), Q4_K min term dropped,
+  Q4_K min from the neighbour group's xf, one value per Q4_K sub-block dropped, Q6_K without the -32,
+  Q6_K both halves with the first sub-block's scale, Q6_K qh crumbs reversed, Q6_K d of the next row,
+  one value per Q6_K sub-block dropped (the mildest: pooled cos vs HF 0.719, top-1 40/84), plus two
+  in the shared decoders (get_scale_min_k4's high bits, Q6_K qh shift) which also fail 2 resp. 3
+  `q4_dequant` cases. All others: pooled cos vs HF <= 0.14, top-1 0/84. Precision-level changes pass the
+  logits checks (vs the reference: d * sc truncated to bf16 in the Q4_K fold 0.99943, Q6_K d to bf16
+  0.99954, Q6_K -31 instead of -32 in 1 of 16 sub-blocks 0.99921; baseline 0.99954); the first two
+  flip `greedy/q4_generate`; in 6b-2, `q4_kernels/*` (bitwise) catches any such deviation of a kernel
+- [x] Perplexity (`scripts/ppl.py bench/ppl_beagle_ch1.txt -t 8 --runq-model <Q4_K_M>`): runq Q4_K_M
+  full **28.911** (+4.86% vs HF fp32 27.571; mynah-slm Q4_K_M 28.864, +4.69%), win512 **34.190**
+  (+6.90% vs 31.984; mynah-slm 34.185); runq Q8_0 GGUF 27.623 / 32.040. The int8 activations add
+  ~0.16% on top of the 4-bit weights here (vs mynah-slm's fp32 activations), as for Q8_0
+- [x] mynah-slm cross-check (`mynah-slm run -m <Q4_K_M> --temp 0 -n 64 -t 8 --think off` vs
+  `runq <Q4_K_M> -t 0 -n 64`; `--raw` vs `-m generate`): chat, 5 of 6 prompts identical over 64 tokens
+  (capital of Australia: both "**Sydney**", the Q4_K_M model's answer; hash table, primes > 100,
+  translation, haiku), "Why is the sky blue?" diverges after 36 characters; raw generation diverges
+  after ~12 ("The three laws of thermodynamics are") and ~33 ("Once upon a time...") characters
+- [x] Speed with the generic kernels, for reference (load 5-7, best of 3, 451-token prompt, decode
+  128 tokens): prefill 168 / 233 tok/s at 8 / 12 threads (Q8_0 GGUF, VNNI: 1,870 / 2,438), decode
+  55-58 / 75 tok/s (Q8_0 GGUF: 157-177 / 151-200). Profile (451 tokens, 8 threads): GEMM qkv 33%,
+  w1 + w3 28%, w2 25%, wo 10%, the rest 3%; the generic Q6_K kernel takes ~2x the time per weight of
+  the Q4_K one (qkv with Q6_K attn_v in 14 layers is slower than w1 + w3 with 1.5x the weights)
+- [x] Robustness: ASan+UBSan builds (`-O1 -g -fsanitize=address,undefined`, AVX-512 and generic) on
+  Q4_K_M: generate at -b 1 / 7 / 512, chat (-r 1, -y, multi-turn, context full at -c 96), logits,
+  dequant: no reports. Scratch harness, 108 corrupted files x (tokenize, generate), both sanitizer
+  builds: header (version, counts), tensor table (types Q5_K / F16 / unknown / Q8_0 / Q4_K <-> Q6_K
+  for matrices and norms, ne0 not % 256 / wrong / huge, ne1 +-16 / huge, n_dims, offsets huge /
+  misaligned / near the end / 0), data (Q4_K d / dmin inf, -inf, NaN at the first / last / a middle
+  block; Q6_K d inf / NaN incl. in the classifier; scale bytes 0xff / int8 -128; d = 65504 with all
+  quants 0xff), 15 random header bit flips, 10 random data byte flips, 17 truncations from 0 to
+  size - 1: 132 clean errors, 84 normal runs, 0 crashes or sanitizer reports per build
+- [x] Tests (`make test` 265 checks, ~30-33 s on the busy box, load 3-6; was 238 / ~25 s): `q4` group
+  (~4 s: dequant vs gguf-py, logits vs HF and vs the Q4 reference at -b 64 on 5 prompts and -b 1 on en,
+  -b 7 / 64 vs -b 1, threads 8 vs 3, AVX-512 build vs generic on -b 1 / 7) and greedy goldens
+  `q4_chat`, `q4_generate` (24 tokens each); skipped if the file is missing (`Q4=` to skip)
+
+## Step 6b-2: AVX-512 kernels for Q4_K / Q6_K (speed)
+Notes from 6b-1 (layouts and arithmetic in `src/kquants.h`; the AVX-512 kernels go into
+`kernels_avx512.h`, dispatched where `kq_dot` / `kq_gemm_n` / `matvec_rows` handle `w->kp`):
+- The kernels must be bit-identical to `q4p_dot` / `q6p_dot` (the definition): integer sums in any
+  order, the float fold per (16-row block, activation row, group) exactly as defined, with explicit
+  rounding intrinsics (`_mm512_mul_round_ps` / `add` / `sub`, as `q8p_fold`; gcc must not contract).
+  `q4_kernels/*` then compares for real: add cases like the Q8 ones (all -b 64: 2 chunks, 6 + 4 row
+  tiles, the all-rows classifier GEMM; a decode with `-b 1` exercises the GEMV incl. the classifier),
+  and check that an FMA in the fold fails them. The greedy goldens `q4_*` and the logits goldens
+  stay unchanged unless the definition changes (it should not)
+- Q4P inner step (per 16-row block, sub-block j): 4 loads of 64 bytes at 320 + 256 j + 64 c; each gives
+  2 vpdpbusd steps: `and 0x0f` (columns 8c..8c+3) and `srli_epi16(4) & 0x0f` (8c+4..8c+7), activations
+  broadcast 4 bytes at a time (xq + 32 g + 8 c, + 4); isum accumulators start at 0. Per (block, group):
+  ds = cvtph2ps(d[16]) * cvt(zx(sc bytes 16 j..16 j + 15)), dm likewise (exact; the d / dmin
+  conversion once per super-block). Per activation row: mul(ds, xs), cvt(isum), mul, mul(dm, xf), sub,
+  add: 6 float ops per 8 vpdpbusd (Q8_0 GS 32: 4), so the GEMM fold pressure is higher than for Q8
+- Q6P inner step (sub-block j of 16 columns): ql loads at 320 + 128 j (+ 64): low / high nibbles = steps
+  0 / 1 (2 / 3); one qh load at 2368 + 64 j: step t's high bits = `(qh << 4 >> 2t) & 0x30` on 16-bit
+  lanes (slli / srli_epi16 + and; bytes stay separate thanks to the mask); q = lo | hi, u8 0..63.
+  Accumulator t_j starts at -32 * (sum of the 16 xq) (activation-only int32: precompute per row, like
+  `q8p_gemv_corr`, e.g. in `matvec_prep` and the GEMM prologue), then I = mullo(t_j0, sc_j0) +
+  mullo(t_j1, sc_j1) with sc from vpmovsxbd of 16 int8 at 64 + 16 j; fold (d * xs) * cvt(I) (d is fp32
+  in Q6P): 4 float ops, as Q8
+- Activation side: `xf` is already precomputed (`matvec_prep` for decode: RunState xq_xf / hq_xf;
+  `kq_gemm_n` per row for prefill); the AVX-512 kernels can use it as is
+- GEMM: a tile as `q8p_tile` (2 row blocks x 6 activation rows), weights unpacked once per step for all
+  activation rows (the unpack is amortized, the fold is not); work items as `q8p_gemm_n` (mixed-type
+  jobs: q / k Q4P with v Q6P in one parallel loop). GEMV (decode): stream each thread's 16-row blocks
+  (one block contiguous over all k), two accumulator chains as `q8p_gemv_blocks`
+- Expected: decode is bandwidth-bound: 398 MB per token vs 670 MB for the Q8_0 GGUF, so up to ~1.6x the
+  Q8_0 decode if both run at the bandwidth limit; the Q6P classifier is 128.8 MB of it (32%), so the
+  Q6P GEMV matters as much as Q4P. Prefill: below Q8_0 (more unpack and fold work per weight)
+- Where the time goes now (generic, 451-token prefill, 8 threads, 2.77 s): GEMM qkv 33%, w1 + w3 28%,
+  w2 25%, wo 10%, rest 3%; decode 55-75 tok/s, compute-bound (generic Q6_K ~2x the cost per weight
+  of Q4_K)
+- Scratch kept for 6b-2: `/tmp/cw6b` (ggml-quants.c / ggml-common.h for reference, a venv with gguf
+  0.19.0 + numpy: `tests/make_dequant_golden.py`, `make_golden.py --q4ref --gguf-py
+  /tmp/cw6b/venv/lib/python3.13/site-packages`)
+
 ## Known bugs
 Found by the tests.
 - [x] Tokenizer: no NFC normalizer (HF's tokenizer.json normalizer is NFC); the input was assumed
@@ -463,7 +609,8 @@ Found by the tests.
 - [x] Step 4 (usability): chat history across turns, faster sampling, startup (embedding rows from the Q8_0 table): done, see above
 - [x] Step 5: NFC normalizer in the tokenizer: done, see above
 - [x] Step 6a: GGUF Q8_0 loading (no export step, no side files): done, see above
-- Step 6b: GGUF Q4_K_M (Q4_K / Q6_K kernels, see the notes in Step 6a)
+- [x] Step 6b-1: GGUF Q4_K_M correct (loader, repacked layouts, arithmetic, generic kernels, tests): done, see above
+- Step 6b-2: AVX-512 kernels for Q4_K / Q6_K (notes above)
 - Step 7: performance leftovers (decode barriers / attention split, bf16 KV cache, 16-thread barriers, prefill rest)
 
 ## Later / ideas
@@ -481,4 +628,5 @@ Found by the tests.
   27.580 (+0.03%), runq Q8_0 27.805 (+0.85%: int8 activations, group 64), mynah-slm Q4_K_M 28.864
   (+4.7%); 512-token windows: 31.984 / 32.039 / 32.206 / 34.185 (+6.9% for Q4_K_M). Step 6a: runq
   on the Q8_0 GGUF (group 32) 27.623 (+0.19%), windows 32.040 (+0.18%)
-- [x] GGUF loading without the Python export step: Q8_0 done (Step 6a); Q4_K_M is Step 6b
+- [x] GGUF loading without the Python export step: Q8_0 done (Step 6a); Q4_K_M Step 6b-1 (runq on it:
+  perplexity 28.911 / win512 34.190, mynah-slm 28.864 / 34.185)

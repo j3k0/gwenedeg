@@ -84,8 +84,8 @@ printf 'My name is Ada.\nWhat is my name?\n' | ./runq models/Qwen3-0.6B-q8.bin -
 KV cache: `-k f16` (the default since Step 7b), `-k bf16` or `-k f32`. The 16-bit caches take half the
 memory (28 layers x 2 x 1,024 values per position: 115 KB instead of 229 KB; 0.47 instead of 0.94 GB at
 `-c 4096`; peak RSS after 3,000 tokens ~1.15 instead of ~1.37 GB for the Q8_0 GGUF, ~0.89 instead of ~1.23
-for Q4_K_M) and decode long contexts faster (3,000 tokens, Q4_K_M, 8 threads: ~160 vs ~136 tok/s, ~100
-before Step 7b). f16 is as close to the fp32 model as the f32 cache (KL divergence from HF fp32 +0.2%,
+for Q4_K_M) and decode long contexts faster (3,000 tokens, Q4_K_M, 8 threads: ~160 vs ~136 tok/s with
+`-k f32`, ~100 before Step 7b). f16 is as close to the fp32 model as the f32 cache (KL divergence from HF fp32 +0.2%,
 within the noise); bf16 is a bit further (+2.6%: |K| reaches ~500, and bf16 keeps 8 significant bits to
 f16's 11) and prefills long prompts ~3% faster. All three pass the same logits thresholds; the attention
 arithmetic is fp32 on the exactly converted values (TODO.md Step 7b).

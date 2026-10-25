@@ -68,11 +68,18 @@ Found by the Step 0b tests; not fixed yet.
   to be NFC already. Decomposed text (`e` + U+0301) and NFC singletons (U+2000 -> U+2002,
   U+212B -> U+00C5, CJK compatibility ideographs) tokenize differently from HF. Tests: XFAIL
   `tokenizer/{nfc_decomposed,nfc_singleton}`; the fuzzer only generates NFC strings.
-- [ ] SwiGLU `1/(1+expf(-x))` under `-Ofast` (finite-math): `expf` overflow gives NaN. Not seen in
-  the shipped int8 path yet, but a scratch build with float activations got whole NaN logits
-  rows; clamping the exponent fixed it. Risk for the Step 2/3 kernels (the logits test checks
-  for NaN).
-- [ ] Minor: `quantize()` divides by a zero scale on an all-zero group (NaN cast to int8 is UB).
+- [x] SwiGLU `1/(1+expf(-x))` under `-Ofast`: for x < -88, `expf` = inf and the vectorized
+  reciprocal (`vrcp14ps` + Newton step, 0 * inf) gives NaN. This *did* happen in the shipped int8
+  path: gate values down to ~-100 in the last layer on the `chat` and `zh` logits prompts and on
+  longer texts. The NaN was quantized to 0, but it broke `quantize()`'s vectorized max (`vmaxps`
+  drops a lane's running max), so the scale of that 64-group came out too small (e.g. 0.073
+  instead of 0.114) and its larger values overflowed the int8 cast (UB, wrapped). Fixed by
+  clamping the exponent to 80 (exact for x >= -80; below, silu is < 1e-33 either way). Logits
+  vs HF improve slightly (zh top-5 0.880 -> 0.893, chat cos mean 0.99888 -> 0.99891); greedy
+  goldens unchanged; en/code/count logits bit-identical.
+- [x] Minor: `quantize()` divided by a zero scale on an all-zero group (NaN cast to int8, UB): now
+  writes q = 0. (Written as an early `continue`: rewriting the `x / scale` loop itself changes
+  its -Ofast code generation and the rounding of some values.)
 
 ## Later / ideas
 - [ ] Chat history: stop resetting to position 0 every turn (keep the KV cache across turns)

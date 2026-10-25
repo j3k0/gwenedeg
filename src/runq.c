@@ -156,6 +156,12 @@ void quantize(QuantizedTensor *qx, float *x, int n) {
         // calculate and write the scaling factor
         float scale = wmax / 127.0f;
         qx->s[group] = scale;
+        if (!(wmax > 0)) { // all-zero group: q = 0 (was 0/0 = NaN cast to int8, UB)
+            memset(qx->q + group * GS, 0, GS);
+            continue;
+        }
+        // (keep `/ scale` as is: under -Ofast it becomes a multiply by the reciprocal, and any
+        // rewrite of this loop changes the rounding of a few values, i.e. the outputs)
 
         // calculate and write the quantized values
         for (int i = 0; i < GS; i++) {
@@ -446,9 +452,11 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
         matmul(s->hb2, &s->xq, w->w3 + l, p->dim, p->hidden_dim);
 
         // SwiGLU non-linearity
-        // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+        // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid. The exponent is clamped: under
+        // -Ofast, expf(-x) = inf for x < -88 gives NaN (vrcp14ps + Newton step: 0 * inf), and
+        // the NaN broke quantize()'s vectorized max, i.e. the scale of its whole group
         for (int i = 0; i < p->hidden_dim; i++)
-            s->hb[i] *= s->hb2[i] * (1.0f / (1.0f + expf(-s->hb[i])));
+            s->hb[i] *= s->hb2[i] * (1.0f / (1.0f + expf(fminf(-s->hb[i], 80.0f))));
 
         // final matmul to get the output of the ffn
         quantize(&s->hq, s->hb, p->hidden_dim);

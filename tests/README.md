@@ -1,14 +1,16 @@
 # Tests
 
-`make test` (or `tests/run_tests.sh`) builds `./runq` if needed and runs everything in about
-18 s on the 16-vCPU dev box (~30 runq processes at ~0.4 s startup each). It needs `models/Qwen3-0.6B-q8.bin`, plus numpy (`.venv/bin/python`
+`make test` (or `tests/run_tests.sh`) builds `./runq` and `./runq-generic` if needed (in parallel)
+and runs everything in about 20 s on the 16-vCPU dev box (~22 s with the rebuild; ~33 runq processes
+at ~0.45 s startup each). It needs `models/Qwen3-0.6B-q8.bin`, plus numpy (`.venv/bin/python`
 if present, else the system `python3`). Torch is only needed to regenerate the HF goldens.
 
 ```sh
 tests/run_tests.sh                    # all tests, OMP_NUM_THREADS=8 unless set
 tests/run_tests.sh -v                 # + per-position logits metrics and a summary table
-tests/run_tests.sh --only logits      # subset: tokenizer,logits,batched,threads,greedy
-RUNQ=/path/to/other-binary tests/run_tests.sh   # test another build (no make)
+tests/run_tests.sh --only logits      # subset: tokenizer,logits,batched,threads,kernels,greedy
+RUNQ=/path/to/other-binary tests/run_tests.sh   # test another build (no make; kernels test skipped)
+RUNQ=./runq RUNQ_GENERIC=./runq-generic tests/run_tests.sh   # ... with the kernels test
 tests/run_tests.sh --update-greedy    # regenerate the greedy goldens
 .venv/bin/python tests/make_golden.py # regenerate the HF goldens (tokenizer + logits, ~15 s)
 .venv/bin/python tests/make_golden.py --tokenizer-only   # only golden/tokenizer.json (~2 s)
@@ -40,6 +42,7 @@ XPASS = an XFAIL case now passes (remove its mark in `make_golden.py`).
 | `logits_batched/*` | the same test (same thresholds) with the batched prefill, `-b 64` (the default; one chunk here) | `golden/logits/*.npz` |
 | `batched/<prompt>_b7`, `_b64` | batched logits vs sequential (`-b 1`) on every logits prompt; `-b 7` gives 3-4 chunks with boundaries mid-prompt. `all_b64`: all 5 prompts concatenated (86 tokens), 2 chunks at `-b 64`. Max abs diff <= 1e-3 and cos >= 0.99999 per row (full vocab), finite; reports "bit-identical" (currently all 11) | sequential run |
 | `threads/bitwise`, `threads/bitwise_b7` | logits file for `en` is byte-identical with OMP_NUM_THREADS=8 and 1, sequential and `-b 7` | |
+| `kernels/en_b1`, `en_b7`, `all_b64` | logits file byte-identical for `./runq` (AVX-512 VNNI kernels) and `./runq-generic` (`-DRUNQ_GENERIC`, generic C kernels, same flags otherwise): GEMV incl. classifier (`-b 1`), GEMM with 6 + 1 row tiles and a 1-row chunk (`-b 7`), 2 chunks with 6 + 4 row tiles and the all-rows classifier GEMM (`all`, `-b 64`) | `./runq-generic` |
 | `greedy/*` | exact stdout of `-t 0 -c 4096` runs: chat, chat with thinking (`-r 1`), chat with system prompt (`-y`), generate; 40-48 tokens. These use the default batched prefill; `generate@b5` = generate in 3 chunks (same golden) | `golden/greedy/*.txt` (our engine) |
 | `greedy/seeded_chunks` | seeded sampling (`-t 0.8 -s 42`, chat): same output with `-b 1` and `-b 5` (chat advances the RNG once per prompt token, as before batched prefill) | |
 
@@ -84,7 +87,7 @@ Sanity check by deliberate breakage (scratch builds, not committed), all caught:
 | no QK-norm / KV written at pos+1 / V read from t-1 / no final norm / attention scale 1/d / rmsnorm eps 1e-2 | | < 0.71 | < 0.16 |
 | activation quantizer truncates instead of rounding (precision loss only) | 0.99713 | en 0.99432 fails, others pass | 0.94 |
 
-Thread invariance: matmul/matmul_batch parallelize over output rows and attention over heads or
+Thread invariance: matmul/matmul_batch (generic and VNNI) parallelize over output rows and attention over heads or
 (row, head) items, each computed whole by one thread, so results are bit-identical for any
 thread count (tested 1 vs 8; also checked 13).
 
@@ -92,7 +95,7 @@ Batched vs sequential: `forward_batch()` gives bit-identical logits to `forward(
 call the same numeric kernels (`dot_q8`, `qk_norm_rope`, `attention_head`, `swiglu`, `rmsnorm`,
 `quantize`) per row, and the 4-row GEMM kernel `dot_q8_x4` is compiled without FP contraction
 (`NO_FP_CONTRACT`, gcc only) so it rounds like `dot_q8`. With contraction (an FMA in the scale
-accumulation) the logits differ slightly and `greedy/chat_system` flips a token. A Step 3 kernel
+accumulation) the logits differ slightly and `greedy/chat_system` flips a token. A future kernel
 that sums in another order may legitimately need the 1e-3 tolerance (or a looser one, justified);
 real bugs are far off. Deliberate breakage (scratch builds, all caught):
 
@@ -101,6 +104,21 @@ real bugs are far off. Deliberate breakage (scratch builds, all caught):
 | causal mask leaks one position (row b sees b+1) | 22.4 .. 32.1 | <= 0.41 | every `batched/*` |
 | K RoPE at the chunk-local position (b, not pos0+b) | 17.3 / 32.1 | 0.47 / -0.42 | `_b7`, `all_b64` |
 | chunk K written one position early (pos0-1) | 13 .. 33.7 | <= 0.68 | `_b7`, `all_b64` (single-chunk `_b64` pass) |
+
+VNNI vs generic kernels (`kernels/*`): the AVX-512 VNNI GEMM and GEMV (`src/kernels_avx512.h`)
+keep the per-group int32 sums exact and the float fold of `dot_q8` (`val + (ws * xs) * (float)
+isum`, groups in order, each operation rounded, via explicit-rounding intrinsics), so they are
+bit-identical to the generic kernels, and the logits are byte-identical to the binary before
+them. The `batched/*` tests cannot see a kernel rounding change (both paths use the same kernel);
+`kernels/*` can: an FMA in the VNNI fold gives max |diff| 2.1 on all three cases (scratch build).
+Also checked once (scratch builds, not in `make test`): tile variants (`-DQ8P_RB=1`, the odd
+block-count tail that Qwen3-0.6B never hits; `-DQ8P_C=1/3/8`, `-DQ8P_NB=5`) byte-identical, and an
+ASan+UBSan build (`-O1 -g -fsanitize=address,undefined`, -b 1/7/13/64): no reports.
+
+Builds without AVX-512 (e.g. `-march=x86-64-v3`) use the generic kernels and pass the logits,
+batched and thread tests, but not the greedy goldens: the rest of the float code (rmsnorm,
+softmax, attention) is vectorized at a different width and rounds differently. The greedy
+goldens belong to AVX-512 (`-march=native` here) builds.
 
 ## Golden data
 

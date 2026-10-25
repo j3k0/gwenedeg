@@ -3,7 +3,8 @@
 Goal: fast Qwen3-0.6B inference in C on CPU, based on qwen3.c (Q8_0).
 Baseline (16-vCPU EPYC Genoa, 8 threads): prefill ~85 tok/s, decode ~100 tok/s.
 Target: prefill several hundred to 1000+ tok/s; decode limited by memory bandwidth.
-Now (Step 2, 8 threads): prefill ~290 tok/s (451-token prompt), ~235 (1,500 tokens); decode ~105.
+Now (Step 3a, 8 threads, -b 128): prefill ~1,180 tok/s (451-token prompt), ~540 (1,500 tokens);
+decode ~139 (memory-bandwidth bound). 12 threads: prefill ~1,560 / ~750.
 
 Status: `[ ]` todo · `[~]` in progress · `[x]` done
 
@@ -74,27 +75,87 @@ Encoding was O(n² · vocab): 109 tokens took 24 s and 217 tokens 104 s, because
   horizontal sum per 64-group, about 10% of the int8 VNNI peak
 - [x] Fixed on the way: SwiGLU NaN in the shipped int8 path (see Known bugs)
 
-## Step 3: AVX-512 VNNI int8 kernels
-Where prefill time goes now (`-DRUNQ_PROFILE`, 8 threads, -b 128): 451 tokens: GEMMs 86% (qkv 25,
-wo 11, w1+w3 34, w2 16), attention 10%, norms/quantize/RoPE/SwiGLU 4%; 1,500 tokens: GEMMs 68%,
-attention 29% (fp32, ~140 GFLOPS: 258 GFLOP in 1.84 s), rest 3%.
-- [ ] GEMM kernel (`vpdpbusd`) with cache tiling, for prefill. Replace `dot_q8_x4` /
-  `matmul_batch`'s inner loop. vpdpbusd is u8 x s8 (Zen 4 has no vpdpbssd): offset the
-  activations by +128 and subtract 128 * (sum of the weight group), precomputed per row. Block
-  rows x activation rows (e.g. 4 x 4) so the per-group int32 sums need no horizontal adds;
-  maybe repack weights. Keeping the per-group int32 sums exact and the float fold as in dot_q8
-  (`val += (ws * xs) * isum`, groups in order, no FMA) keeps it bit-identical to the GEMV
-- [ ] Attention for long prompts (29% at 1,500 tokens now, will dominate after the GEMM):
-  several query rows per K/V row (tile over positions, K row in L1), scores for 16 positions per
-  vector instead of one horizontal sum per position; online softmax (flash style) would change
-  the rounding (then the batched test needs a tolerance)
-- [ ] GEMV kernel for decode
-- [ ] Threading: fewer barriers per token, parallelize over rows. Prefill now scales to 12
-  threads (406 tok/s at 451 tokens) but still collapses at 16 (73); `OMP_WAIT_POLICY=passive`
-  avoids that for prefill (250 at 16 threads) but kills decode (~20). matmul_batch uses static
-  scheduling: one preempted thread stalls the whole region
-- [ ] Keep a portable fallback (non-AVX-512); tests compare both
-- [ ] Measure against the memory-bandwidth limit (~87 GB/s at 8 threads)
+## Step 3a: AVX-512 VNNI int8 kernels (GEMM, GEMV)
+Before (Step 2, `-DRUNQ_PROFILE`, 8 threads, -b 128): 451 tokens: GEMMs 86% (qkv 25, wo 11, w1+w3 34,
+w2 16), attention 10%, rest 4%; 1,500 tokens: GEMMs 68%, attention 29%, rest 3%.
+- [x] GEMM kernel (`vpdpbusd`) with cache tiling, for prefill: `src/kernels_avx512.h`, `q8p_gemm`.
+  Weights repacked once at load ("Q8P"): per 16-row block and 64-group, 16 x 64 bytes where dword
+  lane r holds 4 consecutive bytes of row r (stored as u8 = w + 128), then the 16 row scales; 1088
+  bytes per (block, group), same size as Q8_0. So the 16 lanes are 16 output rows and there are no
+  horizontal reductions at all (instead of a 16 -> 1 reduction per group, ~3 shuffle/add ops per
+  `vpdpbusd` for a row-major 4x4 tile). Activations stay s8, broadcast 4 bytes at a time (embedded
+  broadcast operand); the +128 offset is removed by starting each group accumulator at
+  -128 * (activation group sum), computed per call (no weight-side sums, no extra memory or decode
+  traffic). Register tile 2 blocks (32 rows) x 6 activation rows: 12 int32 + 12 float zmm
+  accumulators, float outputs stay in registers over all groups, no spills. Work items = (32-row
+  tile, 64 activation rows), static; the weight tile (34 KB at k=1024, 102 KB at k=3072) is reused
+  from L1/L2 for every 6 rows. Tile width C = 4..8 and NB = 24..128 rows all within noise (+-4%).
+  Result: 0.30 -> 2.42-2.48 TOPS at 8 threads (8x), ~85% of the measured `vpdpbusd` peak (2.9 TOPS,
+  372 GOPS per thread, register-only microbenchmark); 12 threads 3.2 TOPS (85% of 3.78). The rest
+  is mostly the float fold (cvt, 2 mul, add per accumulator and group, 2 of them on the same pipes
+  as `vpdpbusd`: ceiling ~89%)
+- [x] GEMV kernel for decode (`q8p_gemv`): same layout, one 16-row block at a time with two
+  accumulator chains (even/odd steps), each thread streams one contiguous range. Decode 8 threads
+  121 -> 139 tok/s, 4 threads 77 -> 115, 12 threads 125 -> 142, 1 thread 25 -> 45 (2026-10-25, same
+  session). Software prefetch (2 KB / 8 KB ahead) was slower (1 thread 46 -> 42 / 38; 4 threads
+  116 -> 107 / 92); transparent huge pages for the packed weights: no measurable difference, so not
+  used (with THP defrag=madvise the faults can stall on compaction, see the KV cache item)
+- [x] Measure against the memory-bandwidth limit: ~0.633 GB of packed weights + ~34 MB of KV cache
+  per token (bench_qwen3c, ~150 positions on average): 8 threads ~92 GB/s, 4 threads ~76 GB/s, 1
+  thread ~30 GB/s; the read-bandwidth test gave 35 / 72 / 100 / 114 GB/s at 1 / 4 / 8 / 12 threads
+  the same day (87 GB/s at 8 in an earlier session). So decode is at the limit up to 8 threads; at
+  12 it gets ~94 of ~114 GB/s (threading overhead, Step 3b)
+- [x] Bit-identity: per-group int32 sums exact; float fold per output exactly as `dot_q8`
+  (`val + (ws * xs) * (float) isum`, groups in order; checked in the -Ofast asm of the generic
+  code), written with explicit-rounding intrinsics (`_mm512_mul_round_ps` / `_add_round_ps`), which
+  gcc can neither contract into an FMA nor reassociate. VNNI GEMM, VNNI GEMV and the generic kernels
+  give byte-identical logits; the logits are byte-identical to the previous commit's binary;
+  greedy goldens unchanged. Deliberate breakage: an FMA in the fold gives max |diff| 2.1 (caught by
+  `kernels/*`, not by `batched/*`: both paths share the kernel). Also checked: Q8P_RB=1 (odd block
+  counts; Qwen3-0.6B has none), C = 1 / 3 / 8, NB = 5, an ASan+UBSan build (-b 1 / 7 / 13 / 64): all
+  identical, no reports
+- [x] Portable fallback: compile-time selection (`__AVX512F__ && __AVX512BW__ && __AVX512VNNI__`
+  and not `-DRUNQ_GENERIC`); `make generic` -> `./runq-generic` (same flags + `-DRUNQ_GENERIC`);
+  `make test` compares both bitwise (`kernels/*`). `-march=x86-64` and `x86-64-v3` builds compile
+  without warnings; x86-64-v3 (AVX2) passes the logits, batched-bitwise and thread tests, but not the
+  greedy goldens: the
+  non-kernel float code (rmsnorm, softmax, attention, vectorized at 8 instead of 16 lanes) rounds
+  differently. Pre-existing, the previous commit built the same way gives the same text
+- [x] Weight repacking cost: load +~55 ms (0.40 -> 0.45 s for a 1-token run), peak RSS 1,316 ->
+  1,362 MB: the packed copy is one anonymous mapping and the mapped Q8_0 pages of each tensor are
+  dropped (`MADV_DONTNEED`) right after packing it
+- [x] Found on the way: the KV cache is calloc'd and was first touched inside the K/V GEMMs, whose
+  page faults serialize in the kernel (~55 ms of a 451-token prefill, half of "gemm qkv"). Now
+  pre-faulted per chunk with `MADV_POPULATE_WRITE`, one call per (layer, K/V) range in parallel
+  (~7 ms). `MADV_HUGEPAGE` on the cache instead made it 2-3x slower (compaction on fault)
+- [x] Results (2026-10-25, 8 threads, -b 128; load 3-10, shared machine): prefill 451 tokens 287 ->
+  1,179 tok/s (4.1x), 1,500 tokens 233 -> 541 (2.3x); 12 threads 389 -> 1,559 and 319 -> 748.
+  Profile now: 451 tokens: GEMMs 43% (qkv 12.8, wo 5.7, w1+w3 16.9, w2 7.7), attention 42%, rest 15%
+  (norm+quantize+residual+KV pre-fault 5.4, qk-norm+RoPE 6.6, swiglu+quantize 2.8); 1,500 tokens:
+  GEMMs 19%, attention 74%, rest 7%
+
+## Step 3b: attention and threading
+- [ ] Attention for long prompts: now the bottleneck (74% at 1,500 tokens, 42% at 451; fp32, ~126
+  GFLOPS: 258 GFLOP in 2.04 s at 8 threads, ~20% of the fp32 FMA peak). Several query rows per K/V
+  row (tile over positions, a K/V block in L1 for the kv_mul = 2 query heads x several rows), scores
+  for 16 positions per vector instead of one horizontal sum per position, the weighted V sum as a
+  small GEMM. Zen 4 has AVX512_BF16 (`vdpbf16ps`): a bf16 K/V cache would halve the bytes and double
+  the FMA rate, but changes the numerics (fine for the batched == sequential test if both paths use
+  it, the logits vs HF test decides). Online softmax (flash style) changes the rounding too
+- [ ] Rest (15% at 451 tokens): qk-norm+RoPE recomputes powf/cosf/sinf for every (row, head, pair)
+  in every layer (~19M calls at 451 tokens, 25 ms = 6.6%): a per-position cos/sin table shared by
+  all layers and heads (same expressions, so the same values); norm/quantize/residual loops are
+  separate parallel regions per phase (fuse them)
+- [ ] Threading: decode at 12 threads reaches ~94 of ~114 GB/s: ~200 parallel regions per token
+  (fork/join + static imbalance, e.g. 64 blocks of 16 rows over 12 threads) cost more than the
+  bandwidth gained. Fewer barriers per token (one parallel region per layer, `omp for nowait` where
+  possible). Prefill: w2 / wo / k / v have only 32 row tiles x 2 chunks, imbalanced at 12 threads.
+  16 threads still collapse (73 tok/s prefill before Step 3a): any preempted thread stalls the
+  spin barriers; `OMP_WAIT_POLICY=passive` kills decode (~20)
+- [ ] Prefill chunk size: with the VNNI GEMM, `-b 128` / `-b 256` are +4-5% / +7% over the default
+  64 at 8 threads and +1-12% / +4-18% at 12 threads; revisit the default after the attention tiling
+- [ ] Decode: the KV cache rows of each new position still fault one page per layer (56 per token,
+  ~1%); could pre-fault ahead like the prefill
 
 ## Known bugs
 Found by the tests.
@@ -121,5 +182,5 @@ Found by the tests.
 - [ ] Perplexity comparison Q4_K_M vs Q8_0 (small text sample)
 - [ ] GGUF loading (Q8_0 / Q4_K_M) without the Python export step
 - [ ] Faster sampling (top-p currently sorts the whole vocab)
-- [ ] Startup ~0.4 s per process, mostly page faults for the dequantized embedding table (~620 MB
+- [ ] Startup ~0.45 s per process (~55 ms of it the VNNI weight repacking), mostly page faults for the dequantized embedding table (~620 MB
   of floats; parallelizing the dequantize didn't help): look up rows from the Q8_0 table instead

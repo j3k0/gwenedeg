@@ -127,6 +127,8 @@ typedef struct {
     QuantizedTensor hq_b; // (nb_max, hidden_dim)
     float *att_b;   // (att_threads, seq_len): one attention score buffer per OpenMP thread
     int att_threads;
+    float *rope_b;  // (nb_max, head_dim): RoPE cos / sin of each row's position (rope_row)
+    float *rope;    // (head_dim,): the same for forward()'s position
 } RunState;
 
 typedef struct {
@@ -160,7 +162,8 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
         s->att_threads = 1;
 #endif
         s->att_b = calloc((size_t)s->att_threads * p->seq_len, sizeof(float));
-        if (!s->x_b || !s->xb_b || !s->q_b || !s->hb_b || !s->hb2_b || !s->xq_b.q || !s->xq_b.s ||
+        s->rope_b = calloc(nb * p->head_dim, sizeof(float));
+        if (!s->rope_b || !s->x_b || !s->xb_b || !s->q_b || !s->hb_b || !s->hb2_b || !s->xq_b.q || !s->xq_b.s ||
             !s->hq_b.q || !s->hq_b.s || !s->att_b) {
             fprintf(stderr, "malloc failed!\n");
             exit(EXIT_FAILURE);
@@ -176,11 +179,12 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
     s->q = calloc(all_heads_dim, sizeof(float));
     s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
+    s->rope = calloc(p->head_dim, sizeof(float));
     s->key_cache = calloc(p->n_layers * (uint64_t)p->seq_len * kv_dim, sizeof(float));
     s->value_cache = calloc(p->n_layers * (uint64_t)p->seq_len * kv_dim, sizeof(float));
 
     // ensure all mallocs went fine
-    if (!s->x || !s->xb || !s->hb || !s->hb2 || !s->q || !s->att || !s->logits || !s->key_cache || !s->value_cache) {
+    if (!s->x || !s->xb || !s->hb || !s->hb2 || !s->q || !s->att || !s->logits || !s->rope || !s->key_cache || !s->value_cache) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
@@ -210,6 +214,8 @@ void free_run_state(RunState* s) {
     free(s->hq_b.q);
     free(s->hq_b.s);
     free(s->att_b);
+    free(s->rope_b);
+    free(s->rope);
 }
 
 // ----------------------------------------------------------------------------
@@ -567,15 +573,27 @@ void matmul_batch(float *out, int ldo, QuantizedTensor *x, int ldx, int nb, Quan
     }
 }
 
-static void qk_norm_rope(float *v, int n_heads, const float *norm_w, int head_dim, int pos) {
-    // Qwen3 QK-norm (RMSNorm per head) then NeoX-style RoPE (pairs j, j + head_dim/2), in place
+static void rope_row(float *cs, int head_dim, int pos) {
+    // RoPE rotation of position pos: cs[j] = cos, cs[j + head_dim/2] = sin of pos * freq_j, computed
+    // once per position (was: in qk_norm_rope for every layer and head, ~6% of a 451-token
+    // prefill), with the original expressions, so the values are the same
+    for (int j = 0; j < head_dim/2; j++) {
+        float freq = powf(1e6, -(float)j / (head_dim/2));
+        float cos_freq = cosf(pos * freq), sin_freq = sinf(pos * freq);
+        cs[j] = cos_freq;
+        cs[j + head_dim/2] = sin_freq;
+    }
+}
+
+static void qk_norm_rope(float *v, int n_heads, const float *norm_w, int head_dim, const float *cs) {
+    // Qwen3 QK-norm (RMSNorm per head) then NeoX-style RoPE (pairs j, j + head_dim/2), in place;
+    // cs: cos / sin of this row's position (rope_row)
     for (int h = 0; h < n_heads; h++) {
         float *q = v + h * head_dim;
 
         rmsnorm(q, q, (float *)norm_w, head_dim);
         for (int j = 0; j < head_dim/2; j++) {
-            float freq = powf(1e6, -(float)j / (head_dim/2));
-            float cos_freq = cosf(pos * freq), sin_freq = sinf(pos * freq);
+            float cos_freq = cs[j], sin_freq = cs[j + head_dim/2];
 
             float x = q[j]; // real part
             float y = q[j + head_dim/2]; // imag part
@@ -634,6 +652,7 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
 
     // copy the token embedding into s->x
     memcpy(s->x, w->token_embedding_table + token * p->dim, p->dim * sizeof(float));
+    rope_row(s->rope, p->head_dim, pos);
 
     // forward all the layers
     for (int l = 0; l < p->n_layers; l++) {
@@ -653,8 +672,8 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
         matmul(s->v, &s->xq, w->wv + l, p->dim, kv_dim);
 
         // Q-RMSNorm + rotate each query head, then the same for each key head
-        qk_norm_rope(s->q, p->n_heads, w->q_norm_weights + l * p->head_dim, p->head_dim, pos);
-        qk_norm_rope(s->k, p->n_kv_heads, w->k_norm_weights + l * p->head_dim, p->head_dim, pos);
+        qk_norm_rope(s->q, p->n_heads, w->q_norm_weights + l * p->head_dim, p->head_dim, s->rope);
+        qk_norm_rope(s->k, p->n_kv_heads, w->k_norm_weights + l * p->head_dim, p->head_dim, s->rope);
 
         // multihead attention. iterate over all heads
         #pragma omp parallel for
@@ -758,8 +777,11 @@ float *forward_batch(Transformer *transformer, int *tokens, int n, int pos0, int
     }
     PROF_START();
 
-    for (int b = 0; b < n; b++)
+    #pragma omp parallel for
+    for (int b = 0; b < n; b++) {
         memcpy(s->x_b + (size_t)b * dim, w->token_embedding_table + (size_t)tokens[b] * dim, dim * sizeof(float));
+        rope_row(s->rope_b + (size_t)b * hd, hd, pos0 + b);
+    }
     kv_populate(s, p, pos0, n);
 
     for (int l = 0; l < p->n_layers; l++) {
@@ -769,12 +791,16 @@ float *forward_batch(Transformer *transformer, int *tokens, int n, int pos0, int
         float *kc = s->key_cache + loff + (size_t)pos0 * kv_dim;
         float *vc = s->value_cache + loff + (size_t)pos0 * kv_dim;
 
-        // attention rmsnorm + quantize, per row
+        // (residual of the previous layer's ffn,) attention rmsnorm + quantize, per row
         #pragma omp parallel for
         for (int b = 0; b < n; b++) {
+            float *x = s->x_b + (size_t)b * dim, *xb = s->xb_b + (size_t)b * xs;
             QuantizedTensor xq = qrow(&s->xq_b, b, xs);
-            rmsnorm(s->xb_b + (size_t)b * xs, s->x_b + (size_t)b * dim, w->rms_att_weight + l * dim, dim);
-            quantize(&xq, s->xb_b + (size_t)b * xs, dim);
+            if (l > 0)
+                for (int i = 0; i < dim; i++)
+                    x[i] += xb[i];
+            rmsnorm(xb, x, w->rms_att_weight + l * dim, dim);
+            quantize(&xq, xb, dim);
         }
         PROF(PF_NORM);
 
@@ -787,8 +813,9 @@ float *forward_batch(Transformer *transformer, int *tokens, int n, int pos0, int
         // QK-norm + RoPE, each row at its own position
         #pragma omp parallel for
         for (int b = 0; b < n; b++) {
-            qk_norm_rope(s->q_b + (size_t)b * all_heads_dim, p->n_heads, w->q_norm_weights + l * hd, hd, pos0 + b);
-            qk_norm_rope(kc + (size_t)b * kv_dim, p->n_kv_heads, w->k_norm_weights + l * hd, hd, pos0 + b);
+            const float *cs = s->rope_b + (size_t)b * hd;
+            qk_norm_rope(s->q_b + (size_t)b * all_heads_dim, p->n_heads, w->q_norm_weights + l * hd, hd, cs);
+            qk_norm_rope(kc + (size_t)b * kv_dim, p->n_kv_heads, w->k_norm_weights + l * hd, hd, cs);
         }
         PROF(PF_ROPE);
 
@@ -847,15 +874,17 @@ float *forward_batch(Transformer *transformer, int *tokens, int n, int pos0, int
 
         matmul_batch(s->xb_b, xs, &s->hq_b, hidden, n, w->w2 + l, hidden, dim);
         PROF(PF_FFN2);
+        // (its residual add is done in the next layer's first loop, or below)
+    }
+    if (logits_mode == LOGITS_NONE)
+        return NULL; // the residual stream x_b is not needed any more
 
-        // residual connection
-        #pragma omp parallel for
-        for (int b = 0; b < n; b++) {
-            float *x = s->x_b + (size_t)b * dim, *xb = s->xb_b + (size_t)b * xs;
-            for (int i = 0; i < dim; i++)
-                x[i] += xb[i];
-        }
-        PROF(PF_NORM);
+    // residual connection of the last layer
+    #pragma omp parallel for
+    for (int b = 0; b < n; b++) {
+        float *x = s->x_b + (size_t)b * dim, *xb = s->xb_b + (size_t)b * xs;
+        for (int i = 0; i < dim; i++)
+            x[i] += xb[i];
     }
 
     if (logits_mode == LOGITS_LAST) {

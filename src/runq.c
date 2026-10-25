@@ -1251,7 +1251,8 @@ float *prefill(Transformer *transformer, int *tokens, int n, int pos0) {
 //
 // cwayn rewrite, matching HF tokenizers on Qwen2/Qwen3's tokenizer.json:
 //   1. added tokens (<|im_start|>, <think>, ...) are split out first, leftmost-longest match
-//   2. normalizer (NFC): NOT implemented, the input is assumed to be NFC already
+//   2. normalizer (NFC), on the text between added tokens (nfc_check / nfc_normalize, tables in
+//      unicode_nfc.h: Unicode 15.1 data with the overrides that match HF tokenizers' older data)
 //   3. pre-tokenizer: Qwen2's split regex, hand-written in pretok_next(), with the Unicode
 //      classes \p{L}, \p{N}, \s from unicode_tables.h (tools/gen_unicode_tables.py)
 //   4. byte-level BPE inside each chunk, starting from the single-byte tokens
@@ -1264,6 +1265,11 @@ float *prefill(Transformer *transformer, int *tokens, int n, int pos0) {
 // tiktoken-style BPE itself produces from the lower-ranked tokens.
 
 #include "unicode_tables.h"
+#include "unicode_nfc.h"
+
+// tokens[] capacity encode() needs for a text of n bytes: one token per byte of the NFC-normalized
+// text, which is at most 3x as long (e.g. U+1D160: 4 bytes -> 3 code points, 12 bytes)
+#define ENCODE_MAX_TOKENS(n) (3 * (size_t)(n) + 3)
 
 typedef struct {
     char **vocab;           // token bytes, NUL-terminated (the token for byte 0x00 reads as "")
@@ -1454,22 +1460,29 @@ static inline int ucls(uint32_t cp) {
     return UCLS_OTHER;
 }
 
-static inline UChar uchar_at(const unsigned char *p, const unsigned char *end) {
-    // decode one UTF-8 code point; an invalid byte counts as one "other" character
-    UChar c = { p[0], 1, UCLS_OTHER };
+static inline uint32_t utf8_cp(const unsigned char *p, const unsigned char *end, int *len) {
+    // decode one UTF-8 code point; an invalid byte gives U+FFFD with *len = 1
     unsigned char b = p[0];
-    if (b < 0x80) { c.cls = ucls(b); return c; }
+    *len = 1;
+    if (b < 0x80) return b;
     int n = b >= 0xf0 ? (b <= 0xf4 ? 4 : 0) : b >= 0xe0 ? 3 : b >= 0xc2 ? 2 : 0;
-    if (n == 0 || end - p < n) { c.cp = 0xfffd; return c; }
+    if (n == 0 || end - p < n) return 0xfffd;
     uint32_t cp = b & (0x7f >> n);
     for (int i = 1; i < n; i++) {
-        if ((p[i] & 0xc0) != 0x80) { c.cp = 0xfffd; return c; }
+        if ((p[i] & 0xc0) != 0x80) return 0xfffd;
         cp = (cp << 6) | (p[i] & 0x3f);
     }
-    if ((n == 3 && (cp < 0x800 || (cp >= 0xd800 && cp <= 0xdfff))) || (n == 4 && (cp < 0x10000 || cp > 0x10ffff))) {
-        c.cp = 0xfffd; return c;
-    }
-    c.cp = cp; c.len = n; c.cls = ucls(cp);
+    if ((n == 3 && (cp < 0x800 || (cp >= 0xd800 && cp <= 0xdfff))) || (n == 4 && (cp < 0x10000 || cp > 0x10ffff)))
+        return 0xfffd;
+    *len = n;
+    return cp;
+}
+
+static inline UChar uchar_at(const unsigned char *p, const unsigned char *end) {
+    // decode one UTF-8 code point; an invalid byte counts as one "other" character (U+FFFD is one)
+    UChar c;
+    c.cp = utf8_cp(p, end, &c.len);
+    c.cls = ucls(c.cp);
     return c;
 }
 
@@ -1534,6 +1547,163 @@ static const unsigned char *pretok_next(const unsigned char *p, const unsigned c
     return last_start;
 }
 
+// --- normalizer: NFC (tokenizer.json). All added tokens are "normalized": false, so HF matches them
+// on the raw text and normalizes each piece between them on its own: so does encode_segment().
+// Invalid UTF-8 (no HF equivalent: a Python str cannot hold it) passes through unchanged, each
+// invalid byte acting as U+FFFD would (a starter that composes with nothing): no reordering or
+// composition across it, and the valid text around it is normalized as usual.
+
+enum { NFC_YES = 0, NFC_MAYBE = 1, NFC_NO = 2 };
+enum { HG_S = 0xAC00, HG_L = 0x1100, HG_V = 0x1161, HG_T = 0x11A7, HG_LN = 19, HG_VN = 21, HG_TN = 28, HG_SN = 11172 };
+#define NFC_RAW 0x110000u // + byte: an invalid UTF-8 byte in the code point buffer (in no table)
+
+static inline int nfc_find(uint32_t cp, const uint32_t *blk) {
+    // index of cp in nfc_cp[], or -1; blk = nfc_any_blk, or nfc_qc_blk when only ccc / qc matter
+    if (cp < NFC_MIN_CP || cp > 0x10ffff || !(blk[cp >> 11] >> (cp >> 6 & 31) & 1)) return -1;
+    int lo = 0, hi = NFC_N - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1;
+        uint32_t m = nfc_cp[mid] & 0x1fffff;
+        if (cp < m) hi = mid - 1;
+        else if (cp > m) lo = mid + 1;
+        else return mid;
+    }
+    return -1;
+}
+
+static inline int nfc_info(int k) { // ccc | 256 if NFC_QC = Maybe (can combine with what precedes it)
+    return k < 0 ? 0 : (int)(nfc_cp[k] >> 23) | ((nfc_cp[k] >> 21 & 3) == NFC_MAYBE) << 8;
+}
+
+static const unsigned char *nfc_check(const unsigned char *p, const unsigned char *end) {
+    // quick check: end if the text is NFC (every code point NFC_QC = Yes, combining marks in
+    // canonical order), else where normalizing must start: the last code point before the first
+    // failure with ccc 0 and NFC_QC = Yes (nothing before it interacts with what follows)
+    const unsigned char *safe = p;
+    int last = 0;
+    while (p < end) {
+        if (*p < 0x80) { // ASCII: ccc 0, Yes
+            while (++p < end && *p < 0x80) {}
+            safe = p - 1;
+            last = 0;
+            continue;
+        }
+        int n, ccc = 0;
+        int k = nfc_find(utf8_cp(p, end, &n), nfc_qc_blk);
+        if (k >= 0) {
+            ccc = nfc_cp[k] >> 23;
+            if ((nfc_cp[k] >> 21 & 3) != NFC_YES || (ccc && ccc < last)) return safe;
+        }
+        if (!ccc) safe = p;
+        last = ccc;
+        p += n;
+    }
+    return end;
+}
+
+static uint32_t nfc_compose(uint32_t a, uint32_t b) {
+    // primary composite of the pair, or 0 (Hangul algorithmically; NFC_RAW values are in no key)
+    if (a - HG_L < HG_LN && b - HG_V < HG_VN) return HG_S + ((a - HG_L) * HG_VN + (b - HG_V)) * HG_TN;
+    if (a - HG_S < HG_SN && (a - HG_S) % HG_TN == 0 && b - HG_T - 1 < HG_TN - 1) return a + (b - HG_T);
+    uint64_t key = (uint64_t)a << 21 | b;
+    int lo = 0, hi = NFC_NCOMP - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1;
+        uint64_t m = nfc_comp[mid] >> 21;
+        if (key < m) hi = mid - 1;
+        else if (key > m) lo = mid + 1;
+        else return (uint32_t)(nfc_comp[mid] & 0x1fffff);
+    }
+    return 0;
+}
+
+static void nfc_sort_marks(uint32_t *cp, uint16_t *inf, int n, uint32_t *tcp, uint16_t *tinf) {
+    // stable sort of a run of combining marks by ccc: insertion sort, counting sort for long runs
+    if (n < 32) {
+        for (int i = 1; i < n; i++) {
+            uint32_t c = cp[i];
+            uint16_t f = inf[i];
+            int j = i;
+            for (; j > 0 && (inf[j - 1] & 0xff) > (f & 0xff); j--) { cp[j] = cp[j - 1]; inf[j] = inf[j - 1]; }
+            cp[j] = c;
+            inf[j] = f;
+        }
+        return;
+    }
+    int cnt[257] = {0};
+    for (int i = 0; i < n; i++) cnt[(inf[i] & 0xff) + 1]++;
+    for (int i = 1; i < 257; i++) cnt[i] += cnt[i - 1];
+    for (int i = 0; i < n; i++) { int j = cnt[inf[i] & 0xff]++; tcp[j] = cp[i]; tinf[j] = inf[i]; }
+    memcpy(cp, tcp, n * sizeof(uint32_t));
+    memcpy(inf, tinf, n * sizeof(uint16_t));
+}
+
+static unsigned char *nfc_normalize(const unsigned char *p, const unsigned char *q, const unsigned char *end, int *out_len) {
+    // NFC of [p, end) as a new buffer: [p, q) copied (nfc_check), [q, end) decomposed, its marks
+    // put in canonical order and composed. Output <= 3x the bytes, <= 2 code points per byte
+    // (both asserted by the table generator)
+    int nb = (int)(end - q), cap = 2 * nb + 1;
+    uint32_t *cp = malloc(2 * (size_t)cap * sizeof(uint32_t)); // code points, then sort scratch
+    uint16_t *inf = malloc(2 * (size_t)cap * sizeof(uint16_t)); // nfc_info of each
+    unsigned char *out = malloc((q - p) + 3 * (size_t)nb + 1);
+    if (!cp || !inf || !out) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    int n = 0;
+    for (const unsigned char *r = q; r < end;) { // decompose
+        int len;
+        uint32_t c = utf8_cp(r, end, &len);
+        if (c == 0xfffd && len == 1) c = NFC_RAW + *r;
+        r += len;
+        if (c - HG_S < HG_SN) {
+            uint32_t s = c - HG_S;
+            cp[n] = HG_L + s / (HG_VN * HG_TN); inf[n++] = 0;
+            cp[n] = HG_V + s % (HG_VN * HG_TN) / HG_TN; inf[n++] = 256;
+            if (s % HG_TN) { cp[n] = HG_T + s % HG_TN; inf[n++] = 256; }
+            continue;
+        }
+        int k = nfc_find(c, nfc_any_blk);
+        if (k >= 0 && nfc_dec[k]) {
+            const uint32_t *d = nfc_pool + (nfc_dec[k] >> 3);
+            for (int i = 0; i < (nfc_dec[k] & 7); i++) { cp[n] = d[i]; inf[n++] = nfc_info(nfc_find(d[i], nfc_qc_blk)); }
+        } else {
+            cp[n] = c; inf[n++] = nfc_info(k);
+        }
+    }
+    for (int i = 0; i < n;) { // canonical order: each run of combining marks sorted by ccc
+        if (!(inf[i] & 0xff)) { i++; continue; }
+        int j = i;
+        while (j < n && (inf[j] & 0xff)) j++;
+        if (j - i > 1) nfc_sort_marks(cp + i, inf + i, j - i, cp + cap, inf + cap);
+        i = j;
+    }
+    int w = 0, starter = -1, last = 0; // compose: last = ccc of the last code point kept
+    for (int i = 0; i < n; i++) {
+        int cc = inf[i] & 0xff;
+        // not blocked: adjacent to the starter, or every mark in between has a lower ccc
+        if (starter >= 0 && (inf[i] & 256) && (w == starter + 1 || last < cc)) {
+            uint32_t x = nfc_compose(cp[starter], cp[i]);
+            if (x) { cp[starter] = x; continue; }
+        }
+        if (!cc) starter = w;
+        last = cc;
+        cp[w++] = cp[i];
+    }
+    unsigned char *o = out;
+    memcpy(o, p, q - p);
+    o += q - p;
+    for (int i = 0; i < w; i++) {
+        uint32_t c = cp[i];
+        if (c >= NFC_RAW) *o++ = (unsigned char)(c - NFC_RAW);
+        else if (c < 0x80) *o++ = c;
+        else if (c < 0x800) { *o++ = 0xc0 | c >> 6; *o++ = 0x80 | (c & 0x3f); }
+        else if (c < 0x10000) { *o++ = 0xe0 | c >> 12; *o++ = 0x80 | (c >> 6 & 0x3f); *o++ = 0x80 | (c & 0x3f); }
+        else { *o++ = 0xf0 | c >> 18; *o++ = 0x80 | (c >> 12 & 0x3f); *o++ = 0x80 | (c >> 6 & 0x3f); *o++ = 0x80 | (c & 0x3f); }
+    }
+    free(cp);
+    free(inf);
+    *out_len = (int)(o - out);
+    return out;
+}
+
 // --- byte-level BPE inside one pre-tokenizer chunk
 
 typedef struct { float score; int pos, len, id; } BpeCand; // merge candidate: symbol at pos + next one
@@ -1543,6 +1713,20 @@ typedef struct {
     BpeCand *heap;
     int cap;
 } BpeScratch;
+
+static void bpe_reserve(BpeScratch *s, int n) {
+    // scratch for chunks of up to n bytes
+    if (n < 1) n = 1;
+    if (s->len && n <= s->cap) return;
+    free(s->len);
+    free(s->heap);
+    s->cap = n;
+    s->len = malloc(3 * (size_t)n * sizeof(int));
+    s->tok = s->len + n;
+    s->prev = s->tok + n;
+    s->heap = malloc(3 * (size_t)n * sizeof(BpeCand)); // n-1 initial pairs + 2 per merge
+    if (!s->len || !s->heap) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+}
 
 static inline int cand_before(const BpeCand *a, const BpeCand *b) {
     return a->score > b->score || (a->score == b->score && a->pos < b->pos);
@@ -1611,12 +1795,22 @@ static void bpe_chunk(Tokenizer *t, const unsigned char *chunk, int n, BpeScratc
 }
 
 static void encode_segment(Tokenizer *t, const unsigned char *p, const unsigned char *end, BpeScratch *s, int *tokens, int *n_tokens) {
-    // text between added tokens: pre-tokenize, then BPE each chunk
+    // text between added tokens: NFC, pre-tokenize, then BPE each chunk
+    unsigned char *norm = NULL;
+    const unsigned char *q = nfc_check(p, end);
+    if (q < end) {
+        int n;
+        norm = nfc_normalize(p, q, end, &n);
+        p = norm;
+        end = norm + n;
+        bpe_reserve(s, n);
+    }
     while (p < end) {
-        const unsigned char *q = pretok_next(p, end);
+        q = pretok_next(p, end);
         bpe_chunk(t, p, (int)(q - p), s, tokens, n_tokens);
         p = q;
     }
+    free(norm);
 }
 
 static int match_added(Tokenizer *t, const unsigned char *p, const unsigned char *end, int *len) {
@@ -1629,17 +1823,11 @@ static int match_added(Tokenizer *t, const unsigned char *p, const unsigned char
 }
 
 void encode(Tokenizer *t, char *text, int *tokens, int *n_tokens) {
-    // encode the string text (input) into an upper-bound preallocated tokens[] array:
-    // at most one token per byte, so strlen(text) ints are enough
+    // encode the string text (input) into an upper-bound preallocated tokens[] array of
+    // ENCODE_MAX_TOKENS(strlen(text)) ints
     const unsigned char *s = (const unsigned char *)text, *end = s + strlen(text);
-    int n = (int)(end - s);
-    BpeScratch sc;
-    sc.cap = n > 0 ? n : 1;
-    sc.len = malloc(3 * (size_t)sc.cap * sizeof(int));
-    sc.tok = sc.len + sc.cap;
-    sc.prev = sc.tok + sc.cap;
-    sc.heap = malloc(3 * (size_t)sc.cap * sizeof(BpeCand)); // n-1 initial pairs + 2 per merge
-    if (!sc.len || !sc.heap) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    BpeScratch sc = {0};
+    bpe_reserve(&sc, (int)(end - s));
 
     *n_tokens = 0;
     const unsigned char *seg = s;
@@ -1882,7 +2070,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 
     // encode the (string) prompt into tokens sequence
     int num_prompt_tokens = 0;
-    int *prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
+    int *prompt_tokens = (int*)malloc(ENCODE_MAX_TOKENS(strlen(prompt)) * sizeof(int));
     encode(tokenizer, prompt, prompt_tokens, &num_prompt_tokens);
     if (num_prompt_tokens < 1) {
         fprintf(stderr, "Please provide a prompt using -i <string> on the command line.\n");
@@ -1989,8 +2177,8 @@ static void iv_append(IntVec *a, const int *x, int n) {
 static void iv_push(IntVec *a, int x) { iv_append(a, &x, 1); }
 
 static void encode_append(Tokenizer *t, IntVec *v, const char *text) {
-    // append the tokens of text (raw, no template); encode needs at most one token per byte
-    iv_reserve(v, (size_t)v->n + strlen(text) + 3);
+    // append the tokens of text (raw, no template)
+    iv_reserve(v, (size_t)v->n + ENCODE_MAX_TOKENS(strlen(text)));
     int n = 0;
     encode(t, (char *)text, v->v + v->n, &n);
     v->n += n;
@@ -2257,7 +2445,7 @@ void tokenize(Tokenizer *tokenizer, char *text, double t_load) {
     // encode the raw text (no chat template), print the token ids space-separated on stdout;
     // timings on stderr (encode only, and the tokenizer load before it)
     int n_tokens = 0;
-    int *tokens = (int *)malloc((strlen(text) + 3) * sizeof(int));
+    int *tokens = (int *)malloc(ENCODE_MAX_TOKENS(strlen(text)) * sizeof(int));
     double t0 = now_s();
     encode(tokenizer, text, tokens, &n_tokens);
     double t_enc = now_s() - t0;
@@ -2292,7 +2480,7 @@ void dump_logits(Transformer *transformer, Tokenizer *tokenizer, char *text, cha
     // file format: int32 n_tokens, int32 vocab_size, int32 ids[n_tokens], float32 logits[n_tokens][vocab_size]
     // -b > 1: batched path (forward_chunked), else one token at a time (forward_sequential)
     int n_tokens = 0, vocab_size = transformer->config.vocab_size;
-    int *tokens = (int *)malloc((strlen(text) + 3) * sizeof(int));
+    int *tokens = (int *)malloc(ENCODE_MAX_TOKENS(strlen(text)) * sizeof(int));
     encode(tokenizer, text, tokens, &n_tokens);
     if (n_tokens < 1 || n_tokens > transformer->config.seq_len) {
         fprintf(stderr, "dump_logits: need 1..%d tokens, got %d\n", transformer->config.seq_len, n_tokens);

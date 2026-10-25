@@ -5,13 +5,16 @@
  * runq.c uses its generic C kernels (dot_q8, dot_q8_x4).
  *
  * Weights are repacked once at load ("Q8P" layout) so that the 16 dword lanes of a zmm hold 16
- * different weight rows: no horizontal reductions at all. For a (d, k) Q8_0 matrix (d % 16 == 0,
- * k % 64 == 0, GS == 64), block rb = rows 16*rb .. 16*rb+15, group g = columns 64*g .. 64*g+63:
- *   pk + (rb * k/64 + g) * Q8P_GROUP:
- *     16 steps st of 64 bytes: lane r, byte j = (uint8)(W[16*rb + r][64*g + 4*st + j] + 128)
+ * different weight rows: no horizontal reductions at all. For a (d, k) Q8_0 matrix with group size
+ * gs = 64 (.bin) or 32 (GGUF) (d % 16 == 0, k % gs == 0), block rb = rows 16*rb .. 16*rb+15, group
+ * g = columns gs*g .. gs*g+gs-1:
+ *   pk + (rb * k/gs + g) * Q8P_GROUP(gs):
+ *     gs/4 steps st of 64 bytes: lane r, byte j = (uint8)(W[16*rb + r][gs*g + 4*st + j] + 128)
  *     then 16 floats: the scales ws[16*rb + r][g]
- * 1088 bytes per (block, group), the same size as the original (q, s) data. One block (all k) is
- * contiguous, so a GEMV streams each thread's rows as one sequential read.
+ * 1088 (gs 64) or 576 (gs 32) bytes per (block, group), the same size as the (q, s) data with fp32
+ * scales. One block (all k) is contiguous, so a GEMV streams each thread's rows as one sequential
+ * read. The group size is a parameter of every function; the inner kernels are instantiated for
+ * both (compile-time step counts).
  *
  * vpdpbusd multiplies u8 x s8: the weights are stored offset by +128 (u8), the activations stay
  * s8 and are broadcast 4 bytes at a time; the offset is removed exactly with the activation
@@ -43,9 +46,8 @@
 #define RUNQ_VNNI 1
 #include <immintrin.h>
 
-#define Q8P_GS 64
 #define Q8P_ROWS 16
-#define Q8P_GROUP (Q8P_ROWS * Q8P_GS + Q8P_ROWS * 4) // bytes per (block, group): 1024 + 64
+#define Q8P_GROUP(gs) (Q8P_ROWS * (gs) + Q8P_ROWS * 4) // bytes per (block, group): 16 x gs + 64
 
 // GEMM register tile: Q8P_RB blocks of 16 weight rows x Q8P_C activation rows; 2 * RB * C zmm
 // accumulators (int32 group sums + float outputs) + RB weight registers (<= 32)
@@ -68,36 +70,47 @@
 
 #define Q8P_RND (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)
 
-static inline size_t q8p_size(int d, int k) { return (size_t)(d / Q8P_ROWS) * (k / Q8P_GS) * Q8P_GROUP; }
+static inline size_t q8p_size(int d, int k, int gs) { return (size_t)(d / Q8P_ROWS) * (k / gs) * Q8P_GROUP(gs); }
 
-static inline int q8p_ok(int d, int k) { return d > 0 && k > 0 && d % Q8P_ROWS == 0 && k % Q8P_GS == 0; }
+static inline int q8p_ok(int d, int k, int gs) {
+    return (gs == 32 || gs == 64) && d > 0 && k > 0 && d % Q8P_ROWS == 0 && k % gs == 0;
+}
 
-static void q8p_pack_blocks(uint8_t *pk, const int8_t *q, const float *s, int nblk, int k) {
+static void q8p_pack_blocks(uint8_t *pk, const int8_t *q, const float *s, int nblk, int k, int gs) {
     // nblk blocks of 16 rows of a Q8_0 matrix with k columns: (q, s) = their rows, row-major, with
-    // k/64 scales per row -> Q8P layout at pk (64-byte aligned). Serial (the caller splits the work)
-    int ng = k / Q8P_GS;
+    // k/gs scales per row -> Q8P layout at pk (64-byte aligned). Serial (the caller splits the work)
+    int ng = k / gs;
     for (int rb = 0; rb < nblk; rb++) {
         for (int g = 0; g < ng; g++) {
-            uint8_t *o = pk + ((size_t)rb * ng + g) * Q8P_GROUP;
+            uint8_t *o = pk + ((size_t)rb * ng + g) * Q8P_GROUP(gs);
             for (int r = 0; r < Q8P_ROWS; r++) {
-                const int8_t *src = q + (size_t)(rb * Q8P_ROWS + r) * k + g * Q8P_GS;
-                for (int st = 0; st < Q8P_GS / 4; st++) {
+                const int8_t *src = q + (size_t)(rb * Q8P_ROWS + r) * k + g * gs;
+                for (int st = 0; st < gs / 4; st++) {
                     uint32_t v;
                     memcpy(&v, src + 4 * st, 4);
                     v ^= 0x80808080u; // int8 w -> uint8 w + 128
                     memcpy(o + st * 64 + r * 4, &v, 4);
                 }
-                memcpy(o + Q8P_ROWS * Q8P_GS + r * 4, s + (size_t)(rb * Q8P_ROWS + r) * ng + g, 4);
+                memcpy(o + Q8P_ROWS * gs + r * 4, s + (size_t)(rb * Q8P_ROWS + r) * ng + g, 4);
             }
         }
     }
 }
 
-static inline int32_t q8p_corr(const int8_t *x) {
-    // -128 * (sum of the 64 int8 values at x): the accumulator start removing the +128 weight offset
-    __m512i u = _mm512_xor_si512(_mm512_loadu_si512(x), _mm512_set1_epi8((char)0x80)); // x + 128
-    __m512i sad = _mm512_sad_epu8(u, _mm512_setzero_si512());
-    int32_t sum = (int32_t)_mm512_reduce_add_epi64(sad) - Q8P_GS * 128;
+static inline int32_t q8p_corr(const int8_t *x, int gs) {
+    // -128 * (sum of the gs = 64 or 32 int8 values at x): the accumulator start removing the +128
+    // weight offset
+    int32_t sum;
+    if (gs == 64) {
+        __m512i u = _mm512_xor_si512(_mm512_loadu_si512(x), _mm512_set1_epi8((char)0x80)); // x + 128
+        __m512i sad = _mm512_sad_epu8(u, _mm512_setzero_si512());
+        sum = (int32_t)_mm512_reduce_add_epi64(sad) - 64 * 128;
+    } else {
+        __m256i u = _mm256_xor_si256(_mm256_loadu_si256((const __m256i *)x), _mm256_set1_epi8((char)0x80));
+        __m256i sad = _mm256_sad_epu8(u, _mm256_setzero_si256());
+        __m128i h = _mm_add_epi64(_mm256_castsi256_si128(sad), _mm256_extracti128_si256(sad, 1));
+        sum = (int32_t)(_mm_cvtsi128_si64(h) + _mm_extract_epi64(h, 1)) - 32 * 128;
+    }
     return -128 * sum;
 }
 
@@ -115,18 +128,18 @@ static inline __m512 q8p_fold(__m512 acc, __m512 ws, float xs, __m512i isum) {
 }
 
 static inline __attribute__((always_inline))
-void q8p_tile(const int RB, const int C, const uint8_t *wp, size_t bstride, int ng,
+void q8p_tile(const int RB, const int C, const int GSZ, const uint8_t *wp, size_t bstride, int ng,
               const int8_t *x, size_t ldx, const float *xs, size_t ldxs, const int32_t *corr,
               float *out, size_t ldo) {
     // out[c * ldo + 16 * r + lane] for r < RB blocks (at wp, wp + bstride), c < C activation rows
-    // (x + c * ldx, scales xs + c * ldxs, corrections corr + c * ng), over all ng groups
+    // (x + c * ldx, scales xs + c * ldxs, corrections corr + c * ng), over all ng groups of GSZ
     __m512 f[Q8P_RB][Q8P_C];
     for (int r = 0; r < RB; r++)
         for (int c = 0; c < C; c++)
             f[r][c] = _mm512_setzero_ps();
     for (int g = 0; g < ng; g++) {
-        const uint8_t *wg = wp + (size_t)g * Q8P_GROUP;
-        const int8_t *xg = x + (size_t)g * Q8P_GS;
+        const uint8_t *wg = wp + (size_t)g * Q8P_GROUP(GSZ);
+        const int8_t *xg = x + (size_t)g * GSZ;
         __m512i acc[Q8P_RB][Q8P_C];
         for (int c = 0; c < C; c++) {
             __m512i cv = _mm512_set1_epi32(corr[(size_t)c * ng + g]);
@@ -134,7 +147,7 @@ void q8p_tile(const int RB, const int C, const uint8_t *wp, size_t bstride, int 
                 acc[r][c] = cv;
         }
         #pragma GCC unroll 16
-        for (int st = 0; st < Q8P_GS / 4; st++) {
+        for (int st = 0; st < GSZ / 4; st++) {
             __m512i w[Q8P_RB];
             for (int r = 0; r < RB; r++)
                 w[r] = _mm512_load_si512((const void *)(wg + r * bstride + st * 64));
@@ -145,7 +158,7 @@ void q8p_tile(const int RB, const int C, const uint8_t *wp, size_t bstride, int 
             }
         }
         for (int r = 0; r < RB; r++) {
-            __m512 ws = _mm512_load_ps((const float *)(wg + r * bstride + Q8P_ROWS * Q8P_GS));
+            __m512 ws = _mm512_load_ps((const float *)(wg + r * bstride + Q8P_ROWS * GSZ));
             for (int c = 0; c < C; c++)
                 f[r][c] = q8p_fold(f[r][c], ws, xs[c * ldxs + g], acc[r][c]);
         }
@@ -155,18 +168,23 @@ void q8p_tile(const int RB, const int C, const uint8_t *wp, size_t bstride, int 
             _mm512_storeu_ps(out + c * ldo + r * Q8P_ROWS, f[r][c]);
 }
 
-static void q8p_tile_any(int rb, int c, const uint8_t *wp, size_t bstride, int ng, const int8_t *x,
+static void q8p_tile_any(int rb, int c, int gs, const uint8_t *wp, size_t bstride, int ng, const int8_t *x,
                          size_t ldx, const float *xs, size_t ldxs, const int32_t *corr, float *out, size_t ldo) {
-    // dispatch to the instance with compile-time RB (1..Q8P_RB) and C (1..Q8P_C <= 8)
-    #define Q8P_CASE(R, CC) case (R) * 16 + (CC): { \
+    // dispatch to the instance with compile-time RB (1..Q8P_RB), C (1..Q8P_C <= 8) and group size
+    #define Q8P_CASE(G, R, CC) case ((G) == 32) * 256 + (R) * 16 + (CC): { \
         if ((R) <= Q8P_RB && (CC) <= Q8P_C) \
-            q8p_tile((R) <= Q8P_RB ? (R) : 1, (CC) <= Q8P_C ? (CC) : 1, wp, bstride, ng, x, ldx, xs, ldxs, corr, out, ldo); \
+            q8p_tile((R) <= Q8P_RB ? (R) : 1, (CC) <= Q8P_C ? (CC) : 1, G, wp, bstride, ng, x, ldx, xs, ldxs, corr, out, ldo); \
         break; }
-    switch (rb * 16 + c) {
-        Q8P_CASE(1, 1) Q8P_CASE(1, 2) Q8P_CASE(1, 3) Q8P_CASE(1, 4) Q8P_CASE(1, 5) Q8P_CASE(1, 6) Q8P_CASE(1, 7) Q8P_CASE(1, 8)
-        Q8P_CASE(2, 1) Q8P_CASE(2, 2) Q8P_CASE(2, 3) Q8P_CASE(2, 4) Q8P_CASE(2, 5) Q8P_CASE(2, 6) Q8P_CASE(2, 7) Q8P_CASE(2, 8)
+    #define Q8P_CASES(G) \
+        Q8P_CASE(G, 1, 1) Q8P_CASE(G, 1, 2) Q8P_CASE(G, 1, 3) Q8P_CASE(G, 1, 4) Q8P_CASE(G, 1, 5) Q8P_CASE(G, 1, 6) \
+        Q8P_CASE(G, 1, 7) Q8P_CASE(G, 1, 8) Q8P_CASE(G, 2, 1) Q8P_CASE(G, 2, 2) Q8P_CASE(G, 2, 3) Q8P_CASE(G, 2, 4) \
+        Q8P_CASE(G, 2, 5) Q8P_CASE(G, 2, 6) Q8P_CASE(G, 2, 7) Q8P_CASE(G, 2, 8)
+    switch ((gs == 32) * 256 + rb * 16 + c) {
+        Q8P_CASES(64)
+        Q8P_CASES(32)
         default: break;
     }
+    #undef Q8P_CASES
     #undef Q8P_CASE
 }
 
@@ -199,16 +217,17 @@ static int q8p_nb(int nb, int ntile) {
 
 typedef struct { float *out; int ldo; const uint8_t *wp; int d; } Q8PJob;
 
-static void q8p_gemm_n(int nj, const Q8PJob *job, const int8_t *xq, const float *xs, int ldx, int nb, int k) {
+static void q8p_gemm_n(int nj, const Q8PJob *job, const int8_t *xq, const float *xs, int ldx, int nb, int k, int gs) {
     // for each job j: job[j].out[b * ldo + i] = W_j[i, :] . x[b, :] for b < nb, i < d_j; all W_j
-    // in Q8P layout (k % 64 == 0, d_j % 16 == 0) on the same input rows x (at xq + b * ldx, scales
-    // xs + b * ldx / 64), in one parallel loop (e.g. q, k, v: one barrier instead of three).
+    // in Q8P layout with group size gs (k % gs == 0, d_j % 16 == 0) on the same input rows x (at
+    // xq + b * ldx, scales xs + b * ldx / gs), in one parallel loop (e.g. q, k, v: one barrier
+    // instead of three).
     // Work items: (32-row weight tile of some W_j, nbi activation rows), static schedule
     // (contiguous items: a thread does all the chunks of a tile in a row; dynamic scheduling
     // measured the same at 8-14 threads and does not prevent the 16-thread collapse); inside,
     // the weight tile (32 x k bytes + scales, 34-102 KB) is reused from L1/L2 for every Q8P_C rows
-    int ng = k / Q8P_GS;
-    size_t bstride = (size_t)ng * Q8P_GROUP, ldxs = (size_t)ldx / Q8P_GS;
+    int ng = k / gs;
+    size_t bstride = (size_t)ng * Q8P_GROUP(gs), ldxs = (size_t)ldx / gs;
     int32_t *corr = q8p_corr_buf((size_t)nb * ng);
     int t0[9], ntile = 0;
     if (nj > 8) { fprintf(stderr, "q8p_gemm_n: too many jobs\n"); exit(EXIT_FAILURE); }
@@ -223,7 +242,7 @@ static void q8p_gemm_n(int nj, const Q8PJob *job, const int8_t *xq, const float 
         #pragma omp for schedule(static)
         for (int b = 0; b < nb; b++)
             for (int g = 0; g < ng; g++)
-                corr[(size_t)b * ng + g] = q8p_corr(xq + (size_t)b * ldx + g * Q8P_GS);
+                corr[(size_t)b * ng + g] = q8p_corr(xq + (size_t)b * ldx + g * gs, gs);
         #pragma omp for schedule(static)
         for (int it = 0; it < ntile * nchunk; it++) {
             int t = it / nchunk, ch = it % nchunk, j = 0;
@@ -234,44 +253,53 @@ static void q8p_gemm_n(int nj, const Q8PJob *job, const int8_t *xq, const float 
             const uint8_t *wt = job[j].wp + (size_t)rb0 * bstride;
             for (int b = ch * nbi; b < b1; b += Q8P_C) {
                 int c = b1 - b < Q8P_C ? b1 - b : Q8P_C;
-                q8p_tile_any(rb, c, wt, bstride, ng, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
+                q8p_tile_any(rb, c, gs, wt, bstride, ng, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
                              corr + (size_t)b * ng, job[j].out + (size_t)b * job[j].ldo + (size_t)rb0 * Q8P_ROWS, job[j].ldo);
             }
         }
     }
 }
 
-static inline void q8p_gemv_corr(int32_t *corr, const int8_t *xq, int k) {
-    // the GEMV's activation corrections, one per 64-group (k / 64 values)
-    for (int g = 0; g < k / Q8P_GS; g++)
-        corr[g] = q8p_corr(xq + g * Q8P_GS);
+static inline void q8p_gemv_corr(int32_t *corr, const int8_t *xq, int k, int gs) {
+    // the GEMV's activation corrections, one per group (k / gs values)
+    for (int g = 0; g < k / gs; g++)
+        corr[g] = q8p_corr(xq + g * gs, gs);
 }
 
-static void q8p_gemv_rows(float *out, const int8_t *xq, const float *xs, const int32_t *corr, const uint8_t *wp,
-                          int k, int rb0, int rb1) {
-    // out[i] = W[i, :] . x for the rows i of the 16-row blocks rb0..rb1-1 (decode; no OpenMP here:
-    // called on disjoint ranges from inside one parallel region). Memory-bound: streams the
-    // blocks once; the activation row (k bytes) stays in L1
-    int ng = k / Q8P_GS;
-    size_t bstride = (size_t)ng * Q8P_GROUP;
+static inline __attribute__((always_inline))
+void q8p_gemv_blocks(const int GSZ, float *out, const int8_t *xq, const float *xs, const int32_t *corr,
+                     const uint8_t *wp, int k, int rb0, int rb1) {
+    int ng = k / GSZ;
+    size_t bstride = (size_t)ng * Q8P_GROUP(GSZ);
     for (int rb = rb0; rb < rb1; rb++) {
         const uint8_t *wb = wp + (size_t)rb * bstride;
         __m512 f = _mm512_setzero_ps();
         for (int g = 0; g < ng; g++) {
-            const uint8_t *wg = wb + (size_t)g * Q8P_GROUP;
-            const int8_t *xg = xq + g * Q8P_GS;
+            const uint8_t *wg = wb + (size_t)g * Q8P_GROUP(GSZ);
+            const int8_t *xg = xq + g * GSZ;
             // two independent chains (even / odd steps) to halve the vpdpbusd latency chain
             __m512i a0 = _mm512_set1_epi32(corr[g]), a1 = _mm512_setzero_si512();
             #pragma GCC unroll 8
-            for (int st = 0; st < Q8P_GS / 4; st += 2) {
+            for (int st = 0; st < GSZ / 4; st += 2) {
                 a0 = _mm512_dpbusd_epi32(a0, _mm512_load_si512((const void *)(wg + st * 64)), q8p_bcast4(xg + st * 4));
                 a1 = _mm512_dpbusd_epi32(a1, _mm512_load_si512((const void *)(wg + st * 64 + 64)), q8p_bcast4(xg + st * 4 + 4));
             }
-            __m512 ws = _mm512_load_ps((const float *)(wg + Q8P_ROWS * Q8P_GS));
+            __m512 ws = _mm512_load_ps((const float *)(wg + Q8P_ROWS * GSZ));
             f = q8p_fold(f, ws, xs[g], _mm512_add_epi32(a0, a1));
         }
         _mm512_storeu_ps(out + (size_t)rb * Q8P_ROWS, f);
     }
+}
+
+static void q8p_gemv_rows(float *out, const int8_t *xq, const float *xs, const int32_t *corr, const uint8_t *wp,
+                          int k, int gs, int rb0, int rb1) {
+    // out[i] = W[i, :] . x for the rows i of the 16-row blocks rb0..rb1-1 (decode; no OpenMP here:
+    // called on disjoint ranges from inside one parallel region). Memory-bound: streams the
+    // blocks once; the activation row (k bytes) stays in L1
+    if (gs == 64)
+        q8p_gemv_blocks(64, out, xq, xs, corr, wp, k, rb0, rb1);
+    else
+        q8p_gemv_blocks(32, out, xq, xs, corr, wp, k, rb0, rb1);
 }
 
 #endif // AVX-512 VNNI

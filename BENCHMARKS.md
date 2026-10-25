@@ -6,9 +6,9 @@ mynah-slm, plus perplexity. All numbers in the Results, Comparison and Quality s
 output of every run: [bench/results-2026-10-25.txt](bench/results-2026-10-25.txt). Earlier
 measurements are only in [History](#history-earlier-measurements) and are labelled there.
 
-The [Apple M1 Pro section](#apple-m1-pro-macos-neon) is a different machine and a different session
-(2026-10-25 14:56 UTC, commit `bb69e5f`) and is not comparable with the tables above (other CPU,
-Q4_K_M instead of Q8_0).
+The [Apple M1 Pro section](#apple-m1-pro-macos-neon) is a different machine and different sessions
+(2026-10-25, 14:56-21:07 UTC, branch `mac-m1-pro`) and is not comparable with the tables above
+(other CPU; Q4_K_M as well as Q8_0).
 
 ## Setup
 
@@ -126,19 +126,21 @@ VNNI weights (~630 MB, ~55 ms to pack). mynah-slm reports a 0.14-0.15 s model lo
 ## Apple M1 Pro (macOS, NEON)
 
 Experimental port, branch `mac-m1-pro`: `runq` built with Apple clang (`make`), NEON `sdot` kernels
-for the Q4_K / Q6_K matrices, the attention (`bb69e5f`) and Q8_0 (`14169f4`), all in
-`src/kernels_neon.h`. Two sessions: Q4_K_M 2026-10-25 14:56-15:05 UTC
-([bench/results-mac-m1-pro-2026-10-25.txt](bench/results-mac-m1-pro-2026-10-25.txt)), Q8_0 with
+for the Q4_K / Q6_K matrices, the attention and Q8_0, all in `src/kernels_neon.h`. Three sessions on
+2026-10-25: Q4_K_M 14:56-15:05 UTC
+([bench/results-mac-m1-pro-2026-10-25.txt](bench/results-mac-m1-pro-2026-10-25.txt)); Q8_0 with
 Q4_K_M rerun for comparison 16:11-16:20 UTC
-([bench/results-mac-m1-pro-q8-2026-10-25.txt](bench/results-mac-m1-pro-q8-2026-10-25.txt)).
+([bench/results-mac-m1-pro-q8-2026-10-25.txt](bench/results-mac-m1-pro-q8-2026-10-25.txt)); both
+formats after the rebase onto Step 7a, against the build from before it, 20:59-21:07 UTC
+([bench/results-mac-m1-pro-step7a-2026-10-25.txt](bench/results-mac-m1-pro-step7a-2026-10-25.txt)).
 
 | | |
 |---|---|
 | CPU | Apple M1 Pro, 8 performance + 2 efficiency cores, 32 GB, macOS 26.6.2 |
-| sharing | a desktop in use: 1-min load 3 before, 9.6 after the runs (iTerm, browser, ...) |
+| sharing | a desktop in use (iTerm, browser, ...): 1-min load before / after the runs 3 / 9.6 (first session), 6.4 / 8.7 (second), 4.3 / 11.1 (third; the "after" values include the benchmark's own threads) |
 | compiler | Apple clang 21.0.0, `-O3 -ffast-math -ffp-contract=on -mcpu=native` (`make`; no OpenMP, the pthread pool) |
 | models | `Qwen3-0.6B-Q4_K_M.gguf` (unsloth @ `50968a4`, 396,705,472 bytes); `Qwen3-0.6B-q8.bin` (633,495,808 bytes, group 64); greedy, `-b 512`, `-c 4096` |
-| runq | Q4_K_M session: `bb69e5f`; Q8_0 session: `a2ab409` + the Q8_0 kernels, committed unchanged as `14169f4` |
+| runq | first session `bb69e5f`; second `a2ab409` + the Q8_0 kernels, committed unchanged as `14169f4` (both before the rebase onto Step 7a, base `92fe41f`; rebased, these commits are `6e7244d` and `6aea56d`); third `33069be` (on `origin/main` `10211a3`) against the pre-rebase build |
 
 ### Q4_K_M (first session)
 
@@ -156,8 +158,10 @@ chat-mode prompts of 451 and 1,500 tokens):
 - NEON vs generic at 8 threads: prefill 8.5x (451 tokens) and 7.0x (1,500 tokens), decode 3.2x.
   Both builds give bit-identical logits (`make test`'s kernels group, and a 688-position comparison
   of all logits, prefill and token by token).
-- 8 threads (the performance cores) is the best setting, and the default here (min(12, nproc -
-  nproc/4) = 8 for 10 CPUs). The two efficiency cores add ~0-1% to prefill and cost ~10% of decode.
+- 8 threads (the performance cores) is the best setting. It was the default in the first two
+  sessions (min(12, nproc - nproc/4) = 8 for 10 CPUs); Step 7a's nproc - nproc/8 would give 9, so
+  since the rebase the default on Apple Silicon is the performance cores (third session below). The
+  two efficiency cores add ~0-1% to prefill and cost ~10% of decode.
 - Run-to-run spread, 8 threads: 1-2% (prefill 451), 1% (decode); one 1,500-token run was disturbed
   (278 vs 959-968 tok/s) and is not the reported best. The decode column of `bench_prefill.sh` (15
   tokens) is lower than the 256-token one (164 vs 190 at 8 threads): different prompt and length.
@@ -196,6 +200,53 @@ Best of 3 runs, 8 threads unless noted, same scripts:
   covers group 32. Rounding: the NEON fold follows `dot_q8` as written, `((float) isum * ws) * xs`;
   gcc -Ofast on x86 reassociates it to `(ws * xs) * isum` (the AVX-512 kernels follow that), so arm64
   and x86 Q8_0 logits differ in the last bits, as they did with the generic kernels.
+
+### After the rebase onto Step 7a (third session)
+
+`origin/main` moved on during the port, from `92fe41f` to `10211a3`: Step 7a (the thread pool with
+phase sync, the decode GEMVs on per-thread item ranges, default threads nproc - nproc/8), then
+`-k f32|bf16|f16` and a vectorized `quantize`. The branch was rebased onto it (three small
+conflicts: the attention signatures, a test label, README text), and the default thread count on
+Apple Silicon became the performance cores (`33069be`: `hw.perflevel0.logicalcpu` when there is
+more than one core type; 8 here instead of 9). The build from before the rebase (the old branch tip
+`f4b8a68`, the code of `14169f4`) and the rebased one ran interleaved, two rounds, best of 3 per
+cell, same scripts (round 1 / round 2):
+
+| model, build, 8 threads | prefill 451 tok | prefill 1,500 tok | decode |
+|---|---|---|---|
+| Q4_K_M, before | 1,294 / 1,304 | 992 / 971 | 179 / 180 |
+| **Q4_K_M, after** | **1,324 / 1,318** | **994 / 988** | **188 / 193** |
+| Q8_0 .bin, before | 1,622 / 1,662 | 1,113 / 1,156 | 132 / 133 |
+| **Q8_0 .bin, after** | **1,666 / 1,665** | **1,164 / 1,203** | **137 / 137** |
+
+- Step 7a on this Mac: decode +5-7% (Q4_K_M) and +4% (Q8_0); prefill +0-5%, mostly within the
+  1-2% run-to-run spread except Q8_0 at 1,500 tokens (+4-5% in both rounds).
+- The pre-rebase build measured lower than in the first two sessions (decode 179-180 vs 190-191 for
+  Q4_K_M, 132-133 vs 140 for Q8_0; prefill up to 8% lower); cause not determined (desktop in use).
+  Compare within a session.
+- Threads, rebased build, decode: Q4_K_M 188 / 193 at 8, 175 / 175 at 9, 164 / 168 at 10; Q8_0
+  137 / 137, 130 / 129, 128 / 127. So 9 threads (Step 7a's default here) cost 7-9% (Q4_K_M) and 5-6%
+  (Q8_0) of decode, 10 threads 7-13%; prefill is within 3% at 8, 9 and 10 threads. Hence the
+  performance cores as the default; without `OMP_NUM_THREADS` the process runs 8 threads (checked).
+- 16-bit KV caches, rebased build, Q4_K_M, 8 threads, a 1,500-token chat prompt then 128 new tokens
+  (best of 3, round 1 / round 2):
+
+  | `-k` | prefill | decode |
+  |---|---|---|
+  | f32 (default) | 995 / 970 | 97 / 98 |
+  | bf16 | 205 / 203 | 67 / 65 |
+  | f16 | 104 / 102 | 39 / 39 |
+
+  The NEON attention handles only the f32 cache; with bf16 / f16 runq.c's generic attention runs (it
+  converts each tile to fp32, then the same arithmetic): prefill ~5x / ~10x slower, decode -31-34% /
+  -60%. Logits are bit-identical to the generic build with both (688 positions, `-b 512` and `-b 1`).
+  A NEON version (the exact conversion in registers, then the existing kernels) is not written; it
+  would halve the ~340 MB of cache reads per decoded token at 1,500 positions. The M1 Pro has no bf16
+  instructions (`hw.optional.arm.FEAT_BF16` 0); the conversion does not need them (a 16-bit shift).
+- `make test` on the rebased build: 162 passed, 8 failed, the same 8 as unmodified `origin/main`
+  built on this Mac (tests that depend on the generated text; README, Known limitations).
+- Disturbed runs, not the reported bests: Q8_0 before, round 2, 9 threads, 1,500 tokens (prefill 373
+  vs 1,154-1,159); Q8_0 after, round 2, 10 threads, 1,500 tokens (decode 60 vs 77).
 
 ### Both
 

@@ -3857,7 +3857,7 @@ int main(int argc, char *argv[]) {
     // ~2,420 tok/s at 439 tokens). All 16 work too (the phases tolerate a preempted thread; with
     // OpenMP's barriers they collapsed to ~2-20 tok/s), just not faster with other processes running.
     // Apple Silicon with efficiency cores: the performance cores only (rq_ncpu_perf). M1 Pro, 8 P + 2 E
-    // (BENCHMARKS.md "Apple M1 Pro"): 9 or 10 threads instead of 8 cost 7-10% of decode, prefill +-2%
+    // (BENCHMARKS.md "Apple M1 Pro"): 9 or 10 threads instead of 8 decode 5-13% slower, prefill within 3%
     if (rq_env_threads()) {
         rq_set_threads(rq_env_threads());
     } else {

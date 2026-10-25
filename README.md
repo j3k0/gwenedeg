@@ -23,14 +23,14 @@ way. Which file to use (measured 2026-10-25 on the 16-vCPU dev box, TODO.md Step
 | perplexity vs HF fp32 (Beagle ch. I) | **+0.19%** | +4.9% | +0.85% |
 | logits vs HF: pooled 1-cos, top-1 (84 positions) | **6.1e-4, 79** | 1.6e-2, 69 | 9.0e-4, 76 |
 | prefill 451 tokens, 8 / 12 threads | 1,870 / 2,540 tok/s | 1,670 / 2,140 | **1,960 / 2,690** |
-| decode, 8 / 12 threads (best of a noisy shared box) | ~150 / ~175 tok/s | **~240 / ~300** | ~160 / ~230 |
+| decode, 8 / 12 threads (best of a noisy shared box) | ~180 / ~200 tok/s | **~280 / ~300** | ~170 / ~230 |
 | peak RSS, startup (12 threads) | ~670 MB, 0.15 s | **~410 MB, 0.12 s** | ~625 MB, 0.13 s |
 
 - Quality first, and prompt-heavy work (long documents, many short answers): the **Q8_0 GGUF**. It is
   the closest to the fp32 model by far; the .bin is less accurate and needs the Python export, so it
   is only worth it for the tests and the comparison with qwen3.c.
 - Generation speed or memory first (long answers, `-r 1` reasoning, small machines): **Q4_K_M**.
-  Decode is memory-bound, and Q4_K_M reads 0.40 GB per token instead of 0.67, so it generates ~1.6x
+  Decode is memory-bound, and Q4_K_M reads 0.40 GB per token instead of 0.67, so it generates ~1.5x
   faster with ~40% less RAM; prefill is ~10-15% slower (more arithmetic per weight). The price is the
   4-bit weights: ~25x the logits error of Q8_0 and +4.9% perplexity (the same for llama.cpp's
   reference engine, mynah-slm: +4.7%), e.g. it answers "Sydney" for the capital of Australia.
@@ -132,7 +132,7 @@ float folds in the GEMM), decode ~5% (the packed weights are ~6% larger: fp32 sc
   chat templates built in (identical to the exporter's `.template*` files);
   GGUF Q4_K_M (Q4_K / Q6_K tensors, type dispatch per tensor): weights repacked at load into 16-row
   interleaved blocks with the 4 / 6-bit data kept packed (398 MB read per decoded token vs 670 MB for
-  Q8_0), activations int8 per 32, AVX-512 VNNI GEMV (at the memory-bandwidth limit: decode ~1.6x
+  Q8_0), activations int8 per 32, AVX-512 VNNI GEMV (at the memory-bandwidth limit: decode ~1.5x
   the Q8_0 GGUF) and GEMM (weight tile unpacked once per thread into u8, ~1.17x the Q8_0 GEMM time),
   bit-identical to the generic C kernels, embedding rows dequantized with ggml's expressions
   (bit-identical to gguf-py), test hook `-m dequant`.

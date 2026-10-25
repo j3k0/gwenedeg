@@ -9,7 +9,7 @@ Startup (Step 4): ~0.06 s per process, peak RSS ~0.63-0.74 GB; chat keeps the co
 GGUF (Step 6a): `./runq Qwen3-0.6B-Q8_0.gguf` directly (no export, no side files); closer to HF than
 the .bin (perplexity +0.19% vs +0.85%), prefill ~4-8% slower.
 Q4_K_M (Step 6b-1/2): `./runq Qwen3-0.6B-Q4_K_M.gguf` (perplexity +4.9% vs HF, mynah-slm +4.7%; Q8_0
-GGUF +0.19%): AVX-512 kernels, decode ~1.6x the Q8_0 GGUF (~200-300 tok/s, bandwidth-bound: 0.40 vs 0.67
+GGUF +0.19%): AVX-512 kernels, decode ~1.5x the Q8_0 GGUF (~200-300 tok/s, bandwidth-bound: 0.40 vs 0.67
 GB per token), prefill ~0.85-0.9x (~1,670 / 2,140 tok/s at 451 tokens, 8 / 12 threads), RSS ~0.41 GB.
 
 Status: `[ ]` todo · `[~]` in progress · `[x]` done
@@ -568,8 +568,9 @@ kernels, Step 6b-1): prefill 451 tokens 168 / 233 tok/s at 8 / 12 threads, decod
   same minute as the reference): 1 thread Q4P 31-34, Q6P 28-31, Q8P 32, read 29-35 GB/s; 8-12 threads
   all kernels within the run-to-run spread of the read loop (72-130 GB/s that day). In decode (below):
   ~435 MB per token for Q4_K_M (398.1 MB weights + ~37 MB KV cache at ~161 positions on average) ->
-  86 / 106 / 131 GB/s effective at 4 / 8 / 12 threads (best runs); Q8_0 GGUF ~707 MB per token: 98 /
-  105 / 125 GB/s. So both are at the bandwidth limit and the speed ratio is the byte ratio (~1.6x)
+  86 / 123 / 131 GB/s effective at 4 / 8 / 12 threads (best runs); Q8_0 GGUF ~707 MB per token: 98 /
+  127 / 141 GB/s. So both are at the bandwidth limit and the speed ratio is about the byte ratio
+  (1.43-1.58x measured, 1.63x in bytes)
 - [x] GEMM (prefill, `kq512_gemm_n`): work items (2-block = 32-row tile, chunk of activation rows) as
   `q8p_gemm_n` (static, `q8p_nb` chunk sizes); q / k / v and w1 / w3 with mixed Q4_K / Q6_K types in
   one parallel loop (`matmul_batch_n` sends the K-quant jobs there, Q8_0 jobs, if any, to `q8p_gemm_n`).
@@ -611,22 +612,25 @@ kernels, Step 6b-1): prefill 451 tokens 168 / 233 tok/s at 8 / 12 threads, decod
   at -b 1 / 7 / 512 on a 119-token prompt, logits -b 1 / 7 / 512 (3 and 8 threads), chat multi-turn at
   -b 1 / 512 and -c 160 -r 1 -y -b 7 (context full), dequant: no reports; the sanitizer builds agree
   with each other and across -b / threads byte for byte
-- [x] Speed (2026-10-25, same session, load 4-8 (shared box, other tenants' memory traffic), best of 3-4;
-  prefill `scripts/bench_prefill.sh -m <model> -l "450 1500" -b 512 -t "8 12"`, decode
-  `scripts/bench_qwen3c.sh <model> 4 8 12` (256 tokens) plus 4 interleaved rounds of the same runs):
+- [x] Speed (2026-10-25, same session, load 4-8 (shared box, other tenants' memory traffic); prefill
+  `scripts/bench_prefill.sh -m <model> -l "450 1500" -b 512 -t "8 12"`, best of 3; decode
+  `scripts/bench_qwen3c.sh <model> 4 8 12` (256 tokens, 3 runs) plus 7 interleaved rounds of the same
+  runs (the 3 models alternated), best of the 7-10 runs per cell):
 
   | | .bin Q8_0 | GGUF Q8_0 | GGUF Q4_K_M |
   |---|---|---|---|
   | prefill 451 tokens, 8 / 12 threads | 1,961 / 2,693 tok/s | 1,874 / 2,540 | 1,670 / 2,142 (0.89x / 0.84x of GGUF Q8_0) |
   | prefill 1,500 tokens, 8 / 12 threads | 1,542 / 2,029 | 1,448 / 2,028 | 1,317 / 1,843 (0.91x / 0.91x) |
-  | decode 4 / 8 / 12 threads (best) | 136 / 160 / 232 tok/s | 138 / 149 / 176 | 198 / 243 / 302 (1.4x / 1.6x / 1.7x) |
-  | decode, effective GB/s (4 / 8 / 12) | | 98 / 105 / 125 | 86 / 106 / 131 |
+  | decode 4 / 8 / 12 threads (best) | 136 / 170 / 232 tok/s | 138 / 179 / 199 | 198 / 283 / 302 (1.43x / 1.58x / 1.52x) |
+  | decode, effective GB/s (4 / 8 / 12) | 91 / 114 / 155 | 98 / 127 / 141 | 86 / 123 / 131 |
   | process wall `-n 1 -i hi`, 12 / 8 threads (median of 9) | 0.133 / 0.148 s | 0.147 / 0.175 | 0.120 / 0.139 |
   | peak RSS | 620-632 MB | 667-673 MB | 408-419 MB |
 
   Decode run to run: +-30% (e.g. Q4_K_M at 12 threads 188-302 tok/s); within one interleaved round
-  Q4_K_M / Q8_0 GGUF was 1.1-2.0x, median ~1.5x. Prefill is ~10-16% slower than Q8_0 GGUF (the GEMM
-  folds, above), decode ~1.6x faster (bytes), startup ~25-35 ms faster (fewer bytes to repack), RSS -38%
+  Q4_K_M / Q8_0 GGUF was 1.1-2.0x, median ~1.5x. GB/s: bytes per token = packed weights (Q4_K_M 398.1
+  MB, Q8_0 GGUF 670.5, .bin 633) + ~37 MB of KV cache (33-token prompt + 256 generated: ~161 positions
+  on average x 229 KB). Prefill is ~10-16% slower than Q8_0 GGUF (the GEMM
+  folds, above), decode ~1.5x faster (bytes), startup ~25-35 ms faster (fewer bytes to repack), RSS -38%
 - [x] Profile (`-DRUNQ_PROFILE`, 8 threads, -b 512, min of 3 per phase): 451 tokens 274 ms: GEMMs 71.5%
   (qkv 58 ms 21.2%, wo 26 9.5%, w1+w3 75 27.4%, w2 37 13.5%), attention+quant 45 16.4%, norm+quant+resid
   16 5.8%, swiglu+quant 11 4.0%, qk-norm+rope+kv 5 1.8%, classifier 1; 1,500 tokens 1.13 s: GEMMs 56%

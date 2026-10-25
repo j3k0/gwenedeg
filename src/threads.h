@@ -67,6 +67,10 @@
     #include <sched.h>
     #include <unistd.h>
 #endif
+#if defined(__APPLE__) && defined(__aarch64__)
+    #include <sys/types.h>
+    #include <sys/sysctl.h> // (rq_ncpu_perf)
+#endif
 #ifdef _OPENMP
     #include <omp.h>
 #endif
@@ -337,6 +341,23 @@ static int rq_ncpu(void) {
 #else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? (int)n : 1;
+#endif
+}
+
+static int rq_ncpu_perf(void) {
+    // Apple Silicon with more than one core type: the performance cores (hw.perflevel0, the fastest
+    // level), at most the online CPUs; else (and on any other system) 0
+#if defined(__APPLE__) && defined(__aarch64__)
+    int levels = 0, n = 0;
+    size_t len = sizeof levels;
+    if (sysctlbyname("hw.nperflevels", &levels, &len, NULL, 0) || levels < 2)
+        return 0;
+    len = sizeof n;
+    if (sysctlbyname("hw.perflevel0.logicalcpu", &n, &len, NULL, 0) || n < 1)
+        return 0;
+    return n < rq_ncpu() ? n : rq_ncpu();
+#else
+    return 0;
 #endif
 }
 

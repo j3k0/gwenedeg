@@ -3768,7 +3768,7 @@ void error_usage() {
     fprintf(stderr, "  -b <int>    prefill chunk size (batched prompt processing), default %d, max %d;\n", PREFILL_CHUNK_DEFAULT, B_MAX);
     fprintf(stderr, "              0 or 1 = one token at a time\n");
     fprintf(stderr, "  -k <string> KV cache type: f32|bf16|f16, default %s (16-bit: half the memory and bandwidth)\n", kv_type_name[KV_TYPE_DEFAULT]);
-    fprintf(stderr, "Threads: OMP_NUM_THREADS, default nproc - nproc/8\n");
+    fprintf(stderr, "Threads: OMP_NUM_THREADS, default nproc - nproc/8 (Apple Silicon: the performance cores)\n");
     exit(EXIT_FAILURE);
 }
 
@@ -3855,12 +3855,14 @@ int main(int argc, char *argv[]) {
     // shared 16-vCPU dev VM (~3 CPUs busy with other work; Step 7a): decode 12 ~ 14 > 16 threads
     // (memory-bound: 12 already saturate the bandwidth), prefill 14 > 16 > 12 (~2,580 / ~2,290-2,500 /
     // ~2,420 tok/s at 439 tokens). All 16 work too (the phases tolerate a preempted thread; with
-    // OpenMP's barriers they collapsed to ~2-20 tok/s), just not faster with other processes running
+    // OpenMP's barriers they collapsed to ~2-20 tok/s), just not faster with other processes running.
+    // Apple Silicon with efficiency cores: the performance cores only (rq_ncpu_perf). M1 Pro, 8 P + 2 E
+    // (BENCHMARKS.md "Apple M1 Pro"): 9 or 10 threads instead of 8 cost 7-10% of decode, prefill +-2%
     if (rq_env_threads()) {
         rq_set_threads(rq_env_threads());
     } else {
-        int np = rq_ncpu();
-        rq_set_threads(np - np / 8);
+        int np = rq_ncpu(), npc = rq_ncpu_perf();
+        rq_set_threads(npc ? npc : np - np / 8);
     }
     rq_config();
 

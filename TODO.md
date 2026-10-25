@@ -44,7 +44,7 @@ Encoding was O(n² · vocab): 109 tokens took 24 s and 217 tokens 104 s, because
   The 5 XFAIL cases pass
 - [x] Byte fallback: BPE starts from the 256 single-byte tokens, so nothing is ever dropped
   (invalid UTF-8 too); the stdout warning is gone
-- [x] Tokenizer goldens 27 -> 69 cases (2 XFAIL: no NFC normalizer, see Known bugs);
+- [x] Tokenizer goldens 27 -> 69 cases (2 XFAIL then: no NFC normalizer, done in Step 5);
   `tests/fuzz_tokenizer.py`: 2,000 random strings + 13 real files (seed 1) and 5,000 (seed 2),
   0 mismatches vs HF
 - [x] Target met: 2,000 tokens encode in 0.3-1.3 ms (README text); before: 28 tokens 0.74 s,
@@ -261,12 +261,61 @@ Before (Step 3a, 8 threads, -b 128): 451 tokens: GEMMs 43%, attention 42%, rest 
     tokenizer load ~8.5 ms (151,936 hash inserts), first forward ~9 ms (incl. KV tile faults),
     exit ~4 ms
 
+## Step 5: NFC normalizer in the tokenizer
+- [x] tokenizer.json's normalizer is NFC. Its added tokens are all `"normalized": false`, so HF
+  matches them on the raw text and normalizes each piece between them separately (a mark after
+  `<|im_end|>` never composes with what precedes the token): runq does the same in
+  `encode_segment()`, before the pre-tokenizer
+- [x] Unicode version: HF tokenizers 0.21.4 links `unicode-normalization-alignments` 0.1.12, whose
+  data is Unicode 9.0. Measured (`tools/gen_unicode_tables.py --check-hf`, 1 s): its NFC equals
+  Python 3.13's (Unicode 15.1) on every single code point, on all 662,596 ordered pairs of the
+  pre-10.0 combining marks and on all primary composites, except for characters added since:
+  108 combining marks (U+1DF6..1DFA, U+0D3B, U+1AC0.., U+1E130.., ...) are ccc 0 in HF (never
+  reordered), and U+11938 (13.0) has no decomposition (U+11935 + U+11930 do not compose). The
+  tables are 15.1 data with exactly these overrides (runq must give HF's ids); `--unicode-only`
+  writes pure 15.1 tables (a scratch build with them equals `unicodedata` everywhere)
+- [x] Tables (`src/unicode_nfc.h`, `gen_unicode_tables.py --nfc`, 42.6 KB): 2,941 sorted entries
+  (cp | NFC_QC << 21 | ccc << 23, binary search) for every code point with ccc != 0, NFC_QC !=
+  Yes or a canonical decomposition, a 16-bit index into a pool of full decompositions (3,266
+  code points), 940 composition pairs as sorted 64-bit keys, and two bitmaps over 64-code-point
+  blocks (any entry / an entry with ccc or QC) so most lookups need no search (CJK, Hangul
+  syllables, most letters). Hangul (de)composition is algorithmic. NFC_QC derived: No = not
+  NFC-stable alone, Maybe = second of a pair (incl. Hangul V / T jamo)
+- [x] Fast path: `nfc_check()`, the standard quick check (all NFC_QC = Yes, ccc in order) with an
+  ASCII skip loop: 0.27 ns/byte on ASCII, 0.7-1.7 ns/byte on Chinese / Russian / Vietnamese /
+  Korean NFC text (~2% of encode). Otherwise only the part from the last boundary (ccc 0 and
+  Yes) before the first failure is normalized (`nfc_normalize`: decompose, stable sort of each
+  mark run by ccc (insertion sort, counting sort from 32 marks), compose; 2.5-10 ns/byte)
+- [x] Output can be up to 3x the input bytes (U+1D160: 4 bytes -> 12) and have more tokens than
+  input bytes, so `encode()` callers allocate `ENCODE_MAX_TOKENS(n)` = 3n + 3 (was n + 3: a heap
+  overflow otherwise, e.g. 50 x U+1D160 = 200 bytes -> 300 tokens) and the BPE scratch grows
+- [x] Invalid UTF-8 (no HF reference: a Python str cannot hold it): passed through unchanged; each
+  invalid byte acts like U+FFFD (a starter composing with nothing), so nothing is reordered or
+  composed across it; the valid text around it is normalized as usual
+- [x] Tests: the 2 XFAIL cases pass; goldens 69 -> 81 (decomposed Latin, mark order incl.
+  blocking, Hangul jamo, Vietnamese, singletons, exclusions, Greek, 600-mark runs, expansion,
+  added tokens next to marks, HF's old-data cases) + `tokenizer/nfc_invalid_utf8` (6 byte
+  strings: token bytes == the valid runs NFC'd separately). Fuzzer: no NFC-only restriction, new
+  generators (marks in random order, jamo, NFD/NFKD words, QC=No characters, mark runs), files
+  also in NFD, normalized text compared with HF's normalizer: seeds 1 and 2, 5,000 random
+  (~2,400 not NFC) + 28 file pieces each (1.25M HF tokens): 0 mismatches. `--nfc-all`: every
+  code point alone (1,112,062), all 850,084 mark pairs, 11,322 composition cases, 13,167 Hangul
+  pairs, 100,000 random strings: 0 differences from HF; from `unicodedata` only on strings with
+  override code points. Breakage (scratch builds): no reordering, Maybe as Yes, no blocking,
+  composing across invalid bytes, unstable counting sort: all caught by `make test` (the fuzzer
+  on no blocking: 12% mismatches, minimized to 3 characters). ASan+UBSan: tokenizer suite,
+  `--nfc-all`, 2,000-case fuzz, edge inputs: clean
+- [x] Speed (same session, load ~4): NFC input unchanged within noise (old speed_2k text
+  0.62-0.81 -> 0.62-0.76 ms, README+TODO 32 KB 3.7-4.1 ms both); NFD input +0.1-0.4 ms per 20 KB.
+  `make test` ~23 s on the busy box (84 tokenizer checks, 0.4 s)
+
 ## Known bugs
 Found by the tests.
-- [ ] Tokenizer: no NFC normalizer (HF's tokenizer.json normalizer is NFC); the input is assumed
+- [x] Tokenizer: no NFC normalizer (HF's tokenizer.json normalizer is NFC); the input was assumed
   to be NFC already. Decomposed text (`e` + U+0301) and NFC singletons (U+2000 -> U+2002,
-  U+212B -> U+00C5, CJK compatibility ideographs) tokenize differently from HF. Tests: XFAIL
-  `tokenizer/{nfc_decomposed,nfc_singleton}`; the fuzzer only generates NFC strings.
+  U+212B -> U+00C5, CJK compatibility ideographs) tokenized differently from HF (XFAIL
+  `tokenizer/{nfc_decomposed,nfc_singleton}`). Fixed in Step 5: NFC with HF's Unicode data, 0
+  differences from HF on every code point and 10k fuzz cases; both cases pass.
 - [x] SwiGLU `1/(1+expf(-x))` under `-Ofast`: for x < -88, `expf` = inf and the vectorized
   reciprocal (`vrcp14ps` + Newton step, 0 * inf) gives NaN. This *did* happen in the shipped int8
   path: gate values down to ~-100 in the last layer on the `chat` and `zh` logits prompts and on
@@ -282,7 +331,7 @@ Found by the tests.
 
 ## Plan for the remaining items (in order)
 - [x] Step 4 (usability): chat history across turns, faster sampling, startup (embedding rows from the Q8_0 table): done, see above
-- Step 5: NFC normalizer in the tokenizer
+- [x] Step 5: NFC normalizer in the tokenizer: done, see above
 - Step 6: GGUF loading (Q8_0 first, then Q4_K_M)
 - Step 7: performance leftovers (decode barriers / attention split, bf16 KV cache, 16-thread barriers, prefill rest)
 

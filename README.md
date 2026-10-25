@@ -14,9 +14,9 @@ G=models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf
 ./runq $G -c 4096 -t 0 -n 200 -i "Why is the sky blue?"
 ```
 
-On macOS (Apple Silicon) `make` uses Apple clang (no OpenMP, no extra packages); the Q4_K_M GGUF
-below is the model to use there (NEON kernels, see Benchmarks). On an M1 Pro: ~1,300 tok/s prefill
-(451 tokens), ~190 tok/s decode.
+On macOS (Apple Silicon) `make` uses Apple clang (no OpenMP, no extra packages); every format has
+NEON kernels there (see Benchmarks). On an M1 Pro, 451-token prefill / decode: Q8_0 .bin ~1,700 /
+~140 tok/s, Q4_K_M ~1,300 / ~190.
 
 The GGUF file is all runq needs: weights, hyperparameters, tokenizer (from its metadata) and the
 chat templates (built in). The Q4_K_M GGUF (`scripts/download_models.py q4km`, 397 MB) works the same
@@ -131,9 +131,9 @@ float folds in the GEMM), decode ~5% (the packed weights are ~6% larger: fp32 sc
   and an AVX-512 attention (shared by decode and prefill) on a tiled KV cache
   (`src/kernels_avx512.h`, compile-time selection; `-DRUNQ_GENERIC` / `make generic` or a CPU
   without AVX-512 gives the generic C kernels, bit-identical results);
-  NEON kernels for Q4_K / Q6_K and the attention on AArch64 with the dot product extension
-  (`src/kernels_neon.h`; tested on macOS only; Q8_0 stays generic there), bit-identical to the
-  generic ones (`make kq-neon-test`);
+  NEON kernels for Q8_0, Q4_K / Q6_K and the attention on AArch64 with the dot product extension
+  (`src/kernels_neon.h`; tested on macOS only), bit-identical to the generic ones
+  (`make kq-neon-test`);
   RoPE cos/sin once per position;
   threading (`src/threads.h`, Step 7a): a decode step / prefill chunk is one job on a persistent
   thread pool, in phases of work items that end when the work is done (not when every thread has
@@ -210,24 +210,25 @@ interleaved with the Step 7a binary, best of 5, load 8-13), Q8_0 GGUF / Q4_K_M, 
 tokens 8 threads 130 -> 164 / 153 -> 220; prefill 450 / 1,500 / 3,000 tokens within -0..+7% (TODO.md Step 7b).
 `scripts/bench_all.sh` reruns the runq tables (~8 min).
 
-Apple M1 Pro (8 P + 2 E cores, branch `mac-m1-pro`, Q4_K_M, 8 threads = the default, a separate
-session, BENCHMARKS.md "Apple M1 Pro"): prefill 1,327 / 968 tok/s at 451 / 1,500 tokens, decode 190
-tok/s (256 new tokens), against 156 / 138 / 60 with the generic C kernels. Not comparable with the
-EPYC table above (other CPU, other quantization).
+Apple M1 Pro (8 P + 2 E cores, branch `mac-m1-pro`, 8 threads = the default, separate sessions,
+BENCHMARKS.md "Apple M1 Pro"), prefill at 451 / 1,500 tokens and decode (256 new tokens), tok/s:
+Q8_0 .bin 1,691 / 1,211 / 140 (generic C kernels: 659 / 441 / 134); Q4_K_M 1,327 / 968 / 190
+(generic: 156 / 138 / 60). Not comparable with the EPYC table above (other CPU).
 
 ## Known limitations
 
 - Q8_0 (.bin or GGUF) and Q4_K_M GGUF (any mix of Q8_0 / Q4_K / Q6_K matrices). Other GGUF types
   (F16, Q5_K, IQ*, ...) are rejected with a clean error. Without AVX-512 VNNI (or `make generic`)
   every format runs on the generic C kernels, with the same results; for Q4_K_M they are ~10x
-  slower in prefill and ~3-4x in decode than the AVX-512 ones. On AArch64 (with `sdot`) the
-  Q4_K / Q6_K matrices and the attention have NEON kernels (same results, 7-8.5x faster prefill and
-  3x faster decode than generic on an M1 Pro); Q8_0 (GGUF or .bin) is still generic there, and so is every x86 CPU
-  without AVX-512 VNNI.
+  slower in prefill and ~3-4x in decode than the AVX-512 ones. On AArch64 (with `sdot`) every
+  format and the attention have NEON kernels (same results; on an M1 Pro vs generic: Q4_K_M 7-8.5x
+  prefill and 3x decode, Q8_0 2.6-2.7x prefill and +4% decode). x86 CPUs without AVX-512 VNNI
+  still use the generic kernels.
 - `tests/run_tests.sh` on arm64: everything passes except the `greedy/*` goldens (exact generated
   text), which come from the x86 build's rounding and also fail with the unmodified source built on
-  the Mac. Last full run: 155 passed, 6 failed (all `greedy/*`), the GGUF Q8_0 tests skipped (file
-  not downloaded); the logits against HF and the batched / thread / kernel bit-identity checks pass.
+  the Mac. Last full run (`14169f4`, with the NEON Q8_0 kernels): 155 passed, 6 failed (all
+  `greedy/*`), the GGUF Q8_0 tests skipped (file not downloaded); the logits against HF and the
+  batched / thread / kernel bit-identity checks pass.
   The goldens need an arm64 re-baseline (`--update-greedy` into a separate file).
 - GGUF: Qwen3 (`general.architecture` qwen3, RoPE theta 1e6, RMSNorm eps 1e-6) with the gpt2 /
   qwen2 tokenizer only; `tokenizer.chat_template` (Jinja) is not interpreted, Qwen3's templates

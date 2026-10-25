@@ -126,18 +126,21 @@ VNNI weights (~630 MB, ~55 ms to pack). mynah-slm reports a 0.14-0.15 s model lo
 ## Apple M1 Pro (macOS, NEON)
 
 Experimental port, branch `mac-m1-pro`: `runq` built with Apple clang (`make`), NEON `sdot` kernels
-for the Q4_K / Q6_K matrices and for the attention (`src/kernels_neon.h`). Q8_0 still runs on the
-generic C kernels on arm64 (not ported: it would only help prefill, ~15-20% by estimate, and decode
-reads more bytes with it). One session, 2026-10-25 14:56-15:05 UTC, raw output:
-[bench/results-mac-m1-pro-2026-10-25.txt](bench/results-mac-m1-pro-2026-10-25.txt).
+for the Q4_K / Q6_K matrices, the attention (`bb69e5f`) and Q8_0 (`14169f4`), all in
+`src/kernels_neon.h`. Two sessions: Q4_K_M 2026-10-25 14:56-15:05 UTC
+([bench/results-mac-m1-pro-2026-10-25.txt](bench/results-mac-m1-pro-2026-10-25.txt)), Q8_0 with
+Q4_K_M rerun for comparison 16:11-16:20 UTC
+([bench/results-mac-m1-pro-q8-2026-10-25.txt](bench/results-mac-m1-pro-q8-2026-10-25.txt)).
 
 | | |
 |---|---|
 | CPU | Apple M1 Pro, 8 performance + 2 efficiency cores, 32 GB, macOS 26.6.2 |
 | sharing | a desktop in use: 1-min load 3 before, 9.6 after the runs (iTerm, browser, ...) |
 | compiler | Apple clang 21.0.0, `-O3 -ffast-math -ffp-contract=on -mcpu=native` (`make`; no OpenMP, the pthread pool) |
-| model | `Qwen3-0.6B-Q4_K_M.gguf` (unsloth @ `50968a4`, 396,705,472 bytes), greedy, `-b 512`, `-c 4096` |
-| runq | `bb69e5f` (the numbers below do not depend on the docs commit on top of it) |
+| models | `Qwen3-0.6B-Q4_K_M.gguf` (unsloth @ `50968a4`, 396,705,472 bytes); `Qwen3-0.6B-q8.bin` (633,495,808 bytes, group 64); greedy, `-b 512`, `-c 4096` |
+| runq | Q4_K_M session: `bb69e5f`; Q8_0 session: `a2ab409` + the Q8_0 kernels, committed unchanged as `14169f4` |
+
+### Q4_K_M (first session)
 
 Best of 3 runs (decode: 256 new tokens, the short bench prompt; prefill: `scripts/bench_prefill.sh`,
 chat-mode prompts of 451 and 1,500 tokens):
@@ -163,6 +166,39 @@ chat-mode prompts of 451 and 1,500 tokens):
   (6 rounded operations per 8 `sdot`s), and register-tile shapes (1x6 to 4x3) changed them by less
   than 4%. Decode falls from 190 to ~100 tok/s at 1,500 tokens: the fp32 KV cache then adds about
   340 MB of reads per token to the ~400 MB of weights.
+### Q8_0 .bin (second session, Q4_K_M rerun alongside)
+
+Best of 3 runs, 8 threads unless noted, same scripts:
+
+| build, threads | prefill 451 tok | prefill 1,500 tok | decode |
+|---|---|---|---|
+| Q8_0, generic C kernels, 8 | 659 | 441 | 134 |
+| Q8_0, NEON, 6 | 1,327 | 943 | 134 |
+| **Q8_0, NEON, 8** | **1,691** | **1,211** | 140 |
+| Q8_0, NEON, 10 | 1,671 | 1,220 | 136 |
+| Q4_K_M, NEON, 8 (rerun) | 1,332 | 1,009 | **191** |
+
+- Q8_0 NEON vs generic at 8 threads: prefill 2.6x / 2.7x, decode +4%. The generic Q8_0 loop was
+  already well auto-vectorized by clang, and decode is bandwidth-bound in both: ~0.67 GB read per
+  token at 140 tok/s is ~94 GB/s, ~84% of the ~112 GB/s an 8-thread streaming read measured on this
+  machine (a 1 GB NEON read loop, not in the repo).
+- Q8_0 vs Q4_K_M, both NEON: prefill +27% (451) / +20% (1,500): no unpacking and 4 float ops per
+  fold instead of 6; decode -27%: ~0.67 vs ~0.40 GB per token. Q8_0 for prompt-heavy work, Q4_K_M
+  for long answers (and Q8_0 is the more accurate one, see Quality).
+- The Q4_K_M rerun matches the first session within 1-4% (prefill 1,332 vs 1,327, 1,009 vs 968;
+  decode 191 vs 190).
+- Startup with the repacking at load: 0.09 s instead of 0.05 s (generic, mapping only); peak RSS
+  ~620 MB both. Run spread at 8 threads 1-2%, except one 1,500-token run at 10 threads (886 vs
+  1,213-1,220). Load 6.4 before, 8.7 after (desktop in use).
+- Bit-identical to the generic build: `make test`'s kernels group (the .bin through both builds),
+  a 688-position comparison of all logits (`-b 512` and `-b 1`), and `make kq-neon-test` (random
+  data, group 32 and 64). The GGUF Q8_0 (group 32) was not downloaded, so only the unit test
+  covers group 32. Rounding: the NEON fold follows `dot_q8` as written, `((float) isum * ws) * xs`;
+  gcc -Ofast on x86 reassociates it to `(ws * xs) * isum` (the AVX-512 kernels follow that), so arm64
+  and x86 Q8_0 logits differ in the last bits, as they did with the generic kernels.
+
+### Both
+
 - The oMLX figures the user reported on this Mac (`mlx-community/Qwen3-0.6B-4bit`, ~1,500 tok/s
   prefill / ~150 tok/s decode) were not measured here and their prompt length and settings are
   unknown, so no comparison is made; the same model needs `mlx_lm` on the same prompts for one.

@@ -61,12 +61,13 @@ TOP5_MIN = 0.75        # per prompt, mean overlap
 # Batched vs sequential logits (same engine, same numerics): currently bit-identical. Deliberate
 # breakage (scratch builds) gives max |diff| 17..32 and min cos <= 0.47: causal mask leaking one
 # position, K RoPE at the chunk-local position, chunk K written one position early.
-BATCH_CHUNKS = [7, 64]   # 7: several chunks with boundaries mid-prompt; 64: the default
+BATCH_CHUNKS = [7, 64]   # 7: several chunks with boundaries mid-prompt; 64: one chunk (two for "all")
 BATCH_MAX_ABS = 1e-3     # logits are O(10)
 BATCH_COS_MIN = 0.99999  # per row, full vocab
 BATCH_LONG = "all"       # extra prompt: all logits prompts concatenated (86 tokens, 2 chunks at -b 64)
 BATCH_LONG2 = "long"     # "all" twice + en: 187 tokens, 12 KV cache tiles, 3 chunks at -b 64
-SEQ, BATCH = 1, 64       # -b of the sequential path and of the default batched path
+SEQ, BATCH = 1, 64       # -b of the sequential path and of the batched path (default -b is 512: the
+                         # same code, one chunk for the short prompts either way)
 
 CTX = "4096"
 TOKENIZE_MAX_MS = 100.0  # encode time limit for the speed checks (measured ~1 ms and ~13 ms)

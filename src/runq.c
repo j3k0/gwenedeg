@@ -27,9 +27,12 @@ int GS = 0; // group size global for quantization of the weights
 #define PROMPT_BUFFER_SIZE 32768
 
 // Batched prefill (forward_batch): prompt tokens are processed in chunks of prefill_chunk
-// rows (-b, at most B_MAX); 0 or 1 = one token at a time through forward()
-#define B_MAX 256
-#define PREFILL_CHUNK_DEFAULT 64
+// rows (-b, at most B_MAX); 0 or 1 = one token at a time through forward(). Bigger chunks are
+// faster (fewer barriers and weight passes per token): 8 threads, 1,500 / 3,000 tokens:
+// -b 64 1,237 / 911 tok/s, 128 1,370 / 1,018, 256 1,467 / 1,093, 512 1,547 / 1,112, 1024 within
+// noise of 512. The chunk buffers take ~58 KB per row (~30 MB at 512)
+#define B_MAX 512
+#define PREFILL_CHUNK_DEFAULT 512
 int prefill_chunk = PREFILL_CHUNK_DEFAULT;
 
 double now_s(void);
@@ -2007,6 +2010,7 @@ void error_usage() {
     fprintf(stderr, "  -n <int>    max new tokens per response, 0 (default) = unlimited\n");
     fprintf(stderr, "  -b <int>    prefill chunk size (batched prompt processing), default %d, max %d;\n", PREFILL_CHUNK_DEFAULT, B_MAX);
     fprintf(stderr, "              0 or 1 = one token at a time\n");
+    fprintf(stderr, "Threads: OMP_NUM_THREADS, default min(12, nproc - nproc/4) (all CPUs collapse on a busy machine)\n");
     exit(EXIT_FAILURE);
 }
 
@@ -2070,6 +2074,18 @@ int main(int argc, char *argv[]) {
         free_tokenizer(&tokenizer);
         return 0;
     }
+
+#ifdef _OPENMP
+    // default thread count if OMP_NUM_THREADS is not set: not all CPUs. libgomp's default (all of
+    // them) collapses on a shared machine: with every CPU running a spinning thread, any other
+    // process preempting one of them stalls the others at every barrier (~200 per token). On the
+    // 16-vCPU dev VM: 16 threads ~20 tok/s decode, 12 the best prefill with decode as at 8
+    if (!getenv("OMP_NUM_THREADS")) {
+        int np = omp_get_num_procs();
+        int nt = np > 4 ? np - np / 4 : np;
+        omp_set_num_threads(nt < 12 ? nt : 12);
+    }
+#endif
 
     // build the Transformer via the model .bin file
     Transformer transformer;

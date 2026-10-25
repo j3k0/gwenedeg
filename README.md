@@ -14,8 +14,9 @@ make                                  # -> ./runq  (make debug -> ./runq-debug)
 
 OMP_NUM_THREADS=8 ./runq models/Qwen3-0.6B-q8.bin -c 4096   # interactive chat
 OMP_NUM_THREADS=8 ./runq models/Qwen3-0.6B-q8.bin -c 4096 -t 0 -n 200 -i "Why is the sky blue?"
-make test                             # regression suite, ~8 s (tests/README.md)
+make test                             # regression suite, ~18 s (tests/README.md)
 make bench                            # thread sweep, prefill/decode tok/s (scripts/bench_qwen3c.sh)
+make bench-prefill                    # prefill tok/s vs prompt length and -b (scripts/bench_prefill.sh)
 scripts/fetch_mynah.sh                # optional reference engine, then scripts/bench_mynah.sh
 ```
 
@@ -37,6 +38,9 @@ Revisions are pinned. Each file is verified by sha256 (LFS files) or git blob sh
 - `src/runq.c`: our engine, from qwen3.c's `runq.c` (MIT, see `LICENSE`). Changes so far:
   `-n <int>` max new tokens, plus a `[timing]` line on stderr (prefill and decode tok/s);
   no classifier matmul for prompt tokens whose logits are unused;
+  batched prefill (`-b <int>` tokens per chunk, default 64, `-b 1` = token by token):
+  `forward_batch()` with a generic-C Q8_0 GEMM, bit-identical to the token-by-token path;
+  SwiGLU NaN fix (`-Ofast` expf overflow, it did corrupt some last-layer activations);
   a rewritten tokenizer matching HF (added tokens, Qwen2 pre-tokenizer regex, byte-level BPE
   with a hash map and a merge heap; ~1 ms for 2,000 tokens; input assumed NFC);
   test hooks `-m tokenize` and `-m logits -o <file>` (see `tests/README.md`).
@@ -52,7 +56,7 @@ Revisions are pinned. Each file is verified by sha256 (LFS files) or git blob sh
 
 ## Benchmarks (2026-10-24, 16-vCPU EPYC Genoa VM, greedy, 256 new tokens, best of 3)
 
-Decode tok/s (prefill similar):
+Decode tok/s:
 
 | threads | qwen3.c Q8_0 | mynah-slm Q8_0 | mynah-slm Q4_K_M |
 |---|---|---|---|
@@ -62,8 +66,8 @@ Decode tok/s (prefill similar):
 | 12 | ~95 | 34.8 | 34.5 |
 | 16 | **~11** (collapse) | 30.3 | 30.4 |
 
-- Since TODO Step 1 (no classifier for prompt tokens), prefill is ahead of decode: at 8 threads
-  ~118 tok/s on a 443-token prompt (was ~99), ~121 on the short bench prompt (was ~92).
+- Decode is unchanged by the batched prefill (2026-10-25, same session: 8 threads 107 vs 97-104
+  before, 4 threads 75-78 vs 68-70).
 - qwen3.c at 16 threads collapses. This is not VM throttling (0% steal time), but OpenMP
   spin-barrier oversubscription: with every vCPU spinning, any other process preempting one
   thread stalls all of them at every barrier (hundreds per token). `OMP_WAIT_POLICY=passive`
@@ -73,6 +77,24 @@ Decode tok/s (prefill similar):
   so it isn't purely bandwidth-bound yet.
 - With mynah-slm, Q4_K_M is no faster than Q8_0 on this CPU.
 - Greedy Q8_0 output is identical from qwen3.c and mynah-slm (cross-check of both engines).
+
+Prefill tok/s (2026-10-25, `scripts/bench_prefill.sh`: chat mode, `-c 4096 -t 0 -n 16`, best of 3,
+machine shared with a load of ~3-5):
+
+| prompt tokens | `-b 1` (token by token) | `-b 16` | `-b 32` | `-b 64` (default) | `-b 128` | `-b 256` |
+|---|---|---|---|---|---|---|
+| 451 | 124.8 | 251.9 | 281.2 | 289.4 | 295.2 | 294.6 |
+| 1,500 | 81.4 | 205.4 | 223.2 | 231.4 | 232.8 | 236.7 |
+
+| threads (`-b 128`) | 4 | 8 | 12 | 16 |
+|---|---|---|---|---|
+| 451 tokens | 154.6 | 299.1 | **405.8** | 72.7 (collapse) |
+| 1,500 tokens | 123.6 | 237.1 | **324.1** | 87.0 (collapse) |
+
+- Generic C GEMM (no intrinsics yet): ~300 GOPS int8 at 8 threads (36-39 per thread), about 10% of
+  the AVX-512 VNNI peak; that is TODO Step 3. Batched prefill is compute-bound: unlike decode it
+  scales to 12 threads.
+- At 1,500 tokens, attention takes 29% of the prefill time (GEMMs 68%), at 451 tokens 10%.
 
 ## Known limitations of qwen3.c
 

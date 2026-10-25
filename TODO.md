@@ -3,6 +3,7 @@
 Goal: fast Qwen3-0.6B inference in C on CPU, based on qwen3.c (Q8_0).
 Baseline (16-vCPU EPYC Genoa, 8 threads): prefill ~85 tok/s, decode ~100 tok/s.
 Target: prefill several hundred to 1000+ tok/s; decode limited by memory bandwidth.
+Now (Step 2, 8 threads): prefill ~290 tok/s (451-token prompt), ~235 (1,500 tokens); decode ~105.
 
 Status: `[ ]` todo · `[~]` in progress · `[x]` done
 
@@ -50,20 +51,53 @@ Encoding was O(n² · vocab): 109 tokens took 24 s and 217 tokens 104 s, because
   longer loads the weights, so the tokenizer tests take 0.2 s and `make test` ~8 s
 
 ## Step 2: batched prefill
-- [ ] `forward_batch(tokens, n, pos)`: chunked (32 to 128 tokens), activations as matrices
-- [ ] Batched quantize, GEMM (generic C first), per-row RMSNorm, QK-norm and RoPE, causal attention inside the chunk, KV cache writes
-- [ ] Test: batched logits match sequential logits (near-exact)
-- [ ] Use it in generate and chat; measure
+- [x] `forward_batch(tokens, n, pos0, logits_mode)`: chunks of `-b` tokens (default 64, max
+  B_MAX = 256; `-b 0/1` = the old token-by-token path), activations as (n, dim) row matrices in
+  separate RunState buffers (decode buffers unchanged); logits none / last row / all rows
+- [x] Per-row RMSNorm, quantize, QK-norm, RoPE (own position); `matmul_batch()` GEMM in generic C:
+  parallel over blocks of 4 weight rows, each block reused from L1 for all n activation rows,
+  `dot_q8_x4` kernel (each activation value loaded once for 4 rows, ~35% faster than 4 x
+  `dot_q8`); K/V GEMMs write straight into the cache; causal attention parallel over (row, head)
+  items, ordered by kv head so the threads re-read one K/V slice from L1/L2 (2.8x faster than
+  plain (row, head) dynamic scheduling at 1,500 tokens)
+- [x] Test: batched logits **bit-identical** to sequential, any chunk size (-b 7/64/256 checked)
+  and thread count (1/8/13), because both paths call the same kernels and the 4-row GEMM is built
+  without FP contraction (`NO_FP_CONTRACT`; with an FMA, `greedy/chat_system` flips). HF logits
+  test also on the batched path; greedy goldens unchanged; seeded `-t 0.8` output identical to
+  before (chat still advances the RNG per prompt token). `make test` ~18 s
+- [x] Used in generate and chat. Prefill tok/s, 8 threads, chat, best of 3 (2026-10-25):
+  451 tokens 124.8 (-b 1) -> 251.9 (16) / 281.2 (32) / 289.4 (64) / 295.2 (128);
+  1,500 tokens 81.4 -> 205.4 / 223.2 / 231.4 / 232.8 (2.3x / 2.9x). At -b 128: 4 threads 155 / 124,
+  12 threads 406 / 324, 16 threads collapse (73 / 87). Decode unchanged (8 threads ~107)
+- [x] GEMM ~290-310 GOPS at 8 threads (int8 ops, 0.88 GOP per token), 36-39 per thread: gcc
+  already auto-vectorizes `dot_q8` into `vpdpwssd` (VNNI on 16-bit, after sign extension) plus a
+  horizontal sum per 64-group, about 10% of the int8 VNNI peak
+- [x] Fixed on the way: SwiGLU NaN in the shipped int8 path (see Known bugs)
 
 ## Step 3: AVX-512 VNNI int8 kernels
-- [ ] GEMM kernel (`vpdpbusd`) with cache tiling, for prefill
+Where prefill time goes now (`-DRUNQ_PROFILE`, 8 threads, -b 128): 451 tokens: GEMMs 86% (qkv 25,
+wo 11, w1+w3 34, w2 16), attention 10%, norms/quantize/RoPE/SwiGLU 4%; 1,500 tokens: GEMMs 68%,
+attention 29% (fp32, ~140 GFLOPS: 258 GFLOP in 1.84 s), rest 3%.
+- [ ] GEMM kernel (`vpdpbusd`) with cache tiling, for prefill. Replace `dot_q8_x4` /
+  `matmul_batch`'s inner loop. vpdpbusd is u8 x s8 (Zen 4 has no vpdpbssd): offset the
+  activations by +128 and subtract 128 * (sum of the weight group), precomputed per row. Block
+  rows x activation rows (e.g. 4 x 4) so the per-group int32 sums need no horizontal adds;
+  maybe repack weights. Keeping the per-group int32 sums exact and the float fold as in dot_q8
+  (`val += (ws * xs) * isum`, groups in order, no FMA) keeps it bit-identical to the GEMV
+- [ ] Attention for long prompts (29% at 1,500 tokens now, will dominate after the GEMM):
+  several query rows per K/V row (tile over positions, K row in L1), scores for 16 positions per
+  vector instead of one horizontal sum per position; online softmax (flash style) would change
+  the rounding (then the batched test needs a tolerance)
 - [ ] GEMV kernel for decode
-- [ ] Threading: fewer barriers per token, parallelize over rows
+- [ ] Threading: fewer barriers per token, parallelize over rows. Prefill now scales to 12
+  threads (406 tok/s at 451 tokens) but still collapses at 16 (73); `OMP_WAIT_POLICY=passive`
+  avoids that for prefill (250 at 16 threads) but kills decode (~20). matmul_batch uses static
+  scheduling: one preempted thread stalls the whole region
 - [ ] Keep a portable fallback (non-AVX-512); tests compare both
 - [ ] Measure against the memory-bandwidth limit (~87 GB/s at 8 threads)
 
 ## Known bugs
-Found by the Step 0b tests; not fixed yet.
+Found by the tests.
 - [ ] Tokenizer: no NFC normalizer (HF's tokenizer.json normalizer is NFC); the input is assumed
   to be NFC already. Decomposed text (`e` + U+0301) and NFC singletons (U+2000 -> U+2002,
   U+212B -> U+00C5, CJK compatibility ideographs) tokenize differently from HF. Tests: XFAIL
@@ -87,3 +121,5 @@ Found by the Step 0b tests; not fixed yet.
 - [ ] Perplexity comparison Q4_K_M vs Q8_0 (small text sample)
 - [ ] GGUF loading (Q8_0 / Q4_K_M) without the Python export step
 - [ ] Faster sampling (top-p currently sorts the whole vocab)
+- [ ] Startup ~0.4 s per process, mostly page faults for the dequantized embedding table (~620 MB
+  of floats; parallelizing the dequantize didn't help): look up rows from the Q8_0 table instead

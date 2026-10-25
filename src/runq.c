@@ -442,8 +442,13 @@ static void gguf_open(Gguf *g, const char *path) {
     // map and parse a GGUF file (-m tokenize; read_checkpoint parses its own mapping)
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "Couldn't open %s\n", path); exit(EXIT_FAILURE); }
+#if defined _WIN32
+    _fseeki64(f, 0, SEEK_END);
+    int64_t size = _ftelli64(f);
+#else
     fseek(f, 0, SEEK_END);
-    long size = ftell(f);
+    int64_t size = ftell(f);
+#endif
     if (size < 24) { fprintf(stderr, "GGUF %s: file too small\n", path); exit(EXIT_FAILURE); }
     void *map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fileno(f), 0);
     fclose(f);

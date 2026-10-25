@@ -549,7 +549,7 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
     int kv_mul = p->n_heads / p->n_kv_heads;
 
     memset(s, 0, sizeof(*s));
-    s->kv_len = (p->seq_len + ATT_T - 1) / ATT_T * ATT_T;
+    s->kv_len = (p->seq_len + ATT_P - 1) / ATT_P * ATT_P; // (whole blocks: the cache layout)
     s->att_nb = (s->kv_len + ATT_P - 1) / ATT_P;
     s->kv_size = (size_t)p->n_layers * s->kv_len * kv_dim;
     s->kvt = kv_type;
@@ -1501,8 +1501,9 @@ static inline uint16_t f32_bf16(float f) {
 
 ATT_EXACT static void attention_vec(int kvt, const float *q, float *out, float *ml, int n, const void *kt0, const void *vt0,
                                     size_t ts, int hd, float scale, float *S) {
-    // one query vector over positions 0..n-1 of one kv head: kt / vt = its tile 0 in the layer's
-    // K / V cache, ts = elements from one tile of this head to the next; S: n (rounded up to 16) floats.
+    // one query vector over positions 0..n-1 (n <= ATT_P: one block) of one kv head: kt / vt = its tile
+    // 0 of the block in the layer's K / V cache, ts = elements from one tile to the next (ATT_T *
+    // head_dim: a block's tiles are contiguous); S: n (rounded up to 16) floats.
     // ml != NULL: one block's partial result (out unnormalized, ml[0] = max score, ml[1] = sum).
     // kvt: cache type; bf16 / f16 (layouts in kernels_avx512.h): each tile / V row converted to fp32
     // first (exact), then the same operations
@@ -1613,16 +1614,16 @@ ATT_EXACT static void att_combine(float *out, int nb, const float *part, size_t 
 }
 
 static void attention_part(int kvt, int nv, const float *const *q, float *const *out, float *const *part, const int *np,
-                           int b0, int b1, const void *kt, const void *vt, size_t ts, int hd, float scale, float *S) {
+                           int b0, int b1, const void *kt, const void *vt, size_t bs, int hd, float scale, float *S) {
     // nv query vectors q[r] sharing one kv head (kt / vt: its tile 0; kvt: cache type), vector r over
     // positions 0..np[r]-1. part NULL: the whole attention into out[r] (all np <= ATT_P). Else the
     // partial results of the blocks b0..b1-1 of ATT_P positions that vector r reaches, block b at
     // part[r] + b * ATT_PSTRIDE(hd): o (unnormalized), m (max score), l (sum of exponentials).
     // S: scratch of nv * (b1 - b0) * ATT_P floats
 #ifdef RUNQ_ATT512
-    if (att512_ok(hd)) { att512_kv(kvt, nv, q, out, part, np, b0, b1, kt, vt, ts, hd, scale, S); return; }
+    if (att512_ok(hd)) { att512_kv(kvt, nv, q, out, part, np, b0, b1, kt, vt, bs, hd, scale, S); return; }
 #endif
-    size_t esz = kvt == KV_F32 ? 4 : 2;
+    size_t esz = kvt == KV_F32 ? 4 : 2, ts = (size_t)ATT_T * hd;
     for (int r = 0; r < nv; r++) {
         if (!part) {
             attention_vec(kvt, q[r], out[r], NULL, np[r], kt, vt, ts, hd, scale, S);
@@ -1631,14 +1632,14 @@ static void attention_part(int kvt, int nv, const float *const *q, float *const 
         for (int b = b0; b < b1 && b * ATT_P < np[r]; b++) {
             float *o = part[r] + (size_t)b * ATT_PSTRIDE(hd);
             int n = np[r] - b * ATT_P < ATT_P ? np[r] - b * ATT_P : ATT_P;
-            size_t t0 = (size_t)(b * (ATT_P / ATT_T)) * ts * esz;
+            size_t t0 = (size_t)b * bs * esz;
             attention_vec(kvt, q[r], o, o + hd, n, (const char *)kt + t0, (const char *)vt + t0, ts, hd, scale, S);
         }
     }
 }
 
 static void attention_kv(int kvt, int nv, const float *const *q, float *const *out, const int *np, const void *kt,
-                         const void *vt, size_t ts, int hd, float scale, float *S, float *part) {
+                         const void *vt, size_t bs, int hd, float scale, float *S, float *part) {
     // nv query vectors q[r] sharing one kv head, vector r over positions 0..np[r]-1, into out[r]:
     // per block of ATT_P positions the partial results, then their combination (one block: the
     // attention directly). S: scratch of nv * (blocks of max np) * ATT_P floats; part: nv * (blocks of
@@ -1647,7 +1648,7 @@ static void attention_kv(int kvt, int nv, const float *const *q, float *const *o
     for (int r = 0; r < nv; r++)
         nmax = np[r] > nmax ? np[r] : nmax;
     if (nmax <= ATT_P) {
-        attention_part(kvt, nv, q, out, NULL, np, 0, 1, kt, vt, ts, hd, scale, S);
+        attention_part(kvt, nv, q, out, NULL, np, 0, 1, kt, vt, bs, hd, scale, S);
         return;
     }
     int nbm = (nmax + ATT_P - 1) / ATT_P;
@@ -1655,22 +1656,23 @@ static void attention_kv(int kvt, int nv, const float *const *q, float *const *o
     float *pv[ATT_NV_MAX];
     for (int r = 0; r < nv; r++)
         pv[r] = part + (size_t)r * nbm * st;
-    attention_part(kvt, nv, q, NULL, pv, np, 0, nbm, kt, vt, ts, hd, scale, S);
+    attention_part(kvt, nv, q, NULL, pv, np, 0, nbm, kt, vt, bs, hd, scale, S);
     for (int r = 0; r < nv; r++)
         att_combine(out[r], (np[r] + ATT_P - 1) / ATT_P, pv[r], st, hd);
 }
 
-static inline size_t kv_tile(int t, int h, int kv_len, int hd) {
-    // offset (elements) of the cache tile holding position t of kv head h, inside a layer: each head's
-    // tiles are contiguous (one sequential stream per head; see kernels_avx512.h)
-    return ((size_t)h * kv_len + (size_t)(t / ATT_T) * ATT_T) * hd;
+static inline size_t kv_tile(int t, int h, int n_kv, int hd) {
+    // offset (elements) of the cache tile holding position t of kv head h, inside a layer: blocks of
+    // ATT_P positions, in a block the heads one after the other, each its ATT_P / ATT_T tiles (one
+    // contiguous stream per head and block; see kernels_avx512.h)
+    return (((size_t)(t / ATT_P) * n_kv + h) * ATT_P + (size_t)(t % ATT_P / ATT_T) * ATT_T) * hd;
 }
 
-static void kv_store(int kvt, void *kl0, void *vl0, int t, int h, int kv_len, int hd, const float *k, const float *v) {
+static void kv_store(int kvt, void *kl0, void *vl0, int t, int h, int n_kv, int hd, const float *k, const float *v) {
     // head h of the key / value rows k, v of position t into the layer's cache tiles kl, vl
     // (k or v may be NULL: only the other one); kvt: cache type (bf16 / f16: rounded to nearest even,
     // layouts in kernels_avx512.h)
-    size_t o = kv_tile(t, h, kv_len, hd);
+    size_t o = kv_tile(t, h, n_kv, hd);
     int j = t % ATT_T;
     if (kvt == KV_F16) {
         uint16_t *kl = kl0, *vl = vl0;
@@ -1716,14 +1718,24 @@ static void kv_populate_one(RunState *s, Config *p, int pos0, int n, int it) {
 #if !defined _WIN32 && defined MADV_POPULATE_WRITE
     int kv_dim = p->n_kv_heads * p->head_dim, l = it / 2, kv = it % 2;
     uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
-    // positions pos0.. of every head: its tiles pos0 / ATT_T .. (pos0 + n - 1) / ATT_T
+    // positions pos0.. of every head: per block of ATT_P positions and head the tiles pos0 / ATT_T ..
+    // (pos0 + n - 1) / ATT_T it holds (one range; adjacent ranges merged: whole blocks are contiguous)
     char *c = (char *)(kv ? s->value_cache : s->key_cache) + l * (uint64_t)s->kv_len * kv_dim * s->kv_esz;
-    for (int h = 0; h < p->n_kv_heads; h++) { // (each head's tiles are contiguous: one range per head)
-        char *ch = c + (size_t)h * s->kv_len * p->head_dim * s->kv_esz;
-        uintptr_t a = (uintptr_t)(ch + (size_t)(pos0 / ATT_T) * ATT_T * p->head_dim * s->kv_esz) & ~(pg - 1);
-        uintptr_t e = (uintptr_t)(ch + (size_t)((pos0 + n - 1) / ATT_T + 1) * ATT_T * p->head_dim * s->kv_esz);
-        madvise((void *)a, e - a, MADV_POPULATE_WRITE);
-    }
+    size_t esz = s->kv_esz;
+    uintptr_t ra = 0, re = 0;
+    for (int b = pos0 / ATT_P; b <= (pos0 + n - 1) / ATT_P; b++)
+        for (int h = 0; h < p->n_kv_heads; h++) {
+            int t0 = pos0 > b * ATT_P ? pos0 : b * ATT_P, t1 = pos0 + n < (b + 1) * ATT_P ? pos0 + n : (b + 1) * ATT_P;
+            uintptr_t a = (uintptr_t)(c + kv_tile(t0, h, p->n_kv_heads, p->head_dim) * esz) & ~(pg - 1);
+            uintptr_t e = (uintptr_t)(c + (kv_tile(t1 - 1, h, p->n_kv_heads, p->head_dim) + (size_t)ATT_T * p->head_dim) * esz);
+            if (a > re) { // (a gap: populate the range so far)
+                if (re > ra)
+                    madvise((void *)ra, re - ra, MADV_POPULATE_WRITE);
+                ra = a;
+            }
+            re = e;
+        }
+    madvise((void *)ra, re - ra, MADV_POPULATE_WRITE);
 #else
     (void)s; (void)p; (void)pos0; (void)n; (void)it;
 #endif
@@ -1793,7 +1805,7 @@ static void decode_worker(void *arg, int tid, int nt) {
     int all_heads_dim = nh * hd, ff = s->ff_rows;
     int ng = kv_mul + 2; // qkv items per kv head: its kv_mul query heads, its key head, its value head
     int nb = (pos + 1 + ATT_P - 1) / ATT_P; // attention blocks (kernels_avx512.h): items per kv head
-    size_t ts = (size_t)ATT_T * hd, pst = ATT_PSTRIDE(hd); // (cache: elements from one tile of a head to the next)
+    size_t bs = (size_t)nkv * ATT_P * hd, pst = ATT_PSTRIDE(hd); // (cache: elements from a head's block to its next)
 
     if (pos % ATT_T == 0) { // first position of a KV cache tile: pre-fault the tile (all layers)
         PH_BEGIN_DYN(2 * p->n_layers, 1)
@@ -1827,10 +1839,10 @@ static void decode_worker(void *arg, int tid, int nt) {
                 } else if (r == kv_mul) {
                     matvec_rows(s->k, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->wk + l, dim, g * hd, (g + 1) * hd);
                     qk_norm_rope(s->k + g * hd, 1, w->k_norm_weights + l * hd, hd, s->rope);
-                    kv_store(s->kvt, kl, NULL, pos, g, s->kv_len, hd, s->k + g * hd, NULL);
+                    kv_store(s->kvt, kl, NULL, pos, g, nkv, hd, s->k + g * hd, NULL);
                 } else {
                     matvec_rows(s->v, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->wv + l, dim, g * hd, (g + 1) * hd);
-                    kv_store(s->kvt, NULL, vl, pos, g, s->kv_len, hd, NULL, s->v + g * hd);
+                    kv_store(s->kvt, NULL, vl, pos, g, nkv, hd, NULL, s->v + g * hd);
                 }
                 rq_count(S, l * nkv + g, 1);
                 continue;
@@ -1847,8 +1859,8 @@ static void decode_worker(void *arg, int tid, int nt) {
                 pv[r] = part + (size_t)r * s->att_nb * pst;
                 npv[r] = pos + 1;
             }
-            size_t o = kv_tile(0, g, s->kv_len, hd);
-            attention_part(s->kvt, kv_mul, qv, ov, nb == 1 ? NULL : pv, npv, b, b + 1, kl + o * s->kv_esz, vl + o * s->kv_esz, ts, hd, s->att_scale,
+            size_t o = kv_tile(0, g, nkv, hd);
+            attention_part(s->kvt, kv_mul, qv, ov, nb == 1 ? NULL : pv, npv, b, b + 1, kl + o * s->kv_esz, vl + o * s->kv_esz, bs, hd, s->att_scale,
                            s->att + ((size_t)g * s->att_nb + b) * kv_mul * ATT_P);
             if (nb > 1) { // the last block of this kv head to finish combines them
                 if (rq_count(S, (p->n_layers + l) * nkv + g, 1) < nb)
@@ -1978,7 +1990,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
     int rch = n / (4 * nt) > 1 ? n / (4 * nt) : 1; // rows per claim in the per-row phases
     int ar = s->att_rows, nrb = (n + ar - 1) / ar;
     int tb0 = pos0 / ATT_T, ntb = (pos0 + n - 1) / ATT_T - tb0 + 1;
-    size_t ts = (size_t)ATT_T * hd;
+    size_t bs = (size_t)nkv * ATT_P * hd;
     uint8_t *scr = s->kq_scr ? s->kq_scr + (size_t)tid * s->kq_scr_bytes : NULL;
     float *att = s->att_b + (size_t)tid * ar * kv_mul * s->att_nb * ATT_P;
     float *part = s->att_pb + (size_t)tid * ar * kv_mul * s->att_nb * ATT_PSTRIDE(hd);
@@ -2046,7 +2058,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
                 qk_norm_rope(s->q_b + (size_t)b * all_heads_dim, p->n_heads, w->q_norm_weights + l * hd, hd, cs);
                 qk_norm_rope(s->k_b + (size_t)b * kv_dim, nkv, w->k_norm_weights + l * hd, hd, cs);
                 for (int h = 0; h < nkv; h++)
-                    kv_store(s->kvt, kl, vl, t, h, s->kv_len, hd, s->k_b + (size_t)b * kv_dim + h * hd, s->v_b + (size_t)b * kv_dim + h * hd);
+                    kv_store(s->kvt, kl, vl, t, h, nkv, hd, s->k_b + (size_t)b * kv_dim + h * hd, s->v_b + (size_t)b * kv_dim + h * hd);
             }
         }
         PH_END_NOEPI
@@ -2071,8 +2083,8 @@ static void prefill_worker(void *arg, int tid, int nt) {
                     ov[nv] = s->xb_b + (size_t)b * xs + h * hd;
                     npv[nv] = pos0 + b + 1;
                 }
-            size_t o = kv_tile(0, g, s->kv_len, hd);
-            attention_kv(s->kvt, nv, qv, ov, npv, kl + o * s->kv_esz, vl + o * s->kv_esz, ts, hd, s->att_scale, att, part);
+            size_t o = kv_tile(0, g, nkv, hd);
+            attention_kv(s->kvt, nv, qv, ov, npv, kl + o * s->kv_esz, vl + o * s->kv_esz, bs, hd, s->att_scale, att, part);
             if (rq_count(S, l * s->pf_nrb + rb, 1) < nkv)
                 continue;
             for (int b = b0; b < b1; b++) {

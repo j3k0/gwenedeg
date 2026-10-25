@@ -13,6 +13,9 @@
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
+#ifdef _OPENMP
+    #include <omp.h>
+#endif
 
 // ----------------------------------------------------------------------------
 // Globals
@@ -20,6 +23,26 @@ int GS = 0; // group size global for quantization of the weights
 
 // Maximum input prompt buffer size
 #define PROMPT_BUFFER_SIZE 32768
+
+// Batched prefill (forward_batch): prompt tokens are processed in chunks of prefill_chunk
+// rows (-b, at most B_MAX); 0 or 1 = one token at a time through forward()
+#define B_MAX 256
+#define PREFILL_CHUNK_DEFAULT 64
+int prefill_chunk = PREFILL_CHUNK_DEFAULT;
+
+double now_s(void);
+#ifdef RUNQ_PROFILE
+// build with -DRUNQ_PROFILE: wall time per forward_batch phase, printed at exit
+enum { PF_NORM, PF_QKV, PF_ROPE, PF_ATT, PF_WO, PF_FFN13, PF_SWIGLU, PF_FFN2, PF_CLS, PF_N };
+static const char *pf_name[PF_N] = { "norm+quant+resid", "gemm qkv", "qk-norm+rope", "attention",
+                                      "gemm wo", "gemm w1+w3", "swiglu+quant", "gemm w2", "classifier" };
+static double pf_time[PF_N], pf_t;
+#define PROF_START() (pf_t = now_s())
+#define PROF(i) do { double t_ = now_s(); pf_time[i] += t_ - pf_t; pf_t = t_; } while (0)
+#else
+#define PROF_START() ((void)0)
+#define PROF(i) ((void)0)
+#endif
 
 // ----------------------------------------------------------------------------
 // Transformer model
@@ -85,6 +108,18 @@ typedef struct {
     // kv cache
     float *key_cache;   // (layer, seq_len, dim)
     float *value_cache; // (layer, seq_len, dim)
+    // batched prefill buffers (forward_batch), nb_max rows each; not allocated if nb_max <= 1
+    int nb_max;
+    int xs;         // row stride of xb_b / xq_b: max(dim, all_heads_dim), a multiple of GS
+    float *x_b;     // (nb_max, dim) residual stream
+    float *xb_b;    // (nb_max, xs)
+    float *q_b;     // (nb_max, all_heads_dim); k and v go straight into the kv cache
+    float *hb_b;    // (nb_max, hidden_dim)
+    float *hb2_b;   // (nb_max, hidden_dim)
+    QuantizedTensor xq_b; // (nb_max, xs)
+    QuantizedTensor hq_b; // (nb_max, hidden_dim)
+    float *att_b;   // (att_threads, seq_len): one attention score buffer per OpenMP thread
+    int att_threads;
 } RunState;
 
 typedef struct {
@@ -95,10 +130,35 @@ typedef struct {
     ssize_t file_size; // size of the checkpoint file in bytes
 } Transformer;
 
-void malloc_run_state(RunState* s, Config *p) {
+void malloc_run_state(RunState* s, Config *p, int nb_max) {
     // we calloc instead of malloc to keep valgrind happy
     int all_heads_dim = p->n_heads * p->head_dim;
     int kv_dim = p->n_kv_heads * p->head_dim;
+
+    memset(s, 0, sizeof(*s));
+    s->nb_max = nb_max > B_MAX ? B_MAX : nb_max;
+    if (s->nb_max > 1) {
+        size_t nb = s->nb_max;
+        s->xs = p->dim > all_heads_dim ? p->dim : all_heads_dim;
+        s->x_b = calloc(nb * p->dim, sizeof(float));
+        s->xb_b = calloc(nb * s->xs, sizeof(float));
+        s->q_b = calloc(nb * all_heads_dim, sizeof(float));
+        s->hb_b = calloc(nb * p->hidden_dim, sizeof(float));
+        s->hb2_b = calloc(nb * p->hidden_dim, sizeof(float));
+        s->xq_b = (QuantizedTensor) { .q = calloc(nb * s->xs, sizeof(int8_t)), .s = calloc(nb * s->xs / GS, sizeof(float)) };
+        s->hq_b = (QuantizedTensor) { .q = calloc(nb * p->hidden_dim, sizeof(int8_t)), .s = calloc(nb * p->hidden_dim / GS, sizeof(float)) };
+#ifdef _OPENMP
+        s->att_threads = omp_get_max_threads();
+#else
+        s->att_threads = 1;
+#endif
+        s->att_b = calloc((size_t)s->att_threads * p->seq_len, sizeof(float));
+        if (!s->x_b || !s->xb_b || !s->q_b || !s->hb_b || !s->hb2_b || !s->xq_b.q || !s->xq_b.s ||
+            !s->hq_b.q || !s->hq_b.s || !s->att_b) {
+            fprintf(stderr, "malloc failed!\n");
+            exit(EXIT_FAILURE);
+        }
+    }
 
     s->x = calloc(p->dim, sizeof(float));
     s->xb = calloc(all_heads_dim, sizeof(float));
@@ -133,6 +193,16 @@ void free_run_state(RunState* s) {
     free(s->logits);
     free(s->key_cache);
     free(s->value_cache);
+    free(s->x_b);
+    free(s->xb_b);
+    free(s->q_b);
+    free(s->hb_b);
+    free(s->hb2_b);
+    free(s->xq_b.q);
+    free(s->xq_b.s);
+    free(s->hq_b.q);
+    free(s->hq_b.s);
+    free(s->att_b);
 }
 
 // ----------------------------------------------------------------------------
@@ -252,11 +322,11 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights* weigh
     memory_map_weights(weights, config, weights_ptr);
 }
 
-void build_transformer(Transformer *t, char *checkpoint_path, int ctx_length) {
+void build_transformer(Transformer *t, char *checkpoint_path, int ctx_length, int nb_max) {
     // read in the Config and the Weights from the checkpoint
     read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->data, &t->file_size, ctx_length);
-    // allocate the RunState buffers
-    malloc_run_state(&t->state, &t->config);
+    // allocate the RunState buffers (batched prefill buffers for nb_max rows if nb_max > 1)
+    malloc_run_state(&t->state, &t->config, nb_max);
 }
 
 void free_transformer(Transformer *t) {
@@ -312,6 +382,21 @@ void softmax(float *x, int size) {
         x[i] /= sum;
 }
 
+// Q8_0 dot product of one weight row with one quantized activation row (n values, n/GS groups):
+// exact int32 sum per group of GS, then accumulated in float, group by group in order.
+// Shared by matmul (GEMV) and matmul_batch (GEMM) so both give bit-identical results.
+static inline float dot_q8(const int8_t *wq, const float *ws, const int8_t *xq, const float *xs, int n) {
+    float val = 0;
+    for (int j = 0; j <= n - GS; j += GS) {
+        int32_t ival = 0;
+        for (int k = 0; k < GS; k++)
+            ival += xq[j + k] * wq[j + k];
+
+        val += ((float) ival) * ws[j / GS] * xs[j / GS];
+    }
+    return val;
+}
+
 void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
@@ -319,20 +404,128 @@ void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
 
     #pragma omp parallel for
     for (int i = 0; i < d; i++) {
-        float val = 0;
         int in = i * n;
-
-        // do the matmul in groups of GS
-        for (int j = 0; j <= n - GS; j += GS) {
-            int32_t ival = 0;
-            for (int k = 0; k < GS; k++)
-                ival += x->q[j + k] * w->q[in + j + k];
-
-            val += ((float) ival) * w->s[(in + j) / GS] * x->s[j / GS];
-        }
-
-        xout[i] = val;
+        xout[i] = dot_q8(w->q + in, w->s + in / GS, x->q, x->s, n);
     }
+}
+
+// The scale chain below must round exactly like dot_q8 as gcc -Ofast compiles it there,
+// val += (ws * xs) * (float) ival as two multiplies and an add. In the 4-row kernel gcc would
+// contract it into an FMA (one rounding less), and the batched logits would then differ from the
+// sequential ones (enough to flip a greedy token). The batched-vs-sequential test checks this
+#if defined(__GNUC__) && !defined(__clang__)
+    #define NO_FP_CONTRACT __attribute__((optimize("fp-contract=off")))
+#else
+    #define NO_FP_CONTRACT
+#endif
+
+// rows of W per work item in matmul_batch: a block of MB_ROWS rows (MB_ROWS * k bytes,
+// 4-12 KB here) stays in L1 while all nb activation rows stream past it
+#define MB_ROWS 4
+
+NO_FP_CONTRACT static inline void dot_q8_x4(float *o, const int8_t *w0, const float *s0, int k, const int8_t *xq, const float *xs) {
+    // o[r] = dot_q8(row r of the 4 consecutive W rows at w0, x) for r < 4: each activation value
+    // is loaded once for 4 rows (~35% faster than 4 dot_q8 calls). Per output, the same
+    // arithmetic in the same order as dot_q8 (see NO_FP_CONTRACT)
+    const int8_t *w1 = w0 + k, *w2 = w1 + k, *w3 = w2 + k;
+    const float *s1 = s0 + k / GS, *s2 = s1 + k / GS, *s3 = s2 + k / GS;
+    float v0 = 0, v1 = 0, v2 = 0, v3 = 0;
+    for (int j = 0; j <= k - GS; j += GS) {
+        int32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        for (int kk = 0; kk < GS; kk++) {
+            int32_t xv = xq[j + kk];
+            a0 += xv * w0[j + kk]; a1 += xv * w1[j + kk]; a2 += xv * w2[j + kk]; a3 += xv * w3[j + kk];
+        }
+        v0 += ((float) a0) * s0[j / GS] * xs[j / GS];
+        v1 += ((float) a1) * s1[j / GS] * xs[j / GS];
+        v2 += ((float) a2) * s2[j / GS] * xs[j / GS];
+        v3 += ((float) a3) * s3[j / GS] * xs[j / GS];
+    }
+    o[0] = v0; o[1] = v1; o[2] = v2; o[3] = v3;
+}
+
+NO_FP_CONTRACT
+void matmul_batch(float *out, int ldo, QuantizedTensor *x, int ldx, int nb, QuantizedTensor *w, int k, int d) {
+    // GEMM: out[b * ldo + i] = W[i, :] . x[b, :]   for b < nb, i < d
+    //   W (d, k) Q8_0, row-major (as in matmul); x: nb quantized rows of k values, row b at
+    //   x->q + b * ldx with its k/GS scales at x->s + b * ldx / GS (ldx a multiple of GS).
+    // Each output is computed exactly as dot_q8() in matmul(), so the batched path matches the
+    // sequential one bit for bit. Parallel over blocks of MB_ROWS output rows; each weight row is
+    // loaded from memory once per call and reused for all nb activation rows from L1.
+    // Step 3 replaces the inner kernel (dot_q8_x4) with AVX-512 VNNI.
+    int nblk = (d + MB_ROWS - 1) / MB_ROWS;
+    #pragma omp parallel for schedule(static)
+    for (int blk = 0; blk < nblk; blk++) {
+        int i0 = blk * MB_ROWS, i1 = i0 + MB_ROWS < d ? i0 + MB_ROWS : d;
+        for (int b = 0; b < nb; b++) {
+            const int8_t *xq = x->q + (size_t)b * ldx;
+            const float *xsc = x->s + (size_t)b * ldx / GS;
+            float *o = out + (size_t)b * ldo;
+            if (i1 - i0 == 4) {
+                dot_q8_x4(o + i0, w->q + (size_t)i0 * k, w->s + (size_t)i0 * k / GS, k, xq, xsc);
+                continue;
+            }
+            for (int i = i0; i < i1; i++) {
+                size_t in = (size_t)i * k;
+                o[i] = dot_q8(w->q + in, w->s + in / GS, xq, xsc, k);
+            }
+        }
+    }
+}
+
+static void qk_norm_rope(float *v, int n_heads, const float *norm_w, int head_dim, int pos) {
+    // Qwen3 QK-norm (RMSNorm per head) then NeoX-style RoPE (pairs j, j + head_dim/2), in place
+    for (int h = 0; h < n_heads; h++) {
+        float *q = v + h * head_dim;
+
+        rmsnorm(q, q, (float *)norm_w, head_dim);
+        for (int j = 0; j < head_dim/2; j++) {
+            float freq = powf(1e6, -(float)j / (head_dim/2));
+            float cos_freq = cosf(pos * freq), sin_freq = sinf(pos * freq);
+
+            float x = q[j]; // real part
+            float y = q[j + head_dim/2]; // imag part
+
+            q[j] = x * cos_freq - y * sin_freq; // new real
+            q[j + head_dim/2] = x * sin_freq + y * cos_freq; // new imag
+        }
+    }
+}
+
+static void attention_head(float *xb, const float *q, const float *kc, const float *vc, int kv_dim, int head_dim, int n_pos, float *att) {
+    // one query head over cached positions 0..n_pos-1: kc / vc point at this head's slice of
+    // position 0 in the layer's key / value cache (row stride kv_dim); att: n_pos scratch floats
+    for (int t = 0; t < n_pos; t++) {
+        // get the key vector for this head and at this timestep
+        const float *k = kc + (size_t)t * kv_dim;
+        // calculate the attention score as the dot product of q and k
+        float score = 0;
+        for (int i = 0; i < head_dim; i++)
+            score += q[i] * k[i];
+
+        // save the score to the attention buffer
+        att[t] = score / sqrtf(head_dim);
+    }
+
+    // softmax the scores to get attention weights, from 0..pos inclusively
+    softmax(att, n_pos);
+
+    // weighted sum of the values, store back into xb
+    memset(xb, 0, head_dim * sizeof(float));
+    for (int t = 0; t < n_pos; t++) {
+        // get the value vector for this head and at this timestep
+        const float *v = vc + (size_t)t * kv_dim;
+        // get the attention weight for this timestep, then accumulate the weighted value into xb
+        for (int i = 0; i < head_dim; i++)
+            xb[i] += att[t] * v[i];
+    }
+}
+
+static void swiglu(float *hb, const float *hb2, int n) {
+    // silu(hb) * hb2, silu(x) = x * sigmoid(x). The exponent is clamped: under -Ofast
+    // (finite-math) expf overflowing to inf for x < -88 can give NaN; for x < -80 silu is ~0 anyway
+    for (int i = 0; i < n; i++)
+        hb[i] *= hb2[i] * (1.0f / (1.0f + expf(fminf(-hb[i], 80.0f))));
 }
 
 float *forward(Transformer *transformer, int token, int pos, int compute_logits) {
@@ -365,73 +558,16 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
         matmul(s->k, &s->xq, w->wk + l, p->dim, kv_dim);
         matmul(s->v, &s->xq, w->wv + l, p->dim, kv_dim);
 
-        /* ------------ Q-RMSNorm + rotate each query head ------------- */
-        for (int h = 0; h < p->n_heads; h++) {
-            float *q = s->q + h * p->head_dim;
-
-            rmsnorm(q, q, w->q_norm_weights + l * p->head_dim, p->head_dim);
-            for (int j = 0; j < p->head_dim/2; j++) {
-                float freq = powf(1e6, -(float)j / (p->head_dim/2));
-                float cos_freq = cosf(pos * freq), sin_freq = sinf(pos * freq);
-
-                float x = q[j]; // real part
-                float y = q[j + p->head_dim/2]; // imag part
-
-                q[j] = x * cos_freq - y * sin_freq; // new real
-                q[j + p->head_dim/2] = x * sin_freq + y * cos_freq; // new imag
-            }
-        }
-
-        /* ------------ K-RMSNorm + rotate each key head ------------ */
-        for (int h = 0; h < p->n_kv_heads; h++) {
-            float *k = s->k + h * p->head_dim;
-
-            rmsnorm(k, k, w->k_norm_weights + l * p->head_dim, p->head_dim);
-            for (int j = 0; j < p->head_dim/2; j++) {
-                float freq = powf(1e6, -(float)j / (p->head_dim/2));
-                float cos_freq = cosf(pos * freq), sin_freq = sinf(pos * freq);
-
-                float x = k[j];
-                float y = k[j + p->head_dim/2];
-
-                k[j] = x * cos_freq - y * sin_freq;
-                k[j + p->head_dim/2] = x * sin_freq + y * cos_freq;
-            }
-        }
+        // Q-RMSNorm + rotate each query head, then the same for each key head
+        qk_norm_rope(s->q, p->n_heads, w->q_norm_weights + l * p->head_dim, p->head_dim, pos);
+        qk_norm_rope(s->k, p->n_kv_heads, w->k_norm_weights + l * p->head_dim, p->head_dim, pos);
 
         // multihead attention. iterate over all heads
         #pragma omp parallel for
         for (int h = 0; h < p->n_heads; h++) {
-            // get the query vector for this head
-            float *q = s->q + h * p->head_dim;
-            // attention scores for this head
-            float *att = s->att + h * p->seq_len;
-            // iterate over all timesteps, including the current one
-            for (int t = 0; t <= pos; t++) {
-                // get the key vector for this head and at this timestep
-                float *k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * p->head_dim;
-                // calculate the attention score as the dot product of q and k
-                float score = 0;
-                for (int i = 0; i < p->head_dim; i++)
-                    score += q[i] * k[i];
-
-                // save the score to the attention buffer
-                att[t] = score / sqrtf(p->head_dim);
-            }
-
-            // softmax the scores to get attention weights, from 0..pos inclusively
-            softmax(att, pos + 1);
-
-            // weighted sum of the values, store back into xb
-            float *xb = s->xb + h * p->head_dim;
-            memset(xb, 0, p->head_dim * sizeof(float));
-            for (int t = 0; t <= pos; t++) {
-                // get the value vector for this head and at this timestep
-                float *v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * p->head_dim;
-                // get the attention weight for this timestep, then accumulate the weighted value into xb
-                for (int i = 0; i < p->head_dim; i++)
-                    xb[i] += att[t] * v[i];
-            }
+            int ho = (h / kv_mul) * p->head_dim;
+            attention_head(s->xb + h * p->head_dim, s->q + h * p->head_dim, s->key_cache + loff + ho,
+                           s->value_cache + loff + ho, kv_dim, p->head_dim, pos + 1, s->att + h * p->seq_len);
         }
 
         // final matmul to get the output of the attention
@@ -452,11 +588,7 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
         matmul(s->hb2, &s->xq, w->w3 + l, p->dim, p->hidden_dim);
 
         // SwiGLU non-linearity
-        // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid. The exponent is clamped: under
-        // -Ofast, expf(-x) = inf for x < -88 gives NaN (vrcp14ps + Newton step: 0 * inf), and
-        // the NaN broke quantize()'s vectorized max, i.e. the scale of its whole group
-        for (int i = 0; i < p->hidden_dim; i++)
-            s->hb[i] *= s->hb2[i] * (1.0f / (1.0f + expf(fminf(-s->hb[i], 80.0f))));
+        swiglu(s->hb, s->hb2, p->hidden_dim);
 
         // final matmul to get the output of the ffn
         quantize(&s->hq, s->hb, p->hidden_dim);
@@ -477,6 +609,171 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
     quantize(&s->xq, s->x, p->dim);
     matmul(s->logits, &s->xq, w->wcls, p->dim, p->vocab_size);
     return s->logits;
+}
+
+#ifndef ATT_ROWS
+#define ATT_ROWS 2 // rows per attention work chunk in forward_batch (x kv_mul query heads)
+#endif
+
+static inline QuantizedTensor qrow(QuantizedTensor *t, int b, int ld) {
+    // row b of a batch of quantized rows with row stride ld (a multiple of GS)
+    return (QuantizedTensor) { t->q + (size_t)b * ld, t->s + (size_t)b * ld / GS };
+}
+
+enum { LOGITS_NONE = 0, LOGITS_LAST = 1, LOGITS_ALL = 2 };
+
+float *forward_batch(Transformer *transformer, int *tokens, int n, int pos0, int logits_mode, float *logits_out) {
+    // Batched prefill: tokens[0..n-1] at positions pos0..pos0+n-1 (1 <= n <= state.nb_max),
+    // the same computation as n calls of forward() but with every weight matrix applied to all
+    // n rows at once (matmul_batch), and bit-identical results. Fills the KV cache.
+    //   LOGITS_NONE: returns NULL
+    //   LOGITS_LAST: logits of the last row in state.logits (returned)
+    //   LOGITS_ALL:  logits of all rows into logits_out (n, vocab_size) (returned)
+    // Note: in LOGITS_LAST mode state.x / state.xq are clobbered (as by forward()).
+    Config *p = &transformer->config;
+    TransformerWeights* w = &transformer->weights;
+    RunState* s = &transformer->state;
+    int dim = p->dim, hd = p->head_dim, hidden = p->hidden_dim, xs = s->xs;
+    int kv_dim = p->n_kv_heads * hd;
+    int kv_mul = p->n_heads / p->n_kv_heads;
+    int all_heads_dim = p->n_heads * hd;
+    if (n < 1 || n > s->nb_max || pos0 < 0 || pos0 + n > p->seq_len) {
+        fprintf(stderr, "forward_batch: bad chunk n=%d pos0=%d (nb_max %d, seq_len %d)\n", n, pos0, s->nb_max, p->seq_len);
+        exit(EXIT_FAILURE);
+    }
+    PROF_START();
+
+    for (int b = 0; b < n; b++)
+        memcpy(s->x_b + (size_t)b * dim, w->token_embedding_table + (size_t)tokens[b] * dim, dim * sizeof(float));
+
+    for (int l = 0; l < p->n_layers; l++) {
+        uint64_t loff = l * (uint64_t)p->seq_len * kv_dim;
+        // k / v rows of this chunk are contiguous in the cache (row stride kv_dim): the GEMMs
+        // write them in place
+        float *kc = s->key_cache + loff + (size_t)pos0 * kv_dim;
+        float *vc = s->value_cache + loff + (size_t)pos0 * kv_dim;
+
+        // attention rmsnorm + quantize, per row
+        #pragma omp parallel for
+        for (int b = 0; b < n; b++) {
+            QuantizedTensor xq = qrow(&s->xq_b, b, xs);
+            rmsnorm(s->xb_b + (size_t)b * xs, s->x_b + (size_t)b * dim, w->rms_att_weight + l * dim, dim);
+            quantize(&xq, s->xb_b + (size_t)b * xs, dim);
+        }
+        PROF(PF_NORM);
+
+        // qkv GEMMs
+        matmul_batch(s->q_b, all_heads_dim, &s->xq_b, xs, n, w->wq + l, dim, all_heads_dim);
+        matmul_batch(kc, kv_dim, &s->xq_b, xs, n, w->wk + l, dim, kv_dim);
+        matmul_batch(vc, kv_dim, &s->xq_b, xs, n, w->wv + l, dim, kv_dim);
+        PROF(PF_QKV);
+
+        // QK-norm + RoPE, each row at its own position
+        #pragma omp parallel for
+        for (int b = 0; b < n; b++) {
+            qk_norm_rope(s->q_b + (size_t)b * all_heads_dim, p->n_heads, w->q_norm_weights + l * hd, hd, pos0 + b);
+            qk_norm_rope(kc + (size_t)b * kv_dim, p->n_kv_heads, w->k_norm_weights + l * hd, hd, pos0 + b);
+        }
+        PROF(PF_ROPE);
+
+        // causal attention: row b (position pos0 + b) attends to positions 0..pos0+b, whose
+        // K/V are all in the cache now. One work item per (row, head), ordered by kv head, then
+        // row, then the kv_mul query heads sharing that kv head; each thread takes ATT_ROWS rows
+        // x kv_mul heads in a row, which read nearly the same K/V slice (pos0 + b positions x
+        // head_dim), so it is re-read from L1/L2 instead of L3
+        #pragma omp parallel for schedule(dynamic, ATT_ROWS * kv_mul)
+        for (int it = 0; it < n * p->n_heads; it++) {
+            int g = it / (n * kv_mul), rem = it % (n * kv_mul);
+            int b = rem / kv_mul, h = g * kv_mul + rem % kv_mul;
+            int ho = g * hd;
+#ifdef _OPENMP
+            float *att = s->att_b + (size_t)omp_get_thread_num() * p->seq_len;
+#else
+            float *att = s->att_b;
+#endif
+            attention_head(s->xb_b + (size_t)b * xs + h * hd, s->q_b + (size_t)b * all_heads_dim + h * hd,
+                           s->key_cache + loff + ho, s->value_cache + loff + ho, kv_dim, hd, pos0 + b + 1, att);
+        }
+        PROF(PF_ATT);
+
+        #pragma omp parallel for
+        for (int b = 0; b < n; b++) {
+            QuantizedTensor xq = qrow(&s->xq_b, b, xs);
+            quantize(&xq, s->xb_b + (size_t)b * xs, all_heads_dim);
+        }
+        PROF(PF_NORM);
+        matmul_batch(s->xb_b, xs, &s->xq_b, xs, n, w->wo + l, all_heads_dim, dim);
+        PROF(PF_WO);
+
+        // residual, ffn rmsnorm, quantize
+        #pragma omp parallel for
+        for (int b = 0; b < n; b++) {
+            float *x = s->x_b + (size_t)b * dim, *xb = s->xb_b + (size_t)b * xs;
+            QuantizedTensor xq = qrow(&s->xq_b, b, xs);
+            for (int i = 0; i < dim; i++)
+                x[i] += xb[i];
+            rmsnorm(xb, x, w->rms_ffn_weight + l * dim, dim);
+            quantize(&xq, xb, dim);
+        }
+        PROF(PF_NORM);
+
+        matmul_batch(s->hb_b, hidden, &s->xq_b, xs, n, w->w1 + l, dim, hidden);
+        matmul_batch(s->hb2_b, hidden, &s->xq_b, xs, n, w->w3 + l, dim, hidden);
+        PROF(PF_FFN13);
+
+        #pragma omp parallel for
+        for (int b = 0; b < n; b++) {
+            QuantizedTensor hq = qrow(&s->hq_b, b, hidden);
+            swiglu(s->hb_b + (size_t)b * hidden, s->hb2_b + (size_t)b * hidden, hidden);
+            quantize(&hq, s->hb_b + (size_t)b * hidden, hidden);
+        }
+        PROF(PF_SWIGLU);
+
+        matmul_batch(s->xb_b, xs, &s->hq_b, hidden, n, w->w2 + l, hidden, dim);
+        PROF(PF_FFN2);
+
+        // residual connection
+        #pragma omp parallel for
+        for (int b = 0; b < n; b++) {
+            float *x = s->x_b + (size_t)b * dim, *xb = s->xb_b + (size_t)b * xs;
+            for (int i = 0; i < dim; i++)
+                x[i] += xb[i];
+        }
+        PROF(PF_NORM);
+    }
+
+    if (logits_mode == LOGITS_LAST) {
+        // final rmsnorm + classifier for the last row only, exactly as in forward()
+        rmsnorm(s->x, s->x_b + (size_t)(n - 1) * dim, w->rms_final_weight, dim);
+        quantize(&s->xq, s->x, dim);
+        matmul(s->logits, &s->xq, w->wcls, dim, p->vocab_size);
+        PROF(PF_CLS);
+        return s->logits;
+    }
+    if (logits_mode == LOGITS_ALL) {
+        #pragma omp parallel for
+        for (int b = 0; b < n; b++) {
+            QuantizedTensor xq = qrow(&s->xq_b, b, xs);
+            rmsnorm(s->xb_b + (size_t)b * xs, s->x_b + (size_t)b * dim, w->rms_final_weight, dim);
+            quantize(&xq, s->xb_b + (size_t)b * xs, dim);
+        }
+        matmul_batch(logits_out, p->vocab_size, &s->xq_b, xs, n, w->wcls, dim, p->vocab_size);
+        PROF(PF_CLS);
+        return logits_out;
+    }
+    return NULL;
+}
+
+float *prefill(Transformer *transformer, int *tokens, int n, int pos0) {
+    // feed tokens[0..n-1] at positions pos0.. in chunks of state.nb_max (> 1) rows;
+    // returns the logits of the last token (state.logits)
+    int nb = transformer->state.nb_max;
+    float *logits = NULL;
+    for (int i = 0; i < n; i += nb) {
+        int m = n - i < nb ? n - i : nb;
+        logits = forward_batch(transformer, tokens + i, m, pos0 + i, i + m == n ? LOGITS_LAST : LOGITS_NONE, NULL);
+    }
+    return logits;
 }
 
 // ----------------------------------------------------------------------------
@@ -1063,16 +1360,28 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     }
 
     // start the main loop
-    int next;        // will store the next token in the sequence
+    int next = 0;    // will store the next token in the sequence
     int token = prompt_tokens[0]; // kick off with the first token in the prompt
     int pos = 0;     // position in the sequence
     int n_gen = 0;
     double t0 = now_s(), t_prefill = t0;
+    float *pre_logits = NULL; // logits of the last prompt token, from the batched prefill
+
+    if (transformer->state.nb_max > 1 && num_prompt_tokens <= transformer->config.seq_len) {
+        // batched prefill of the whole prompt, then resume the loop at its last token
+        pre_logits = prefill(transformer, prompt_tokens, num_prompt_tokens, 0);
+        for (int i = 0; i < num_prompt_tokens - 1; i++)
+            printf("%s", decode(tokenizer, prompt_tokens[i]));
+        fflush(stdout);
+        pos = num_prompt_tokens - 1;
+        token = prompt_tokens[pos];
+    }
 
     while (pos < transformer->config.seq_len) {
         // forward the transformer to get logits for the next token
         // (only needed from the last prompt token on)
-        float *logits = forward(transformer, token, pos, pos >= num_prompt_tokens - 1);
+        float *logits = pre_logits ? pre_logits : forward(transformer, token, pos, pos >= num_prompt_tokens - 1);
+        pre_logits = NULL;
 
         // advance the state state machine
         if (pos < num_prompt_tokens - 1) {
@@ -1123,7 +1432,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
 
     // start the main loop
     int user_turn = 1; // user starts
-    int next;        // will store the next token in the sequence
+    int next = 0;    // will store the next token in the sequence
     int token;       // stores the current token to feed into the transformer
     int pos = 0;     // position in the sequence
     int n_gen = 0;
@@ -1167,19 +1476,31 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
             t0 = t_prefill = now_s();
         }
 
-        // determine the token to pass into the transformer next
-        if (pos < num_prompt_tokens) {
-            // if we are still processing the input prompt, force the next prompt token
-            token = prompt_tokens[pos];
+        float *logits;
+        if (pos == 0 && transformer->state.nb_max > 1 && num_prompt_tokens <= transformer->config.seq_len) {
+            // batched prefill of the whole prompt: same as the token-by-token branch below,
+            // ending at the last prompt token (incl. the RNG draws of the skipped tokens)
+            logits = prefill(transformer, prompt_tokens, num_prompt_tokens, 0);
+            token = prompt_tokens[num_prompt_tokens - 1];
+            pos = num_prompt_tokens;
+            if (sampler->temperature != 0)
+                for (int i = 0; i < num_prompt_tokens - 1; i++)
+                    random_f32(&sampler->rng_state);
         } else {
-            // otherwise use the next token sampled from previous turn
-            token = next;
-        }
+            // determine the token to pass into the transformer next
+            if (pos < num_prompt_tokens) {
+                // if we are still processing the input prompt, force the next prompt token
+                token = prompt_tokens[pos];
+            } else {
+                // otherwise use the next token sampled from previous turn
+                token = next;
+            }
 
-        // forward the transformer to get logits for the next token; `next` is only used
-        // from the last prompt token on, so earlier prompt tokens skip the classifier
-        float *logits = forward(transformer, token, pos, pos >= num_prompt_tokens - 1);
-        pos++;
+            // forward the transformer to get logits for the next token; `next` is only used
+            // from the last prompt token on, so earlier prompt tokens skip the classifier
+            logits = forward(transformer, token, pos, pos >= num_prompt_tokens - 1);
+            pos++;
+        }
         if (logits)
             next = sample(sampler, logits);
         else if (sampler->temperature != 0)
@@ -1233,8 +1554,18 @@ void forward_sequential(Transformer *transformer, int *tokens, int n_tokens, flo
     }
 }
 
+void forward_chunked(Transformer *transformer, int *tokens, int n_tokens, float *out) {
+    // the same with the batched path: chunks of state.nb_max rows, logits of every row
+    int vocab_size = transformer->config.vocab_size, nb = transformer->state.nb_max;
+    for (int i = 0; i < n_tokens; i += nb) {
+        int m = n_tokens - i < nb ? n_tokens - i : nb;
+        forward_batch(transformer, tokens + i, m, i, LOGITS_ALL, out + (size_t)i * vocab_size);
+    }
+}
+
 void dump_logits(Transformer *transformer, Tokenizer *tokenizer, char *text, char *out_path) {
     // file format: int32 n_tokens, int32 vocab_size, int32 ids[n_tokens], float32 logits[n_tokens][vocab_size]
+    // -b > 1: batched path (forward_chunked), else one token at a time (forward_sequential)
     int n_tokens = 0, vocab_size = transformer->config.vocab_size;
     int *tokens = (int *)malloc((strlen(text) + 3) * sizeof(int));
     encode(tokenizer, text, tokens, &n_tokens);
@@ -1245,7 +1576,10 @@ void dump_logits(Transformer *transformer, Tokenizer *tokenizer, char *text, cha
 
     float *out = (float *)malloc((size_t)n_tokens * vocab_size * sizeof(float));
     if (!out) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
-    forward_sequential(transformer, tokens, n_tokens, out);
+    if (transformer->state.nb_max > 1)
+        forward_chunked(transformer, tokens, n_tokens, out);
+    else
+        forward_sequential(transformer, tokens, n_tokens, out);
 
     FILE *file = fopen(out_path, "wb");
     if (!file) { fprintf(stderr, "Couldn't open %s for writing\n", out_path); exit(EXIT_FAILURE); }
@@ -1277,6 +1611,8 @@ void error_usage() {
     fprintf(stderr, "  -y <string> system prompt in chat mode, default is none\n");
     fprintf(stderr, "  -r <int>    reasoning mode, 0 (default) = no thinking, 1 = thinking\n");
     fprintf(stderr, "  -n <int>    max new tokens per response, 0 (default) = unlimited\n");
+    fprintf(stderr, "  -b <int>    prefill chunk size (batched prompt processing), default %d, max %d;\n", PREFILL_CHUNK_DEFAULT, B_MAX);
+    fprintf(stderr, "              0 or 1 = one token at a time\n");
     exit(EXIT_FAILURE);
 }
 
@@ -1311,6 +1647,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'r') { enable_thinking = atoi(argv[i + 1]); }
         else if (argv[i][1] == 'n') { max_new_tokens = atoi(argv[i + 1]); }
         else if (argv[i][1] == 'o') { out_path = argv[i + 1]; }
+        else if (argv[i][1] == 'b') { prefill_chunk = atoi(argv[i + 1]); }
         else { error_usage(); }
     }
 
@@ -1320,6 +1657,8 @@ int main(int argc, char *argv[]) {
     if (topp < 0 || 1.0 < topp) topp = 0.9;
     if ((strcmp(mode, "tokenize") == 0 || strcmp(mode, "logits") == 0) && !prompt) { error_usage(); }
     if (strcmp(mode, "logits") == 0 && !out_path) { error_usage(); }
+    if (prefill_chunk < 0) prefill_chunk = 0;
+    if (prefill_chunk > B_MAX) prefill_chunk = B_MAX;
 
     if (strcmp(mode, "tokenize") == 0) {
         // only the header is needed (vocab_size): skip mapping and dequantizing the weights
@@ -1340,7 +1679,7 @@ int main(int argc, char *argv[]) {
 
     // build the Transformer via the model .bin file
     Transformer transformer;
-    build_transformer(&transformer, checkpoint_path, ctx_length);
+    build_transformer(&transformer, checkpoint_path, ctx_length, prefill_chunk);
 
     // build the Tokenizer via the tokenizer .bin file
     Tokenizer tokenizer;
@@ -1369,5 +1708,12 @@ int main(int argc, char *argv[]) {
     free_sampler(&sampler);
     free_tokenizer(&tokenizer);
     free_transformer(&transformer);
+#ifdef RUNQ_PROFILE
+    double pf_total = 0;
+    for (int i = 0; i < PF_N; i++) pf_total += pf_time[i];
+    fprintf(stderr, "[profile] forward_batch total %.3f s\n", pf_total);
+    for (int i = 0; i < PF_N; i++)
+        fprintf(stderr, "[profile]   %-18s %8.3f s  %5.1f%%\n", pf_name[i], pf_time[i], 100 * pf_time[i] / (pf_total > 0 ? pf_total : 1));
+#endif
     return 0;
 }

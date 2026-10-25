@@ -169,7 +169,6 @@ typedef struct {
     int32_t *bq_corr, *bq_c16, *bh_corr, *bh_c16; // forward_batch GEMM activation prep of xq_b / hq_b rows
     float *bq_xf, *bh_xf;                         //   (Gemm, act_prep_row)
     uint8_t *kq_scr; size_t kq_scr_bytes;         // per-thread K-quant GEMM tile scratch (AVX-512)
-    int dec_chunk, cls_chunk; // 16-row blocks per claim in forward()'s GEMVs / classifier
 } RunState;
 
 // ----------------------------------------------------------------------------
@@ -1629,9 +1628,11 @@ static inline QuantizedTensor qsub(QuantizedTensor *t, int i0) {
 // (Items that wait on a dependency counter inside a phase need the shared counter: every item they
 // depend on is claimed before them, by a running thread. With per-thread ranges and stealing, all
 // threads can end up waiting in stolen items whose dependencies sit unclaimed in their own ranges:
-// an intermediate version deadlocked that way at 4 threads.) Decode uses the shared counter
-// everywhere (short phases: per-thread ranges and the victim scan at the end of each phase decoded
-// ~20-40% slower at 8-12 threads); prefill uses per-thread ranges for the GEMMs and per-row phases
+// an intermediate version deadlocked that way at 4 threads.) The GEMV / GEMM phases use per-thread
+// ranges: each thread streams a contiguous part of the weights (decode, 16-vCPU VM, best / median of
+// 6: 4 threads 142 / 106 tok/s vs 125 / 111 with shared-counter claims of 1-4 blocks, 8 threads 212 /
+// 189 vs 173 / 161, 12 threads 217 / 183 vs 199 / 176; prefill: claims of single tiles were ~15%
+// slower than ranges)
 #define PH_BEGIN_U(n_, chunk_, unit_) { RqIt it_ = rq_it(k_, (n_), (chunk_), (unit_), tid); int lo, hi; \
     while (rq_next(S, &it_, &lo, &hi)) {
 #define PH_EPILOGUE if (rq_finish(S, &it_, hi - lo)) {
@@ -1750,7 +1751,7 @@ static void decode_worker(void *arg, int tid, int nt) {
 
         // final matmul to get the output of the attention (16-row blocks); epilogue: residual
         // connection back into s->x, ffn rmsnorm, quantize
-        PH_BEGIN_DYN(dim / 16, s->dec_chunk)
+        PH_BEGIN(dim / 16, 1)
             matvec_rows(s->xb, &s->aq, s->aq_corr, s->aq_xf, s->aq_c16, w->wo + l, all_heads_dim, lo * 16, hi * 16);
         PH_EPILOGUE
             for (int i = 0; i < dim; i++)
@@ -1762,7 +1763,7 @@ static void decode_worker(void *arg, int tid, int nt) {
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x)): per item,
         // ff rows of self.w1(x) and self.w3(x), the SwiGLU non-linearity and their quantization
-        PH_BEGIN_DYN(hidden / ff, 1)
+        PH_BEGIN(hidden / ff, 1)
         for (int i0 = lo * ff; i0 < hi * ff; i0 += ff) {
             matvec_rows(s->hb, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->w1 + l, dim, i0, i0 + ff);
             matvec_rows(s->hb2, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->w3 + l, dim, i0, i0 + ff);
@@ -1775,7 +1776,7 @@ static void decode_worker(void *arg, int tid, int nt) {
 
         // final matmul to get the output of the ffn; epilogue: its residual, then the next layer's
         // attention rmsnorm + quantize (or the final rmsnorm for the classifier; none without logits)
-        PH_BEGIN_DYN(dim / 16, s->dec_chunk)
+        PH_BEGIN(dim / 16, 1)
             matvec_rows(s->xb, &s->hq, s->hq_corr, s->hq_xf, s->hq_c16, w->w2 + l, hidden, lo * 16, hi * 16);
         PH_EPILOGUE
             if (l + 1 < p->n_layers || job->compute_logits)
@@ -1785,7 +1786,7 @@ static void decode_worker(void *arg, int tid, int nt) {
 
     if (job->compute_logits) { // classifier into logits
         int nblk = (p->vocab_size + 15) / 16;
-        PH_BEGIN_DYN(nblk, s->cls_chunk)
+        PH_BEGIN(nblk, 8)
             matvec_rows(s->logits, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->wcls, dim, lo * 16,
                         hi * 16 < p->vocab_size ? hi * 16 : p->vocab_size);
         PH_END_NOEPI
@@ -1813,12 +1814,6 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
 
     int nt = rq_nthreads();
     rq_begin(&s->sync, decode_phases(p), decode_counters(p), nt, rq_spin_dec);
-    // GEMV claims of 16-row blocks: ~4 per thread (dim / 16 = 64 blocks); the classifier 32 blocks
-    // (~0.6 MB, ~20 us): ~300 claims of 9,496 blocks. (With ~8 claims per thread, ~0.2 ms each at 4
-    // threads, the other threads waited longer than their spin at the end of the phase and slept every
-    // token: decode ~20-40% slower at 4-8 threads)
-    s->dec_chunk = p->dim / 16 / (4 * nt) > 1 ? p->dim / 16 / (4 * nt) : 1;
-    s->cls_chunk = 32;
     DecodeJob job = { transformer, token, pos, compute_logits };
     rq_parallel(decode_worker, &job);
     return compute_logits ? s->logits : NULL;

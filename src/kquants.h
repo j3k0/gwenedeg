@@ -1,7 +1,7 @@
 /* K-quants (GGUF Q4_K and Q6_K, as in llama.cpp's Q4_K_M files) for runq.c: the block formats,
  * their dequantization, the repacked layouts (Q4P, Q6P) the matmul kernels read, and the generic C
  * kernels. The arithmetic of a matmul output is defined here (below); the generic kernels follow
- * it, and so do the AVX-512 ones (kernels_avx512.h: kq4_gemv_rows / kq6_gemv_rows, kq512_gemm_n),
+ * it, and so do the AVX-512 ones (kernels_avx512.h: kq4_gemv_rows / kq6_gemv_rows, kq512_gemm_item),
  * so that every build gives bit-identical logits (checked by make test's q4_kernels group).
  *
  * Block formats (ggml-common.h, ggml-quants.c; super-blocks of QK_K = 256 values of one row):

@@ -165,6 +165,10 @@ typedef struct {
     int att_nb;     // attention blocks of ATT_P positions in kv_len
     float *att_part; // forward(): per (kv head, query head, block) partial results (ATT_PSTRIDE floats)
     float *att_pb;  // forward_batch: the same per thread, att_rows * kv_mul vectors
+    int pf_nrb;     // forward_batch: attention row blocks per chunk (at most)
+    int32_t *bq_corr, *bq_c16, *bh_corr, *bh_c16; // forward_batch GEMM activation prep of xq_b / hq_b rows
+    float *bq_xf, *bh_xf;                         //   (Gemm, act_prep_row)
+    uint8_t *kq_scr; size_t kq_scr_bytes;         // per-thread K-quant GEMM tile scratch (AVX-512)
     int dec_chunk, cls_chunk; // 16-row blocks per claim in forward()'s GEMVs / classifier
 } RunState;
 
@@ -563,11 +567,24 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
         s->hb2_b = calloc(nb * p->hidden_dim, sizeof(float));
         s->xq_b = (QuantizedTensor) { .q = calloc(nb * s->xs, sizeof(int8_t)), .s = calloc(nb * s->xs / GS, sizeof(float)) };
         s->hq_b = (QuantizedTensor) { .q = calloc(nb * p->hidden_dim, sizeof(int8_t)), .s = calloc(nb * p->hidden_dim / GS, sizeof(float)) };
-#ifdef _OPENMP
-        s->att_threads = omp_get_max_threads();
-#else
-        s->att_threads = 1;
+        s->att_threads = rq_nthreads();
+        s->pf_nrb = (s->nb_max + s->att_rows - 1) / s->att_rows;
+        s->bq_corr = calloc(nb * (s->xs / GS) + 1, sizeof(int32_t));
+        s->bh_corr = calloc(nb * (p->hidden_dim / GS) + 1, sizeof(int32_t));
+        if (!s->bq_corr || !s->bh_corr) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+        if (KQ) {
+            s->bq_xf = calloc(nb * (s->xs / GS) + 1, sizeof(float));
+            s->bh_xf = calloc(nb * (p->hidden_dim / GS) + 1, sizeof(float));
+            s->bq_c16 = calloc(nb * (s->xs / 16) + 1, sizeof(int32_t));
+            s->bh_c16 = calloc(nb * (p->hidden_dim / 16) + 1, sizeof(int32_t));
+            if (!s->bq_xf || !s->bh_xf || !s->bq_c16 || !s->bh_c16) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+#ifdef RUNQ_VNNI
+            int kmax = p->hidden_dim > s->xs ? p->hidden_dim : s->xs;
+            s->kq_scr_bytes = (KQ512_SCRATCH(kmax) + 63) / 64 * 64;
+            s->kq_scr = aligned_alloc(64, s->kq_scr_bytes * s->att_threads);
+            if (!s->kq_scr) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
 #endif
+        }
         s->att_b = calloc((size_t)s->att_threads * s->att_rows * kv_mul * s->att_nb * ATT_P, sizeof(float));
         s->att_pb = calloc((size_t)s->att_threads * s->att_rows * kv_mul * s->att_nb * ATT_PSTRIDE(p->head_dim), sizeof(float));
         s->rope_b = calloc(nb * p->head_dim, sizeof(float));
@@ -606,7 +623,10 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
     s->att_part = calloc((size_t)p->n_heads * s->att_nb * ATT_PSTRIDE(p->head_dim), sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
     s->rope = calloc(p->head_dim, sizeof(float));
-    rq_sync_init(&s->sync, 8 * p->n_layers + 8, 8 * p->n_layers * p->n_kv_heads + 64);
+    // phase / counter capacity: decode 4 / layer, 2 counters per (layer, kv head); prefill 9 / layer,
+    // a counter per (layer, attention row block)
+    int ncnt = 2 * p->n_kv_heads > s->pf_nrb ? 2 * p->n_kv_heads : s->pf_nrb;
+    rq_sync_init(&s->sync, 10 * p->n_layers + 8, p->n_layers * ncnt + 64);
     s->key_cache = alloc_big(s->kv_size * sizeof(float));
     s->value_cache = alloc_big(s->kv_size * sizeof(float));
 
@@ -657,6 +677,13 @@ void free_run_state(RunState* s) {
     free(s->hq_b.s);
     free(s->att_b);
     free(s->att_pb);
+    free(s->bq_corr);
+    free(s->bq_xf);
+    free(s->bq_c16);
+    free(s->bh_corr);
+    free(s->bh_xf);
+    free(s->bh_c16);
+    free(s->kq_scr);
     free(s->att_part);
     free(s->rope_b);
     free(s->rope);
@@ -877,6 +904,74 @@ static void read_at(int fd, void *dst, size_t n, const void *mapped) {
         memcpy((char *)dst + done, (const char *)mapped + done, n - done);
 }
 
+typedef struct { QuantizedTensor *t; int d, k, bpi; size_t off; long it0; } PrepItem; // a matrix of prepare_weights
+
+typedef struct {
+    const PrepItem *job; long nit;
+    uint8_t *packed; size_t total, pg_chunk; long npg;
+    size_t rows_max; int kmax, gguf, pack, fd;
+    long next_pg, next_it; int bad; // shared: claim counters, any corrupt scale
+} PrepJob;
+
+static void prepare_worker(void *arg, int tid, int nt) {
+    // prepare_weights' parallel part: pre-fault the destination (2 MB per item), then convert the
+    // items (runs of 16-row blocks of one matrix), both claimed from shared counters
+    (void)tid; (void)nt;
+    PrepJob *P = arg;
+    const PrepItem *job = P->job;
+    size_t rows_max = P->rows_max;
+    int kmax = P->kmax, gguf = P->gguf, pack = P->pack, fd = P->fd, bad = 0;
+#if !defined _WIN32 && defined MADV_POPULATE_WRITE
+    for (long c; (c = __atomic_fetch_add(&P->next_pg, 1, __ATOMIC_RELAXED)) < P->npg;) {
+        size_t a = (size_t)c * P->pg_chunk, e = a + P->pg_chunk < P->total ? a + P->pg_chunk : P->total;
+        madvise(P->packed + a, e - a, MADV_POPULATE_WRITE); // (errors ignored: plain faults then)
+    }
+#endif
+    // scratch: source rows (VNNI: q / s before packing; GGUF: the blocks, Q8_0 the largest)
+    int8_t *qb = malloc(rows_max * kmax);
+    float *sb = malloc(rows_max * (kmax / GS) * sizeof(float));
+    uint8_t *bb = gguf ? malloc(rows_max * (kmax / 32) * Q8_0_BLOCK) : NULL;
+    if (!qb || !sb || (gguf && !bb)) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    int jj = 0;
+    for (long i0; (i0 = __atomic_fetch_add(&P->next_it, 4, __ATOMIC_RELAXED)) < P->nit;)
+    for (long it = i0; it < i0 + 4 && it < P->nit; it++) {
+        while (it >= job[jj + 1].it0) jj++; // (items in order per claim)
+        while (it < job[jj].it0) jj--;
+        QuantizedTensor *t = job[jj].t;
+        int k = job[jj].k, ng = k / GS, nblk = (job[jj].d + 15) / 16; // (VNNI: d % 16 == 0)
+        int rb0 = (int)(it - job[jj].it0) * job[jj].bpi;
+        int nb = nblk - rb0 < job[jj].bpi ? nblk - rb0 : job[jj].bpi;
+        size_t r0 = (size_t)rb0 * 16, nr = (size_t)nb * 16;
+        if (r0 + nr > (size_t)job[jj].d) nr = job[jj].d - r0;
+        if (t->kp) { // Q4_K / Q6_K: blocks of nr rows (k / 256 each) -> Q4P / Q6P
+            size_t rowb = (size_t)(k / QK_K) * kq_block_bytes(t->type);
+            read_at(fd, bb, nr * rowb, t->b + r0 * rowb);
+            for (size_t i = 0; i < nr * (k / QK_K); i++)
+                bad |= !kq_block_ok(t->type, bb + i * kq_block_bytes(t->type));
+            kq_pack_blocks(t->type, t->kp + (size_t)rb0 * (k / QK_K) * kq_sb_bytes(t->type), bb, nb, k);
+            continue;
+        }
+        int8_t *q = pack ? qb : t->q + r0 * k;
+        float *s = pack ? sb : t->s + r0 * ng;
+        if (t->b) { // GGUF (GS == 32: one block per group)
+            read_at(fd, bb, nr * ng * Q8_0_BLOCK, t->b + r0 * ng * Q8_0_BLOCK);
+            bad |= !q8_from_blocks(q, s, bb, nr * ng);
+        } else {
+            read_at(fd, q, nr * k, t->q + r0 * k);
+            read_at(fd, s, nr * ng * sizeof(float), t->s + r0 * ng);
+        }
+#ifdef RUNQ_VNNI
+        if (pack)
+            q8p_pack_blocks(t->p + (size_t)rb0 * ng * Q8P_GROUP(GS), qb, sb, nb, k, GS);
+#endif
+    }
+    free(qb);
+    free(sb);
+    free(bb);
+    if (bad)
+        __atomic_fetch_or(&P->bad, 1, __ATOMIC_RELAXED);
+}
+
 void prepare_weights(TransformerWeights *w, Config *p, int fd) {
     // Converts every matmul weight (7 per layer + the classifier) once at load, into one allocation,
     // in one parallel loop over (matrix, block of rows) items:
@@ -889,6 +984,7 @@ void prepare_weights(TransformerWeights *w, Config *p, int fd) {
     // The source rows are read with pread (read_at), not through the mapping: only the norms and
     // the token embedding rows looked up later (the classifier is shared with them) are ever
     // mapped. The destination is pre-faulted in parallel (MADV_POPULATE_WRITE, 2 MB per call).
+    // (On the thread pool of threads.h, like the forward passes: no second set of threads)
     // Was: faults on both sides + one MADV_DONTNEED of the mapped source per tensor, ~90 ms; now
     // ~25 ms (12 threads)
     int L = p->n_layers, dim = p->dim, hid = p->hidden_dim;
@@ -916,7 +1012,7 @@ void prepare_weights(TransformerWeights *w, Config *p, int fd) {
 
     // the matrices in order, their place in the packed buffer, and the work items: runs of
     // bpi(k) 16-row blocks, ~64 KB of source rows each
-    struct { QuantizedTensor *t; int d, k, bpi; size_t off; long it0; } *job = malloc((nt + 1) * sizeof(*job));
+    PrepItem *job = malloc((nt + 1) * sizeof(*job));
     if (!job) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
     size_t off = 0;
     long nit = 0;
@@ -964,59 +1060,10 @@ void prepare_weights(TransformerWeights *w, Config *p, int fd) {
     size_t rows_max = 65536 / kmax > 16 ? 65536 / kmax : 16;
     rows_max = rows_max / 16 * 16 + 16;
     size_t pg_chunk = (size_t)2 << 20;
-    long npg = (long)((total + pg_chunk - 1) / pg_chunk);
-    int bad = 0;
-    #pragma omp parallel reduction(|:bad)
-    {
-#if !defined _WIN32 && defined MADV_POPULATE_WRITE
-        #pragma omp for schedule(dynamic, 1)
-        for (long c = 0; c < npg; c++) {
-            size_t a = (size_t)c * pg_chunk, e = a + pg_chunk < total ? a + pg_chunk : total;
-            madvise(w->packed + a, e - a, MADV_POPULATE_WRITE); // (errors ignored: plain faults then)
-        }
-#endif
-        // scratch: source rows (VNNI: q / s before packing; GGUF: the blocks, Q8_0 the largest)
-        int8_t *qb = malloc(rows_max * kmax);
-        float *sb = malloc(rows_max * (kmax / GS) * sizeof(float));
-        uint8_t *bb = gguf ? malloc(rows_max * (kmax / 32) * Q8_0_BLOCK) : NULL;
-        if (!qb || !sb || (gguf && !bb)) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
-        int jj = 0;
-        #pragma omp for schedule(dynamic, 4)
-        for (long it = 0; it < nit; it++) {
-            while (it >= job[jj + 1].it0) jj++; // (items in order per thread)
-            while (it < job[jj].it0) jj--;
-            QuantizedTensor *t = job[jj].t;
-            int k = job[jj].k, ng = k / GS, nblk = (job[jj].d + 15) / 16; // (VNNI: d % 16 == 0)
-            int rb0 = (int)(it - job[jj].it0) * job[jj].bpi;
-            int nb = nblk - rb0 < job[jj].bpi ? nblk - rb0 : job[jj].bpi;
-            size_t r0 = (size_t)rb0 * 16, nr = (size_t)nb * 16;
-            if (r0 + nr > (size_t)job[jj].d) nr = job[jj].d - r0;
-            if (t->kp) { // Q4_K / Q6_K: blocks of nr rows (k / 256 each) -> Q4P / Q6P
-                size_t rowb = (size_t)(k / QK_K) * kq_block_bytes(t->type);
-                read_at(fd, bb, nr * rowb, t->b + r0 * rowb);
-                for (size_t i = 0; i < nr * (k / QK_K); i++)
-                    bad |= !kq_block_ok(t->type, bb + i * kq_block_bytes(t->type));
-                kq_pack_blocks(t->type, t->kp + (size_t)rb0 * (k / QK_K) * kq_sb_bytes(t->type), bb, nb, k);
-                continue;
-            }
-            int8_t *q = pack ? qb : t->q + r0 * k;
-            float *s = pack ? sb : t->s + r0 * ng;
-            if (t->b) { // GGUF (GS == 32: one block per group)
-                read_at(fd, bb, nr * ng * Q8_0_BLOCK, t->b + r0 * ng * Q8_0_BLOCK);
-                bad |= !q8_from_blocks(q, s, bb, nr * ng);
-            } else {
-                read_at(fd, q, nr * k, t->q + r0 * k);
-                read_at(fd, s, nr * ng * sizeof(float), t->s + r0 * ng);
-            }
-#ifdef RUNQ_VNNI
-            if (pack)
-                q8p_pack_blocks(t->p + (size_t)rb0 * ng * Q8P_GROUP(GS), qb, sb, nb, k, GS);
-#endif
-        }
-        free(qb);
-        free(sb);
-        free(bb);
-    }
+    PrepJob pj = { job, nit, w->packed, total, pg_chunk, (long)((total + pg_chunk - 1) / pg_chunk), rows_max, kmax,
+                   gguf, pack, fd, 0, 0, 0 };
+    rq_parallel(prepare_worker, &pj);
+    int bad = pj.bad;
     free(job);
     if (bad) { fprintf(stderr, "Corrupt checkpoint: a weight scale (fp16 d / dmin) is inf or NaN\n"); exit(EXIT_FAILURE); }
 }
@@ -1189,36 +1236,6 @@ static inline void matvec_rows(float *xout, QuantizedTensor *x, const int32_t *c
     }
 }
 
-static float *kq_xf_buf(size_t n) {
-    // scratch for the activation group sums xf of matmul / matmul_batch_n (called from the serial
-    // part of the forward pass only, as q8p_corr_buf)
-    static float *buf = NULL;
-    static size_t cap = 0;
-    if (n > cap) {
-        free(buf);
-        cap = n > 4096 ? n : 4096;
-        buf = malloc(cap * sizeof(float));
-        if (!buf) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
-    }
-    return buf;
-}
-
-void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
-    // W (d,n) @ x (n,) -> xout (d,), its own parallel region (forward_batch's last-row classifier)
-    if (n % GS != 0) { fprintf(stderr, "matmul: n=%d is not a multiple of GS=%d\n", n, GS); exit(EXIT_FAILURE); }
-    int32_t *corr = NULL, *c16 = NULL;
-    float *xf = w->kp ? kq_xf_buf(n / GS + 1 + n / 16) : NULL;
-#ifdef RUNQ_VNNI
-    corr = q8p_corr_buf(n / GS + 1);
-    if (xf)
-        c16 = (int32_t *)(xf + n / GS + 1); // (the same scratch, after xf)
-#endif
-    matvec_prep(corr, xf, c16, x, 0, n);
-    #pragma omp parallel for schedule(static)
-    for (int i0 = 0; i0 < d; i0 += 16)
-        matvec_rows(xout, x, corr, xf, c16, w, n, i0, i0 + 16 < d ? i0 + 16 : d);
-}
-
 // The scale chain below must round exactly like dot_q8 as gcc -Ofast compiles it there,
 // val += (ws * xs) * (float) ival as two multiplies and an add. In the 4-row kernel gcc would
 // contract it into an FMA (one rounding less), and the batched logits would then differ from the
@@ -1254,118 +1271,105 @@ NO_FP_CONTRACT static inline void dot_q8_x4(float *o, const int8_t *w0, const fl
     o[0] = v0; o[1] = v1; o[2] = v2; o[3] = v3;
 }
 
-typedef struct { float *out; int ldo; QuantizedTensor *w; int d; } MatJob; // one GEMM of matmul_batch_n
+typedef struct { float *out; int ldo; QuantizedTensor *w; int d; } MatJob; // one GEMM of a Gemm phase
 
-#ifndef RUNQ_VNNI // (AVX-512 builds: kq512_gemm_n, kernels_avx512.h)
-static void kq_gemm_n(int nj, const MatJob *job, QuantizedTensor *x, int ldx, int nb, int k) {
-    // the K-quant jobs of matmul_batch_n (those with w->kp; the others are skipped), one parallel
-    // loop: work items = (job, 16-row block), each over all nb rows, KQ_NC rows per kq_dot call
-    // (the same per-output arithmetic as the GEMV, matvec_rows: batched == sequential)
-    int ng = k / GS, b0[9], nblk = 0;
+// One batched-matmul phase of forward_batch: up to 3 GEMMs on the same nb quantized activation rows
+// (q / k / v, w1 / w3), out[b * ldo + i] = W[i, :] . x[b, :] (W d x k; x row b at x->q + b * ldx,
+// its k / GS scales at x->s + b * ldx / GS), as work items of one phase:
+//   AVX-512 build: (32-row tile, chunk of nbi activation rows), Q8P (q8p_gemm_item) or Q4P / Q6P
+//     (kq512_gemm_item); the items of a tile are claimed together (chunk = nchunk), so the weight
+//     tile is read (K-quants: unpacked) once per claim and reused from L1/L2
+//   generic: blocks of MB_ROWS rows (Q8_0, dot_q8_x4) or of 16 rows (K-quants, kq_dot) over all nb rows
+// Each output is computed exactly as in the decode GEMV (matvec_rows), so the batched path matches the
+// sequential one bit for bit. Activation prep (row stride k / GS, k / GS, k / 16): corr (AVX-512 Q8P),
+// xf (K-quants), c16 (AVX-512 Q6_K), computed per row when the row is quantized (act_prep_row)
+typedef struct {
+    int nj; MatJob job[3];
+    int it0[4];          // items of job j: it0[j] .. it0[j + 1] - 1
+    int tiled[3];        // job j in tiles x chunks (else blocks over all rows)
+    int nbi, nchunk;     // tiled: activation rows per chunk, chunks
+    int chunk, unit;     // items per claim; ranges of whole units (tiled: a tile's chunks)
+    QuantizedTensor *x; int ldx, nb, k;
+    const int32_t *corr; const float *xf; const int32_t *c16;
+} Gemm;
+
+static void gemm_plan(Gemm *g, int nj, const MatJob *job, QuantizedTensor *x, int ldx, int nb, int k, const int32_t *corr,
+                      const float *xf, const int32_t *c16, int nt) {
+    // (computed by every thread of the job: the same plan everywhere; results never depend on it)
+    g->nj = nj; g->x = x; g->ldx = ldx; g->nb = nb; g->k = k; g->corr = corr; g->xf = xf; g->c16 = c16;
+    int ntile = 0, all_tiled = 1;
     for (int j = 0; j < nj; j++) {
-        b0[j] = nblk;
-        nblk += job[j].w->kp ? job[j].d / KQ_ROWS : 0;
-    }
-    b0[nj] = nblk;
-    float *xf = kq_xf_buf((size_t)nb * ng);
-    #pragma omp parallel
-    {
-        #pragma omp for schedule(static)
-        for (int b = 0; b < nb; b++)
-            kq_act_prep(xf + (size_t)b * ng, x->q + (size_t)b * ldx, x->s + (size_t)b * ldx / GS, k);
-        #pragma omp for schedule(static)
-        for (int blk = 0; blk < nblk; blk++) {
-            int j = 0;
-            while (blk >= b0[j + 1]) j++;
-            QuantizedTensor *w = job[j].w;
-            int rb = blk - b0[j];
-            const uint8_t *wb = w->kp + (size_t)rb * (k / QK_K) * kq_sb_bytes(w->type);
-            for (int b = 0; b < nb; b += KQ_NC) {
-                int nc = nb - b < KQ_NC ? nb - b : KQ_NC;
-                kq_dot(w->type, job[j].out + (size_t)b * job[j].ldo + rb * KQ_ROWS, job[j].ldo, wb, k, nc,
-                       x->q + (size_t)b * ldx, ldx, x->s + (size_t)b * ldx / GS, ldx / GS, xf + (size_t)b * ng, ng);
-            }
-        }
-    }
-}
-#endif
-
-NO_FP_CONTRACT
-void matmul_batch_n(int nj, const MatJob *job, QuantizedTensor *x, int ldx, int nb, int k) {
-    // GEMMs on the same input rows, for each job: out[b * ldo + i] = W[i, :] . x[b, :]  for b < nb, i < d
-    //   W (d, k) Q8_0, row-major (as in matmul); x: nb quantized rows of k values, row b at
-    //   x->q + b * ldx with its k/GS scales at x->s + b * ldx / GS (ldx a multiple of GS).
-    // All jobs in one parallel loop (q / k / v, w1 / w3: one barrier, better balance).
-    // Each output is computed exactly as dot_q8() in matmul(), so the batched path matches the
-    // sequential one bit for bit. Work items: blocks of MB_ROWS output rows; each weight row is
-    // loaded from memory once per call and reused for all nb activation rows from L1.
-    // The VNNI build uses q8p_gemm_n (kernels_avx512.h) on the repacked weights instead, with the
-    // same per-output arithmetic.
-    if (k % GS != 0 || ldx % GS != 0) { fprintf(stderr, "matmul_batch: k=%d / ldx=%d not multiples of GS=%d\n", k, ldx, GS); exit(EXIT_FAILURE); }
-    if (nj > 8) { fprintf(stderr, "matmul_batch_n: too many jobs\n"); exit(EXIT_FAILURE); }
-    int nk = 0;
-    for (int j = 0; j < nj; j++)
-        nk += job[j].w->kp != NULL;
-    if (nk) { // Q4_K / Q6_K jobs (kq_gemm_n), then the Q8_0 ones (if any) as before
-        MatJob q8[8];
-        int n8 = 0;
-        for (int j = 0; j < nj; j++)
-            if (!job[j].w->kp)
-                q8[n8++] = job[j];
+        g->job[j] = job[j];
+        g->tiled[j] = 0;
 #ifdef RUNQ_VNNI
-        KQJob kj[8] = { 0 };
-        int nkj = 0;
-        for (int j = 0; j < nj; j++)
-            if (job[j].w->kp)
-                kj[nkj++] = (KQJob) { job[j].out, job[j].ldo, job[j].w->kp, job[j].w->type, job[j].d };
-        kq512_gemm_n(nkj, kj, x->q, x->s, ldx, nb, k);
-#else
-        kq_gemm_n(nj, job, x, ldx, nb, k);
+        g->tiled[j] = job[j].w->kp || job[j].w->p;
 #endif
-        if (n8)
-            matmul_batch_n(n8, q8, x, ldx, nb, k);
+        all_tiled &= g->tiled[j];
+        if (g->tiled[j])
+            ntile += (job[j].d / 16 + 1) / 2;
+    }
+    g->nbi = nb;
+    g->nchunk = 1;
+#ifdef RUNQ_VNNI
+    if (ntile) {
+        g->nbi = q8p_nb(nb, ntile, nt);
+        g->nchunk = (nb + g->nbi - 1) / g->nbi;
+    }
+#endif
+    int n = 0;
+    for (int j = 0; j < nj; j++) {
+        g->it0[j] = n;
+        n += g->tiled[j] ? (job[j].d / 16 + 1) / 2 * g->nchunk : job[j].w->kp ? job[j].d / KQ_ROWS : (job[j].d + MB_ROWS - 1) / MB_ROWS;
+    }
+    g->it0[nj] = n;
+    // each thread's range in whole tiles, taken one tile (its chunks) at a time; generic: a few blocks
+    g->unit = all_tiled ? g->nchunk : 1;
+    g->chunk = all_tiled ? g->nchunk : (n / (8 * nt) > 1 ? n / (8 * nt) : 1);
+}
+
+NO_FP_CONTRACT static void gemm_item(const Gemm *g, int it, uint8_t *scr, const void **last) {
+    // work item it of the phase (scr / last: this thread's K-quant scratch, kq512_gemm_item)
+    int j = 0;
+    while (it >= g->it0[j + 1]) j++;
+    const MatJob *jb = &g->job[j];
+    QuantizedTensor *w = jb->w, *x = g->x;
+    int i = it - g->it0[j], k = g->k, ldx = g->ldx, nb = g->nb;
+#ifdef RUNQ_VNNI
+    if (g->tiled[j]) {
+        int t = i / g->nchunk, ch = i % g->nchunk;
+        if (w->kp)
+            kq512_gemm_item(jb->out, jb->ldo, w->kp, w->type, jb->d, t, ch, g->nbi, x->q, x->s, ldx, nb, k, g->xf, g->c16, scr, last);
+        else
+            q8p_gemm_item(jb->out, jb->ldo, w->p, jb->d, t, ch, g->nbi, x->q, x->s, ldx, nb, k, GS, g->corr);
         return;
     }
-#ifdef RUNQ_VNNI
-    int packed = 1;
-    Q8PJob qj[8];
-    for (int j = 0; j < nj; j++) {
-        packed &= job[j].w->p != NULL;
-        qj[j] = (Q8PJob) { job[j].out, job[j].ldo, job[j].w->p, job[j].d };
-    }
-    if (packed) { q8p_gemm_n(nj, qj, x->q, x->s, ldx, nb, k, GS); return; }
 #endif
-    int b0[9], nblk = 0;
-    for (int j = 0; j < nj; j++) {
-        b0[j] = nblk;
-        nblk += (job[j].d + MB_ROWS - 1) / MB_ROWS;
+    (void)scr; (void)last;
+    int ng = k / GS;
+    if (w->kp) { // K-quants, generic: one 16-row block over all rows, KQ_NC rows per kq_dot call
+        const uint8_t *wb = w->kp + (size_t)i * (k / QK_K) * kq_sb_bytes(w->type);
+        for (int b = 0; b < nb; b += KQ_NC) {
+            int nc = nb - b < KQ_NC ? nb - b : KQ_NC;
+            kq_dot(w->type, jb->out + (size_t)b * jb->ldo + i * KQ_ROWS, jb->ldo, wb, k, nc, x->q + (size_t)b * ldx, ldx,
+                   x->s + (size_t)b * ldx / GS, ldx / GS, g->xf + (size_t)b * ng, ng);
+        }
+        return;
     }
-    b0[nj] = nblk;
-    #pragma omp parallel for schedule(static)
-    for (int blk = 0; blk < nblk; blk++) {
-        int j = 0;
-        while (blk >= b0[j + 1]) j++;
-        QuantizedTensor *w = job[j].w;
-        int d = job[j].d, i0 = (blk - b0[j]) * MB_ROWS, i1 = i0 + MB_ROWS < d ? i0 + MB_ROWS : d;
-        for (int b = 0; b < nb; b++) {
-            const int8_t *xq = x->q + (size_t)b * ldx;
-            const float *xsc = x->s + (size_t)b * ldx / GS;
-            float *o = job[j].out + (size_t)b * job[j].ldo;
-            if (i1 - i0 == 4) {
-                dot_q8_x4(o + i0, w->q + (size_t)i0 * k, w->s + (size_t)i0 * k / GS, k, xq, xsc);
-                continue;
-            }
-            for (int i = i0; i < i1; i++) {
-                size_t in = (size_t)i * k;
-                o[i] = dot_q8(w->q + in, w->s + in / GS, xq, xsc, k);
-            }
+    // Q8_0, generic: MB_ROWS weight rows (in L1) over all activation rows
+    int d = jb->d, i0 = i * MB_ROWS, i1 = i0 + MB_ROWS < d ? i0 + MB_ROWS : d;
+    for (int b = 0; b < nb; b++) {
+        const int8_t *xq = x->q + (size_t)b * ldx;
+        const float *xsc = x->s + (size_t)b * ldx / GS;
+        float *o = jb->out + (size_t)b * jb->ldo;
+        if (i1 - i0 == 4) {
+            dot_q8_x4(o + i0, w->q + (size_t)i0 * k, w->s + (size_t)i0 * k / GS, k, xq, xsc);
+            continue;
+        }
+        for (int r = i0; r < i1; r++) {
+            size_t in = (size_t)r * k;
+            o[r] = dot_q8(w->q + in, w->s + in / GS, xq, xsc, k);
         }
     }
-}
-
-void matmul_batch(float *out, int ldo, QuantizedTensor *x, int ldx, int nb, QuantizedTensor *w, int k, int d) {
-    MatJob j = { out, ldo, w, d };
-    matmul_batch_n(1, &j, x, ldx, nb, k);
 }
 
 static void rope_row(float *cs, int head_dim, int pos) {
@@ -1594,7 +1598,11 @@ static void swiglu(float *hb, const float *hb2, int n) {
 }
 
 static void kv_populate_one(RunState *s, Config *p, int pos0, int n, int it) {
-    // kv_populate's item it = (layer it / 2, K or V)
+    // Pre-fault the KV cache tiles of positions pos0..pos0+n-1 of layer it / 2, K (it even) or V
+    // (anonymous memory, untouched pages are not mapped yet): one madvise per range instead of one
+    // page fault per 4 KB, the 2 * n_layers items in parallel. Otherwise these faults happen inside
+    // the K/V GEMMs, serialized in the kernel: ~55 ms of a 451-token prefill (8 threads), vs ~7 ms
+    // here. Linux >= 5.14; errors ignored
 #if !defined _WIN32 && defined MADV_POPULATE_WRITE
     int kv_dim = p->n_kv_heads * p->head_dim, l = it / 2, kv = it % 2;
     uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
@@ -1608,16 +1616,6 @@ static void kv_populate_one(RunState *s, Config *p, int pos0, int n, int it) {
 #endif
 }
 
-static void kv_populate(RunState *s, Config *p, int pos0, int n) {
-    // Pre-fault the KV cache tiles of positions pos0..pos0+n-1 of every layer (anonymous memory,
-    // untouched pages are not mapped yet), in parallel and one madvise per range instead of one page fault
-    // per 4 KB. Otherwise these faults happen inside the K/V GEMMs, serialized in the kernel:
-    // ~55 ms of a 451-token prefill (8 threads), vs ~7 ms here. Linux >= 5.14; errors ignored
-    #pragma omp parallel for schedule(static)
-    for (int it = 0; it < 2 * p->n_layers; it++)
-        kv_populate_one(s, p, pos0, n, it);
-}
-
 static inline QuantizedTensor qsub(QuantizedTensor *t, int i0) {
     // the quantized values from index i0 on (a multiple of GS)
     return (QuantizedTensor) { .q = t->q + i0, .s = t->s + i0 / GS, .p = NULL };
@@ -1626,7 +1624,9 @@ static inline QuantizedTensor qsub(QuantizedTensor *t, int i0) {
 // Phases of a decode job (threads.h): PH_BEGIN(n, chunk) ... [PH_EPILOGUE ...] PH_END runs phase k_
 // with n items, claimed in ranges [lo, hi) of up to chunk items; the epilogue (if any) runs once, on
 // the thread finishing the last item, before the phase is published; every thread then waits for it
-#define PH_BEGIN(n_, chunk_) { RqIt it_ = rq_it(k_, (n_), (chunk_), tid); int lo, hi; \
+#define PH_BEGIN(n_, chunk_) PH_BEGIN_U(n_, chunk_, 1)
+#define PH_BEGIN_DYN(n_, chunk_) PH_BEGIN_U(n_, chunk_, 0) // one shared counter, items in order
+#define PH_BEGIN_U(n_, chunk_, unit_) { RqIt it_ = rq_it(k_, (n_), (chunk_), (unit_), tid); int lo, hi; \
     while (rq_next(S, &it_, &lo, &hi)) {
 #define PH_EPILOGUE if (rq_finish(S, &it_, hi - lo)) {
 #define PH_END rq_publish(S, k_ + 1); } } rq_wait(S, ++k_); }
@@ -1695,7 +1695,7 @@ static void decode_worker(void *arg, int tid, int nt) {
         // the last of the nb items to finish combines (att_combine: the same definition as the
         // prefill's attention_kv); then the quantization of the outputs for wo (into aq: xq may
         // still be read)
-        PH_BEGIN(nkv * ng + nkv * nb, 1)
+        PH_BEGIN_DYN(nkv * ng + nkv * nb, 1)
         for (int it = lo; it < hi; it++) {
             if (it < nkv * ng) {
                 int g = it / ng, r = it % ng;
@@ -1822,90 +1822,126 @@ static inline QuantizedTensor qrow(QuantizedTensor *t, int b, int ld) {
 
 enum { LOGITS_NONE = 0, LOGITS_LAST = 1, LOGITS_ALL = 2 };
 
-float *forward_batch(Transformer *transformer, int *tokens, int n, int pos0, int logits_mode, float *logits_out) {
-    // Batched prefill: tokens[0..n-1] at positions pos0..pos0+n-1 (1 <= n <= state.nb_max),
-    // the same computation as n calls of forward() but with every weight matrix applied to all
-    // n rows at once (matmul_batch), and bit-identical results. Fills the KV cache.
-    //   LOGITS_NONE: returns NULL
-    //   LOGITS_LAST: logits of the last row in state.logits (returned)
-    //   LOGITS_ALL:  logits of all rows into logits_out (n, vocab_size) (returned)
-    // Note: in LOGITS_LAST mode state.x / state.xq are clobbered (as by forward()).
+static void act_prep_row(RunState *s, QuantizedTensor *xq, int k, int32_t *corr, float *xf, int32_t *c16, int b) {
+    // the GEMM activation prep of quantized row b (k values; the Gemm strides): matvec_prep
+    matvec_prep(corr + (size_t)b * (k / GS), xf ? xf + (size_t)b * (k / GS) : NULL, c16 ? c16 + (size_t)b * (k / 16) : NULL,
+                xq, 0, k);
+    (void)s;
+}
+
+typedef struct { Transformer *tr; int *tokens; int n, pos0, logits_mode; float *logits_out; } PrefillJob;
+
+static int prefill_phases(Config *p) { return 9 * p->n_layers + 4; }
+
+#ifdef RUNQ_PROFILE
+#define PPROF(i) do { if (tid == 0) PROF(i); } while (0)
+#else
+#define PPROF(i) ((void)0)
+#endif
+
+static void prefill_worker(void *arg, int tid, int nt) {
+    // forward_batch's job: per layer 9 phases (the first layer 8): [residual + rmsnorm + quantize per
+    // row] -> [q / k / v GEMM] -> [QK-norm + RoPE + K/V cache store per 16-position tile] ->
+    // [attention per (block of att_rows rows, kv head), longest first; the last head of a row block
+    // to finish quantizes its rows for wo] -> [wo GEMM] -> [residual + rmsnorm + quantize per row]
+    // -> [w1 / w3 GEMM] -> [SwiGLU + quantize per row] -> [w2 GEMM]; the first phase also embeds the
+    // tokens and pre-faults the chunk's KV cache tiles. Each phase's items as before (same results)
+    PrefillJob *job = arg;
+    Transformer *transformer = job->tr;
     Config *p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
     RunState* s = &transformer->state;
-    int dim = p->dim, hd = p->head_dim, hidden = p->hidden_dim, xs = s->xs;
-    int kv_dim = p->n_kv_heads * hd;
-    int kv_mul = p->n_heads / p->n_kv_heads;
+    RqSync *S = &s->sync;
+    int n = job->n, pos0 = job->pos0, k_ = 0;
+    int dim = p->dim, hd = p->head_dim, hidden = p->hidden_dim, xs = s->xs, nkv = p->n_kv_heads;
+    int kv_dim = nkv * hd;
+    int kv_mul = p->n_heads / nkv;
     int all_heads_dim = p->n_heads * hd;
-    if (n < 1 || n > s->nb_max || pos0 < 0 || pos0 + n > p->seq_len) {
-        fprintf(stderr, "forward_batch: bad chunk n=%d pos0=%d (nb_max %d, seq_len %d)\n", n, pos0, s->nb_max, p->seq_len);
-        exit(EXIT_FAILURE);
-    }
-    PROF_START();
+    int rch = n / (4 * nt) > 1 ? n / (4 * nt) : 1; // rows per claim in the per-row phases
+    int ar = s->att_rows, nrb = (n + ar - 1) / ar;
+    int tb0 = pos0 / ATT_T, ntb = (pos0 + n - 1) / ATT_T - tb0 + 1;
+    size_t ts = (size_t)nkv * ATT_T * hd;
+    uint8_t *scr = s->kq_scr ? s->kq_scr + (size_t)tid * s->kq_scr_bytes : NULL;
+    float *att = s->att_b + (size_t)tid * ar * kv_mul * s->att_nb * ATT_P;
+    float *part = s->att_pb + (size_t)tid * ar * kv_mul * s->att_nb * ATT_PSTRIDE(hd);
+    Gemm G;
 
-    #pragma omp parallel for
-    for (int b = 0; b < n; b++) {
-        embed_row(s->x_b + (size_t)b * dim, w->q_tokens, tokens[b], dim);
+    // embeddings, RoPE cos / sin per row, layer 0's attention rmsnorm + quantize; KV tile pre-faults
+    PH_BEGIN(n + 2 * p->n_layers, 1)
+    for (int b = lo; b < hi; b++) {
+        if (b >= n) {
+            kv_populate_one(s, p, pos0, n, b - n);
+            continue;
+        }
+        float *x = s->x_b + (size_t)b * dim, *xb = s->xb_b + (size_t)b * xs;
+        QuantizedTensor xq = qrow(&s->xq_b, b, xs);
+        embed_row(x, w->q_tokens, job->tokens[b], dim);
         rope_row(s->rope_b + (size_t)b * hd, hd, pos0 + b);
+        rmsnorm(xb, x, w->rms_att_weight, dim);
+        quantize(&xq, xb, dim);
+        act_prep_row(s, &xq, dim, s->bq_corr, s->bq_xf, s->bq_c16, b);
     }
-    kv_populate(s, p, pos0, n);
+    PH_END_NOEPI
+    PPROF(PF_NORM);
 
     for (int l = 0; l < p->n_layers; l++) {
         uint64_t loff = l * (uint64_t)s->kv_len * kv_dim;
         float *kl = s->key_cache + loff, *vl = s->value_cache + loff;
 
-        // (residual of the previous layer's ffn,) attention rmsnorm + quantize, per row
-        #pragma omp parallel for
-        for (int b = 0; b < n; b++) {
-            float *x = s->x_b + (size_t)b * dim, *xb = s->xb_b + (size_t)b * xs;
-            QuantizedTensor xq = qrow(&s->xq_b, b, xs);
-            if (l > 0)
+        if (l > 0) { // residual of the previous layer's ffn, attention rmsnorm + quantize, per row
+            PH_BEGIN(n, rch)
+            for (int b = lo; b < hi; b++) {
+                float *x = s->x_b + (size_t)b * dim, *xb = s->xb_b + (size_t)b * xs;
+                QuantizedTensor xq = qrow(&s->xq_b, b, xs);
                 for (int i = 0; i < dim; i++)
                     x[i] += xb[i];
-            rmsnorm(xb, x, w->rms_att_weight + l * dim, dim);
-            quantize(&xq, xb, dim);
+                rmsnorm(xb, x, w->rms_att_weight + l * dim, dim);
+                quantize(&xq, xb, dim);
+                act_prep_row(s, &xq, dim, s->bq_corr, s->bq_xf, s->bq_c16, b);
+            }
+            PH_END_NOEPI
+            PPROF(PF_NORM);
         }
-        PROF(PF_NORM);
 
-        // qkv GEMMs (one parallel loop)
+        // qkv GEMMs (one phase)
         MatJob qkv[3] = { { s->q_b, all_heads_dim, w->wq + l, all_heads_dim }, { s->k_b, kv_dim, w->wk + l, kv_dim },
                           { s->v_b, kv_dim, w->wv + l, kv_dim } };
-        matmul_batch_n(3, qkv, &s->xq_b, xs, n, dim);
-        PROF(PF_QKV);
-
-        // QK-norm + RoPE, each row at its own position; then the chunk's K / V rows into the
-        // cache, one (tile, kv head) per work item
-        int tb0 = pos0 / ATT_T, ntb = (pos0 + n - 1) / ATT_T - tb0 + 1;
-        #pragma omp parallel
+        gemm_plan(&G, 3, qkv, &s->xq_b, xs, n, dim, s->bq_corr, s->bq_xf, s->bq_c16, nt);
         {
-            #pragma omp for
-            for (int b = 0; b < n; b++) {
+            const void *last = NULL;
+            PH_BEGIN_U(G.it0[G.nj], G.chunk, G.unit)
+            for (int it = lo; it < hi; it++)
+                gemm_item(&G, it, scr, &last);
+            PH_END_NOEPI
+        }
+        PPROF(PF_QKV);
+
+        // QK-norm + RoPE, each row at its own position, and the K / V rows into the cache: one
+        // 16-position cache tile per item (its rows, all heads)
+        PH_BEGIN(ntb, 1)
+        for (int it = lo; it < hi; it++) {
+            int tb = tb0 + it;
+            int t1 = (tb + 1) * ATT_T < pos0 + n ? (tb + 1) * ATT_T : pos0 + n;
+            for (int t = tb * ATT_T > pos0 ? tb * ATT_T : pos0; t < t1; t++) {
+                int b = t - pos0;
                 const float *cs = s->rope_b + (size_t)b * hd;
                 qk_norm_rope(s->q_b + (size_t)b * all_heads_dim, p->n_heads, w->q_norm_weights + l * hd, hd, cs);
-                qk_norm_rope(s->k_b + (size_t)b * kv_dim, p->n_kv_heads, w->k_norm_weights + l * hd, hd, cs);
-            }
-            #pragma omp for
-            for (int it = 0; it < ntb * p->n_kv_heads; it++) {
-                int tb = tb0 + it / p->n_kv_heads, h = it % p->n_kv_heads;
-                int t1 = (tb + 1) * ATT_T < pos0 + n ? (tb + 1) * ATT_T : pos0 + n;
-                for (int t = tb * ATT_T > pos0 ? tb * ATT_T : pos0; t < t1; t++)
-                    kv_store(kl, vl, t, h, p->n_kv_heads, hd, s->k_b + (size_t)(t - pos0) * kv_dim + h * hd,
-                             s->v_b + (size_t)(t - pos0) * kv_dim + h * hd);
+                qk_norm_rope(s->k_b + (size_t)b * kv_dim, nkv, w->k_norm_weights + l * hd, hd, cs);
+                for (int h = 0; h < nkv; h++)
+                    kv_store(kl, vl, t, h, nkv, hd, s->k_b + (size_t)b * kv_dim + h * hd, s->v_b + (size_t)b * kv_dim + h * hd);
             }
         }
-        PROF(PF_ROPE);
+        PH_END_NOEPI
+        PPROF(PF_ROPE);
 
         // causal attention: row b (position pos0 + b) attends to positions 0..pos0+b, whose K/V
         // are all in the cache now. Work item = (block of att_rows rows, kv head): its rows x
-        // kv_mul query heads in one attention_kv call (K/V read once for all of them). Dynamic
-        // schedule, last (longest) row blocks first, for the load balance
-        int ar = s->att_rows, nrb = (n + ar - 1) / ar;
-        size_t ts = (size_t)p->n_kv_heads * ATT_T * hd;
-        #pragma omp parallel
-        {
-        #pragma omp for schedule(dynamic, 1)
-        for (int it = 0; it < nrb * p->n_kv_heads; it++) {
-            int rb = nrb - 1 - it / p->n_kv_heads, g = it % p->n_kv_heads;
+        // kv_mul query heads in one attention_kv call (K/V read once for all of them), last
+        // (longest) row blocks first, for the load balance. The last of a row block's nkv items
+        // to finish quantizes its rows for wo (into xq_b: the qkv GEMM is done with it)
+        PH_BEGIN_DYN(nrb * nkv, 1)
+        for (int it = lo; it < hi; it++) {
+            int rb = nrb - 1 - it / nkv, g = it % nkv;
             int b0 = rb * ar, b1 = b0 + ar < n ? b0 + ar : n, nv = 0;
             const float *qv[ATT_NV_MAX];
             float *ov[ATT_NV_MAX];
@@ -1917,85 +1953,139 @@ float *forward_batch(Transformer *transformer, int *tokens, int n, int pos0, int
                     ov[nv] = s->xb_b + (size_t)b * xs + h * hd;
                     npv[nv] = pos0 + b + 1;
                 }
-            int tid = 0;
-#ifdef _OPENMP
-            tid = omp_get_thread_num();
-#endif
-            float *att = s->att_b + (size_t)tid * ar * kv_mul * s->att_nb * ATT_P;
-            float *part = s->att_pb + (size_t)tid * ar * kv_mul * s->att_nb * ATT_PSTRIDE(hd);
-            size_t o = kv_tile(0, g, p->n_kv_heads, hd);
+            size_t o = kv_tile(0, g, nkv, hd);
             attention_kv(nv, qv, ov, npv, kl + o, vl + o, ts, hd, s->att_scale, att, part);
+            if (rq_count(S, l * s->pf_nrb + rb, 1) < nkv)
+                continue;
+            for (int b = b0; b < b1; b++) {
+                QuantizedTensor xq = qrow(&s->xq_b, b, xs);
+                quantize(&xq, s->xb_b + (size_t)b * xs, all_heads_dim);
+                act_prep_row(s, &xq, all_heads_dim, s->bq_corr, s->bq_xf, s->bq_c16, b);
+            }
         }
-        // (then quantize the attention output rows for wo, in the same parallel region)
-        #pragma omp for
-        for (int b = 0; b < n; b++) {
-            QuantizedTensor xq = qrow(&s->xq_b, b, xs);
-            quantize(&xq, s->xb_b + (size_t)b * xs, all_heads_dim);
+        PH_END_NOEPI
+        PPROF(PF_ATT);
+
+        MatJob wo = { s->xb_b, xs, w->wo + l, dim };
+        gemm_plan(&G, 1, &wo, &s->xq_b, xs, n, all_heads_dim, s->bq_corr, s->bq_xf, s->bq_c16, nt);
+        {
+            const void *last = NULL;
+            PH_BEGIN_U(G.it0[G.nj], G.chunk, G.unit)
+            for (int it = lo; it < hi; it++)
+                gemm_item(&G, it, scr, &last);
+            PH_END_NOEPI
         }
-        } // omp parallel
-        PROF(PF_ATT);
-        matmul_batch(s->xb_b, xs, &s->xq_b, xs, n, w->wo + l, all_heads_dim, dim);
-        PROF(PF_WO);
+        PPROF(PF_WO);
 
         // residual, ffn rmsnorm, quantize
-        #pragma omp parallel for
-        for (int b = 0; b < n; b++) {
+        PH_BEGIN(n, rch)
+        for (int b = lo; b < hi; b++) {
             float *x = s->x_b + (size_t)b * dim, *xb = s->xb_b + (size_t)b * xs;
             QuantizedTensor xq = qrow(&s->xq_b, b, xs);
             for (int i = 0; i < dim; i++)
                 x[i] += xb[i];
             rmsnorm(xb, x, w->rms_ffn_weight + l * dim, dim);
             quantize(&xq, xb, dim);
+            act_prep_row(s, &xq, dim, s->bq_corr, s->bq_xf, s->bq_c16, b);
         }
-        PROF(PF_NORM);
+        PH_END_NOEPI
+        PPROF(PF_NORM);
 
         MatJob w13[2] = { { s->hb_b, hidden, w->w1 + l, hidden }, { s->hb2_b, hidden, w->w3 + l, hidden } };
-        matmul_batch_n(2, w13, &s->xq_b, xs, n, dim);
-        PROF(PF_FFN13);
+        gemm_plan(&G, 2, w13, &s->xq_b, xs, n, dim, s->bq_corr, s->bq_xf, s->bq_c16, nt);
+        {
+            const void *last = NULL;
+            PH_BEGIN_U(G.it0[G.nj], G.chunk, G.unit)
+            for (int it = lo; it < hi; it++)
+                gemm_item(&G, it, scr, &last);
+            PH_END_NOEPI
+        }
+        PPROF(PF_FFN13);
 
-        #pragma omp parallel for
-        for (int b = 0; b < n; b++) {
+        PH_BEGIN(n, rch)
+        for (int b = lo; b < hi; b++) {
             QuantizedTensor hq = qrow(&s->hq_b, b, hidden);
             swiglu(s->hb_b + (size_t)b * hidden, s->hb2_b + (size_t)b * hidden, hidden);
             quantize(&hq, s->hb_b + (size_t)b * hidden, hidden);
+            act_prep_row(s, &hq, hidden, s->bh_corr, s->bh_xf, s->bh_c16, b);
         }
-        PROF(PF_SWIGLU);
+        PH_END_NOEPI
+        PPROF(PF_SWIGLU);
 
-        matmul_batch(s->xb_b, xs, &s->hq_b, hidden, n, w->w2 + l, hidden, dim);
-        PROF(PF_FFN2);
-        // (its residual add is done in the next layer's first loop, or below)
-    }
-    if (logits_mode == LOGITS_NONE)
-        return NULL; // the residual stream x_b is not needed any more
-
-    // residual connection of the last layer
-    #pragma omp parallel for
-    for (int b = 0; b < n; b++) {
-        float *x = s->x_b + (size_t)b * dim, *xb = s->xb_b + (size_t)b * xs;
-        for (int i = 0; i < dim; i++)
-            x[i] += xb[i];
+        MatJob w2 = { s->xb_b, xs, w->w2 + l, dim };
+        gemm_plan(&G, 1, &w2, &s->hq_b, hidden, n, hidden, s->bh_corr, s->bh_xf, s->bh_c16, nt);
+        {
+            const void *last = NULL;
+            PH_BEGIN_U(G.it0[G.nj], G.chunk, G.unit)
+            for (int it = lo; it < hi; it++)
+                gemm_item(&G, it, scr, &last);
+            PH_END_NOEPI
+        }
+        PPROF(PF_FFN2);
+        // (its residual add is done in the next layer's first phase, or below)
     }
 
-    if (logits_mode == LOGITS_LAST) {
-        // final rmsnorm + classifier for the last row only, exactly as in forward()
-        rmsnorm(s->x, s->x_b + (size_t)(n - 1) * dim, w->rms_final_weight, dim);
-        quantize(&s->xq, s->x, dim);
-        matmul(s->logits, &s->xq, w->wcls, dim, p->vocab_size);
-        PROF(PF_CLS);
-        return s->logits;
-    }
-    if (logits_mode == LOGITS_ALL) {
-        #pragma omp parallel for
-        for (int b = 0; b < n; b++) {
+    if (job->logits_mode == LOGITS_LAST) {
+        // residual of the last row, final rmsnorm + classifier for it, exactly as in forward()
+        PH_BEGIN(1, 1)
+            float *x = s->x_b + (size_t)(n - 1) * dim, *xb = s->xb_b + (size_t)(n - 1) * xs;
+            for (int i = 0; i < dim; i++)
+                x[i] += xb[i];
+            rmsnorm(s->x, x, w->rms_final_weight, dim);
+            quantize(&s->xq, s->x, dim);
+            matvec_prep(s->xq_corr, s->xq_xf, s->xq_c16, &s->xq, 0, dim);
+        PH_END_NOEPI
+        int nblk = (p->vocab_size + 15) / 16, cc = nblk / (8 * nt) > 1 ? nblk / (8 * nt) : 1;
+        PH_BEGIN(nblk, cc)
+            matvec_rows(s->logits, &s->xq, s->xq_corr, s->xq_xf, s->xq_c16, w->wcls, dim, lo * 16,
+                        hi * 16 < p->vocab_size ? hi * 16 : p->vocab_size);
+        PH_END_NOEPI
+        PPROF(PF_CLS);
+    } else if (job->logits_mode == LOGITS_ALL) {
+        PH_BEGIN(n, rch)
+        for (int b = lo; b < hi; b++) {
+            float *x = s->x_b + (size_t)b * dim, *xb = s->xb_b + (size_t)b * xs;
             QuantizedTensor xq = qrow(&s->xq_b, b, xs);
-            rmsnorm(s->xb_b + (size_t)b * xs, s->x_b + (size_t)b * dim, w->rms_final_weight, dim);
-            quantize(&xq, s->xb_b + (size_t)b * xs, dim);
+            for (int i = 0; i < dim; i++)
+                x[i] += xb[i];
+            rmsnorm(xb, x, w->rms_final_weight, dim);
+            quantize(&xq, xb, dim);
+            act_prep_row(s, &xq, dim, s->bq_corr, s->bq_xf, s->bq_c16, b);
         }
-        matmul_batch(logits_out, p->vocab_size, &s->xq_b, xs, n, w->wcls, dim, p->vocab_size);
-        PROF(PF_CLS);
-        return logits_out;
+        PH_END_NOEPI
+        MatJob cls = { job->logits_out, p->vocab_size, w->wcls, p->vocab_size };
+        gemm_plan(&G, 1, &cls, &s->xq_b, xs, n, dim, s->bq_corr, s->bq_xf, s->bq_c16, nt);
+        {
+            const void *last = NULL;
+            PH_BEGIN_U(G.it0[G.nj], G.chunk, G.unit)
+            for (int it = lo; it < hi; it++)
+                gemm_item(&G, it, scr, &last);
+            PH_END_NOEPI
+        }
+        PPROF(PF_CLS);
     }
-    return NULL;
+}
+
+float *forward_batch(Transformer *transformer, int *tokens, int n, int pos0, int logits_mode, float *logits_out) {
+    // Batched prefill: tokens[0..n-1] at positions pos0..pos0+n-1 (1 <= n <= state.nb_max),
+    // the same computation as n calls of forward() but with every weight matrix applied to all
+    // n rows at once (GEMM work items), and bit-identical results. Fills the KV cache.
+    //   LOGITS_NONE: returns NULL
+    //   LOGITS_LAST: logits of the last row in state.logits (returned)
+    //   LOGITS_ALL:  logits of all rows into logits_out (n, vocab_size) (returned)
+    // Note: in LOGITS_LAST mode state.x / state.xq are clobbered (as by forward()).
+    // One parallel job per chunk (prefill_worker), in phases (threads.h)
+    Config *p = &transformer->config;
+    RunState* s = &transformer->state;
+    if (n < 1 || n > s->nb_max || pos0 < 0 || pos0 + n > p->seq_len) {
+        fprintf(stderr, "forward_batch: bad chunk n=%d pos0=%d (nb_max %d, seq_len %d)\n", n, pos0, s->nb_max, p->seq_len);
+        exit(EXIT_FAILURE);
+    }
+    PROF_START();
+    rq_begin(&s->sync, prefill_phases(p), p->n_layers * s->pf_nrb, rq_nthreads());
+    PrefillJob job = { transformer, tokens, n, pos0, logits_mode, logits_out };
+    rq_parallel(prefill_worker, &job);
+    return logits_mode == LOGITS_LAST ? s->logits : logits_mode == LOGITS_ALL ? logits_out : NULL;
 }
 
 float *prefill(Transformer *transformer, int *tokens, int n, int pos0) {
@@ -2227,6 +2317,28 @@ static int gpt2_decode(const char *s, uint64_t n, char *out) {
     return len;
 }
 
+typedef struct { Tokenizer *t; const Gguf *g; const uint64_t *mo; int *mid; long nmg; unsigned int max_len; long next; } MergeJob;
+
+static void merge_worker(void *arg, int tid, int nt) {
+    // build_tokenizer_gguf: the tokens produced by the merges (mid[r]: id, -1 none, -2 not GPT-2
+    // form), in claims of 4,096 merges
+    (void)tid; (void)nt;
+    MergeJob *M = arg;
+    char *buf = malloc(2 * (size_t)M->max_len + 2);
+    if (!buf) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    for (long r0; (r0 = __atomic_fetch_add(&M->next, 4096, __ATOMIC_RELAXED)) < M->nmg;)
+        for (long r = r0; r < r0 + 4096 && r < M->nmg; r++) {
+            uint64_t sl, p = M->mo[r];
+            memcpy(&sl, M->g->map + p, 8); // (in the file: checked by the walk above)
+            const char *s = (const char *)M->g->map + p + 8, *sp;
+            M->mid[r] = -1;
+            if (sl > 2 * (uint64_t)M->max_len + 1 || !(sp = memchr(s, ' ', sl))) continue;
+            int la = gpt2_decode(s, sp - s, buf), lb = la < 0 ? -1 : gpt2_decode(sp + 1, sl - (sp + 1 - s), buf + la);
+            M->mid[r] = la < 0 || lb < 0 ? -2 : vocab_lookup(M->t, (const unsigned char *)buf, la + lb);
+        }
+    free(buf);
+}
+
 void build_tokenizer_gguf(Tokenizer *t, const Gguf *g, int vocab_size, int enable_thinking) {
     // The tokenizer from GGUF metadata (llama.cpp's "gpt2" model with the "qwen2" pre-tokenizer,
     // which is what encode() implements):
@@ -2313,22 +2425,8 @@ void build_tokenizer_gguf(Tokenizer *t, const Gguf *g, int vocab_size, int enabl
         mo[r] = pos;
         gguf_str(g, &pos, &s, "tokenizer.ggml.merges");
     }
-    #pragma omp parallel
-    {
-        char *buf = malloc(2 * (size_t)max_len + 2);
-        if (!buf) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
-        #pragma omp for schedule(static)
-        for (long r = 0; r < nmg; r++) {
-            uint64_t sl, p = mo[r];
-            memcpy(&sl, g->map + p, 8); // (in the file: checked by the walk above)
-            const char *s = (const char *)g->map + p + 8, *sp;
-            mid[r] = -1;
-            if (sl > 2 * (uint64_t)max_len + 1 || !(sp = memchr(s, ' ', sl))) continue;
-            int la = gpt2_decode(s, sp - s, buf), lb = la < 0 ? -1 : gpt2_decode(sp + 1, sl - (sp + 1 - s), buf + la);
-            mid[r] = la < 0 || lb < 0 ? -2 : vocab_lookup(t, (const unsigned char *)buf, la + lb);
-        }
-        free(buf);
-    }
+    MergeJob mj = { t, g, mo, mid, nmg, max_len, 0 };
+    rq_parallel(merge_worker, &mj);
     for (long r = 0; r < nmg; r++) {
         if (mid[r] == -2) gguf_fail(g, "a merge is not in GPT-2 byte-level form%s", NULL);
         if (mid[r] >= 0 && t->merge_scores[mid[r]] == -999999.0f)
@@ -3567,9 +3665,7 @@ int main(int argc, char *argv[]) {
         // (GGUF: the metadata, the tensor data stays unread)
         Config config;
         Tokenizer tokenizer;
-#ifdef _OPENMP
-        omp_set_num_threads(1); // (one light process: the tests run many in parallel)
-#endif
+        rq_set_threads(1); // (one light process: the tests run many in parallel)
         double t0 = now_s();
         if (file_is_gguf(checkpoint_path)) {
             Gguf g;
@@ -3593,17 +3689,16 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-#ifdef _OPENMP
-    // default thread count if OMP_NUM_THREADS is not set: not all CPUs. libgomp's default (all of
-    // them) collapses on a shared machine: with every CPU running a spinning thread, any other
-    // process preempting one of them stalls the others at every barrier (~200 per token). On the
-    // 16-vCPU dev VM: 16 threads ~20 tok/s decode, 12 the best prefill with decode as at 8
-    if (!getenv("OMP_NUM_THREADS")) {
-        int np = omp_get_num_procs();
+    // threads: OMP_NUM_THREADS, else the default: not all CPUs. With OpenMP's spin barriers all of
+    // them collapsed on a shared machine (any other process preempting one thread stalled the
+    // others at every barrier, ~200 per token: 16 threads ~20 tok/s decode on the 16-vCPU dev VM)
+    if (rq_env_threads()) {
+        rq_set_threads(rq_env_threads());
+    } else {
+        int np = rq_ncpu();
         int nt = np > 4 ? np - np / 4 : np;
-        omp_set_num_threads(nt < 12 ? nt : 12);
+        rq_set_threads(nt < 12 ? nt : 12);
     }
-#endif
     rq_config();
 
     // build the Transformer via the model .bin file

@@ -9,8 +9,9 @@
  * (futex at once) costs a sleep / wake per barrier instead (~40 tok/s).
  *
  * Phases. A parallel job (one decoded token, one prefill chunk) is a sequence of phases 0, 1, ...;
- * phase k has n_k >= 1 work items. Threads claim items with an atomic counter (rq_next; chunks of
- * items) and count the finished ones (rq_finish); the thread finishing the last item of phase k may
+ * phase k has n_k >= 1 work items. Each thread works through its own contiguous range of them, and
+ * then steals from the back of the others' ranges (rq_next; chunks of items), and counts the
+ * finished ones (rq_finish); the thread finishing the last item of phase k may
  * run an epilogue (serial work, e.g. the residual + rmsnorm + quantize after a matmul) and then
  * publishes "k + 1 phases complete" (rq_publish); a thread enters phase k + 1 once that is visible
  * (rq_wait). So a phase ends when its *work* is done, not when every thread has arrived: a thread
@@ -21,8 +22,8 @@
  * only if there are any (no syscall in the common case).
  * Results do not depend on which thread runs an item (each output is computed whole by one thread,
  * as with the static schedules before), so any thread count and any interleaving give the same bits.
- * Static mode (RUNQ_SYNC=static, for comparison): thread t takes items [t n / nt, (t + 1) n / nt) of
- * every phase, i.e. a barrier per phase with the same wait.
+ * Static mode (RUNQ_SYNC=static, for comparison): no stealing, thread t does exactly its range
+ * [t n / nt, (t + 1) n / nt) of every phase, i.e. a barrier per phase with the same wait.
  *
  * Parallel region (rq_parallel): a persistent pthread pool (default, except on Windows), which waits
  * at the end only for the threads that actually joined the job (a worker that has not started when
@@ -55,6 +56,7 @@
     #include <windows.h>
 #else
     #include <sched.h>
+    #include <unistd.h>
 #endif
 #ifdef _OPENMP
     #include <omp.h>
@@ -120,21 +122,25 @@ static void rq_store_wake(int *word, int v, int *sleepers) {
 
 // ----------------------------------------------------------------------------------- phases
 
-typedef struct { int claim, done; char pad[56]; } RqPhase; // one cache line per phase
+typedef struct { int done, claim; char pad[56]; } RqPhase; // one cache line per phase
 
 typedef struct {
-    RqPhase *ph;   // per phase: items claimed / finished (reset by rq_begin)
+    RqPhase *ph;   // per phase: items finished (reset by rq_begin)
     int nph;       // capacity
     int nt;        // threads of the job
     int *ready;    // phases complete (futex word; own cache line)
     int *sleepers; // threads sleeping on ready (or on a dependency counter)
     int *cnt;      // dependency counters inside phases (reset by rq_begin)
     int ncnt;
+    uint64_t *own; // per (thread, phase): the thread's remaining item range, [tid * nph + k]
+    int own_nt;    // threads own[] is sized for
+    uint32_t epoch; // job number (16 bits): own[] words of older jobs are stale = the initial range
     void *mem;
 } RqSync;
 
 static void rq_sync_init(RqSync *s, int nph, int ncnt) {
     size_t bytes = (size_t)(nph + 2) * 64 + ((size_t)ncnt * sizeof(int) + 63) / 64 * 64;
+    memset(s, 0, sizeof(*s));
     s->mem = aligned_alloc(64, bytes);
     if (!s->mem) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
     memset(s->mem, 0, bytes);
@@ -147,37 +153,105 @@ static void rq_sync_init(RqSync *s, int nph, int ncnt) {
     s->nt = 1;
 }
 
-static void rq_sync_free(RqSync *s) { free(s->mem); s->mem = NULL; }
+static void rq_sync_free(RqSync *s) { free(s->mem); free(s->own); s->mem = NULL; s->own = NULL; }
 
 static void rq_begin(RqSync *s, int nph, int ncnt, int nt) {
-    // before a job (serial): reset the counters of phases 0..nph-1 and dependency counters 0..ncnt-1
+    // before a job (serial): reset the counters of phases 0..nph-1 and dependency counters 0..ncnt-1;
+    // a new epoch invalidates every thread's ranges (all zero again after 65,535 jobs)
     if (nph > s->nph || ncnt > s->ncnt) { fprintf(stderr, "rq_begin: too many phases / counters\n"); exit(EXIT_FAILURE); }
     memset(s->ph, 0, (size_t)nph * sizeof(RqPhase));
     memset(s->cnt, 0, (size_t)ncnt * sizeof(int));
     __atomic_store_n(s->ready, 0, __ATOMIC_RELAXED);
+    if (nt > s->own_nt) {
+        free(s->own);
+        s->own = aligned_alloc(64, ((size_t)nt * s->nph * 8 + 63) / 64 * 64);
+        if (!s->own) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+        s->own_nt = nt;
+        s->epoch = 0xffff;
+    }
+    s->epoch = (s->epoch + 1) & 0xffff;
+    if (s->epoch == 0) {
+        memset(s->own, 0, (size_t)s->own_nt * s->nph * 8);
+        s->epoch = 1;
+    }
     s->nt = nt;
 }
 
-// per-thread iteration state of one phase
-typedef struct { int k, n, chunk, tid, done; } RqIt;
+// Items of a phase: thread t owns the range [t n / nt, (t + 1) n / nt) (in whole units of `unit`
+// items, e.g. the chunks of a GEMM weight tile) and takes it from the front, `chunk` items at a time
+// (contiguous, as a static schedule: long memory streams for the GEMV / GEMM weights); a thread with
+// nothing left steals single items from the back of the others' ranges (a preempted thread's work
+// gets done, and the end of a phase is balanced item by item). A range is one 64-bit word
+// (epoch 16 | lo 24 | hi 24), updated by CAS; a word of an older epoch stands for the initial range
+// Or (unit 0, rq_it_dyn) one shared counter: items claimed in order, `chunk` at a time (e.g. the
+// prefill attention, longest items first: the best balance for items of unequal cost)
+typedef struct { int k, n, unit, chunk, tid, state, victim; } RqIt;
 
-static inline RqIt rq_it(int k, int n, int chunk, int tid) { RqIt it = { k, n, chunk > 0 ? chunk : 1, tid, 0 }; return it; }
+static inline RqIt rq_it(int k, int n, int chunk, int unit, int tid) {
+    // phase k, n items, the owner's chunks of `chunk` items, ranges of whole units (thieves take
+    // single items from the back: the finest balance at the end of a phase); unit 0: shared counter
+    if (unit < 0) unit = 1;
+    if (chunk < 1) chunk = 1;
+    RqIt it = { k, n, unit, chunk, tid, 0, 1 };
+    return it;
+}
+
+static inline uint64_t rq_range(const RqSync *s, const RqIt *it, int t, uint64_t w, int *lo, int *hi) {
+    // decode the range word w of thread t (the initial range if w is of another epoch)
+    if ((uint32_t)(w >> 48) != s->epoch) {
+        int nu = (it->n + it->unit - 1) / it->unit;
+        *lo = (int)((long)nu * t / s->nt) * it->unit;
+        *hi = (int)((long)nu * (t + 1) / s->nt) * it->unit;
+        if (*hi > it->n) *hi = it->n;
+    } else {
+        *lo = (int)(w >> 24 & 0xffffff);
+        *hi = (int)(w & 0xffffff);
+    }
+    return w;
+}
+
+static inline uint64_t rq_word(const RqSync *s, int lo, int hi) { return (uint64_t)s->epoch << 48 | (uint64_t)lo << 24 | (uint64_t)hi; }
+
+static inline int rq_take(RqSync *s, RqIt *it, int t, int front, int *lo, int *hi) {
+    // take a chunk from the front (owner) or the back (thief) of thread t's range
+    uint64_t *p = &s->own[(size_t)t * s->nph + it->k];
+    uint64_t w = __atomic_load_n(p, __ATOMIC_ACQUIRE);
+    for (;;) {
+        int a, b;
+        rq_range(s, it, t, w, &a, &b);
+        if (a >= b) return 0;
+        int na = a, nb = b;
+        if (front) {
+            na = a + it->chunk < b ? a + it->chunk : b;
+            *lo = a; *hi = na;
+        } else { // one item from the back
+            nb = b - 1;
+            *lo = nb; *hi = b;
+        }
+        if (__atomic_compare_exchange_n(p, &w, rq_word(s, na, nb), 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return 1;
+    }
+}
 
 static inline int rq_next(RqSync *s, RqIt *it, int *lo, int *hi) {
     // the next range of items [lo, hi) of phase it->k for this thread; 0 when there are no more
-    if (rq_static) {
-        if (it->done) return 0;
-        it->done = 1;
-        *lo = (int)((long)it->n * it->tid / s->nt);
-        *hi = (int)((long)it->n * (it->tid + 1) / s->nt);
-        return *hi > *lo;
+    if (it->unit == 0 && !rq_static) { // shared counter
+        if (RQ_LOAD(&s->ph[it->k].claim) >= it->n) return 0; // (no RMW on a finished phase)
+        int a = RQ_ADD(&s->ph[it->k].claim, it->chunk);
+        if (a >= it->n) return 0;
+        *lo = a;
+        *hi = a + it->chunk < it->n ? a + it->chunk : it->n;
+        return 1;
     }
-    if (RQ_LOAD(&s->ph[it->k].claim) >= it->n) return 0; // (no RMW on a finished phase)
-    int a = RQ_ADD(&s->ph[it->k].claim, it->chunk);
-    if (a >= it->n) return 0;
-    *lo = a;
-    *hi = a + it->chunk < it->n ? a + it->chunk : it->n;
-    return 1;
+    if (it->unit == 0) it->unit = 1;
+    if (it->state == 0) {
+        if (rq_take(s, it, it->tid, 1, lo, hi)) return 1;
+        it->state = rq_static ? 2 : 1;
+    }
+    for (; it->state == 1 && it->victim < s->nt; it->victim++)
+        if (rq_take(s, it, (it->tid + it->victim) % s->nt, 0, lo, hi)) return 1;
+    it->state = 2;
+    return 0;
 }
 
 static inline int rq_finish(RqSync *s, const RqIt *it, int cnt) {
@@ -213,15 +287,39 @@ static inline void rq_wait_count(RqSync *s, int i, int target) {
 
 typedef void (*RqFn)(void *ctx, int tid, int nt);
 
+static int rq_nt = 0; // threads per job (rq_set_threads); 0: OMP_NUM_THREADS, else 1
+
+static void rq_set_threads(int n) {
+    rq_nt = n < 1 ? 1 : n > 256 ? 256 : n;
+#ifdef _OPENMP
+    omp_set_num_threads(rq_nt); // (the OpenMP parallel region of -DRUNQ_NO_POOL / Windows)
+#endif
+}
+
+static int rq_env_threads(void) {
+    // OMP_NUM_THREADS (its first value), 0 if unset or invalid
+    const char *e = getenv("OMP_NUM_THREADS");
+    int n = e ? atoi(e) : 0;
+    return n > 0 ? (n < 256 ? n : 256) : 0;
+}
+
+static int rq_ncpu(void) {
+    // online CPUs
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (int)si.dwNumberOfProcessors;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 1;
+#endif
+}
+
 static int rq_threads(void) {
     // threads per job
-#ifdef _OPENMP
-    return omp_get_max_threads();
-#else
-    const char *e = getenv("OMP_NUM_THREADS");
-    int n = e ? atoi(e) : 1;
-    return n > 0 ? (n < 256 ? n : 256) : 1;
-#endif
+    if (rq_nt) return rq_nt;
+    int n = rq_env_threads();
+    return n ? n : 1;
 }
 
 #ifdef RUNQ_POOL

@@ -193,75 +193,33 @@ static void q8p_tile_any(int rb, int c, int gs, const uint8_t *wp, size_t bstrid
     #undef Q8P_CASE
 }
 
-static int32_t *q8p_corr_buf(size_t n) {
-    // scratch for the activation corrections; matmul / matmul_batch are only called from the
-    // serial part of the forward pass, so one buffer is enough
-    static int32_t *buf = NULL;
-    static size_t cap = 0;
-    if (n > cap) {
-        free(buf);
-        cap = n > 4096 ? n : 4096;
-        buf = malloc(cap * sizeof(int32_t));
-        if (!buf) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
-    }
-    return buf;
-}
-
-static int q8p_nb(int nb, int ntile) {
+static int q8p_nb(int nb, int ntile, int nt) {
     // activation rows per GEMM work item: Q8P_NB, halved (down to 4 * Q8P_C) while there are
     // fewer than ~6 items per thread (e.g. wo / w2 / k / v: 32 tiles x 2 chunks at 128 rows), so
     // 12 or 16 threads get balanced work. (Results do not depend on the partition)
-    int nt = 1, nbi = Q8P_NB;
-#ifdef _OPENMP
-    nt = omp_get_max_threads();
-#endif
+    int nbi = Q8P_NB;
     while (nbi > 4 * Q8P_C && (long)ntile * ((nb + nbi - 1) / nbi) < 6L * nt)
         nbi /= 2;
     return nbi;
 }
 
-typedef struct { float *out; int ldo; const uint8_t *wp; int d; } Q8PJob;
-
-static void q8p_gemm_n(int nj, const Q8PJob *job, const int8_t *xq, const float *xs, int ldx, int nb, int k, int gs) {
-    // for each job j: job[j].out[b * ldo + i] = W_j[i, :] . x[b, :] for b < nb, i < d_j; all W_j
-    // in Q8P layout with group size gs (k % gs == 0, d_j % 16 == 0) on the same input rows x (at
-    // xq + b * ldx, scales xs + b * ldx / gs), in one parallel loop (e.g. q, k, v: one barrier
-    // instead of three).
-    // Work items: (32-row weight tile of some W_j, nbi activation rows), static schedule
-    // (contiguous items: a thread does all the chunks of a tile in a row; dynamic scheduling
-    // measured the same at 8-14 threads and does not prevent the 16-thread collapse); inside,
-    // the weight tile (32 x k bytes + scales, 34-102 KB) is reused from L1/L2 for every Q8P_C rows
+static void q8p_gemm_item(float *out, int ldo, const uint8_t *wp, int d, int t, int ch, int nbi, const int8_t *xq,
+                          const float *xs, int ldx, int nb, int k, int gs, const int32_t *corr) {
+    // one GEMM work item: out[b * ldo + i] = W[i, :] . x[b, :] for the rows i of 32-row tile t of W
+    // (d x k, Q8P layout, group size gs) and the activation rows b of chunk ch (nbi rows; x at xq +
+    // b * ldx, scales xs + b * ldx / gs, corrections corr + b * k / gs: q8p_gemv_corr of each row).
+    // Callers run the items of q / k / v (or w1 / w3) in one phase, the chunks of a tile together
+    // (the weight tile, 32 x k bytes + scales, 34-102 KB, is reused from L1/L2 for every Q8P_C rows)
     int ng = k / gs;
     size_t bstride = (size_t)ng * Q8P_GROUP(gs), ldxs = (size_t)ldx / gs;
-    int32_t *corr = q8p_corr_buf((size_t)nb * ng);
-    int t0[9], ntile = 0;
-    if (nj > 8) { fprintf(stderr, "q8p_gemm_n: too many jobs\n"); exit(EXIT_FAILURE); }
-    for (int j = 0; j < nj; j++) {
-        t0[j] = ntile;
-        ntile += (job[j].d / Q8P_ROWS + Q8P_RB - 1) / Q8P_RB;
-    }
-    t0[nj] = ntile;
-    int nbi = q8p_nb(nb, ntile), nchunk = (nb + nbi - 1) / nbi;
-    #pragma omp parallel
-    {
-        #pragma omp for schedule(static)
-        for (int b = 0; b < nb; b++)
-            for (int g = 0; g < ng; g++)
-                corr[(size_t)b * ng + g] = q8p_corr(xq + (size_t)b * ldx + g * gs, gs);
-        #pragma omp for schedule(static)
-        for (int it = 0; it < ntile * nchunk; it++) {
-            int t = it / nchunk, ch = it % nchunk, j = 0;
-            while (t >= t0[j + 1]) j++;
-            int nblk = job[j].d / Q8P_ROWS, rb0 = (t - t0[j]) * Q8P_RB;
-            int rb = nblk - rb0 < Q8P_RB ? nblk - rb0 : Q8P_RB;
-            int b1 = (ch + 1) * nbi < nb ? (ch + 1) * nbi : nb;
-            const uint8_t *wt = job[j].wp + (size_t)rb0 * bstride;
-            for (int b = ch * nbi; b < b1; b += Q8P_C) {
-                int c = b1 - b < Q8P_C ? b1 - b : Q8P_C;
-                q8p_tile_any(rb, c, gs, wt, bstride, ng, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
-                             corr + (size_t)b * ng, job[j].out + (size_t)b * job[j].ldo + (size_t)rb0 * Q8P_ROWS, job[j].ldo);
-            }
-        }
+    int nblk = d / Q8P_ROWS, rb0 = t * Q8P_RB;
+    int rb = nblk - rb0 < Q8P_RB ? nblk - rb0 : Q8P_RB;
+    int b1 = (ch + 1) * nbi < nb ? (ch + 1) * nbi : nb;
+    const uint8_t *wt = wp + (size_t)rb0 * bstride;
+    for (int b = ch * nbi; b < b1; b += Q8P_C) {
+        int c = b1 - b < Q8P_C ? b1 - b : Q8P_C;
+        q8p_tile_any(rb, c, gs, wt, bstride, ng, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
+                     corr + (size_t)b * ng, out + (size_t)b * ldo + (size_t)rb0 * Q8P_ROWS, ldo);
     }
 }
 
@@ -323,7 +281,7 @@ static void q8p_gemv_rows(float *out, const int8_t *xq, const float *xs, const i
  * GEMV: one 16-row block at a time, streamed (decode is memory-bound: the 4 / 6-bit data is read
  * once, packed, and unpacked in registers: and 0x0f / shift right 4 for the nibbles, Q6_K's high
  * 2 bits shifted into bits 4-5 of each byte and or'ed in).
- * GEMM: work items (2-block = 32-row weight tile, chunk of activation rows), as q8p_gemm_n. Each
+ * GEMM: work items (2-block = 32-row weight tile, chunk of activation rows), as q8p_gemm_item. Each
  * thread unpacks its weight tile once into a per-thread scratch ("KQS": per block and group of 32
  * columns 8 steps of 64 bytes of u8 q, lane r = row r, 4 consecutive columns per step, the Q8P
  * step layout; Q4_K: + ds, dm as fp32; Q6_K: + sc_j0, sc_j1 as int32, d as fp32) and reuses it
@@ -608,81 +566,30 @@ static void kq_tile_any(int type, int rb, int c, const uint8_t *ws, size_t bstri
     #undef KQ_CASE
 }
 
-typedef struct { float *out; int ldo; const uint8_t *kp; int type; int d; } KQJob;
+#define KQ512_SCRATCH(k) ((size_t)KQ_RB * ((k) / 32) * KQS_Q6) // per-thread GEMM scratch bytes (the larger type)
 
-static void *kq_scratch(size_t n) {
-    // grow-only 64-byte aligned scratch (called from the serial part only, as q8p_corr_buf)
-    static void *buf = NULL;
-    static size_t cap = 0;
-    if (n > cap) {
-        free(buf);
-        cap = n;
-        buf = aligned_alloc(64, (n + 63) / 64 * 64);
-        if (!buf) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
-    }
-    return buf;
-}
-
-static void kq512_gemm_n(int nj, const KQJob *job, const int8_t *xq, const float *xs, int ldx, int nb, int k) {
-    // for each job j: job[j].out[b * ldo + i] = W_j[i, :] . x[b, :] for b < nb, i < d_j; W_j Q4P or
-    // Q6P (mixed types in one call, e.g. q / k Q4_K with v Q6_K), activation rows at xq + b * ldx
-    // (group-32 scales at xs + b * ldx / 32), one parallel loop. Work items as q8p_gemm_n: (2-block
-    // tile, chunk of activation rows), static (a thread's items are consecutive: each tile is unpacked
-    // once per thread into its scratch and reused for all its chunks)
-    int ng = k / 32, n16 = k / 16;
+static void kq512_gemm_item(float *out, int ldo, const uint8_t *kp, int type, int d, int t, int ch, int nbi,
+                            const int8_t *xq, const float *xs, int ldx, int nb, int k, const float *xf,
+                            const int32_t *c16, uint8_t *scr, const void **last) {
+    // one K-quant GEMM work item, as q8p_gemm_item: 32-row tile t of W (Q4P / Q6P), activation rows
+    // of chunk ch (xf + b * k / 32: kq_act_prep, c16 + b * k / 16: kq512_c16 of each row). The
+    // thread's scratch scr (KQ512_SCRATCH(k) bytes) holds the tile unpacked (KQS layout); *last =
+    // the tile it holds (unpacked again only for another tile: callers claim all chunks of a tile at once)
+    int ng = k / 32, n16 = k / 16, sbb = kq_sb_bytes(type);
     size_t ldxs = (size_t)ldx / 32;
-    int t0[9], ntile = 0, any6 = 0;
-    if (nj > 8) { fprintf(stderr, "kq512_gemm_n: too many jobs\n"); exit(EXIT_FAILURE); }
-    for (int j = 0; j < nj; j++) {
-        t0[j] = ntile;
-        ntile += (job[j].d / KQ_ROWS + KQ_RB - 1) / KQ_RB;
-        any6 |= job[j].type == GGML_Q6_K;
+    int nblk = d / KQ_ROWS, rb0 = t * KQ_RB;
+    int rb = nblk - rb0 < KQ_RB ? nblk - rb0 : KQ_RB;
+    size_t bstride = (size_t)ng * (type == GGML_Q4_K ? KQS_Q4 : KQS_Q6);
+    const uint8_t *wt = kp + (size_t)rb0 * (k / QK_K) * sbb;
+    if (*last != wt) {
+        kq_unpack_tile(type, scr, wt, rb, k);
+        *last = wt;
     }
-    t0[nj] = ntile;
-    int nt = 1;
-#ifdef _OPENMP
-    nt = omp_get_max_threads();
-#endif
-    size_t scr_bytes = (size_t)KQ_RB * ng * KQS_Q6; // (the larger of the two)
-    size_t xf_bytes = ((size_t)nb * ng * sizeof(float) + 63) / 64 * 64, c16_bytes = any6 ? (size_t)nb * n16 * sizeof(int32_t) : 0;
-    uint8_t *mem = kq_scratch(nt * scr_bytes + xf_bytes + c16_bytes);
-    float *xf = (float *)(mem + nt * scr_bytes);
-    int32_t *c16 = (int32_t *)(mem + nt * scr_bytes + xf_bytes);
-    int nbi = q8p_nb(nb, ntile), nchunk = (nb + nbi - 1) / nbi;
-    #pragma omp parallel
-    {
-        int tid = 0;
-#ifdef _OPENMP
-        tid = omp_get_thread_num();
-#endif
-        uint8_t *scr = mem + (size_t)tid * scr_bytes;
-        int last = -1;
-        #pragma omp for schedule(static)
-        for (int b = 0; b < nb; b++) {
-            kq_act_prep(xf + (size_t)b * ng, xq + (size_t)b * ldx, xs + (size_t)b * ldxs, k);
-            if (any6)
-                kq512_c16(c16 + (size_t)b * n16, xq + (size_t)b * ldx, k);
-        }
-        #pragma omp for schedule(static)
-        for (int it = 0; it < ntile * nchunk; it++) {
-            int t = it / nchunk, ch = it % nchunk, j = 0;
-            while (t >= t0[j + 1]) j++;
-            int type = job[j].type, sbb = kq_sb_bytes(type);
-            int nblk = job[j].d / KQ_ROWS, rb0 = (t - t0[j]) * KQ_RB;
-            int rb = nblk - rb0 < KQ_RB ? nblk - rb0 : KQ_RB;
-            size_t bstride = (size_t)ng * (type == GGML_Q4_K ? KQS_Q4 : KQS_Q6);
-            if (t != last) {
-                kq_unpack_tile(type, scr, job[j].kp + (size_t)rb0 * (k / QK_K) * sbb, rb, k);
-                last = t;
-            }
-            int b1 = (ch + 1) * nbi < nb ? (ch + 1) * nbi : nb, C = type == GGML_Q4_K ? KQ4_C : KQ6_C;
-            for (int b = ch * nbi; b < b1; b += C) {
-                int c = b1 - b < C ? b1 - b : C;
-                kq_tile_any(type, rb, c, scr, bstride, ng, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
-                            xf + (size_t)b * ng, ng, c16 + (size_t)b * n16, n16,
-                            job[j].out + (size_t)b * job[j].ldo + (size_t)rb0 * KQ_ROWS, job[j].ldo);
-            }
-        }
+    int b1 = (ch + 1) * nbi < nb ? (ch + 1) * nbi : nb, C = type == GGML_Q4_K ? KQ4_C : KQ6_C;
+    for (int b = ch * nbi; b < b1; b += C) {
+        int c = b1 - b < C ? b1 - b : C;
+        kq_tile_any(type, rb, c, scr, bstride, ng, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
+                    xf + (size_t)b * ng, ng, c16 + (size_t)b * n16, n16, out + (size_t)b * ldo + (size_t)rb0 * KQ_ROWS, ldo);
     }
 }
 

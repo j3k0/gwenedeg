@@ -1464,28 +1464,24 @@ static inline float bf16_f32(uint16_t h) {
 }
 
 static inline uint16_t f32_f16(float f) {
-    // fp32 -> IEEE half, round to nearest even (the f16 KV cache stores; integer arithmetic, the same
-    // in every build): equal to vcvtps2ph for every non-denormal input, except that magnitudes that
-    // would round to inf saturate at 65504 (|K| <= ~500, |V| <= ~100 measured for Qwen3-0.6B). f16
-    // subnormals (|x| < 2^-14) rounded exactly; NaN stays a (quiet) NaN. (Checked exhaustively over
-    // all 2^32 inputs against vcvtps2ph, and fp16_to_f32 against vcvtph2ps)
+    // fp32 -> IEEE half, round to nearest even (the f16 KV cache stores; the same operations in every
+    // build, branch-free so that the stores vectorize): equal to vcvtps2ph for every non-denormal input
+    // (-Ofast's FTZ / DAZ: none here), except that magnitudes that would round to inf saturate at 65504
+    // (|K| <= ~500, |V| <= ~100 measured for Qwen3-0.6B); f16 subnormals (|x| < 2^-14) rounded exactly
+    // (x * 2^24 is exact, rintf rounds to even); NaN stays a quiet NaN. Checked exhaustively over all
+    // 2^32 inputs against vcvtps2ph, and fp16_to_f32 (kquants.h, the loads) against vcvtph2ps
     uint32_t u;
     memcpy(&u, &f, 4);
-    uint32_t sign = (u >> 16) & 0x8000u, a = u & 0x7fffffffu;
-    if (a > 0x7f800000u)
-        return (uint16_t)(sign | 0x7e00u | ((a >> 13) & 0x3ffu));
-    if (a >= 0x477ff000u) // >= 65520: would round to inf
-        return (uint16_t)(sign | 0x7bffu);
-    if (a < 0x38800000u) { // below 2^-14: subnormal (or 0) half, m * 2^-24
-        if (a <= 0x33000000u) // <= 2^-25: 0 (2^-25 ties to even)
-            return (uint16_t)sign;
-        uint32_t e = a >> 23, m = (a & 0x7fffffu) | 0x800000u, sh = 126 - e;
-        uint32_t r = m >> sh, rem = m & ((1u << sh) - 1), half = 1u << (sh - 1);
-        r += rem > half || (rem == half && (r & 1));
-        return (uint16_t)(sign | r);
-    }
-    uint32_t r = a - 0x38000000u; // exponent bias 127 -> 15, then 13 mantissa bits rounded off
-    return (uint16_t)(sign | ((r + 0xfffu + ((r >> 13) & 1)) >> 13));
+    uint32_t sign = (u >> 16) & 0x8000u, a = u & 0x7fffffffu, n = a - 0x38000000u;
+    uint32_t h = (n + 0xfffu + ((n >> 13) & 1)) >> 13; // normal: exponent bias 127 -> 15, 13 bits off
+    uint32_t as = a < 0x38800000u ? a : 0;               // below 2^-14: m * 2^-24, m = rint(|x| 2^24)
+    float fs;
+    memcpy(&fs, &as, 4);
+    uint32_t sub = (uint32_t)rintf(fs * 0x1p24f);
+    h = a < 0x38800000u ? sub : h;
+    h = a >= 0x477ff000u ? 0x7bffu : h;                  // >= 65520: would round to inf
+    h = a > 0x7f800000u ? (0x7e00u | ((a >> 13) & 0x3ffu)) : h;
+    return (uint16_t)(sign | h);
 }
 
 static inline uint16_t f32_bf16(float f) {
@@ -1494,9 +1490,8 @@ static inline uint16_t f32_bf16(float f) {
     // -Ofast's FTZ / DAZ never produce here); NaN stays a (quiet) NaN
     uint32_t u;
     memcpy(&u, &f, 4);
-    if ((u & 0x7fffffffu) > 0x7f800000u)
-        return (uint16_t)((u >> 16) | 0x40);
-    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1)) >> 16);
+    uint32_t r = (u + 0x7fffu + ((u >> 16) & 1)) >> 16;
+    return (uint16_t)((u & 0x7fffffffu) > 0x7f800000u ? (u >> 16) | 0x40 : r);
 }
 
 ATT_EXACT static void attention_vec(int kvt, const float *q, float *out, float *ml, int n, const void *kt0, const void *vt0,

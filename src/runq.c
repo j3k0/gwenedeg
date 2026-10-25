@@ -18,10 +18,13 @@
 #endif
 // AVX-512 VNNI kernels (defines RUNQ_VNNI when built for AVX-512 VNNI without -DRUNQ_GENERIC)
 #include "kernels_avx512.h"
+// K-quants (GGUF Q4_K / Q6_K): block formats, repacked layouts, arithmetic, generic kernels
+#include "kquants.h"
 
 // ----------------------------------------------------------------------------
 // Globals
 int GS = 0; // group size global for quantization of the weights
+int KQ = 0; // the model has K-quant weights (GGUF Q4_K / Q6_K): the activation sums xf are needed
 
 // Maximum input prompt buffer size
 #define PROMPT_BUFFER_SIZE 32768
@@ -72,8 +75,11 @@ typedef struct {
     float *s; // scaling factors
     uint8_t *p;   // weights only: the same matrix repacked for the VNNI kernels (Q8P layout,
                   // see kernels_avx512.h), or NULL (generic kernels on q / s)
-    const uint8_t *b; // GGUF weights: the Q8_0 blocks in the file mapping (per 32 values an fp16
-                  // scale + 32 int8, Q8_0_BLOCK bytes), converted at load (prepare_weights); or NULL
+    const uint8_t *b; // GGUF weights: the blocks in the file mapping (Q8_0: per 32 values an fp16
+                  // scale + 32 int8, Q8_0_BLOCK bytes; Q4_K / Q6_K: kquants.h), converted at load
+                  // (prepare_weights); or NULL
+    int type;     // weights: ggml type, GGML_Q8_0 (also the .bin's group-64 Q8), GGML_Q4_K, GGML_Q6_K
+    uint8_t *kp;  // Q4_K / Q6_K weights: repacked (Q4P / Q6P layout, kquants.h), else NULL
 } QuantizedTensor;
 
 typedef struct {
@@ -127,6 +133,8 @@ typedef struct {
     float att_scale;    // 1 / sqrt(head_dim)
     int32_t *xq_corr;   // VNNI GEMV activation corrections of xq / hq (q8p_gemv_corr), per GS-group
     int32_t *hq_corr;
+    float *xq_xf;       // K-quant kernels: activation group sums of xq / hq (kq_act_prep), or NULL
+    float *hq_xf;
     int ff_rows;        // hidden rows per forward() ffn work item (w1 + w3 + swiglu + quantize)
     // batched prefill buffers (forward_batch), nb_max rows each; not allocated if nb_max <= 1
     int nb_max;
@@ -374,9 +382,8 @@ static const uint8_t *gguf_weight(const Gguf *g, const char *name, uint32_t type
     int dims = ne1 ? 2 : 1;
     if (t->type != type) {
         char msg[160];
-        snprintf(msg, sizeof(msg), "tensor %%s has ggml type %u, need %u (%s)%s", t->type, type,
-                 type == GGML_Q8_0 ? "Q8_0" : type == GGML_F32 ? "F32" : "?", t->type == 12 || t->type == 14 ?
-                 "; K-quants (Q4_K_M) are not supported yet" : "");
+        snprintf(msg, sizeof(msg), "tensor %%s has ggml type %u, need %u (%s)", t->type, type,
+                 type == GGML_Q8_0 ? "Q8_0" : type == GGML_F32 ? "F32" : "?");
         gguf_fail(g, msg, name);
     }
     if (t->n_dims != (uint32_t)dims || t->ne[0] != ne0 || (ne1 && t->ne[1] != ne1)) {
@@ -435,7 +442,7 @@ static void gguf_config(const Gguf *g, Config *c) {
     c->head_dim = (int)v[6];
     c->vocab_size = (int)emb->ne[1];
     c->shared_classifier = gguf_tensor(g, "output.weight") == NULL; // absent: tied to token_embd
-    c->group_size = 32; // Q8_0 blocks
+    c->group_size = 32; // activation groups: Q8_0 blocks, Q4_K sub-blocks, 2 Q6_K sub-blocks
 }
 
 static void gguf_open(Gguf *g, const char *path) {
@@ -565,6 +572,11 @@ void malloc_run_state(RunState* s, Config *p, int nb_max) {
     s->q = calloc(all_heads_dim, sizeof(float));
     s->xq_corr = calloc((all_heads_dim > p->dim ? all_heads_dim : p->dim) / GS + 1, sizeof(int32_t));
     s->hq_corr = calloc(p->hidden_dim / GS + 1, sizeof(int32_t));
+    if (KQ) {
+        s->xq_xf = calloc((all_heads_dim > p->dim ? all_heads_dim : p->dim) / GS + 1, sizeof(float));
+        s->hq_xf = calloc(p->hidden_dim / GS + 1, sizeof(float));
+        if (!s->xq_xf || !s->hq_xf) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    }
     s->k = calloc(kv_dim, sizeof(float));
     s->v = calloc(kv_dim, sizeof(float));
     s->att = calloc((size_t)p->n_heads * s->kv_len, sizeof(float));
@@ -592,6 +604,8 @@ void free_run_state(RunState* s) {
     free(s->q);
     free(s->xq_corr);
     free(s->hq_corr);
+    free(s->xq_xf);
+    free(s->hq_xf);
     free(s->k);
     free(s->v);
     free(s->att);
@@ -646,20 +660,7 @@ void quantize(QuantizedTensor *qx, float *x, int n) {
     }
 }
 
-static float fp16_to_f32(uint16_t h) {
-    // IEEE half -> float, exact (every half value is a float)
-    uint32_t sign = (uint32_t)(h & 0x8000) << 16, e = h >> 10 & 0x1f, m = h & 0x3ff, bits;
-    if (e == 0x1f) bits = sign | 0x7f800000u | m << 13; // inf / NaN
-    else if (e) bits = sign | (e + 112) << 23 | m << 13; // normal: exponent bias 15 -> 127
-    else if (m) { // subnormal: m * 2^-24, exact as a float
-        float f = (float)m * 5.9604644775390625e-8f;
-        memcpy(&bits, &f, 4);
-        bits |= sign;
-    } else bits = sign; // +-0
-    float f;
-    memcpy(&f, &bits, 4);
-    return f;
-}
+// (fp16_to_f32: kquants.h)
 
 static int q8_from_blocks(int8_t *q, float *s, const uint8_t *blk, size_t nblk) {
     // nblk GGUF Q8_0 blocks -> 32 * nblk int8 values + nblk fp32 scales (exact); 0 if a scale is
@@ -681,6 +682,10 @@ static void embed_row(float *x, const QuantizedTensor *t, int token, int dim) {
     // as the whole dequantized table upstream kept in memory. GGUF: from its blocks, the same
     // expression with the fp16 scale as a float (dim % 32 == 0, checked at load)
     size_t e0 = (size_t)token * dim;
+    if (t->kp) { // GGUF Q4_K / Q6_K: ggml's dequantization of the row's blocks (dim % 256 == 0)
+        kq_dequant_row(t->type, t->b + (size_t)token * (dim / QK_K) * kq_block_bytes(t->type), dim, x);
+        return;
+    }
     if (t->b) {
         const uint8_t *blk = t->b + e0 / 32 * Q8_0_BLOCK;
         for (int g = 0; g < dim / 32; g++, blk += Q8_0_BLOCK) {
@@ -717,6 +722,8 @@ QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each) {
         *ptr = (float*)*ptr + size_each / GS;
         res[i].p = NULL;
         res[i].b = NULL;
+        res[i].type = GGML_Q8_0;
+        res[i].kp = NULL;
     }
     return res;
 }
@@ -755,14 +762,28 @@ void memory_map_weights(TransformerWeights *w, Config *p, void *ptr) {
 }
 
 static QuantizedTensor *gguf_matrices(const Gguf *g, int n, const char *fmt, int d, int k) {
-    // n Q8_0 matrices (d, k) (fmt: name with the layer number, or a plain name for n = 1): their
-    // blocks in the mapping; q / s / p are set by prepare_weights
+    // n matrices (d, k) (fmt: name with the layer number, or a plain name for n = 1), each Q8_0,
+    // Q4_K or Q6_K (dispatch per tensor: Q4_K_M mixes them within a role): their blocks in the
+    // mapping; q / s / p / kp are set by prepare_weights
     QuantizedTensor *res = calloc(n, sizeof(QuantizedTensor));
     if (!res) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
     for (int l = 0; l < n; l++) {
         char name[96];
         snprintf(name, sizeof(name), fmt, l);
-        res[l].b = gguf_weight(g, name, GGML_Q8_0, k, d);
+        const GgufTensor *t = gguf_tensor(g, name);
+        uint32_t type = t ? t->type : GGML_Q8_0; // (missing: gguf_weight reports it)
+        if (type != GGML_Q8_0 && type != GGML_Q4_K && type != GGML_Q6_K) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "tensor %%s has ggml type %u, need Q8_0 (8), Q4_K (12) or Q6_K (14)", type);
+            gguf_fail(g, msg, name);
+        }
+        res[l].b = gguf_weight(g, name, type, k, d);
+        res[l].type = (int)type;
+        if (type != GGML_Q8_0) {
+            // the repacked layouts: 16-row blocks, 256-column super-blocks (activation groups of 32)
+            if (d % KQ_ROWS || k % QK_K || GS != 32) gguf_fail(g, "tensor %s: K-quant shape not supported (rows % 16, columns % 256)", name);
+            KQ = 1;
+        }
     }
     return res;
 }
@@ -829,6 +850,7 @@ void prepare_weights(TransformerWeights *w, Config *p, int fd) {
     //   generic kernels on a GGUF file: its Q8_0 blocks (fp16 scale + 32 int8) into the q / s
     //     arrays the .bin format has (fp16 -> fp32 is exact)
     //   generic kernels on a .bin file: nothing to do, q / s are the mapping
+    //   GGUF Q4_K / Q6_K tensors (any build): repacked into the Q4P / Q6P layouts of kquants.h
     // The source rows are read with pread (read_at), not through the mapping: only the norms and
     // the token embedding rows looked up later (the classifier is shared with them) are ever
     // mapped. The destination is pre-faulted in parallel (MADV_POPULATE_WRITE, 2 MB per call).
@@ -851,20 +873,11 @@ void prepare_weights(TransformerWeights *w, Config *p, int fd) {
 #endif
     if (!pack && !gguf)
         return;
-    size_t total = 0;
     int nt = 0, kmax = 0;
     for (int i = 0; i < nm; i++) {
-        size_t sz = (size_t)m[i].d * m[i].k + (size_t)m[i].d * (m[i].k / GS) * sizeof(float);
-#ifdef RUNQ_VNNI
-        if (pack) sz = q8p_size(m[i].d, m[i].k, GS);
-#endif
-        total += m[i].n * ((sz + 63) / 64 * 64);
         nt += m[i].n;
         kmax = m[i].k > kmax ? m[i].k : kmax;
     }
-    w->packed = alloc_big(total);
-    if (!w->packed) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
-    w->packed_size = total;
 
     // the matrices in order, their place in the packed buffer, and the work items: runs of
     // bpi(k) 16-row blocks, ~64 KB of source rows each
@@ -885,20 +898,34 @@ void prepare_weights(TransformerWeights *w, Config *p, int fd) {
             job[j].bpi = bpi > 0 ? bpi : 1;
             job[j].off = off;
             job[j].it0 = nit;
+            if (t->type != GGML_Q8_0) // Q4_K / Q6_K (GGUF; d % 16 == 0, k % 256 == 0 checked)
+                sz = kq_size(t->type, m[i].d, m[i].k);
 #ifdef RUNQ_VNNI
-            if (pack) {
-                t->p = w->packed + off;
+            else if (pack)
                 sz = q8p_size(m[i].d, m[i].k, GS);
-            }
 #endif
-            if (!pack) { // generic kernels on GGUF: q / s arrays
-                t->q = (int8_t *)(w->packed + off);
-                t->s = (float *)(w->packed + off + nq); // (nq is a multiple of 16 * GS)
-            }
             off += (sz + 63) / 64 * 64;
             nit += ((m[i].d + 15) / 16 + job[j].bpi - 1) / job[j].bpi;
         }
     job[nt].it0 = nit;
+    size_t total = off;
+    w->packed = alloc_big(total);
+    if (!w->packed) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    w->packed_size = total;
+    for (j = 0; j < nt; j++) {
+        QuantizedTensor *t = job[j].t;
+        size_t nq = (size_t)job[j].d * job[j].k;
+        if (t->type != GGML_Q8_0)
+            t->kp = w->packed + job[j].off;
+#ifdef RUNQ_VNNI
+        else if (pack)
+            t->p = w->packed + job[j].off;
+#endif
+        else { // generic kernels on GGUF: q / s arrays
+            t->q = (int8_t *)(w->packed + job[j].off);
+            t->s = (float *)(w->packed + job[j].off + nq); // (nq is a multiple of 16 * GS)
+        }
+    }
     size_t rows_max = 65536 / kmax > 16 ? 65536 / kmax : 16;
     rows_max = rows_max / 16 * 16 + 16;
     size_t pg_chunk = (size_t)2 << 20;
@@ -913,7 +940,7 @@ void prepare_weights(TransformerWeights *w, Config *p, int fd) {
             madvise(w->packed + a, e - a, MADV_POPULATE_WRITE); // (errors ignored: plain faults then)
         }
 #endif
-        // scratch: source rows (VNNI: q / s before packing; GGUF: the blocks)
+        // scratch: source rows (VNNI: q / s before packing; GGUF: the blocks, Q8_0 the largest)
         int8_t *qb = malloc(rows_max * kmax);
         float *sb = malloc(rows_max * (kmax / GS) * sizeof(float));
         uint8_t *bb = gguf ? malloc(rows_max * (kmax / 32) * Q8_0_BLOCK) : NULL;
@@ -929,6 +956,14 @@ void prepare_weights(TransformerWeights *w, Config *p, int fd) {
             int nb = nblk - rb0 < job[jj].bpi ? nblk - rb0 : job[jj].bpi;
             size_t r0 = (size_t)rb0 * 16, nr = (size_t)nb * 16;
             if (r0 + nr > (size_t)job[jj].d) nr = job[jj].d - r0;
+            if (t->kp) { // Q4_K / Q6_K: blocks of nr rows (k / 256 each) -> Q4P / Q6P
+                size_t rowb = (size_t)(k / QK_K) * kq_block_bytes(t->type);
+                read_at(fd, bb, nr * rowb, t->b + r0 * rowb);
+                for (size_t i = 0; i < nr * (k / QK_K); i++)
+                    bad |= !kq_block_ok(t->type, bb + i * kq_block_bytes(t->type));
+                kq_pack_blocks(t->type, t->kp + (size_t)rb0 * (k / QK_K) * kq_sb_bytes(t->type), bb, nb, k);
+                continue;
+            }
             int8_t *q = pack ? qb : t->q + r0 * k;
             float *s = pack ? sb : t->s + r0 * ng;
             if (t->b) { // GGUF (GS == 32: one block per group)
@@ -948,7 +983,7 @@ void prepare_weights(TransformerWeights *w, Config *p, int fd) {
         free(bb);
     }
     free(job);
-    if (bad) { fprintf(stderr, "Corrupt checkpoint: a Q8_0 weight scale is inf or NaN\n"); exit(EXIT_FAILURE); }
+    if (bad) { fprintf(stderr, "Corrupt checkpoint: a weight scale (fp16 d / dmin) is inf or NaN\n"); exit(EXIT_FAILURE); }
 }
 
 void read_checkpoint(char *checkpoint, Config *config, TransformerWeights* weights, float** data, ssize_t* file_size, int ctx_length,
@@ -1079,17 +1114,27 @@ static inline float dot_q8(const int8_t *wq, const float *ws, const int8_t *xq, 
 
 // Decode GEMV, in pieces: forward() runs all of a token in one parallel region, with the rows
 // of each matrix split into work items. matvec_prep: the VNNI kernel's activation corrections for
-// x[i0 .. i0+n) (one per GS-group; nothing to do for the generic kernel); matvec_rows: rows i0..i1-1
-static inline void matvec_prep(int32_t *corr, QuantizedTensor *x, int i0, int n) {
+// x[i0 .. i0+n) (one per GS-group; nothing to do for the generic kernel), and with K-quant weights
+// (xf != NULL) the activation group sums xf of kquants.h; matvec_rows: rows i0..i1-1
+static inline void matvec_prep(int32_t *corr, float *xf, QuantizedTensor *x, int i0, int n) {
 #ifdef RUNQ_VNNI
     q8p_gemv_corr(corr + i0 / GS, x->q + i0, n, GS);
 #else
-    (void)corr; (void)x; (void)i0; (void)n;
+    (void)corr;
 #endif
+    if (xf)
+        kq_act_prep(xf + i0 / GS, x->q + i0, x->s + i0 / GS, n);
 }
 
-static inline void matvec_rows(float *xout, QuantizedTensor *x, const int32_t *corr, QuantizedTensor *w, int n, int i0, int i1) {
+static inline void matvec_rows(float *xout, QuantizedTensor *x, const int32_t *corr, const float *xf, QuantizedTensor *w,
+                               int n, int i0, int i1) {
     // xout[i] = W (d,n) row i . x (n,) for i0 <= i < i1 (multiples of 16, as the VNNI blocks)
+    if (w->kp) { // Q4_K / Q6_K, 16-row blocks (kquants.h)
+        for (int i = i0; i < i1; i += KQ_ROWS)
+            kq_dot(w->type, xout + i, 0, w->kp + (size_t)(i / KQ_ROWS) * (n / QK_K) * kq_sb_bytes(w->type), n, 1,
+                   x->q, 0, x->s, 0, xf, 0);
+        return;
+    }
 #ifdef RUNQ_VNNI
     if (w->p) { q8p_gemv_rows(xout, x->q, x->s, corr, w->p, n, GS, i0 / 16, i1 / 16); return; }
 #else
@@ -1101,17 +1146,32 @@ static inline void matvec_rows(float *xout, QuantizedTensor *x, const int32_t *c
     }
 }
 
+static float *kq_xf_buf(size_t n) {
+    // scratch for the activation group sums xf of matmul / matmul_batch_n (called from the serial
+    // part of the forward pass only, as q8p_corr_buf)
+    static float *buf = NULL;
+    static size_t cap = 0;
+    if (n > cap) {
+        free(buf);
+        cap = n > 4096 ? n : 4096;
+        buf = malloc(cap * sizeof(float));
+        if (!buf) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    }
+    return buf;
+}
+
 void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,), its own parallel region (forward_batch's last-row classifier)
     if (n % GS != 0) { fprintf(stderr, "matmul: n=%d is not a multiple of GS=%d\n", n, GS); exit(EXIT_FAILURE); }
     int32_t *corr = NULL;
+    float *xf = w->kp ? kq_xf_buf(n / GS + 1) : NULL;
 #ifdef RUNQ_VNNI
     corr = q8p_corr_buf(n / GS + 1);
 #endif
-    matvec_prep(corr, x, 0, n);
+    matvec_prep(corr, xf, x, 0, n);
     #pragma omp parallel for schedule(static)
     for (int i0 = 0; i0 < d; i0 += 16)
-        matvec_rows(xout, x, corr, w, n, i0, i0 + 16 < d ? i0 + 16 : d);
+        matvec_rows(xout, x, corr, xf, w, n, i0, i0 + 16 < d ? i0 + 16 : d);
 }
 
 // The scale chain below must round exactly like dot_q8 as gcc -Ofast compiles it there,
@@ -1151,6 +1211,38 @@ NO_FP_CONTRACT static inline void dot_q8_x4(float *o, const int8_t *w0, const fl
 
 typedef struct { float *out; int ldo; QuantizedTensor *w; int d; } MatJob; // one GEMM of matmul_batch_n
 
+static void kq_gemm_n(int nj, const MatJob *job, QuantizedTensor *x, int ldx, int nb, int k) {
+    // the K-quant jobs of matmul_batch_n (those with w->kp; the others are skipped), one parallel
+    // loop: work items = (job, 16-row block), each over all nb rows, KQ_NC rows per kq_dot call
+    // (the same per-output arithmetic as the GEMV, matvec_rows: batched == sequential)
+    int ng = k / GS, b0[9], nblk = 0;
+    for (int j = 0; j < nj; j++) {
+        b0[j] = nblk;
+        nblk += job[j].w->kp ? job[j].d / KQ_ROWS : 0;
+    }
+    b0[nj] = nblk;
+    float *xf = kq_xf_buf((size_t)nb * ng);
+    #pragma omp parallel
+    {
+        #pragma omp for schedule(static)
+        for (int b = 0; b < nb; b++)
+            kq_act_prep(xf + (size_t)b * ng, x->q + (size_t)b * ldx, x->s + (size_t)b * ldx / GS, k);
+        #pragma omp for schedule(static)
+        for (int blk = 0; blk < nblk; blk++) {
+            int j = 0;
+            while (blk >= b0[j + 1]) j++;
+            QuantizedTensor *w = job[j].w;
+            int rb = blk - b0[j];
+            const uint8_t *wb = w->kp + (size_t)rb * (k / QK_K) * kq_sb_bytes(w->type);
+            for (int b = 0; b < nb; b += KQ_NC) {
+                int nc = nb - b < KQ_NC ? nb - b : KQ_NC;
+                kq_dot(w->type, job[j].out + (size_t)b * job[j].ldo + rb * KQ_ROWS, job[j].ldo, wb, k, nc,
+                       x->q + (size_t)b * ldx, ldx, x->s + (size_t)b * ldx / GS, ldx / GS, xf + (size_t)b * ng, ng);
+            }
+        }
+    }
+}
+
 NO_FP_CONTRACT
 void matmul_batch_n(int nj, const MatJob *job, QuantizedTensor *x, int ldx, int nb, int k) {
     // GEMMs on the same input rows, for each job: out[b * ldo + i] = W[i, :] . x[b, :]  for b < nb, i < d
@@ -1164,6 +1256,20 @@ void matmul_batch_n(int nj, const MatJob *job, QuantizedTensor *x, int ldx, int 
     // same per-output arithmetic.
     if (k % GS != 0 || ldx % GS != 0) { fprintf(stderr, "matmul_batch: k=%d / ldx=%d not multiples of GS=%d\n", k, ldx, GS); exit(EXIT_FAILURE); }
     if (nj > 8) { fprintf(stderr, "matmul_batch_n: too many jobs\n"); exit(EXIT_FAILURE); }
+    int nk = 0;
+    for (int j = 0; j < nj; j++)
+        nk += job[j].w->kp != NULL;
+    if (nk) { // Q4_K / Q6_K jobs (kq_gemm_n), then the Q8_0 ones (if any) as before
+        MatJob q8[8];
+        int n8 = 0;
+        for (int j = 0; j < nj; j++)
+            if (!job[j].w->kp)
+                q8[n8++] = job[j];
+        kq_gemm_n(nj, job, x, ldx, nb, k);
+        if (n8)
+            matmul_batch_n(n8, q8, x, ldx, nb, k);
+        return;
+    }
 #ifdef RUNQ_VNNI
     int packed = 1;
     Q8PJob qj[8];
@@ -1428,7 +1534,7 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
                     s->x[i] += s->xb[i];
             rmsnorm(s->xb, s->x, w->rms_att_weight + l * dim, dim);
             quantize(&s->xq, s->xb, dim);
-            matvec_prep(s->xq_corr, &s->xq, 0, dim);
+            matvec_prep(s->xq_corr, s->xq_xf, &s->xq, 0, dim);
         }
 
         // qkv matmuls for this position, one head per item: Q-RMSNorm + rotate each query head,
@@ -1436,16 +1542,16 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
         #pragma omp for schedule(static)
         for (int it = 0; it < nh + 2 * nkv; it++) {
             if (it < nh) {
-                matvec_rows(s->q, &s->xq, s->xq_corr, w->wq + l, dim, it * hd, (it + 1) * hd);
+                matvec_rows(s->q, &s->xq, s->xq_corr, s->xq_xf, w->wq + l, dim, it * hd, (it + 1) * hd);
                 qk_norm_rope(s->q + it * hd, 1, w->q_norm_weights + l * hd, hd, s->rope);
             } else if (it < nh + nkv) {
                 int h = it - nh;
-                matvec_rows(s->k, &s->xq, s->xq_corr, w->wk + l, dim, h * hd, (h + 1) * hd);
+                matvec_rows(s->k, &s->xq, s->xq_corr, s->xq_xf, w->wk + l, dim, h * hd, (h + 1) * hd);
                 qk_norm_rope(s->k + h * hd, 1, w->k_norm_weights + l * hd, hd, s->rope);
                 kv_store(kl, NULL, pos, h, nkv, hd, s->k + h * hd, NULL);
             } else {
                 int h = it - nh - nkv;
-                matvec_rows(s->v, &s->xq, s->xq_corr, w->wv + l, dim, h * hd, (h + 1) * hd);
+                matvec_rows(s->v, &s->xq, s->xq_corr, s->xq_xf, w->wv + l, dim, h * hd, (h + 1) * hd);
                 kv_store(NULL, vl, pos, h, nkv, hd, NULL, s->v + h * hd);
             }
         }
@@ -1467,13 +1573,13 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
             int i0 = g * kv_mul * hd;
             QuantizedTensor xg = qsub(&s->xq, i0);
             quantize(&xg, s->xb + i0, kv_mul * hd);
-            matvec_prep(s->xq_corr, &s->xq, i0, kv_mul * hd);
+            matvec_prep(s->xq_corr, s->xq_xf, &s->xq, i0, kv_mul * hd);
         }
 
         // final matmul to get the output of the attention
         #pragma omp for schedule(static)
         for (int i0 = 0; i0 < dim; i0 += 16)
-            matvec_rows(s->xb, &s->xq, s->xq_corr, w->wo + l, all_heads_dim, i0, i0 + 16);
+            matvec_rows(s->xb, &s->xq, s->xq_corr, s->xq_xf, w->wo + l, all_heads_dim, i0, i0 + 16);
 
         // residual connection back into s->x, ffn rmsnorm, quantize
         #pragma omp single
@@ -1482,25 +1588,25 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
                 s->x[i] += s->xb[i];
             rmsnorm(s->xb, s->x, w->rms_ffn_weight + l * dim, dim);
             quantize(&s->xq, s->xb, dim);
-            matvec_prep(s->xq_corr, &s->xq, 0, dim);
+            matvec_prep(s->xq_corr, s->xq_xf, &s->xq, 0, dim);
         }
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x)): per item,
         // ff rows of self.w1(x) and self.w3(x), the SwiGLU non-linearity and their quantization
         #pragma omp for schedule(static)
         for (int i0 = 0; i0 < hidden; i0 += ff) {
-            matvec_rows(s->hb, &s->xq, s->xq_corr, w->w1 + l, dim, i0, i0 + ff);
-            matvec_rows(s->hb2, &s->xq, s->xq_corr, w->w3 + l, dim, i0, i0 + ff);
+            matvec_rows(s->hb, &s->xq, s->xq_corr, s->xq_xf, w->w1 + l, dim, i0, i0 + ff);
+            matvec_rows(s->hb2, &s->xq, s->xq_corr, s->xq_xf, w->w3 + l, dim, i0, i0 + ff);
             swiglu(s->hb + i0, s->hb2 + i0, ff);
             QuantizedTensor hg = qsub(&s->hq, i0);
             quantize(&hg, s->hb + i0, ff);
-            matvec_prep(s->hq_corr, &s->hq, i0, ff);
+            matvec_prep(s->hq_corr, s->hq_xf, &s->hq, i0, ff);
         }
 
         // final matmul to get the output of the ffn (its residual: next layer, or below)
         #pragma omp for schedule(static)
         for (int i0 = 0; i0 < dim; i0 += 16)
-            matvec_rows(s->xb, &s->hq, s->hq_corr, w->w2 + l, hidden, i0, i0 + 16);
+            matvec_rows(s->xb, &s->hq, s->hq_corr, s->hq_xf, w->w2 + l, hidden, i0, i0 + 16);
     }
 
     if (compute_logits) {
@@ -1511,11 +1617,11 @@ float *forward(Transformer *transformer, int token, int pos, int compute_logits)
                 s->x[i] += s->xb[i];
             rmsnorm(s->x, s->x, w->rms_final_weight, dim);
             quantize(&s->xq, s->x, dim);
-            matvec_prep(s->xq_corr, &s->xq, 0, dim);
+            matvec_prep(s->xq_corr, s->xq_xf, &s->xq, 0, dim);
         }
         #pragma omp for schedule(static)
         for (int i0 = 0; i0 < p->vocab_size; i0 += 16)
-            matvec_rows(s->logits, &s->xq, s->xq_corr, w->wcls, dim, i0, i0 + 16 < p->vocab_size ? i0 + 16 : p->vocab_size);
+            matvec_rows(s->logits, &s->xq, s->xq_corr, s->xq_xf, w->wcls, dim, i0, i0 + 16 < p->vocab_size ? i0 + 16 : p->vocab_size);
     }
     } // omp parallel
     return compute_logits ? s->logits : NULL;

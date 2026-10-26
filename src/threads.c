@@ -1,5 +1,6 @@
 /* The thread pool of threads.h (one per process) and the threading configuration. */
 #include "threads.h"
+#include "runq.h"
 
 int rq_spin_dec = RQ_SPIN_DEC, rq_spin_pf = RQ_SPIN_PF;
 int rq_static = 0;
@@ -51,7 +52,7 @@ int rq_ncpu_perf(void) {
 #endif
 }
 
-static int rq_threads(void) {
+static int rq_threads_cfg(void) {
     // threads per job
     if (rq_nt) return rq_nt;
     int n = rq_env_threads();
@@ -68,7 +69,7 @@ static int rq_threads(void) {
 // opened it but not bumped gen yet, and then enter that job a second time: harmless (it runs fn
 // after its first run returned, with the same tid: claims find their items taken, scratch per tid)
 static struct {
-    int gen, sleepers, state, state_sleepers, nt, entered;
+    int gen, sleepers, state, state_sleepers, nt, started;
     RqFn fn;
     void *ctx;
     pthread_t *th;
@@ -92,16 +93,28 @@ static void *rq_pool_main(void *arg) {
     return NULL;
 }
 
-void rq_parallel(RqFn fn, void *ctx) {
-    int nt = rq_threads();
-    if (!rq_pool.th) {
-        rq_pool.nt = nt;
-        rq_pool.state = 1;
-        rq_pool.th = calloc(nt, sizeof(pthread_t));
-        for (int i = 1; i < nt; i++)
-            if (pthread_create(&rq_pool.th[i], NULL, rq_pool_main, (void *)(intptr_t)i)) { fprintf(stderr, "pthread_create failed\n"); exit(EXIT_FAILURE); }
+static void rq_pool_start(void) {
+    // the workers (at the first job); if the system refuses some, the pool has the ones it got
+    int nt = rq_threads_cfg();
+    rq_pool.state = 1;
+    rq_pool.th = calloc(nt, sizeof(pthread_t));
+    rq_pool.nt = 1;
+    for (int i = 1; i < nt && rq_pool.th; i++) {
+        if (pthread_create(&rq_pool.th[i], NULL, rq_pool_main, (void *)(intptr_t)i))
+            break;
+        rq_pool.nt = i + 1;
     }
-    nt = rq_pool.nt;
+    rq_pool.started = 1;
+}
+
+void rq_parallel(RqFn fn, void *ctx) {
+    if (!rq_pool.started)
+        rq_pool_start();
+    int nt = rq_pool.nt;
+    if (nt == 1) {
+        fn(ctx, 0, 1);
+        return;
+    }
     rq_pool.fn = fn;
     rq_pool.ctx = ctx;
     // open the job, then announce it: in the other order, a worker spinning on gen saw the new gen
@@ -127,7 +140,7 @@ void rq_parallel(RqFn fn, void *ctx) {
     }
 }
 
-int rq_nthreads(void) { return rq_pool.th ? rq_pool.nt : rq_threads(); }
+int rq_nthreads(void) { return rq_pool.started ? rq_pool.nt : rq_threads_cfg(); }
 #else
 void rq_parallel(RqFn fn, void *ctx) {
 #ifdef _OPENMP
@@ -138,11 +151,12 @@ void rq_parallel(RqFn fn, void *ctx) {
 #endif
 }
 
-int rq_nthreads(void) { return rq_threads(); }
+int rq_nthreads(void) { return rq_threads_cfg(); }
 #endif
 
-void rq_config(void) {
-    // tuning knobs from the environment (RUNQ_SPIN=decode[,prefill], RUNQ_SYNC=static)
+const char *rq_config(void) {
+    // tuning knobs from the environment (RUNQ_SPIN=decode[,prefill], RUNQ_SYNC=static); a warning
+    // for the caller to show, or NULL
     const char *e = getenv("RUNQ_SPIN");
     if (e) {
         rq_spin_dec = rq_spin_pf = atoi(e);
@@ -152,7 +166,32 @@ void rq_config(void) {
     e = getenv("RUNQ_SYNC");
     if (e && !strcmp(e, "static")) rq_static = 1;
 #ifdef RUNQ_POOL
-    if (rq_static) { fprintf(stderr, "RUNQ_SYNC=static: not with the pool (workers may skip a job), ignored\n"); rq_static = 0; }
+    if (rq_static) {
+        rq_static = 0;
+        return "RUNQ_SYNC=static: not with the pool (workers may skip a job), ignored";
+    }
 #endif
+    return NULL;
 }
 
+
+const char *rq_threads_init(int n) {
+    // threads: n, else OMP_NUM_THREADS, else the default nproc - nproc/8 (14 of 16 vCPUs). Measured on
+    // the shared 16-vCPU dev VM (~3 CPUs busy with other work; Step 7a): decode 12 ~ 14 > 16 threads
+    // (memory-bound: 12 already saturate the bandwidth), prefill 14 > 16 > 12 (~2,580 / ~2,290-2,500 /
+    // ~2,420 tok/s at 439 tokens). All 16 work too (the phases tolerate a preempted thread; with
+    // OpenMP's barriers they collapsed to ~2-20 tok/s), just not faster with other processes running.
+    // Apple Silicon with efficiency cores: the performance cores only (rq_ncpu_perf). M1 Pro, 8 P + 2 E
+    // (BENCHMARKS.md "Apple M1 Pro"): 9 or 10 threads instead of 8 decode 5-13% slower, prefill within 3%
+    if (n > 0) {
+        rq_set_threads(n);
+    } else if (rq_env_threads()) {
+        rq_set_threads(rq_env_threads());
+    } else {
+        int np = rq_ncpu(), npc = rq_ncpu_perf();
+        rq_set_threads(npc ? npc : np - np / 8);
+    }
+    return rq_config();
+}
+
+int rq_threads(void) { return rq_nthreads(); }

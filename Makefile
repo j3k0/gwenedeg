@@ -21,7 +21,7 @@ LDLIBS  += -lm -lpthread
 
 # the library modules (runq.h) and the CLI; each module is its own translation unit, all numeric code
 # of the forward passes is in forward.c (README.md, Architecture)
-LIB = model gguf forward tokenizer sampler threads
+LIB = model gguf forward tokenizer sampler chat threads
 HDR = $(wildcard src/*.h)
 Q8  = models/Qwen3-0.6B-q8.bin
 B   = build

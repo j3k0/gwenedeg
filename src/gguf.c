@@ -1,13 +1,23 @@
-/* GGUF reader. */
+/* GGUF reader (llama.cpp's format, versions 2 and 3). Layout (little-endian):
+ *   "GGUF", u32 version, u64 n_tensors, u64 n_kv;
+ *   n_kv x (string key, u32 value type, value); string = u64 length + bytes (no NUL); array =
+ *     u32 element type, u64 count, the elements (no nested arrays here);
+ *   n_tensors x (string name, u32 n_dims, u64 ne[n_dims], u32 ggml type, u64 offset);
+ *   padding to general.alignment (default 32), then the tensor data, tensor i at data_off + offset.
+ * ne[0] is the fastest dimension: a row-major (d, k) matrix has ne = { k, d }.
+ * The file is untrusted input: every count, length and offset is checked against the file size
+ * (gguf_take, overflow-safe) before use, counts before any allocation, and every tensor's data
+ * range when its header is read; errors (gguf_fail) name the file and end the load (LoadErr).
+ */
 #include "internal.h"
 
 static const uint8_t gv_size[GV_N] = { 1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8 }; // scalar value bytes
 
 void gguf_fail(const Gguf *g, const char *fmt, const char *arg) {
-    fprintf(stderr, "GGUF %s: ", g->path);
-    fprintf(stderr, fmt, arg ? arg : "");
-    fprintf(stderr, "\n");
-    exit(EXIT_FAILURE);
+    // "GGUF <path>: " + fmt with its one %s = arg, then back to rq_model_load
+    char m[512];
+    snprintf(m, sizeof(m), fmt, arg ? arg : "");
+    load_fail(g->err, "GGUF %s: %s", g->path, m);
 }
 
 static const uint8_t *gguf_take(const Gguf *g, uint64_t *pos, uint64_t n, const char *what) {
@@ -61,7 +71,7 @@ void gguf_parse(Gguf *g) {
         gguf_fail(g, "corrupt header (tensor / metadata counts too large)%s", NULL);
     g->kv = calloc(g->n_kv + 1, sizeof(GgufKV));
     g->t = calloc(g->n_t + 1, sizeof(GgufTensor));
-    if (!g->kv || !g->t) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    if (!g->kv || !g->t) load_fail(g->err, "malloc failed!");
 
     g->alignment = 32;
     for (uint64_t i = 0; i < g->n_kv; i++) {
@@ -263,35 +273,3 @@ void gguf_config(const Gguf *g, Config *c) {
     c->shared_classifier = gguf_tensor(g, "output.weight") == NULL; // absent: tied to token_embd
     c->group_size = 32; // activation groups: Q8_0 blocks, Q4_K sub-blocks, 2 Q6_K sub-blocks
 }
-
-void gguf_open(Gguf *g, const char *path) {
-    // map and parse a GGUF file (-m tokenize; read_checkpoint parses its own mapping)
-    FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "Couldn't open %s\n", path); exit(EXIT_FAILURE); }
-#if defined _WIN32
-    _fseeki64(f, 0, SEEK_END);
-    int64_t size = _ftelli64(f);
-#else
-    fseek(f, 0, SEEK_END);
-    int64_t size = ftell(f);
-#endif
-    if (size < 24) { fprintf(stderr, "GGUF %s: file too small\n", path); exit(EXIT_FAILURE); }
-    void *map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fileno(f), 0);
-    fclose(f);
-    if (map == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
-    memset(g, 0, sizeof(*g));
-    g->map = map;
-    g->size = (uint64_t)size;
-    g->path = path;
-    gguf_parse(g);
-}
-
-int file_is_gguf(const char *path) {
-    // the checkpoint format by magic: GGUF, else a qwen3.c .bin
-    FILE *f = fopen(path, "rb");
-    uint32_t magic = 0;
-    if (f && fread(&magic, 4, 1, f) != 1) magic = 0;
-    if (f) fclose(f);
-    return magic == GGUF_MAGIC;
-}
-

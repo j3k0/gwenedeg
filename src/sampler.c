@@ -1,5 +1,20 @@
-/* Sampler. */
+/* The sampler: greedy argmax, sampling from the full distribution, top-p (nucleus) sampling, with a
+ * per-call configuration (RqSampling) and the sequence's RNG; an optional token mask for constrained
+ * decoding. */
 #include "internal.h"
+
+typedef struct {
+    float prob;
+    int index;
+} ProbIndex; // a top-p candidate
+
+typedef struct {
+    int vocab_size;
+    ProbIndex *probindex; // buffer used in top-p sampling
+    float temperature;
+    float topp;
+    unsigned long long rng_state;
+} Sampler;
 
 void softmax(float *x, int size) {
     // find max value (for numerical stability)
@@ -20,9 +35,6 @@ void softmax(float *x, int size) {
         x[i] /= sum;
 }
 
-// ----------------------------------------------------------------------------
-// The Sampler, which takes logits and returns a sampled token
-// sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
 
 int sample_argmax(float *probabilities, int n) {
     // return the index that has the highest probability: the first one holding the maximum (as the
@@ -159,19 +171,6 @@ int sample_topp(float *probabilities, int n, float topp, ProbIndex *probindex, f
     return probindex[n0 - 1 - last_idx].index; // in case of rounding errors
 }
 
-void build_sampler(Sampler *sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
-    sampler->vocab_size = vocab_size;
-    sampler->temperature = temperature;
-    sampler->topp = topp;
-    sampler->rng_state = rng_seed;
-    // buffer only used with nucleus sampling; may not need but it's ~small
-    sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
-}
-
-void free_sampler(Sampler *sampler) {
-    free(sampler->probindex);
-}
-
 unsigned int random_u32(unsigned long long *state) {
     // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
     *state ^= *state >> 12;
@@ -183,6 +182,12 @@ float random_f32(unsigned long long *state) { // random float32 in [0,1)
     return (random_u32(state) >> 8) / 16777216.0f;
 }
 
+// (not inlined: as a function of its own, taking the configuration through a pointer, its code is
+// the same as before the API; e.g. the temperature division stays a division per value, which
+// -Ofast would otherwise be free to turn into a multiplication by the reciprocal, other bits)
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
 int sample(Sampler *sampler, float *logits) {
     // sample the token given the logits and some hyperparameters
     if (sampler->temperature == 0) {
@@ -206,3 +211,22 @@ int sample(Sampler *sampler, float *logits) {
     }
 }
 
+int rq_sample(RqCtx *c, RqSeq *s, float *logits, const RqSampling *cfg) {
+    int V = ctx_vocab(c);
+    if (cfg->temperature < 0 || cfg->temperature != cfg->temperature) return RQ_ERR_ARG;
+    if (cfg->allow) {
+        // constrained decoding: the disallowed logits become a large negative finite value (no
+        // infinities under -Ofast), one that stays so after the temperature division
+        int any = 0;
+        for (int i = 0; i < V && !any; i++)
+            any = cfg->allow[i] != 0;
+        if (!any) return RQ_ERR_ARG;
+        float low = cfg->temperature > 0 && cfg->temperature < 1 ? -1e30f * cfg->temperature : -1e30f;
+        for (int i = 0; i < V; i++)
+            if (!cfg->allow[i]) logits[i] = low;
+    }
+    Sampler smp = { V, ctx_sampler_scratch(c), cfg->temperature, cfg->topp, s->rng };
+    int token = sample(&smp, logits);
+    s->rng = smp.rng_state;
+    return token;
+}

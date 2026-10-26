@@ -1,46 +1,24 @@
-/* Tokenizer. */
+/* The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens.
+ *
+ * cwayn rewrite, matching HF tokenizers on Qwen2/Qwen3's tokenizer.json:
+ *   1. added tokens (<|im_start|>, <think>, ...) are split out first, leftmost-longest match
+ *   2. normalizer (NFC), on the text between added tokens (nfc_check / nfc_normalize, tables in
+ *      unicode_nfc.h: Unicode 15.1 data with the overrides that match HF tokenizers' older data)
+ *   3. pre-tokenizer: Qwen2's split regex, hand-written in pretok_next(), with the Unicode
+ *      classes \p{L}, \p{N}, \s from unicode_tables.h (tools/gen_unicode_tables.py)
+ *   4. byte-level BPE inside each chunk, starting from the single-byte tokens
+ * Merge order: the .tokenizer file (third_party/qwen3.c/export.py) has one score per token,
+ * -log(rank + 1) of the merge producing it, and no merge pairs. bpe_chunk() merges any adjacent
+ * pair whose concatenation is a vocab token, best score first, leftmost on ties (tiktoken
+ * style). Verified against HF's BPE with tokenizer.json's model.merges: identical on all
+ * 151,643 vocab strings and 300k random token concatenations (no pre-tokenizer), since Qwen's
+ * merge list is the tiktoken-consistent one: one merge per token, in id order, each the split
+ * tiktoken-style BPE itself produces from the lower-ranked tokens.
+ * Load errors go through load_fail / gguf_fail (model.c); encode() returns RQ_ERR_NOMEM if an
+ * allocation fails. */
 #include "internal.h"
-
-// ----------------------------------------------------------------------------
-// The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
-//
-// cwayn rewrite, matching HF tokenizers on Qwen2/Qwen3's tokenizer.json:
-//   1. added tokens (<|im_start|>, <think>, ...) are split out first, leftmost-longest match
-//   2. normalizer (NFC), on the text between added tokens (nfc_check / nfc_normalize, tables in
-//      unicode_nfc.h: Unicode 15.1 data with the overrides that match HF tokenizers' older data)
-//   3. pre-tokenizer: Qwen2's split regex, hand-written in pretok_next(), with the Unicode
-//      classes \p{L}, \p{N}, \s from unicode_tables.h (tools/gen_unicode_tables.py)
-//   4. byte-level BPE inside each chunk, starting from the single-byte tokens
-// Merge order: the .tokenizer file (third_party/qwen3.c/export.py) has one score per token,
-// -log(rank + 1) of the merge producing it, and no merge pairs. bpe_chunk() merges any adjacent
-// pair whose concatenation is a vocab token, best score first, leftmost on ties (tiktoken
-// style). Verified against HF's BPE with tokenizer.json's model.merges: identical on all
-// 151,643 vocab strings and 300k random token concatenations (no pre-tokenizer), since Qwen's
-// merge list is the tiktoken-consistent one: one merge per token, in id order, each the split
-// tiktoken-style BPE itself produces from the lower-ranked tokens.
-
 #include "unicode_tables.h"
 #include "unicode_nfc.h"
-
-// tokens[] capacity encode() needs for a text of n bytes: one token per byte of the NFC-normalized
-// text, which is at most 3x as long (e.g. U+1D160: 4 bytes -> 3 code points, 12 bytes)
-#define ENCODE_MAX_TOKENS(n) (3 * (size_t)(n) + 3)
-
-void load_prompt_template(char *checkpoint_path, char *out_template, int with_system_prompt, int enable_thinking) {
-    char prompt_path[1024];
-
-    strcpy(prompt_path, checkpoint_path);
-    if (with_system_prompt)
-        strcat(prompt_path, enable_thinking ? ".template.with-system-and-thinking" : ".template.with-system");
-    else
-        strcat(prompt_path, enable_thinking ? ".template.with-thinking" : ".template");
-
-    memset(out_template, 0, 1024);
-    FILE *file = fopen(prompt_path, "rb");
-    if (!file) { fprintf(stderr, "Couldn't load prompt template %s\n", prompt_path); exit(EXIT_FAILURE); }
-    fread(out_template, 1024, 1, file);
-    fclose(file);
-}
 
 static inline uint64_t bytes_hash(const unsigned char *s, int n) {
     uint64_t h = 1469598103934665603ull; // FNV-1a, then a murmur3 finalizer for the low bits
@@ -49,9 +27,9 @@ static inline uint64_t bytes_hash(const unsigned char *s, int n) {
     return h;
 }
 
-void tokenizer_index(Tokenizer *t);
+static void tokenizer_index(Tokenizer *t, LoadErr *e);
 
-int vocab_lookup(Tokenizer *t, const unsigned char *s, int n) {
+static int vocab_lookup(const Tokenizer *t, const unsigned char *s, int n) {
     // id of the regular token with exactly these n bytes, or -1
     uint64_t h = bytes_hash(s, n);
     uint32_t tag = (uint32_t)(h >> 32);
@@ -62,22 +40,23 @@ int vocab_lookup(Tokenizer *t, const unsigned char *s, int n) {
     }
 }
 
-void build_tokenizer(Tokenizer *t, char *checkpoint_path, int vocab_size, int enable_thinking) {
-    char tokenizer_path[1024];
-
-    strcpy(tokenizer_path, checkpoint_path);
-    strcat(tokenizer_path, ".tokenizer");
+void build_tokenizer(Tokenizer *t, const char *checkpoint_path, int vocab_size, LoadErr *e) {
+    // the .bin's side file <checkpoint>.tokenizer (third_party/qwen3.c/export.py)
+    char tokenizer_path[1100];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s.tokenizer", checkpoint_path);
 
     // read the whole file: header (max_token_length, bos, eos), then per token
     // float score, int32 length, bytes; tokens missing at the end (padding ids) are empty
     FILE *file = fopen(tokenizer_path, "rb");
-    if (!file) { fprintf(stderr, "Couldn't load tokenizer model %s\n", tokenizer_path); exit(EXIT_FAILURE); }
+    if (!file) load_fail(e, "Couldn't load tokenizer model %s", tokenizer_path);
     fseek(file, 0, SEEK_END);
     long fsize = ftell(file);
     fseek(file, 0, SEEK_SET);
     unsigned char *buf = malloc(fsize > 0 ? fsize : 1);
-    if (fsize < 12 || fread(buf, 1, fsize, file) != (size_t)fsize) {
-        fprintf(stderr, "Couldn't read tokenizer model %s\n", tokenizer_path); exit(EXIT_FAILURE);
+    if (!buf || fsize < 12 || fread(buf, 1, fsize, file) != (size_t)fsize) {
+        fclose(file);
+        free(buf);
+        load_fail(e, "Couldn't read tokenizer model %s", tokenizer_path);
     }
     fclose(file);
     memcpy(&t->max_token_length, buf, 4);
@@ -89,7 +68,10 @@ void build_tokenizer(Tokenizer *t, char *checkpoint_path, int vocab_size, int en
     t->vocab_len = malloc(vocab_size * sizeof(int));
     t->merge_scores = malloc(vocab_size * sizeof(float));
     t->vocab_data = malloc(fsize + vocab_size); // string bytes + one NUL per token
-    if (!t->vocab || !t->vocab_len || !t->merge_scores || !t->vocab_data) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    if (!t->vocab || !t->vocab_len || !t->merge_scores || !t->vocab_data) {
+        free(buf);
+        load_fail(e, "malloc failed!");
+    }
     long off = 12;
     char *dst = t->vocab_data;
     unsigned int max_len = 0;
@@ -99,7 +81,10 @@ void build_tokenizer(Tokenizer *t, char *checkpoint_path, int vocab_size, int en
         if (off + 8 <= fsize) {
             memcpy(&score, buf + off, 4);
             memcpy(&len, buf + off + 4, 4);
-            if (len < 0 || off + 8 + len > fsize) { fprintf(stderr, "Corrupt tokenizer model %s\n", tokenizer_path); exit(EXIT_FAILURE); }
+            if (len < 0 || off + 8 + len > fsize) {
+                free(buf);
+                load_fail(e, "Corrupt tokenizer model %s", tokenizer_path);
+            }
             memcpy(dst, buf + off + 8, len);
             off += 8 + len;
         }
@@ -112,13 +97,10 @@ void build_tokenizer(Tokenizer *t, char *checkpoint_path, int vocab_size, int en
     }
     free(buf);
     t->max_token_length = max_len;
-    tokenizer_index(t);
-
-    load_prompt_template(checkpoint_path, t->prompt_template, 0, enable_thinking);
-    load_prompt_template(checkpoint_path, t->system_prompt_template, 1, enable_thinking);
+    tokenizer_index(t, e);
 }
 
-void tokenizer_index(Tokenizer *t) {
+static void tokenizer_index(Tokenizer *t, LoadErr *e) {
     // classify: single bytes, merge results (score > -1e6) and added tokens (the rest, len > 1;
     // export.py gives every token that no merge produces the score -1e6)
     int vocab_size = t->vocab_size;
@@ -129,7 +111,7 @@ void tokenizer_index(Tokenizer *t) {
     t->hash_ids = malloc(cap * sizeof(int32_t));
     t->hash_tags = malloc(cap * sizeof(uint32_t));
     t->added = malloc(vocab_size * sizeof(int));
-    if (!t->hash_ids || !t->hash_tags || !t->added) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    if (!t->hash_ids || !t->hash_tags || !t->added) load_fail(e, "malloc failed!");
     memset(t->hash_ids, 0xff, cap * sizeof(int32_t));
     t->n_added = 0;
     memset(t->added_first, 0, sizeof(t->added_first));
@@ -155,7 +137,7 @@ void tokenizer_index(Tokenizer *t) {
         t->hash_tags[j] = (uint32_t)(h >> 32);
     }
     for (int b = 0; b < 256; b++) {
-        if (t->byte_token[b] < 0) { fprintf(stderr, "Tokenizer has no token for byte 0x%02x (not byte-level BPE?)\n", b); exit(EXIT_FAILURE); }
+        if (t->byte_token[b] < 0) load_fail(e, "Tokenizer has no token for byte 0x%02x (not byte-level BPE?)", b);
     }
     for (int i = 1; i < t->n_added; i++) { // longest first (insertion sort, ~26 entries), stable
         int id = t->added[i], k = i;
@@ -163,14 +145,6 @@ void tokenizer_index(Tokenizer *t) {
         t->added[k] = id;
     }
 }
-
-// Qwen3's chat template (tokenizer_config.json) rendered for one user message "%s", with and without
-// a system message "%s" and enable_thinking: the strings export.py writes into the .template* files
-// (byte-identical; make test compares the chat token ids of a .bin and a GGUF run). Used for GGUF
-// files, whose tokenizer.chat_template is Jinja (not interpreted here)
-#define QWEN3_TMPL_SYS "<|im_start|>system\n%s<|im_end|>\n"
-#define QWEN3_TMPL_USER "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n"
-#define QWEN3_TMPL_NOTHINK "<think>\n\n</think>\n\n"
 
 static int gpt2_byte(uint32_t cp) {
     // GPT-2's bytes_to_unicode, inverted: the printable bytes ('!'..'~', 0xa1..0xac, 0xae..0xff)
@@ -198,7 +172,7 @@ static int gpt2_decode(const char *s, uint64_t n, char *out) {
     return len;
 }
 
-typedef struct { Tokenizer *t; const Gguf *g; const uint64_t *mo; int *mid; long nmg; unsigned int max_len; long next; } MergeJob;
+typedef struct { Tokenizer *t; const Gguf *g; const uint64_t *mo; int *mid; long nmg; unsigned int max_len; long next; int nomem; } MergeJob;
 
 static void merge_worker(void *arg, int tid, int nt) {
     // build_tokenizer_gguf: the tokens produced by the merges (mid[r]: id, -1 none, -2 not GPT-2
@@ -206,7 +180,10 @@ static void merge_worker(void *arg, int tid, int nt) {
     (void)tid; (void)nt;
     MergeJob *M = arg;
     char *buf = malloc(2 * (size_t)M->max_len + 2);
-    if (!buf) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    if (!buf) {
+        __atomic_store_n(&M->nomem, 1, __ATOMIC_RELAXED);
+        return; // (the other threads do the work; the load fails anyway)
+    }
     for (long r0; (r0 = __atomic_fetch_add(&M->next, 4096, __ATOMIC_RELAXED)) < M->nmg;)
         for (long r = r0; r < r0 + 4096 && r < M->nmg; r++) {
             uint64_t sl, p = M->mo[r];
@@ -220,7 +197,7 @@ static void merge_worker(void *arg, int tid, int nt) {
     free(buf);
 }
 
-void build_tokenizer_gguf(Tokenizer *t, const Gguf *g, int vocab_size, int enable_thinking) {
+void build_tokenizer_gguf(Tokenizer *t, const Gguf *g, int vocab_size) {
     // The tokenizer from GGUF metadata (llama.cpp's "gpt2" model with the "qwen2" pre-tokenizer,
     // which is what encode() implements):
     //   tokenizer.ggml.tokens: token strings, in GPT-2's byte-to-unicode form for normal tokens
@@ -257,7 +234,7 @@ void build_tokenizer_gguf(Tokenizer *t, const Gguf *g, int vocab_size, int enabl
         bytes += gguf_str(g, &pos, &s, "tokenizer.ggml.tokens");
     }
     t->vocab_data = malloc(bytes + vocab_size);
-    if (!t->vocab || !t->vocab_len || !t->merge_scores || !t->vocab_data) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    if (!t->vocab || !t->vocab_len || !t->merge_scores || !t->vocab_data) load_fail(g->err, "malloc failed!");
     char *dst = t->vocab_data;
     unsigned int max_len = 0;
     pos = tk->off;
@@ -290,7 +267,7 @@ void build_tokenizer_gguf(Tokenizer *t, const Gguf *g, int vocab_size, int enabl
         if ((unsigned int)len > max_len) max_len = len;
     }
     t->max_token_length = max_len;
-    tokenizer_index(t);
+    tokenizer_index(t, g->err);
 
     // merge ranks -> scores of the tokens they produce: the merge strings located (serial walk),
     // decoded and looked up in parallel (151k hash lookups, ~12 ms on one thread), then the scores
@@ -299,22 +276,29 @@ void build_tokenizer_gguf(Tokenizer *t, const Gguf *g, int vocab_size, int enabl
     long nmg = (long)mg->n;
     uint64_t *mo = malloc((nmg + 1) * sizeof(uint64_t));
     int *mid = malloc((nmg + 1) * sizeof(int));
-    if (!mo || !mid) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    if (!mo || !mid) {
+        free(mo);
+        free(mid);
+        load_fail(g->err, "malloc failed!");
+    }
     pos = mg->off;
     for (long r = 0; r < nmg; r++) {
         const char *s;
         mo[r] = pos;
-        gguf_str(g, &pos, &s, "tokenizer.ggml.merges");
+        gguf_str(g, &pos, &s, "tokenizer.ggml.merges"); // (cannot fail: gguf_parse walked every string)
     }
-    MergeJob mj = { t, g, mo, mid, nmg, max_len, 0 };
+    MergeJob mj = { t, g, mo, mid, nmg, max_len, 0, 0 };
     rq_parallel(merge_worker, &mj);
-    for (long r = 0; r < nmg; r++) {
-        if (mid[r] == -2) gguf_fail(g, "a merge is not in GPT-2 byte-level form%s", NULL);
-        if (mid[r] >= 0 && t->merge_scores[mid[r]] == -999999.0f)
+    int bad = mj.nomem ? 2 : 0;
+    for (long r = 0; r < nmg && !bad; r++) {
+        if (mid[r] == -2) bad = 1;
+        else if (mid[r] >= 0 && t->merge_scores[mid[r]] == -999999.0f)
             t->merge_scores[mid[r]] = -(float)r;
     }
     free(mo);
     free(mid);
+    if (bad == 2) load_fail(g->err, "malloc failed!");
+    if (bad) gguf_fail(g, "a merge is not in GPT-2 byte-level form%s", NULL);
 
     int64_t v;
     if (!gguf_get_int(g, "tokenizer.ggml.eos_token_id", &v) || v < 0 || v >= vocab_size)
@@ -329,9 +313,6 @@ void build_tokenizer_gguf(Tokenizer *t, const Gguf *g, int vocab_size, int enabl
             if (t->vocab_len[t->added[k]] == 13 && !memcmp(t->vocab[t->added[k]], "<|endoftext|>", 13))
                 t->bos_token_id = t->added[k];
     }
-
-    strcpy(t->prompt_template, enable_thinking ? QWEN3_TMPL_USER : QWEN3_TMPL_USER QWEN3_TMPL_NOTHINK);
-    strcpy(t->system_prompt_template, enable_thinking ? QWEN3_TMPL_SYS QWEN3_TMPL_USER : QWEN3_TMPL_SYS QWEN3_TMPL_USER QWEN3_TMPL_NOTHINK);
 }
 
 void free_tokenizer(Tokenizer *t) {
@@ -344,10 +325,7 @@ void free_tokenizer(Tokenizer *t) {
     free(t->added);
 }
 
-char *decode(Tokenizer *t, int token) {
-    // raw token bytes; a code point split over several tokens comes out whole once all are printed
-    return t->vocab[token];
-}
+
 
 // --- pre-tokenizer: Qwen2's Split regex (tokenizer.json, behavior Isolated)
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
@@ -550,6 +528,7 @@ static void nfc_sort_marks(uint32_t *cp, uint16_t *inf, int n, uint32_t *tcp, ui
 }
 
 static unsigned char *nfc_normalize(const unsigned char *p, const unsigned char *q, const unsigned char *end, int *out_len) {
+    // (NULL if out of memory)
     // NFC of [p, end) as a new buffer: [p, q) copied (nfc_check), [q, end) decomposed, its marks
     // put in canonical order and composed. Output <= 3x the bytes, <= 2 code points per byte
     // (both asserted by the table generator)
@@ -557,7 +536,12 @@ static unsigned char *nfc_normalize(const unsigned char *p, const unsigned char 
     uint32_t *cp = malloc(2 * (size_t)cap * sizeof(uint32_t)); // code points, then sort scratch
     uint16_t *inf = malloc(2 * (size_t)cap * sizeof(uint16_t)); // nfc_info of each
     unsigned char *out = malloc((q - p) + 3 * (size_t)nb + 1);
-    if (!cp || !inf || !out) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    if (!cp || !inf || !out) {
+        free(cp);
+        free(inf);
+        free(out);
+        return NULL;
+    }
     int n = 0;
     for (const unsigned char *r = q; r < end;) { // decompose
         int len;
@@ -625,10 +609,10 @@ typedef struct {
     int cap;
 } BpeScratch;
 
-static void bpe_reserve(BpeScratch *s, int n) {
-    // scratch for chunks of up to n bytes
+static int bpe_reserve(BpeScratch *s, int n) {
+    // scratch for chunks of up to n bytes; 0 if out of memory
     if (n < 1) n = 1;
-    if (s->len && n <= s->cap) return;
+    if (s->len && n <= s->cap) return 1;
     free(s->len);
     free(s->heap);
     s->cap = n;
@@ -636,7 +620,15 @@ static void bpe_reserve(BpeScratch *s, int n) {
     s->tok = s->len + n;
     s->prev = s->tok + n;
     s->heap = malloc(3 * (size_t)n * sizeof(BpeCand)); // n-1 initial pairs + 2 per merge
-    if (!s->len || !s->heap) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    if (!s->len || !s->heap) {
+        free(s->len);
+        free(s->heap);
+        s->len = NULL;
+        s->heap = NULL;
+        s->cap = 0;
+        return 0;
+    }
+    return 1;
 }
 
 static inline int cand_before(const BpeCand *a, const BpeCand *b) {
@@ -669,7 +661,7 @@ static BpeCand heap_pop(BpeCand *h, int *n) {
     return top;
 }
 
-static inline void bpe_push(Tokenizer *t, const unsigned char *chunk, BpeScratch *s, int *nh, int a, int b) {
+static inline void bpe_push(const Tokenizer *t, const unsigned char *chunk, BpeScratch *s, int *nh, int a, int b) {
     // symbols a and b are adjacent, so their concatenation is chunk[a .. a + len)
     int len = s->len[a] + s->len[b];
     if ((unsigned int)len > t->max_token_length) return;
@@ -679,7 +671,7 @@ static inline void bpe_push(Tokenizer *t, const unsigned char *chunk, BpeScratch
     heap_push(s->heap, nh, c);
 }
 
-static void bpe_chunk(Tokenizer *t, const unsigned char *chunk, int n, BpeScratch *s, int *tokens, int *n_tokens) {
+static void bpe_chunk(const Tokenizer *t, const unsigned char *chunk, int n, BpeScratch *s, int *tokens, int *n_tokens) {
     if (n == 1) { tokens[(*n_tokens)++] = t->byte_token[chunk[0]]; return; }
     for (int i = 0; i < n; i++) {
         s->len[i] = 1;
@@ -705,16 +697,20 @@ static void bpe_chunk(Tokenizer *t, const unsigned char *chunk, int n, BpeScratc
     for (int i = 0; i < n; i += s->len[i]) tokens[(*n_tokens)++] = s->tok[i];
 }
 
-static void encode_segment(Tokenizer *t, const unsigned char *p, const unsigned char *end, BpeScratch *s, int *tokens, int *n_tokens) {
-    // text between added tokens: NFC, pre-tokenize, then BPE each chunk
+static int encode_segment(const Tokenizer *t, const unsigned char *p, const unsigned char *end, BpeScratch *s, int *tokens,
+                          int *n_tokens) {
+    // text between added tokens: NFC, pre-tokenize, then BPE each chunk; 0 if out of memory
     unsigned char *norm = NULL;
     const unsigned char *q = nfc_check(p, end);
     if (q < end) {
         int n;
         norm = nfc_normalize(p, q, end, &n);
+        if (!norm || !bpe_reserve(s, n)) {
+            free(norm);
+            return 0;
+        }
         p = norm;
         end = norm + n;
-        bpe_reserve(s, n);
     }
     while (p < end) {
         q = pretok_next(p, end);
@@ -722,9 +718,10 @@ static void encode_segment(Tokenizer *t, const unsigned char *p, const unsigned 
         p = q;
     }
     free(norm);
+    return 1;
 }
 
-static int match_added(Tokenizer *t, const unsigned char *p, const unsigned char *end, int *len) {
+static int match_added(const Tokenizer *t, const unsigned char *p, const unsigned char *end, int *len) {
     // longest added token starting at p (t->added is sorted longest first), or -1
     for (int k = 0; k < t->n_added; k++) {
         int id = t->added[k], n = t->vocab_len[id];
@@ -733,26 +730,129 @@ static int match_added(Tokenizer *t, const unsigned char *p, const unsigned char
     return -1;
 }
 
-void encode(Tokenizer *t, char *text, int *tokens, int *n_tokens) {
-    // encode the string text (input) into an upper-bound preallocated tokens[] array of
-    // ENCODE_MAX_TOKENS(strlen(text)) ints
-    const unsigned char *s = (const unsigned char *)text, *end = s + strlen(text);
-    BpeScratch sc = {0};
-    bpe_reserve(&sc, (int)(end - s));
-
+int encode(const Tokenizer *t, const char *text, size_t n, int *tokens, int *n_tokens) {
+    // encode the n bytes at text into an upper-bound preallocated tokens[] array of
+    // ENCODE_MAX_TOKENS(n) ints; RQ_OK, RQ_ERR_ARG (n too large) or RQ_ERR_NOMEM
     *n_tokens = 0;
+    if (n > 0x7fffffff / 4) return RQ_ERR_ARG; // (byte offsets are ints; the NFC output is <= 3n)
+    const unsigned char *s = (const unsigned char *)text, *end = s + n;
+    BpeScratch sc = {0};
+    int ok = bpe_reserve(&sc, (int)(end - s));
     const unsigned char *seg = s;
-    for (const unsigned char *p = s; p < end;) {
+    for (const unsigned char *p = s; p < end && ok;) {
         int len, id = t->added_first[*p] ? match_added(t, p, end, &len) : -1;
         if (id < 0) { p++; continue; }
-        encode_segment(t, seg, p, &sc, tokens, n_tokens);
+        ok = encode_segment(t, seg, p, &sc, tokens, n_tokens);
         tokens[(*n_tokens)++] = id;
         p += len;
         seg = p;
     }
-    encode_segment(t, seg, end, &sc, tokens, n_tokens);
-
+    if (ok)
+        ok = encode_segment(t, seg, end, &sc, tokens, n_tokens);
     free(sc.len);
     free(sc.heap);
+    return ok ? RQ_OK : RQ_ERR_NOMEM;
 }
+
+// ----------------------------------------------------------------------------
+// API (runq.h)
+
+int rq_tokens_push(RqTokens *a, const int *x, int n) {
+    if (n <= 0) return RQ_OK; // (x may be NULL then)
+    if ((size_t)a->n + n > (size_t)a->cap) {
+        size_t cap = a->cap ? (size_t)a->cap : 256;
+        while (cap < (size_t)a->n + n) cap *= 2;
+        if (cap > 0x7fffffff) return RQ_ERR_NOMEM;
+        int *v = realloc(a->v, cap * sizeof(int));
+        if (!v) return RQ_ERR_NOMEM;
+        a->v = v;
+        a->cap = (int)cap;
+    }
+    memcpy(a->v + a->n, x, n * sizeof(int));
+    a->n += n;
+    return RQ_OK;
+}
+
+void rq_tokens_free(RqTokens *a) {
+    free(a->v);
+    a->v = NULL;
+    a->n = a->cap = 0;
+}
+
+int rq_tokenize(const RqModel *m, const char *text, long len, RqTokens *out) {
+    if (!m->has_tok) return RQ_ERR_STATE;
+    size_t n = len < 0 ? strlen(text) : (size_t)len;
+    if (n > 0x7fffffff / 4) return RQ_ERR_ARG;
+    size_t need = (size_t)out->n + ENCODE_MAX_TOKENS(n);
+    if (need > 0x7fffffff) return RQ_ERR_ARG;
+    if (need > (size_t)out->cap) {
+        int *v = realloc(out->v, need * sizeof(int));
+        if (!v) return RQ_ERR_NOMEM;
+        out->v = v;
+        out->cap = (int)need;
+    }
+    int k = 0, e = encode(&m->tok, text, n, out->v + out->n, &k);
+    if (e == RQ_OK) out->n += k;
+    return e;
+}
+
+const char *rq_token_bytes(const RqModel *m, int token, int *len) {
+    // raw token bytes; a code point split over several tokens comes out whole once all are printed
+    if (!m->has_tok || token < 0 || token >= m->tok.vocab_size) {
+        if (len) *len = 0;
+        return "";
+    }
+    if (len) *len = m->tok.vocab_len[token];
+    return m->tok.vocab[token];
+}
+
+int rq_is_end_token(const RqModel *m, int token) {
+    return m->has_tok && (token == (int)m->tok.eos_token_id || token == (int)m->tok.bos_token_id);
+}
+
+static int utf8_need(unsigned char b) {
+    // bytes of the UTF-8 sequence starting with b: 1 (ASCII, or an invalid lead byte: passed on as is)
+    return b >= 0xf0 && b <= 0xf4 ? 4 : b >= 0xe0 && b < 0xf0 ? 3 : b >= 0xc2 && b < 0xe0 ? 2 : 1;
+}
+
+static int detok_emit(RqDetok *d, char *out, size_t cap, int all) {
+    // write the pending bytes up to the last complete (or invalid) character; all: everything
+    size_t n = 0;
+    int i = 0;
+    while (i < d->n) {
+        int k = utf8_need(d->b[i]), j = 1;
+        while (j < k && i + j < d->n && (d->b[i + j] & 0xc0) == 0x80) j++;
+        if (j < k && i + j == d->n && !all) break; // incomplete at the end: wait for the next token
+        if (n + j > cap) return RQ_ERR_ARG;
+        memcpy(out + n, d->b + i, j); // (a complete character, or a broken sequence: its bytes as they are)
+        n += j;
+        i += j;
+    }
+    memmove(d->b, d->b + i, d->n - i);
+    d->n -= i;
+    return (int)n;
+}
+
+int rq_detok_push(const RqModel *m, RqDetok *d, int token, char *out, size_t cap) {
+    int len;
+    const char *s = rq_token_bytes(m, token, &len);
+    size_t n = 0;
+    for (int i = 0; i < len; i++) {
+        if (d->n == (int)sizeof(d->b)) { // (cannot hold more than one incomplete character: flush)
+            int w = detok_emit(d, out + n, cap - n, 1);
+            if (w < 0) return w;
+            n += w;
+        }
+        d->b[d->n++] = (unsigned char)s[i];
+        if (d->n >= 4 || (unsigned char)s[i] < 0x80) { // (emit eagerly: keeps the pending part short)
+            int w = detok_emit(d, out + n, cap - n, 0);
+            if (w < 0) return w;
+            n += w;
+        }
+    }
+    int w = detok_emit(d, out + n, cap - n, 0);
+    return w < 0 ? w : (int)(n + w);
+}
+
+int rq_detok_flush(RqDetok *d, char *out, size_t cap) { return detok_emit(d, out, cap, 1); }
 

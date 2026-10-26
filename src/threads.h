@@ -166,11 +166,12 @@ typedef struct {
     void *mem;
 } RqSync;
 
-static void rq_sync_init(RqSync *s, int nph, int ncnt) {
+static int rq_sync_init(RqSync *s, int nph, int ncnt) {
+    // capacity for jobs of up to nph phases and ncnt dependency counters; 0, or -1 (no memory)
     size_t bytes = (size_t)(nph + 2) * 64 + ((size_t)ncnt * sizeof(int) + 63) / 64 * 64;
     memset(s, 0, sizeof(*s));
     s->mem = aligned_alloc(64, bytes);
-    if (!s->mem) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    if (!s->mem) return -1;
     memset(s->mem, 0, bytes);
     s->ph = (RqPhase *)((char *)s->mem + 128);
     s->ready = (int *)s->mem;
@@ -179,21 +180,23 @@ static void rq_sync_init(RqSync *s, int nph, int ncnt) {
     s->nph = nph;
     s->ncnt = ncnt;
     s->nt = 1;
+    return 0;
 }
 
 static void rq_sync_free(RqSync *s) { free(s->mem); free(s->own); s->mem = NULL; s->own = NULL; }
 
-static void rq_begin(RqSync *s, int nph, int ncnt, int nt, int spin) {
+static int rq_begin(RqSync *s, int nph, int ncnt, int nt, int spin) {
     // before a job (serial): reset the counters of phases 0..nph-1 and dependency counters 0..ncnt-1;
-    // a new epoch invalidates every thread's ranges (all zero again after 65,535 jobs)
-    if (nph > s->nph || ncnt > s->ncnt) { fprintf(stderr, "rq_begin: too many phases / counters\n"); exit(EXIT_FAILURE); }
+    // a new epoch invalidates every thread's ranges (all zero again after 65,535 jobs). 0, or -1 (more
+    // phases / counters than rq_sync_init's capacity: a bug) or -2 (no memory)
+    if (nph > s->nph || ncnt > s->ncnt) return -1;
     memset(s->ph, 0, (size_t)nph * sizeof(RqPhase));
     memset(s->cnt, 0, (size_t)ncnt * sizeof(int));
     __atomic_store_n(s->ready, 0, __ATOMIC_RELAXED);
     if (nt > s->own_nt) {
         free(s->own);
         s->own = aligned_alloc(64, ((size_t)nt * s->nph * 8 + 63) / 64 * 64);
-        if (!s->own) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+        if (!s->own) { s->own_nt = 0; return -2; }
         s->own_nt = nt;
         s->epoch = 0xffff;
     }
@@ -204,6 +207,7 @@ static void rq_begin(RqSync *s, int nph, int ncnt, int nt, int spin) {
     }
     s->nt = nt;
     s->spin = spin;
+    return 0;
 }
 
 // Items of a phase: thread t owns the range [t n / nt, (t + 1) n / nt) (in whole units of `unit`
@@ -323,6 +327,6 @@ int rq_ncpu(void);            // online CPUs
 int rq_ncpu_perf(void);       // Apple Silicon: the performance cores, else 0
 void rq_parallel(RqFn fn, void *ctx); // run fn on every thread of the pool (tid 0 = the caller)
 int rq_nthreads(void);        // threads of a job
-void rq_config(void);         // tuning knobs from the environment (RUNQ_SPIN, RUNQ_SYNC)
+const char *rq_config(void);  // tuning knobs from the environment (RUNQ_SPIN, RUNQ_SYNC); a warning or NULL
 
 #endif // RUNQ_THREADS_H

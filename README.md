@@ -1,6 +1,7 @@
 # cwayn
 
-Personal experiment: running Qwen3-0.6B from plain C on the CPU.
+Personal experiment: running Qwen3-0.6B from plain C on the CPU, and the bigger dense Qwen3 models on the same
+engine (1.7B, 4B, 8B, 4B-Instruct-2507 / Thinking-2507: see Other models).
 The engine is a small C library (`src/runq.h`, see Architecture below) with the `runq` command line on
 top, derived from qwen3.c, and `runq serve`, an OpenAI-compatible HTTP server (see Server below; e.g. the
 LLM judge of LiteLLM's complexity router). Roadmap and status: [TODO.md](TODO.md).
@@ -53,7 +54,7 @@ scripts/export_q8.sh                  # -> models/Qwen3-0.6B-q8.bin (Q8_0, ~630 
 # (or: make models, which runs download + export if the .bin is missing)
 ./runq models/Qwen3-0.6B-q8.bin -c 4096
 
-make test                             # regression suite, ~32 s (tests/README.md)
+make test                             # regression suite, ~30 s (tests/README.md; make test-models: the bigger models)
 make bench                            # thread sweep, prefill/decode tok/s (scripts/bench_qwen3c.sh)
 make bench-prefill                    # prefill tok/s vs prompt length and -b (scripts/bench_prefill.sh)
 scripts/bench_all.sh                  # all runq speed tables of BENCHMARKS.md (~8 min)
@@ -73,7 +74,8 @@ printf 'My name is Ada.\nWhat is my name?\n' | ./runq models/Qwen3-0.6B-q8.bin -
 
 - Each turn prefills only what is new: the `<|im_end|>` that ended the previous answer, `\n`, and
   the next user turn of Qwen3's chat template (`<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n`,
-  plus `<think>\n\n</think>\n\n` with `-r 0`). The `[timing]` line per turn counts those new tokens.
+  plus `<think>\n\n</think>\n\n` with `-r 0`; the 2507 models' variants: Other models). The `[timing]` line per
+  turn counts those new tokens.
 - Thinking (`-r 1`): as in Qwen3's template, earlier answers stay in the history without their
   `<think>...</think>` block: at the next turn the cache is cut back to where the answer started and
   the visible answer is re-prefilled (usually a few dozen tokens; the reasoning is usually much
@@ -105,8 +107,9 @@ All CPUs work too since Step 7a (16 of 16 vCPUs: decode ~140-170 tok/s with othe
 with OpenMP barriers it collapsed to ~2-20), but are not faster on a busy machine. Long prompts: decode
 splits each kv head's attention over threads per 256 positions (3,000 tokens at 12 threads, Q8_0 GGUF:
 ~70 -> ~100 tok/s in Step 7a, ~150 since Step 7b's cache layout and f16). Pass `-c` (context size):
-without it the KV cache is sized for the full 40,960-token context, 4.7 GB of address space (9.4 GB with
-`-k f32`), touched only as far as the conversation goes.
+without it the KV cache is sized for the model's full context, at most 40,960 tokens (Qwen3's; the 2507 models'
+262,144 would be 38.6 GB): 4.7 GB of address space for 0.6B (9.4 GB with `-k f32`), touched only as far as the
+conversation goes.
 
 ## Server (`runq serve`)
 
@@ -151,7 +154,7 @@ prompt, completion and cached prompt tokens (`prompt_tokens_details.cached_token
 has `code: context_length_exceeded`), 401, 404, 405, 411 (chunked uploads), 413, 503 (queue full / shutting
 down), 504. Not supported: tools / function calls, images, `n > 1`, `json_object`, penalties (ignored).
 
-- **Conversation**: rendered with Qwen3's template in the CLI chat's form (`runq -m chat`), so a greedy
+- **Conversation**: rendered with Qwen3's template (the model's variant: Other models) in the CLI chat's form (`runq -m chat`), so a greedy
   request gives the same text as the CLI for the same messages (tested bitwise, also with a seed: the RNG
   draws as the CLI's chat does for a first turn). Earlier assistant messages lose their `<think>` block.
 - **Prefix reuse**: a new request takes the idle slot with the longest common token prefix, truncated
@@ -251,7 +254,7 @@ of a batched pass on the thread pool, each with its own settings: the same token
 loop: prefill, sample, decode; callbacks per token and per logits vector; timing in a struct),
 `rq_tokenize`, `rq_detok_push` (incremental, never splits a UTF-8 character: streaming),
 `rq_chat_render` (system / user / assistant messages in Qwen3's template, thinking on or off, as the
-CLI's chat keeps the conversation). Errors are `RQ_ERR_*` codes (e.g. `RQ_ERR_CONTEXT` for a prompt
+CLI's chat keeps the conversation; the template variant of the model, `RqModelInfo.chat`). Errors are `RQ_ERR_*` codes (e.g. `RQ_ERR_CONTEXT` for a prompt
 longer than the sequence's capacity); the library never prints or exits.
 
 Batched decode (Step 10a): N sequences decoding together, one row each per `rq_forward_batch` pass, share
@@ -311,8 +314,61 @@ same group size, per process.
 | `hf` | `Qwen/Qwen3-0.6B` @ `c1899de` | bf16 safetensors + tokenizer (input for the .bin export, HF test goldens) |
 | `q4km` | `unsloth/Qwen3-0.6B-GGUF` @ `50968a4` | `Qwen3-0.6B-Q4_K_M.gguf` (imatrix; runq loads it directly) |
 | `q8gguf` | `unsloth/Qwen3-0.6B-GGUF` @ `50968a4` | `Qwen3-0.6B-Q8_0.gguf` (runq loads it directly) |
+| `1.7b-q8`, `1.7b-q4km` | `unsloth/Qwen3-1.7B-GGUF` @ `d7f544e` | `Qwen3-1.7B-Q8_0.gguf` (1,834 MB), `-Q4_K_M.gguf` (1,107 MB) |
+| `1.7b-hf` | `Qwen/Qwen3-1.7B` @ `70d244c` | bf16 safetensors + tokenizer (4,079 MB: the HF goldens of the models tests) |
+| `4b-q8`, `4b-q4km` | `unsloth/Qwen3-4B-GGUF` @ `22c9fc8` | `Qwen3-4B-Q8_0.gguf` (4,280 MB), `-Q4_K_M.gguf` (2,497 MB) |
+| `4b-2507i-q4km` | `unsloth/Qwen3-4B-Instruct-2507-GGUF` @ `a06e946` | `Qwen3-4B-Instruct-2507-Q4_K_M.gguf` (2,497 MB) |
+| `4b-2507t-q4km` | `unsloth/Qwen3-4B-Thinking-2507-GGUF` @ `f40adb1` | `Qwen3-4B-Thinking-2507-Q4_K_M.gguf` (2,497 MB) |
+| `8b-q4km` | `unsloth/Qwen3-8B-GGUF` @ `a6adef1` | `Qwen3-8B-Q4_K_M.gguf` (5,028 MB) |
+| `family` (group) | | `1.7b-q8 1.7b-q4km 1.7b-hf 4b-q4km 4b-q8 4b-2507i-q4km 8b-q4km` (21.3 GB) |
 
 Revisions are pinned. Each file is verified by sha256 (LFS files) or git blob sha1 (small files).
+
+## Other models (Step 11)
+
+The Qwen3 dense models share 0.6B's architecture (QK-norm, GQA with 8 kv heads, head_dim 128, NeoX RoPE, SwiGLU,
+the same tokenizer), so the engine runs their GGUF files (Q8_0, Q4_K_M) as they are: the shape, the RoPE theta
+(Qwen3 1e6, the 2507 models 5e6), a tied or untied classifier and the chat template variant come from the file.
+Every path is bit-identical as for 0.6B (batched vs sequential, threads, AVX-512 vs generic, batched decode rows),
+and runq's logits are within its int8 activations of each file's own weights (`make test-models`, tests/README.md).
+Measured 2026-10-26 on the 16-vCPU box (load 14-20, best of 2, interleaved; TODO.md Step 11):
+
+| file | MB | peak RSS (1,500 tok, `-c 4096`) | prefill 451 tok, 8 / 12 thr | decode, 8 / 12 thr | batched decode N=8, 8 / 12 thr | quality |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B Q8_0 | 639 | 0.93 GB | 1,813 / 2,287 tok/s | 207 / 165 | 814 / 910 | ppl 27.60 (HF fp32 27.57) |
+| Qwen3-0.6B Q4_K_M | 397 | 0.67 GB | 1,721 / 2,338 | 278 / 373 | 1,005 / 1,096 | ppl 28.95 |
+| Qwen3-1.7B Q8_0 | 1,834 | 2.1 GB | 790 / 1,013 | 78 / 78 | 381 / 458 | ppl 18.90 (HF 18.84); vs HF cos 0.9994 |
+| Qwen3-1.7B Q4_K_M | 1,107 | 1.4 GB | 680 / 943 | 101 / 112 | 466 / 529 | ppl 19.09 |
+| Qwen3-4B Q8_0 | 4,280 | 4.7 GB | 313 / 412 | 29 / 31 | 157 / 201 | ppl 15.65 |
+| Qwen3-4B Q4_K_M | 2,497 | 2.8 GB | 276 / 385 | 47 / 51 | 177 / 226 | ppl 16.26 |
+| Qwen3-4B-Instruct-2507 Q4_K_M | 2,497 | 2.8 GB | 284 / 401 | 56 / 56 | 173 / 237 | ppl 11.86, no thinking |
+| Qwen3-4B-Thinking-2507 Q4_K_M | 2,497 | 2.8 GB | 280 / 375 | 51 / 58 | 179 / 233 | ppl 13.61, always thinks |
+| Qwen3-8B Q4_K_M | 5,028 | 4.9 GB | 158 / 219 | 30 / 30 | 91 / 119 | ppl 11.53 |
+
+(Perplexity: `scripts/ppl.py bench/ppl_beagle_ch1.txt`, the whole 4,142-token text; decode after a short prompt, 128
+tokens; batched decode: `scripts/bench_batch.sh -N 8 -L 50`, aggregate tok/s; `scripts/bench_models.py` makes the
+rest of the table. Startup 0.1-0.2 s up to 1.7B, ~0.5 s for 4B, ~1 s for 8B. Decode is memory-bound, so it moves
+with the box's load: 8B ranged 12-30 tok/s.)
+
+- Which one: 0.6B for speed (or a weak judge as a two-way splitter); **1.7B Q8_0** as the smallest good LiteLLM judge
+  (88% on the router eval, ~50 ms per classification) and a much better chat model than 0.6B at ~80 tok/s;
+  **4B-Instruct-2507 Q4_K_M** for chat (no thinking, the best 4B on perplexity, as good a judge as 4B: 88-92% at ~130
+  ms); 4B-Thinking-2507 or Qwen3-4B / 8B with `-r 1` for reasoning; 8B Q4_K_M when quality matters more than speed
+  (judge 92%, ~260 ms; ~30 tok/s, 4.9 GB). Q4_K_M is the better trade at 4B / 8B (decode ~1.6x Q8_0 at ~60% of the RAM).
+- Chat templates (detected from the file's `tokenizer.chat_template`, not interpreted): the hybrid Qwen3 one (0.6B ..
+  8B: `-r 0` / `-r 1`), Instruct-2507 (never thinks: `-r 1` is ignored with a note; replies stay verbatim in the
+  history) and Thinking-2507 (always thinks: the prompt ends with `<think>\n`, the chat prints it, `-r 0` is ignored
+  with a note; earlier turns keep only their answers). `runq serve` does the same (Thinking-2507: `reasoning_content`
+  on every reply, except under a `json_schema` constraint, where it gets the hybrid's empty think block, which is not
+  in its template: the router eval's 84% instead of 89% for Instruct-2507). The renderings equal HF's
+  `apply_chat_template` (tests/golden/chat_render.json; runq's documented differences: the hybrid with `-r 0` keeps the
+  empty think block in earlier turns).
+- Context: without `-c`, the model's maximum but at most 40,960 positions (the 2507 models' 262,144 would reserve 38.6
+  GB of KV cache address space; pass `-c` for more). 36-layer models (4B, 8B) take 147 KB per position (f16), 28-layer
+  ones 115 KB.
+- Not supported: other GGUF types (Q5_K_M, Q4_0, the UD files: Q5_K / Q4_1 / IQ4_XS tensors are rejected with a clean
+  error; Q6_K-only files should work, untested), Qwen3-14B and larger (beyond this box's memory, untested), the MoE
+  models (`qwen3moe`), Qwen3-Embedding / Reranker (other outputs), RoPE scaling (YaRN).
 
 GGUF vs .bin: both Q8_0. The GGUF has 32-weight groups with fp16 scales (fp32 once loaded,
 exactly), the .bin 64-weight groups with fp32 scales; runq quantizes the activations to int8 in
@@ -455,6 +511,8 @@ vs the f32 cache +8-10% / +17-22% / +23-29% after 451 / 1,500 / 3,000-token prom
   Q8_0 tests are skipped (file not downloaded); the logits against HF and the batched / thread /
   kernel bit-identity checks pass.
   The goldens need an arm64 re-baseline (`--update-greedy` into a separate file).
-- GGUF: Qwen3 (`general.architecture` qwen3, RoPE theta 1e6, RMSNorm eps 1e-6) with the gpt2 /
-  qwen2 tokenizer only; `tokenizer.chat_template` (Jinja) is not interpreted, Qwen3's templates
-  are built in.
+- GGUF: Qwen3 (`general.architecture` qwen3: the dense models, any RoPE theta without scaling, RMSNorm eps 1e-6)
+  with the gpt2 / qwen2 tokenizer only; `tokenizer.chat_template` (Jinja) is not interpreted: Qwen3's templates are
+  built in, the variant (hybrid / Instruct-2507 / Thinking-2507) is detected from it (Other models).
+- The Step 11 fixes (RoPE theta, rmsnorm, the untied embedding) are shared C code, but untested on the Mac (NEON,
+  clang): its goldens need a re-run.

@@ -33,6 +33,11 @@ Continuous batching (Step 10b): `runq serve` runs every request in one batched p
 alone: 0.6B, 12 threads, 128-token replies, 16 clients ~1,185 / 1,223 tok/s in aggregate (Q4_K_M / Q8_0; one at
 a time before: ~300 / ~200), time to first token ~0.1 s (was 3.5-5.7 s); LiteLLM-judge-like load 1.3-1.4x
 (prefill-bound); streams keep flowing (<= ~70-90 ms gaps) while a 2,000-token prompt is prefilled.
+Other models (Step 11): Qwen3-1.7B, 4B, 8B, 4B-Instruct-2507 / Thinking-2507 (GGUF Q8_0 / Q4_K_M) run, bit-identical on
+every path and within their int8 activations of their own dequantized weights (1.7B Q8_0 vs HF: pooled cos 0.9994);
+fixed: 8B's untied Q4_K embedding (NaN), RoPE theta from the GGUF (2507: 5e6), rmsnorm's reciprocal (4B: batched !=
+sequential), the 2507 chat templates (detected from the GGUF), the default context (at most 40,960). 8 threads: 1.7B
+Q4_K_M ~680 / ~100 tok/s prefill / decode, 4B Q4_K_M ~280 / ~47, 8B Q4_K_M ~160 / ~30 (RSS 1.4 / 2.8 / 4.9 GB).
 
 Status: `[ ]` todo · `[~]` in progress · `[x]` done
 
@@ -1529,6 +1534,204 @@ unchanged. Before (Step 9): one engine thread ran one Job at a time from a FIFO 
   subset classifier); `json_object` / free strings in schemas; logprobs with streaming; per-request priorities;
   the HTTP layer is one thread per connection (fine up to `--max-conns` 128)
 
+## Step 11: other models (the Qwen3 dense family)
+Goal: the bigger Qwen3 models that share the engine's architecture (QK-norm, GQA, NeoX RoPE, SwiGLU) run, correctly
+and bit-identically on every path, without changing a 0.6B bit. Before (the frozen pre-Step-8 binary, research in a
+scratch session): Qwen3-1.7B and 4B ran, but 4B's batched prefill != sequential != generic (1-cos ~2e-4); 8B Q4_K_M
+printed `!!!!` (every logit NaN); 4B-Instruct-2507 was rejected at load (`qwen3.rope.freq_base must be 1e6`), and with
+that fixed its default `-r 0` was off its template.
+- [x] Research (HF API, pinned revisions; `scripts/download_models.py`, `2ce78aa`): the family has 0.6B's shape apart
+  from the sizes; one `tokenizer.json` (and identical GGUF tokenizer metadata) for all, eos 151645 / bos 151643, vocab
+  151,936, head_dim 128, 8 kv heads, RMSNorm eps 1e-6, no RoPE scaling (2507 too: its 262,144 context is native):
+
+  | model (repo @ rev) | layers | dim | heads / kv | q dim | ffn | theta | ctx | tied | chat template |
+  |---|---|---|---|---|---|---|---|---|---|
+  | Qwen3-0.6B | 28 | 1024 | 16 / 8 | 2048 | 3072 | 1e6 | 40960 | yes | hybrid (`enable_thinking`) |
+  | Qwen3-1.7B @ 70d244c | 28 | 2048 | 16 / 8 | 2048 | 6144 | 1e6 | 40960 | yes | = 0.6B's |
+  | Qwen3-4B @ 1cfa9a7 | 36 | 2560 | 32 / 8 | 4096 | 9728 | 1e6 | 40960 | yes | = 0.6B's |
+  | Qwen3-8B @ b968826 | 36 | 4096 | 32 / 8 | 4096 | 12288 | 1e6 | 40960 | **no** | = 0.6B's |
+  | Qwen3-4B-Instruct-2507 @ cdbee75 | 36 | 2560 | 32 / 8 | 4096 | 9728 | **5e6** | **262144** | yes | **no thinking** |
+  | Qwen3-4B-Thinking-2507 @ 768f209 | 36 | 2560 | 32 / 8 | 4096 | 9728 | **5e6** | **262144** | yes | **always thinking** |
+
+  GGUF files (Unsloth, as for 0.6B; Qwen has no 2507 GGUFs and only Q8_0 for 1.7B): Q8_0 files are Q8_0 throughout;
+  Q4_K_M files Q4_K with Q6_K `attn_v` / `ffn_down` in half the layers and a Q6_K `token_embd` (tied), except 8B: a
+  **Q4_K `token_embd`** and a Q6_K `output.weight`. Q5_K_M, Q4_0, UD-Q4_K_XL use Q5_K / Q4_0 / Q4_1 / IQ4_XS (not
+  supported). Skipped: Qwen3-14B (~9 GB at Q4_K_M), the MoE models (`qwen3moe`), Qwen3-Embedding / Reranker (vocab
+  151,669, pooled / yes-no outputs: another output mode). Downloaded (`scripts/download_models.py family` +
+  `4b-2507t-q4km`): 1.7B HF bf16 (4.1 GB, for HF goldens) + Q8_0 + Q4_K_M, 4B Q8_0 + Q4_K_M, 4B-Instruct-2507 and
+  Thinking-2507 Q4_K_M, 8B Q4_K_M: ~23.8 GB (16 GB left on the disk)
+- [x] Fixes (`fb2b9fb`), each without changing a 0.6B output (`tests/compare_bins.sh`, below):
+  - **Untied K-quant embedding** (8B): `embed_row` chose the K-quant dequantization by `t->kp` (the repacked
+    layout), which only the matmul weights get; a tied table got it as the classifier, an untied one never, so its
+    Q4_K rows were decoded as Q8_0 blocks (fp16 scale + 32 int8: garbage, NaN). Now by the tensor's type (blocks in
+    the file and not Q8_0). Untied Q8_0 tables were right before (that path)
+  - **RoPE theta from the GGUF** (`qwen3.rope.freq_base`, 1e3..1e9; the .bin keeps 1e6), per model
+    (`RqModel.rope_log_theta`, passed to `rope_row`, so models of different theta can share a process). gcc -Ofast
+    compiled the constant `powf(1e6, x)` into a vectorized `expf(x * ln 1e6)`; a variable base becomes the vector
+    `powf` (other bits from position 1 on). Written as `expf(log_theta * x)` with `log_theta = (float)ln(theta)`: the
+    same bits for 1e6 in every path (decode, `prefill_worker`, `batch_decode_worker`; AVX-512 and generic)
+  - **rmsnorm's `ss / size`** (4B): under -Ofast (reciprocal math) gcc multiplies by a hoisted `1 / size` where
+    rmsnorm is inlined into a per-row loop (the batched passes) but divides in the single decode call: the same for
+    power-of-two sizes, 1 ulp apart in some rows for 2560 (data-dependent; bisected to layer 4's ffn norm on one prompt).
+    Now `ss * (1.0f / size)` everywhere (exact = the old bits for 1024 / 2048 / 4096)
+  - **Chat template variants** (below), **the default context** (below), `runq serve` loading with its `-c` (the cap
+    would clamp a larger one), the server's startup line (context of the model's, chat template variant)
+  - From the audit (no family model triggers them): the decode buffers `xb` / `xq` sized for max(dim, q dim) (were q
+    dim: a model with dim > q dim would overflow; Qwen3's q dim is >= dim everywhere); the batched decode classifier's
+    last partial 16-row block (vocab % 16 != 0 dropped rows; only possible on the generic kernels)
+- [x] Audit of the 0.6B-only assumptions (each checked in the code and on the models, bitwise tests below):
+  - Divisions by a runtime dimension under -Ofast (the rmsnorm hazard): rmsnorm (all workers and QK-norm use the one
+    function: fixed); RoPE's `j / (head_dim / 2)` (64 for every Qwen3: exact either way); the attention scale
+    (`1 / sqrt(head_dim)`, computed once per model); quantize (`127 / wmax`, `wmax / 127`: not a dimension; the group
+    size GS is an integer); softmax / temperature / top-p cutoff `(1 - p) / (n - 1)` (all in the one noinline
+    `sample()`, n = vocab, the same for the family); K-quant code and the attention: integer divisions only, the fp32
+    `1 / sum` / `1 / L` once per vector. No other float division by a dimension
+  - Shapes: K-quant columns % 256 (2560 = 10 x 256, 9728 = 38 x 256: ok), rows % 16; `ff_rows` 64 divides every ffn
+    width; head_dim % 32; GQA 4 (4B / 8B: `kv_mul` 4, prefill attention items of 6 rows x 4 heads = 24 <= 64 vectors,
+    decode 4 per kv head, batched-decode q / k / v items 12 per kv head); 36 layers (phase / counter capacities scale
+    per layer); kv_dim 1024 everywhere (115 KB per position for 28 layers, 147 KB for 36); `xs` = max(dim, q dim) per
+    batched row (4B: q dim 4096 > dim 2560); B_MAX scratch per row; small-batch kernels: any k % 256, 16-row blocks;
+    thread partitioning in 16-row blocks / per-thread ranges; the size_t KV offsets (36 x 262,144 x 1,024 > 2^31 ok).
+    The process-wide group size (Step 8) does not bite: every GGUF has 32, only the .bin 64
+- [x] Chat templates (`gguf_chat_variant`): the variant from the Jinja source in `tokenizer.chat_template` (not
+  interpreted; HF's and Unsloth's rewrites alike): `enable_thinking` -> **hybrid** (as before); a generation prompt
+  `'<|im_start|>assistant\n<think>\n'` -> **thinking** (Thinking-2507); another ChatML template -> **instruct**
+  (Instruct-2507: no think block ever); absent / not ChatML -> hybrid. `RqModelInfo.chat`, `rq_chat_name`.
+  Rendering: instruct: the user turn without the empty think block in both modes, replies verbatim in the history (as
+  its template); thinking: the user turn ends with `<think>\n` (the reply starts inside the reasoning, no opening tag),
+  an answered turn loses it (`rq_chat_user_history`, new: HF renders earlier assistant turns as `assistant\n` + the
+  answer; the CLI re-prefills from the answer anyway, as with the hybrid's `-r 1`); with thinking off (only `runq serve`
+  under a JSON-schema constraint) the hybrid's empty think block, which is not in its template. `rq_chat_assistant`
+  (new): the generation prompt alone (`runq serve`'s sequences that `rq_chat_user` cannot express). CLI: `-r 1` on an
+  Instruct-2507 model is ignored with a note, `-r 0` on Thinking-2507 too (it always thinks; the chat prints the
+  `<think>\n` the prompt opened). `runq serve`: Instruct-2507 never returns `reasoning_content`; Thinking-2507 always
+  thinks (`reasoning_content`, the reply starts in it) unless the request is constrained. Checked against HF's
+  `apply_chat_template` with the three HF templates: 23 of 30 cases equal (single / multi-turn, system prompt, an
+  earlier reply with reasoning, Unicode; thinking on and off), the other 7 are runq's documented forms (the hybrid
+  with thinking off keeps the empty think block and earlier replies verbatim, as the CLI keeps them in the cache;
+  Thinking-2507 with thinking off); the GGUFs' own (Unsloth) templates give the same variant on all 7 files
+- [x] Default context: `-c 0` (and `RqModelOpts.ctx_len` 0) = the model's maximum, at most `RQ_CTX_DEFAULT_MAX` 40,960
+  (Qwen3's own maximum, so no default changes for 0.6B .. 8B; the 2507 models' 262,144 reserved 38.6 GB of KV address
+  space per sequence, 5.9 GB now). An explicit `-c` up to the model's maximum is taken as given. `runq serve` sizes its
+  pool from the model's KV bytes per position (115 KB for 28 layers, 147 KB for 36): at the default `-c 8192` and
+  `--kv-mem` 15.3 GiB, 4B / 8B get 13 slots (1.12 GiB each) and 13 running requests at most
+- [x] Correctness per model (`tests/check_models.py`, group `models`; logits at `-b 64` on en / code / chat at every
+  position + long2 at positions 248..296 step 8, 61 positions, cos over a 1,024-id subset + the reference's top 64):
+
+  | file | vs | pooled cos (pos >= 1) | per-prompt cos mean | worst position | top-1 |
+  |---|---|---|---|---|---|
+  | 1.7B Q8_0 | HF fp32 | 0.99944 | 0.9987-0.9998 | 0.9957 | 59/61 |
+  | 1.7B Q8_0 | its dequantized weights (fp32) | 0.99968 | 0.9991-0.9999 | 0.9973 | 58/61 |
+  | 1.7B Q4_K_M | HF fp32 | 0.97929 | 0.928 (en) / 0.989-0.998 | 0.280 (en pos 8) | 57/61 |
+  | 1.7B Q4_K_M | its dequantized weights | 0.99974 | 0.9994-0.9999 | 0.9978 | 60/61 |
+  | (1.7B Q4_K_M reference) | HF fp32 | 0.96739 | 0.890 (en) / 0.977-0.997 | -0.137 (en pos 8) | 56/61 |
+  | 4B Q8_0 | its dequantized weights | 0.99973 | 0.9989-0.9999 | 0.9966 | 61/61 |
+  | 4B Q4_K_M | its dequantized weights | 0.99940 | 0.9967-0.9998 | 0.9783 (long2 pos 248; -k f32 0.983) | 61/61 |
+  | 4B-Instruct-2507 Q4_K_M | its dequantized weights | 0.99988 | 0.9998-0.9999 | 0.9992 | 60/61 |
+  | 4B-Thinking-2507 Q4_K_M | its dequantized weights | 0.99984 | 0.9996-1.0000 | 0.9980 | 58/61 |
+  | 8B Q4_K_M | its dequantized weights | 0.99984 | 0.9996-0.9999 | 0.9990 | 61/61 |
+
+  The reference: `tests/ref_forward.py`, a numpy fp32 forward pass on the file's weights dequantized with ggml's
+  expressions (`tests/ggufmini.py`, bit-identical to gguf-py), layer by layer (the 4B / 8B fp32 models, 16 / 33 GB,
+  would not fit; ~1 GB peak); on 0.6B Q4_K_M it reproduces `golden/logits_q4` (HF with the dequantized weights) to the
+  goldens' float16 rounding. So runq vs its own weights is within its int8 activations for every model, as for 0.6B
+  (Q4_K_M vs its reference 2.9e-4 there). Earlier, on the 5 logits prompts (84 positions; research session): 1.7B Q8_0
+  vs HF 1-cos 7.6e-4, top-1 82/84; Q4_K_M vs HF 2.3e-2 / 78. The Q4 per-position problem: on 1.7B Q4_K_M "en"
+  position 8 the reference itself has cos -0.137 vs HF (the whole logit vector shifted, top-1 still right), so vs HF
+  only means are bounded for Q4_K_M (thresholds and their measurement: tests/README.md). Perplexity
+  (`scripts/ppl.py bench/ppl_beagle_ch1.txt`, 4,142 tokens, full / 512-token windows):
+
+  | | full | win512 |
+  |---|---|---|
+  | HF fp32 0.6B / runq 0.6B Q8_0 GGUF / Q4_K_M | 27.571 / 27.602 / 28.947 | 31.984 / 32.025 / 34.198 |
+  | HF fp32 1.7B / runq 1.7B Q8_0 / Q4_K_M | 18.837 / 18.902 (+0.35%) / 19.091 (+1.35%) | 20.864 / 20.931 / 21.344 |
+  | runq 4B Q8_0 / Q4_K_M | 15.652 / 16.263 (+3.9%) | 19.658 / 20.019 |
+  | runq 4B-Instruct-2507 Q4_K_M (theta forced to 1e6: 12.332 / 14.321) | 11.855 | 13.941 |
+  | runq 4B-Thinking-2507 Q4_K_M | 13.605 | 15.511 |
+  | runq 8B Q4_K_M | 11.534 | 13.406 |
+
+  (All but Thinking-2507 measured in the research session with a scratch build of the three fixes, whose logits are
+  byte-identical to this build's on 1.7B Q8_0, 4B Q4_K_M, 4B-Instruct-2507 and 8B: checked.)
+- [x] Bitwise, every model (group `models`): `-b 7` / `-b 64` / all `-b 64` vs `-b 1` (the decode path), long2 `-b 512`
+  vs `-b 64` (297 tokens, past one attention block), 8 vs 3 threads, AVX-512 vs generic (`-b 1` GEMV, `-b 7` GEMM),
+  `api_test` on the file (24 checks: sequences interleaved / batched / truncated == alone, batched decode rows N = 1..17
+  incl. positions 248-260 == `rq_decode`, mixed passes, sampling): all identical on all 7 files (after the rmsnorm fix;
+  4B's three paths differed before). `runq serve`'s greedy completion == the CLI's text on each
+- [x] Tests: group **synth** in `make test` (`tests/make_synth.py`: a 3-layer GGUF cut out of 0.6B Q4_K_M with dim 768,
+  8 / 2 heads, ffn 1280, an untied Q4_K embedding + Q6_K classifier, theta 5e6, context 262,144 and the Instruct-2507
+  template, plus tokenizer-only files with the three HF templates; 45 checks: logits vs the numpy reference, batched /
+  threads / generic bitwise, api_test, the chat renderings vs `golden/chat_render.json`). Breakage (scratch builds):
+  each of the three bugs fails it (rmsnorm `ss / size`: 4 batched + 3 kernels checks; the embedding by `kp`: NaN;
+  theta 1e6: the reference checks, cos 0.98 / 0.87 / 0.62). `make test` 430 -> 475 checks, 28.6-29.8 s vs 26.6-28.0 s
+  without the group (interleaved, load 8-34; after cutting its CPU: numpy's BLAS spun 8 threads, ~20 core-s; one
+  render process per template file instead of 30; no generic api digests). Group **models** (opt-in:
+  `tests/run_tests.sh --models` / `make test-models`): 199 checks on the 7 files in ~4.5 min alone, ~7 min next to compare_bins (details:
+  tests/README.md); goldens in `tests/golden/models` (~1.1 MB: 1.7B HF fp32 via `make_golden.py --model-dir`, the
+  dequantized-weights references via `tests/make_model_ref.py`, greedy texts). `-m render` (new hook: the token ids of
+  `rq_chat_render` for JSON messages, tokenizer only). ASan + UBSan (scratch): `-m render` (incl. malformed JSON), chat
+  with `RUNQ_CHAT_DUMP` on the synth model, a 2-turn sampled chat on 4B-Thinking-2507, api_test on the synth model: no
+  reports
+- [x] Speed (`scripts/bench_models.py`, new: per file prefill of a 451- / 1,500-token chat prompt, decode of 128 tokens
+  after a short prompt / after the 1,500, peak RSS of the 1,500-token run at `-c 4096`, startup = `-n 1 -i hi` wall
+  time; best of 2 rounds, models interleaved, load 14-20, 2026-10-26; tok/s):
+
+  | file | MB | threads | prefill 451 / 1,500 | decode short / after 1,500 | peak RSS | startup |
+  |---|---|---|---|---|---|---|
+  | 0.6B Q8_0 | 639 | 8 / 12 | 1,813 / 1,410, 2,287 / 1,927 | 207 / 156, 165 / 168 | 926 MB | 0.09 / 0.07 s |
+  | 0.6B Q4_K_M | 397 | 8 / 12 | 1,721 / 1,311, 2,338 / 1,800 | 278 / 209, 373 / 236 | 667 MB | 0.08 / 0.07 s |
+  | 1.7B Q8_0 | 1,834 | 8 / 12 | 790 / 684, 1,013 / 958 | 78 / 74, 78 / 70 | 2,103 MB | 0.20 s |
+  | 1.7B Q4_K_M | 1,107 | 8 / 12 | 680 / 628, 943 / 878 | 101 / 105, 112 / 113 | 1,366 MB | 0.18 / 0.14 s |
+  | 4B Q8_0 | 4,280 | 8 / 12 | 313 / 277, 412 / 399 | 29 / 30, 31 / 38 | 4,655 MB | 0.64 / 0.66 s |
+  | 4B Q4_K_M | 2,497 | 8 / 12 | 276 / 250, 385 / 366 | 47 / 45, 51 / 56 | 2,787 MB | 0.52 / 0.42 s |
+  | 4B-Instruct-2507 Q4_K_M | 2,497 | 8 / 12 | 284 / 253, 401 / 358 | 56 / 48, 56 / 53 | 2,773 MB | 0.52 / 0.43 s |
+  | 4B-Thinking-2507 Q4_K_M | 2,497 | 8 / 12 | 280 / 252, 375 / 356 | 51 / 44, 58 / 56 | 2,774 MB | 0.49 / 0.43 s |
+  | 8B Q4_K_M | 5,028 | 8 / 12 | 158 / 149, 219 / 213 | 30 / 25, 30 / 28 | 4,917 MB | 1.05 / 0.90 s |
+
+  Prefill per weight is flat across sizes (~1.1-1.2 G weight-rows/s at 8 threads); decode is bandwidth-bound (4B Q4_K_M
+  reads 2.55 GB per token: ~120 GB/s at 47 tok/s; 8B 4.8 GB: ~145 GB/s at 30) and so swings most with the box's load
+  (the research session saw 8B at 12.6-29 tok/s). Batched decode (`scripts/bench_batch.sh -N 1,8,16 -L 50`, aggregate
+  tok/s, 32 steps x 3 reps, load 6.5-12.7):
+
+  | file | 8 threads N=1 / 8 / 16 | 12 threads N=1 / 8 / 16 |
+  |---|---|---|
+  | 0.6B Q8_0 | 148 / 814 / 1,093 | 190 / 910 / 1,249 |
+  | 0.6B Q4_K_M | 241 / 1,005 / 1,092 | 279 / 1,096 / 1,248 |
+  | 1.7B Q8_0 | 77 / 381 / 491 | 82 / 458 / 647 |
+  | 1.7B Q4_K_M | 104 / 466 / 487 | 128 / 529 / 650 |
+  | 4B Q8_0 | 35 / 157 / 204 | 39 / 201 / 266 |
+  | 4B Q4_K_M | 39 / 177 / 202 | 57 / 226 / 276 |
+  | 4B-Instruct-2507 Q4_K_M | 42 / 173 / 205 | 56 / 237 / 277 |
+  | 4B-Thinking-2507 Q4_K_M | 41 / 179 / 202 | 53 / 233 / 281 |
+  | 8B Q4_K_M | 28 / 91 / 108 | 28 / 119 / 148 |
+
+  N = 8 gives 4-5x the single-sequence rate for every size (the weights are read once per pass); at 16 the K-quant
+  models are compute-bound at 8 threads (as 0.6B in Step 10a), 12 threads help
+- [x] Judge quality (`scripts/eval_router.py`, LiteLLM 1.105's classifier request, 80 prompts, 8 threads; the Step 9
+  table has 0.6B / 1.7B / 4B): accuracy legacy / chat / agentic / business rubric, latency first / median (legacy):
+
+  | model | legacy | chat | agentic | business | p(gold), legacy | latency |
+  |---|---|---|---|---|---|---|
+  | Qwen3-1.7B Q8_0 (Step 9) | 88% | 82% | 86% | 79% | 0.84 | 399 / 51 ms |
+  | Qwen3-4B Q4_K_M (Step 9) | 91% | 88% | 92% | 79% | 0.90 | 963 / 139 ms |
+  | Qwen3-4B-Instruct-2507 Q4_K_M | 89% | 88% | 92% | 75% | 0.88 | 935 / 127 ms |
+  | Qwen3-4B-Thinking-2507 Q4_K_M | 84% | 80% | 85% | 74% | 0.84 | 959 / 143 ms |
+  | Qwen3-8B Q4_K_M | 92% | 88% | 92% | 80% | 0.91 | 1,694 / 259 ms |
+
+  Instruct-2507 is as good a judge as 4B (and a little faster: no think block in the prompt); Thinking-2507, made to
+  answer with an empty think block it was not trained with, is worse; 8B gains 1 point at twice the latency. Every
+  rubric's errors are within one tier 97.5-100% of the time; business again puts REASONING prompts in COMPLEX (20-40%
+  REASONING recall). For a router: 1.7B Q8_0 if latency matters (~50 ms), else 4B (-Instruct-2507) Q4_K_M (~130 ms)
+- [x] Verification: `tests/compare_bins.sh -j 4 /tmp/cwref .` (360 jobs vs the pre-Step-8 binaries): identical except
+  the usage text of the error cases (16 jobs: the `-c`, `-m render`, `-r` help lines), after each commit; the batched
+  passes of `api_test --digest --long --n65` (decode-rows worker, mixed passes, 65 rows) on the .bin, Q8_0 and Q4_K_M
+  0.6B files: the same 13 digests as the Step 10b build; `make test` green (475, 29-31 s);
+  `tests/run_tests.sh --models` green (199)
+- Open: the NEON (Mac) paths of the fixes are untested (forward.c is shared, so the same code; the theta form and the
+  rmsnorm reciprocal under clang's `-ffast-math` need a run of the Mac goldens); other quant types (Q5_K: Q5_K_M and
+  the UD files; Q4_0 / Q4_1; IQ4_XS) and F16 / BF16 weights; Qwen3-14B and larger (memory here), the MoE models, the
+  Embedding / Reranker models (an output mode); YaRN RoPE scaling (contexts past 40,960 for the hybrid models, 262,144
+  for 2507); per-model sampling defaults (2507: temperature 0.7, top-p 0.8, top-k 20; runq has no top-k)
+
 ## Known bugs
 Found by the tests.
 - [x] Tokenizer: no NFC normalizer (HF's tokenizer.json normalizer is NFC); the input was assumed
@@ -1578,11 +1781,22 @@ this box runs 1.105.0 (`/opt/litellm/venv-1.105.0`; never touch the running prox
 - [x] Step 10b: continuous batching in `runq serve` (a scheduler: every running job's decode row and prompt
   chunks in one pass per step, a slot pool with prefix reuse / copies, benchmarks, bit-identity tests): done,
   see above
-- [ ] Step 11 (next): other models that should run on this engine (Qwen3 dense family: 1.7B, 4B, 8B; other
-  GGUF quant types of them), pinned downloads, correctness vs HF, speed. (`runq serve` open items after Step 10b:
-  the end of its section: paged / shared KV, priorities, the subset classifier, json_object)
+- [x] Step 11: other models that run on this engine (Qwen3 dense family: 1.7B, 4B, 8B, 4B-Instruct-2507 /
+  Thinking-2507; Q8_0 and Q4_K_M), pinned downloads, fixes (untied K-quant embedding, RoPE theta, rmsnorm's
+  reciprocal, chat template variants, default context), correctness vs HF / the dequantized weights, bitwise on every
+  path, tests (synth in make test, models opt-in), speed, judge quality: done, see above
+- [ ] Next (not planned yet): `runq serve` open items after Step 10b (the end of its section: paged / shared KV,
+  priorities, the subset classifier, json_object); more GGUF types (Q5_K, Q4_0, IQ4_XS) for the family's other files;
+  a run of the Mac goldens after Step 11 (below)
 
 ## Later / ideas
+- [ ] Other GGUF quant types (Step 11): Q5_K (Q5_K_M and the Unsloth UD files), Q6_K-only files (should work: untested),
+  Q4_0 / Q4_1, IQ4_XS, F16 / BF16 weights; each needs its block format, repacked layout and kernels (kquants.h)
+- [ ] NEON / macOS after Step 11: the theta form `expf(ln(theta) * x)` and rmsnorm's explicit reciprocal are shared C
+  code, untested under clang `-ffast-math` (re-run the Mac goldens, `make kq-neon-test`, and the synth group there)
+- [ ] YaRN RoPE scaling (Qwen3 up to 131,072 tokens, documented by Qwen; the 2507 models need none up to 262,144);
+  top-k sampling and per-model sampling defaults from the GGUF / generation_config (2507: 0.7 / 0.8 / top-k 20)
+- [ ] Qwen3-Embedding / Reranker (0.6B: same architecture, vocab 151,669): a pooled-embedding / yes-no score output mode
 - [x] 16-thread collapse: phase synchronization that waits for the work, not for every thread, on a
   thread pool, spin then futex (Step 7a)
 - [x] 16-bit K/V cache (Step 7b: f16 default, bf16; the arithmetic stays fp32 on converted values).

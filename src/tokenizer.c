@@ -810,6 +810,12 @@ int rq_is_end_token(const RqModel *m, int token) {
     return m->has_tok && (token == (int)m->tok.eos_token_id || token == (int)m->tok.bos_token_id);
 }
 
+int rq_token_is_added(const RqModel *m, int token) {
+    // (as tokenizer_index classifies them: longer than a byte, produced by no merge)
+    return m->has_tok && token >= 0 && token < m->tok.vocab_size && m->tok.vocab_len[token] > 1 &&
+           m->tok.merge_scores[token] <= -1e6f;
+}
+
 static int utf8_need(unsigned char b) {
     // bytes of the UTF-8 sequence starting with b: 1 (ASCII, or an invalid lead byte: passed on as is)
     return b >= 0xf0 && b <= 0xf4 ? 4 : b >= 0xe0 && b < 0xf0 ? 3 : b >= 0xc2 && b < 0xe0 ? 2 : 1;

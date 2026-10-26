@@ -427,7 +427,10 @@ static void error_usage(void) {
     exit(EXIT_FAILURE);
 }
 
+int serve_main(int argc, char **argv); // serve.c: `runq serve <checkpoint> ...` (the HTTP server)
+
 int main(int argc, char *argv[]) {
+    if (argc >= 2 && !strcmp(argv[1], "serve")) return serve_main(argc - 1, argv + 1);
     // default parameters
     char *checkpoint_path = NULL;  // e.g. out/model.bin
     float temperature = 1.0f;   // 0 = greedy deterministic. 1.0 = original. don't set higher

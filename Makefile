@@ -22,6 +22,8 @@ LDLIBS  += -lm -lpthread
 # the library modules (runq.h) and the CLI; each module is its own translation unit, all numeric code
 # of the forward passes is in forward.c (README.md, Architecture)
 LIB = model gguf forward tokenizer sampler chat threads
+# runq serve (an OpenAI-compatible HTTP server; serve.h): linked into the runq binary, not part of the library
+SRV = json constrain http engine serve
 HDR = $(wildcard src/*.h)
 Q8  = models/Qwen3-0.6B-q8.bin
 B   = build
@@ -46,16 +48,16 @@ $(B)/generic/%.o: src/%.c $(HDR) $(B)/generic/.flags
 $(B)/debug/%.o: src/%.c $(HDR) $(B)/debug/.flags
 	$(CC) $(DBGFLAGS) $(CPPFLAGS) -c $< -o $@
 
-runq: $(LIB:%=$(B)/native/%.o) $(B)/native/cli.o
+runq: $(LIB:%=$(B)/native/%.o) $(SRV:%=$(B)/native/%.o) $(B)/native/cli.o
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
-runq-debug: $(LIB:%=$(B)/debug/%.o) $(B)/debug/cli.o
+runq-debug: $(LIB:%=$(B)/debug/%.o) $(SRV:%=$(B)/debug/%.o) $(B)/debug/cli.o
 	$(CC) $(DBGFLAGS) $^ $(LDLIBS) -o $@
 
 # Same flags, but the generic C kernels instead of the AVX-512 VNNI ones (kernels_avx512.h);
 # `make test` checks that both give bit-identical logits. (On a CPU without AVX-512 VNNI,
 # plain `make` already builds the generic kernels: the selection is at compile time.)
-runq-generic: $(LIB:%=$(B)/generic/%.o) $(B)/generic/cli.o
+runq-generic: $(LIB:%=$(B)/generic/%.o) $(SRV:%=$(B)/generic/%.o) $(B)/generic/cli.o
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
 debug: runq-debug

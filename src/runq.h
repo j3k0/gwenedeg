@@ -154,6 +154,7 @@ void rq_tokens_free(RqTokens *t);
 int rq_tokenize(const RqModel *m, const char *text, long len, RqTokens *out);
 const char *rq_token_bytes(const RqModel *m, int token, int *len); // raw bytes (NUL-terminated too)
 int rq_is_end_token(const RqModel *m, int token);                   // eos or bos
+int rq_token_is_added(const RqModel *m, int token);                 // an added token (<|im_end|>, <think>, ...)
 
 // Incremental detokenization for streaming: rq_detok_push appends a token's bytes and writes the
 // part that ends at a UTF-8 character boundary (a character split over tokens comes out whole once

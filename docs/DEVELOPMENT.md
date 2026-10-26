@@ -2,15 +2,16 @@
 
 Details moved out of the [README](../README.md) when the project (then called cwayn) was prepared for
 publication: what changed relative to qwen3.c, the 0.6B file comparison, chat / KV cache / thread details,
-benchmark notes and the platform test status. The step-by-step history with every measurement is
-[TODO.md](../TODO.md). "The box" / "the dev box" is the development machine: a shared 16-vCPU AMD EPYC
-Genoa (Zen 4) KVM VM (see [BENCHMARKS.md](../BENCHMARKS.md), Setup).
+benchmark notes, the platform test status, and design notes with the experiments that were measured and not
+kept. "Step N" refers to the development log ([History](#history)); open work is in [TODO.md](../TODO.md).
+"The box" / "the dev box" is the development machine: a shared 16-vCPU AMD EPYC Genoa (Zen 4) KVM VM (see
+[BENCHMARKS.md](../BENCHMARKS.md), Setup).
 
 ## Qwen3-0.6B: which file to use
 
 The GGUF file is all runq needs: weights, hyperparameters, tokenizer (from its metadata) and the
 chat templates (built in). The Q4_K_M GGUF (`scripts/download_models.py q4km`, 397 MB) works the same
-way. Which file to use (measured 2026-10-25 on the 16-vCPU dev box, TODO.md Steps 6a, 6b-1, 6b-2, 7a, 7b):
+way. Which file to use (measured 2026-10-25 on the 16-vCPU dev box, Steps 6a, 6b-1, 6b-2, 7a, 7b):
 
 | | Q8_0 GGUF (639 MB) | Q4_K_M GGUF (397 MB) | Q8_0 .bin (export) |
 |---|---|---|---|
@@ -33,7 +34,7 @@ way. Which file to use (measured 2026-10-25 on the 16-vCPU dev box, TODO.md Step
 GGUF vs .bin: both Q8_0. The GGUF has 32-weight groups with fp16 scales (fp32 once loaded,
 exactly), the .bin 64-weight groups with fp32 scales; runq quantizes the activations to int8 in
 groups of the same size. The GGUF is closer to HF: perplexity +0.19% vs +0.85% over fp32, logits
-pooled 1-cos 6.1e-4 vs 9.0e-4 (TODO.md, Step 6a). Prefill is ~4-8% slower (twice as many
+pooled 1-cos 6.1e-4 vs 9.0e-4 (Step 6a). Prefill is ~4-8% slower (twice as many
 float folds in the GEMM), decode ~5% (the packed weights are ~6% larger: fp32 scales per 32).
 
 ## Chat, KV cache and threads (details)
@@ -72,7 +73,7 @@ for Q4_K_M) and decode long contexts faster (3,000 tokens, Q4_K_M, 8 threads: ~1
 `-k f32`, ~100 before Step 7b). f16 is as close to the fp32 model as the f32 cache (KL divergence from HF fp32 +0.2%,
 within the noise); bf16 is a bit further (+2.6%: |K| reaches ~500, and bf16 keeps 8 significant bits to
 f16's 11) and prefills long prompts ~3% faster. All three pass the same logits thresholds; the attention
-arithmetic is fp32 on the exactly converted values (TODO.md Step 7b).
+arithmetic is fp32 on the exactly converted values (Step 7b).
 
 Threads: without `OMP_NUM_THREADS`, runq uses nproc - nproc/8 threads (Apple Silicon with efficiency
 cores: the performance cores, see the M1 Pro notes under Benchmarks; 14 on the 16-vCPU dev box).
@@ -152,7 +153,8 @@ conversation goes.
   `tools/gen_unicode_tables.py` (Python's unicodedata, Unicode 15.1).
 - `src/unicode_nfc.h`: NFC tables (combining classes, decompositions, compositions, quick check),
   `tools/gen_unicode_tables.py --nfc`: Unicode 15.1 with the overrides that reproduce HF
-  tokenizers' older (9.0) normalization data (108 newer marks ccc 0, U+11938); see TODO.md Step 5.
+  tokenizers' older (9.0) normalization data (108 newer marks ccc 0, U+11938); see
+  [tests/README.md](../tests/README.md#tokenizer-fuzz-test-on-demand-not-in-make-test) (`--nfc-all`).
 - `third_party/qwen3.c/`: pristine https://github.com/adriancable/qwen3.c @ `55643ff`
   (2025-07-05), kept for diffs (upstream's `runq.c`; ours is `src/*.c` since Step 8, the single file
   before it in git history). Only its
@@ -174,15 +176,15 @@ Full tables, methodology and baselines: [BENCHMARKS.md](../BENCHMARKS.md) (one s
 
 Same session: upstream qwen3.c decodes at 101 / 106 tok/s (8 / 12 threads) with ~99 tok/s token-by-token
 prefill; mynah-slm at ~34 (Q8_0 and Q4_K_M). Perplexity vs HF fp32: runq Q8_0 +0.8%, Q4_K_M +4.7%
-(mynah-slm); runq on the Q8_0 GGUF +0.19% (TODO.md Step 6a, measured later), on the Q4_K_M GGUF
+(mynah-slm); runq on the Q8_0 GGUF +0.19% (Step 6a, measured later), on the Q4_K_M GGUF
 +4.9% (Step 6b-1). Q4_K_M with the AVX-512 kernels (Step 6b-2, not in BENCHMARKS.md yet): see the
-table under "Qwen3-0.6B: which file to use" above and TODO.md. Step 7a (threading, not in BENCHMARKS.md yet; same box, later
+table under "Qwen3-0.6B: which file to use" above. Step 7a (threading, not in BENCHMARKS.md yet; same box, later
 session, interleaved with the Step 6b-2 binary, best / median of 8): decode Q8_0 GGUF 8 / 12 / 16 threads
 192 / 168, 210 / 182, ~140-170 / ~115-160 tok/s (before: 198 / 137, 179 / 118, collapse); prefill
-within ~5% at 8-14 threads, no collapse at 16 (TODO.md Step 7a). Step 7b (KV cache, not in BENCHMARKS.md yet;
+within ~5% at 8-14 threads, no collapse at 16. Step 7b (KV cache, not in BENCHMARKS.md yet;
 interleaved with the Step 7a binary, best of 5, load 8-13), Q8_0 GGUF / Q4_K_M, f16 cache: decode after a
 3,000-token prompt 8 threads 90 -> 128 / 103 -> 158 tok/s, 12 threads 114 -> 147 / 120 -> 180; after 1,500
-tokens 8 threads 130 -> 164 / 153 -> 220; prefill 450 / 1,500 / 3,000 tokens within -0..+7% (TODO.md Step 7b).
+tokens 8 threads 130 -> 164 / 153 -> 220; prefill 450 / 1,500 / 3,000 tokens within -0..+7%.
 `scripts/bench_all.sh` reruns the runq tables (~8 min).
 
 Apple M1 Pro (8 P + 2 E cores, branch `mac-m1-pro`, 8 threads = the default there (the performance
@@ -221,3 +223,97 @@ vs the f32 cache +8-10% / +17-22% / +23-29% after 451 / 1,500 / 3,000-token prom
   built in, the variant (hybrid / Instruct-2507 / Thinking-2507) is detected from it (README, Chat templates).
 - The Step 11 fixes (RoPE theta, rmsnorm, the untied embedding) are shared C code, but untested on the Mac (NEON,
   clang): its goldens need a re-run.
+
+## Design notes and rejected experiments
+
+Measured alternatives that were not kept, plus the limits they ran into, where the source comments do not already
+record them (those cover the kernel layouts and arithmetic, `src/kquants.h` and `src/kernels_avx512.h`; the
+thread-pool design, `src/threads.h`; the per-thread ranges vs shared-counter claims, `src/forward.c`; huge pages,
+`src/model.c`; byte-level constrained decoding, `src/constrain.c`). Same box, so the usual ±15-30% noise applies;
+the step names the log entry with the full measurement.
+
+Kernels
+- Q8_0 GEMV with software prefetch (2 KB / 8 KB ahead) was slower: 1 thread 46 -> 42 / 38 tok/s, 4 threads 116 ->
+  107 / 92 (Step 3a). The hardware prefetchers do best with one sequential stream per thread, which is also why
+  Q6P keeps each sub-block's high bits next to its low bits (`src/kquants.h`).
+- Ceilings: the Q8_0 GEMM runs at ~85% of the measured `vpdpbusd` peak (2.9 TOPS at 8 threads, 372 GOPS per
+  thread, register-only microbenchmark). The rest is the float fold (cvt, 2 mul, add per accumulator and group,
+  two of them on `vpdpbusd`'s ports): ~89% at most with groups of 64, ~80% with 32. The K-quant GEMM reaches
+  63-74% (6-7 fold ops per 8 `vpdpbusd`, Step 6b-2). The fold order is the bit-identity definition, so it cannot
+  simply be fused into FMAs.
+- K-quant GEMM: unpacking Q4_K in registers per 6-row tile, instead of once per thread into the scratch tile, was
+  ~8% slower (w1 + w3 80-81 vs 74-75 ms at 451 tokens, 8 threads). Register tile widths (Q8_0 C = 4-8 and NB =
+  24-128; Q4_K C = 4-8; Q6_K C = 2-6) were all within noise. Generic K-quant kernels with more rows per unpack
+  (`KQ_NC` 4 -> 8 / 16) were only 7-10% faster, so this was not changed.
+
+Attention
+- Block size: `ATT_P` 128 and 512 are as accurate as 256 against a double-precision attention (within ~5%). 512
+  costs the same in prefill and gives fewer decode work items at mid contexts, so 256 was kept (Step 7a).
+- Prefill rows per work item: 3 / 6 / 8 / 12 were within noise at first (Step 3b). Later, 12 rows (24 vectors)
+  measured worse: 66 vs 48 ms at 451 tokens, 2.24 vs 1.58 s at 3,000. `ATT_ROWS` stays at 6 (Step 7b).
+- bf16 scores: converting both halves of a K pair at once spilled registers (+15% prefill attention over fp32);
+  loading the 64-byte pair per dim, as the fp32 loop does, gives -2%.
+- Prefill attention at long prompts is compute-bound, not bandwidth-bound: from 1 to 8 threads it speeds up 6.96x,
+  the same with the half-size bf16 cache. The exp is only ~3% of it (Step 7b).
+
+Prefill "rest" (norms, SwiGLU, RoPE, K / V stores; ~11% of a 451-token prefill, 5% at 3,000)
+- Fusing w1 + w3 + SwiGLU + quantize into one GEMM phase was slower (79-81 ms vs 63-64 + 9-10 ms at 451 tokens):
+  partial-line writes scattered across rows, and bigger column groups unbalance the threads. Reverted
+  (`15f697d`).
+- These phases are memory-traffic bound: the rows were written by other cores' GEMM tiles. A 451-token norm phase
+  takes ~0.3 ms against ~60 us of arithmetic per thread.
+- SwiGLU's `expf` (libmvec) is ~0.75% of a 451-token prefill. A polynomial would save ~0.4% and change the
+  numerics, so it was not done.
+
+Threads
+- With OpenMP barriers, 16 threads on the 16 vCPUs collapsed (decode ~15-22 tok/s). No libgomp setting fixed it:
+  `OMP_WAIT_POLICY=passive` gave ~40 tok/s, `GOMP_SPINCOUNT` 1e3 / 3e4 / 3e6 ~40 / ~9 / ~54, and
+  `OMP_PROC_BIND=close` ~20-30 (Step 3b). Hence the phase synchronization on our own pool (`src/threads.h`).
+  Spinning only 100 rounds (~3 us) before sleeping was ~30% slower: sleeps and wake-ups every phase.
+- Batched decode worker (Step 10a), measured and not kept:
+  - the attention items of each kv head placed after the next head's q / k / v items: ~5-10% slower;
+  - the norms as the first items of the next phase: one sync point less, but the w1 / w3 items then come from a
+    shared counter, ~10% slower at 8 rows;
+  - the norms as a phase epilogue for more than 2 rows: within noise at 4, ~10% slower at 8 and 16.
+  - q / k / v items of 32 / 64 / 128 weight rows were within noise. Above 64 rows per pass, the prefill path's
+    GEMM is the faster one: ~10% at 96-256 rows, equal at 48-64.
+
+Sampling and the KV cache type
+- At `-t > 0`, the sampler's remaining cost is the temperature scale and the softmax over the vocabulary (~80-110
+  us per token, already vectorized by gcc). Splitting it over threads while keeping gcc's exact summation order
+  was not done: ~2% of decode at ~190 tok/s.
+- The default cache is f16, not bf16: bf16 missed the "< 0.1% perplexity" bar. A paired per-token NLL over 49k
+  tokens gave bf16 vs f32 +0.11% ± 0.08 (95%), and KL +2.6%, consistently. f16 is within the noise of f32.
+
+Server
+- `--chunk` (prompt tokens per pass while others decode), 8 streams + 4 prompts of ~2,000 tokens, 0.6B Q4_K_M, 12
+  threads, values 32 / 64 / 128: the long prompts' time to first token was 1,762 / 1,386 / 1,224 ms, the streams'
+  token gaps p99 48 / 66 / 122 ms and at most 147 / 71 / 144 ms. 64 was kept.
+- `--parallel` 16 vs 32, with 32 clients: 1,139-1,206 vs 1,218-1,250 tok/s, time to first token p50 1.7-1.8 vs
+  0.22-0.24 s. 16 was kept for memory: 32 slots of 8,192 positions would take 29 GiB on the 30 GB box.
+- Byte-level masking: the non-canonical first tokens (e.g. `S` + `IMPLE` rather than `SIM` + `PLE`) carry at most
+  0.2% (0.6B) / 1.1% (1.7B) of the probability mass on the router eval set. It is small, but a trie of
+  canonical token sequences would drop it.
+
+## History
+
+Until 2026-10-26, [TODO.md](../TODO.md) was the development log: one section per step with its design decisions,
+every measurement (before / after tables, profiles), the test results and the deliberate-breakage checks. It now
+lists open work only; the full log is in git: `git show b3e48a3:TODO.md`. The steps and their main commits:
+
+| step | what | commits |
+|---|---|---|
+| 0a, 0b | repository layout; the test suite (tokenizer and logits vs HF, greedy goldens) | `87e08aa`, `43d5977` |
+| 1, 1b | no classifier for prompt tokens; HF-exact tokenizer (pre-tokenizer, BPE with a merge heap) | `6003108`, `da82485` |
+| 2 | batched prefill (generic GEMM), bit-identical to token by token; the SwiGLU NaN fix | `e737c02`, `7b2b034` |
+| 3a, 3b | AVX-512 VNNI GEMM / GEMV on repacked weights; AVX-512 attention on a tiled KV cache, threading | `21fb5bd`, `219b072`, `cc1c164` |
+| 4 | chat history in the KV cache, faster sampling, startup ~0.5 -> ~0.06 s | `9ffdb96`, `39f4cc8`, `86d88d0` |
+| 5 | NFC normalizer matching HF tokenizers | `271f2e7` |
+| 6a, 6b-1, 6b-2 | GGUF Q8_0 loading; Q4_K_M (layouts, arithmetic, generic kernels); AVX-512 K-quant kernels | `b4180af`, `ca07a0c`, `546033a` |
+| 7a, 7b | phase synchronization on a thread pool, attention blocks of 256; 16-bit KV cache (f16 default) | `779b99f`, `fed707e`, `52928cf`, `989f712` |
+| 8 | modules and the library API (`src/runq.h`) | `dfed67f`, `1f8bf3b` |
+| 9 | `runq serve` (OpenAI API, prefix reuse, constrained decoding) | `69078ea` |
+| 10a, 10b | batched decode of several sequences; continuous batching in `runq serve` | `302e0b2`, `38b71d9` |
+| 11 | the other Qwen3 dense models (1.7B-8B, 2507), fixes and tests | `fb2b9fb`, `6e1f251` |
+
+The macOS / NEON port (`67d7296` onwards) was developed on a separate branch and merged after Step 7b.

@@ -291,7 +291,7 @@ mynah-slm, an optional reference engine for comparison (not part of this reposit
 
 ## Credits and license
 
-Gwenedeg is MIT-licensed ([LICENSE](LICENSE)).
+Gwenedeg is MIT-licensed ([LICENSE](LICENSE)). Third-party code, data and formats (qwen3.c, ggml / llama.cpp formats, Unicode data, Qwen chat templates and test data, LiteLLM's rubric) are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 - The engine started from [qwen3.c](https://github.com/adriancable/qwen3.c) by Adrian Cable (MIT), itself
   based on Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama2.c) (MIT). An unmodified copy of

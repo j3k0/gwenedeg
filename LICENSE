@@ -21,13 +21,3 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
----
-
-Gwenedeg's engine (src/*.c, src/*.h: qwen3.c's runq.c, since rewritten and split
-into modules) and src/win.c / src/win.h are derived from qwen3.c
-(https://github.com/adriancable/qwen3.c, Copyright (c) 2025 Adrian Cable, MIT),
-which itself started from Andrej Karpathy's llama2.c
-(https://github.com/karpathy/llama2.c, MIT).
-
-Third-party code, data and formats (qwen3.c, ggml / llama.cpp formats, Unicode
-data, Qwen chat templates and test data, LiteLLM's rubric): THIRD_PARTY_NOTICES.md.

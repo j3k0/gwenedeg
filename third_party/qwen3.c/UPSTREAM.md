@@ -5,10 +5,11 @@
 - License: MIT (see `LICENSE`)
 
 This directory is kept pristine (identical to upstream, apart from this file) so that
-our changes can be diffed against it:
+our changes can be diffed against it. Gwenedeg's engine started as a copy of `runq.c` (`src/runq.c`,
+until Step 8 of TODO.md split it into the modules of `src/`; the single file is in git history):
 
-    diff -u third_party/qwen3.c/runq.c src/runq.c
+    git show 87e08aa:src/runq.c | diff -u third_party/qwen3.c/runq.c -   # upstream + the -n / [timing] patch
 
 - `export.py` and `model.py` are used as-is by `scripts/export_q8.sh` (HF weights to Q8_0 `.bin`).
-- The engine we build and modify lives in `src/runq.c` (built by the top-level `Makefile`).
+- The engine we build and modify lives in `src/` (built by the top-level `Makefile`).
   Nothing here is compiled.

@@ -38,7 +38,7 @@ SYNTH_REF = ["en", "code", "long2"]   # logits vs the numpy reference (-b 64)
 # measured 1 - cos mean 0.7e-3 (en) .. 4.3e-3 (long2), position min 0.962, top-1 0.83..1; a RoPE theta of 1e6
 # instead of 5e6 gives 0.98 / 0.61 (mean) and top-1 0.06 on long2, an embedding read as Q8_0 NaN
 TH_SYNTH = dict(cos_mean=0.99, cos_pos=0.90, top1=0.6)
-SYNTH_BATCHED = [("en", 7), ("en", 64), ("long2", 64), ("long2", 512)]   # vs -b 1, bitwise
+SYNTH_BATCHED = [("en", 7), ("en", 64), ("long2", 64)]   # vs -b 1, bitwise (long2: past one attention block)
 SYNTH_KERNELS = [("en", 1), ("en", 7), ("en", 64)]                       # AVX-512 vs generic, bitwise
 
 
@@ -82,24 +82,23 @@ def cos_rows(a, b):
 # ------------------------------------------------------------------------------------------ chat rendering
 
 def render_cases(runq, model, variant, res, prefix, jobs=None):
-    """runq -m render on model (tokenizer only) for the golden cases of its template variant"""
+    """runq -m render on model (tokenizer only, one process for all cases) for the golden cases of its variant"""
     with open(os.path.join(GOLDEN, "chat_render.json"), encoding="utf-8") as f:
         cases = [c for c in json.load(f)["cases"] if c["variant"] == variant]
-
-    def one(c):
-        p = run([runq, model, "-m", "render", "-r", str(c["thinking"]), "-i", json.dumps(c["messages"])], 1)
-        return c, p
-    import concurrent.futures as cf
-    with cf.ThreadPoolExecutor(max_workers=jobs or 6) as ex:
-        outs = list(ex.map(one, cases))
-    for c, p in outs:
-        ids = [int(x) for x in p.stdout.split()] if p.returncode == 0 else None
-        err = p.stderr.decode(errors="replace")
+    conv = [{"messages": c["messages"], "thinking": c["thinking"]} for c in cases]
+    p = run([runq, model, "-m", "render", "-i", json.dumps(conv)], 1)
+    lines = p.stdout.decode().splitlines() if p.returncode == 0 else []
+    errs = p.stderr.decode(errors="replace").splitlines()
+    if len(lines) != len(cases):
+        res.report(False, f"{prefix}/run", f"exit status {p.returncode}, {len(lines)} renderings: {errs[-2:]}")
+        return
+    for c, line, err in zip(cases, lines, [e for e in errs if e.startswith("[render]")]):
+        ids = [int(x) for x in line.split()]
         det = f"[{variant}] -r {c['thinking']}: {len(c['ids'])} tokens" + (", = HF's apply_chat_template" if c["hf"] else
               " (runq's documented form, not HF's)")
         ok = ids == c["ids"] and f"chat template {variant}," in err
         if not ok:
-            det += f"  <- got {ids if ids is None else len(ids)} tokens, {err.strip()[-200:]!r}"
+            det += f"  <- got {len(ids)} tokens, {err!r}"
         res.report(ok, f"{prefix}/r{c['thinking']}_{c['name']}", det)
 
 
@@ -135,9 +134,7 @@ def synth_start(a, tmp, ex, gx, texts):
     S["lf"] = lf
     if a.api_test:
         S["api"] = ex.submit(run, [a.api_test, m], SYNTH_THREADS)
-        gen = a.api_test + "-generic"
-        if os.path.exists(gen):
-            S["api_gen"] = gx.submit(run, [gen, m, "--digest-small"], SYNTH_GEN_THREADS)
+        # (the generic build: the CLI runs below, SYNTH_KERNELS; its api digests cost ~1.7 core-s more)
         S["api_t"] = ex.submit(run, [a.api_test, m, "--digest-small"], 8 if nd != 8 else 2)
     for name in SYNTH_REF:
         lf(name, 64)

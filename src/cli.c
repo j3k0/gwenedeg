@@ -341,14 +341,8 @@ static void tokenize(const RqModel *m, char *text, double t_load) {
     rq_tokens_free(&t);
 }
 
-static void render_chat(const RqModel *m, const char *json, int thinking) {
-    // -m render (test hook): the token ids of the conversation -i (a JSON array of {"role": system / user /
-    // assistant, "content": text}) rendered by rq_chat_render with -r, space-separated on stdout
-    char err[256];
-    JsDoc *d = json_parse(json, strlen(json), err, sizeof(err));
-    if (!d) { fprintf(stderr, "-m render: invalid JSON: %s\n", err); exit(EXIT_FAILURE); }
-    const Js *a = json_root(d);
-    if (a->t != JS_ARR) die("-m render: -i must be a JSON array of messages");
+static void render_one(const RqModel *m, const Js *a, int thinking) {
+    // one conversation (a JSON array of messages) rendered: its ids on a line of stdout
     RqMessage *msg = calloc(a->n + 1, sizeof(RqMessage));
     if (!msg) die("malloc failed!");
     for (int i = 0; i < a->n; i++) {
@@ -369,6 +363,27 @@ static void render_chat(const RqModel *m, const char *json, int thinking) {
     fprintf(stderr, "[render] chat template %s, thinking %d: %d tokens\n", rq_chat_name(info.chat), thinking, t.n);
     rq_tokens_free(&t);
     free(msg);
+}
+
+static void render_chat(const RqModel *m, const char *json, int thinking) {
+    // -m render (test hook): the token ids of the conversation -i (a JSON array of {"role": system / user /
+    // assistant, "content": text}) rendered by rq_chat_render with -r, space-separated on stdout; or of several
+    // (-i: an array of {"messages": [...], "thinking": 0 / 1 (default -r)}), one line each
+    char err[256];
+    JsDoc *d = json_parse(json, strlen(json), err, sizeof(err));
+    if (!d) { fprintf(stderr, "-m render: invalid JSON: %s\n", err); exit(EXIT_FAILURE); }
+    const Js *a = json_root(d);
+    if (a->t != JS_ARR) die("-m render: -i must be a JSON array of messages");
+    if (a->n > 0 && json_get(a->v[0], "messages")) {
+        for (int i = 0; i < a->n; i++) {
+            const Js *ms = json_get(a->v[i], "messages"), *th = json_get(a->v[i], "thinking");
+            long long t = thinking;
+            if (!ms || ms->t != JS_ARR || (th && !json_is_int(th, &t))) die("-m render: bad conversation");
+            render_one(m, ms, t != 0);
+        }
+    } else {
+        render_one(m, a, thinking);
+    }
     json_free(d);
 }
 

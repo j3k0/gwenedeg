@@ -1,5 +1,5 @@
 // Unit test of the NEON kernels (kernels_neon.h) against the generic ones on random data: K-quants
-// (vs kquants.h) and Q8_0 (vs a copy of runq.c's dot_q8), GEMV and GEMM must be bit-identical; the
+// (vs kquants.h) and Q8_0 (vs a copy of forward.c's dot_q8), GEMV and GEMM must be bit-identical; the
 // attention on the bf16 / f16 KV caches vs the fp32 cache holding the same values (exact conversion,
 // the same arithmetic: bit-identical; the fp32 attention vs the generic one: make test).
 // Build: make kq-neon-test
@@ -38,7 +38,7 @@ static int cmp(const char *what, const float *a, const float *b, int n) {
 }
 
 static float dot_q8_ref(const int8_t *wq, const float *ws, const int8_t *xq, const float *xs, int n, int gs) { RQ_FP_EXACT
-    // runq.c's dot_q8, the same expression (GS a parameter here)
+    // forward.c's dot_q8, the same expression (GS a parameter here)
     float val = 0;
     for (int j = 0; j <= n - gs; j += gs) {
         int32_t ival = 0;
@@ -80,13 +80,13 @@ static int test_q8(int gs, int k) {
 }
 
 static size_t att_tile(int t, int h, int nkv, int hd) {
-    // runq.c's kv_tile: blocks of ATT_P positions, in a block each head's ATT_PT tiles contiguous
+    // forward.c's kv_tile: blocks of ATT_P positions, in a block each head's ATT_PT tiles contiguous
     return (((size_t)(t / ATT_P) * nkv + h) * ATT_P + (size_t)(t % ATT_P / ATT_T) * ATT_T) * hd;
 }
 
 static int test_attn(int kvt, int hd) {
     // head 1 of 2 (so a wrong block stride reads the other head), 3 blocks (the last one partial); random
-    // 16-bit values (bf16 / f16 bit patterns, f16 subnormals included) in runq.c's layouts and their
+    // 16-bit values (bf16 / f16 bit patterns, f16 subnormals included) in forward.c's layouts and their
     // exact fp32 values in the fp32 layout
     int nkv = 2, npos = 3 * ATT_P - 37, h = 1, fails = 0;
     size_t bs = (size_t)nkv * ATT_P * hd, n = 3 * bs, pst = ATT_PSTRIDE(hd);

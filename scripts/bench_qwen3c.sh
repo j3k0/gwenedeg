@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Benchmark ./runq (src/runq.c) decode/prefill speed across thread counts.
+# Benchmark ./runq (src/*.c) decode/prefill speed across thread counts.
 # Usage: scripts/bench_qwen3c.sh [model.bin] [threads...]
 #   default model: models/Qwen3-0.6B-q8.bin, default threads: 1 2 4 8 12
 #   (16 threads on the 16-vCPU VM: no collapse since Step 7a, but not faster than 12-14 with other load)

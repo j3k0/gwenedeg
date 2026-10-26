@@ -232,7 +232,7 @@ RqCtx *rq_ctx_new(const RqModel *mc, int nb_max, int max_ctx, int *err) {
     if (!m->has_weights) { e = RQ_ERR_STATE; goto fail; }
     c = calloc(1, sizeof(RqCtx));
     if (!c) goto fail;
-    int all_heads_dim = m->all_heads_dim, kv_dim = m->kv_dim, kv_mul = m->kv_mul, hd = p->head_dim;
+    int all_heads_dim = m->all_heads_dim, kv_dim = m->kv_dim, hd = p->head_dim;
     int ad = all_heads_dim > p->dim ? all_heads_dim : p->dim;
     c->m = m;
     c->nt = rq_nthreads();
@@ -316,7 +316,6 @@ RqCtx *rq_ctx_new(const RqModel *mc, int nb_max, int max_ctx, int *err) {
     if (ctx_alloc_att(c, (max_ctx + ATT_P - 1) / ATT_P) != RQ_OK) goto fail;
     // phase / counter capacity: decode 4 / layer, 2 counters per (layer, kv head); prefill 9 / layer,
     // a counter per (layer, attention row block)
-    (void)kv_mul;
     int ncnt = 2 * p->n_kv_heads > c->pf_nrb + c->nb_max ? 2 * p->n_kv_heads : c->pf_nrb + c->nb_max;
     if (rq_sync_init(&c->sync, 10 * p->n_layers + 8, p->n_layers * ncnt + 64) != 0) goto fail;
     if (err) *err = RQ_OK;
@@ -450,7 +449,7 @@ void rmsnorm(float *o, float *x, float *weight, int size) {
 
 // Q8_0 dot product of one weight row with one quantized activation row (n values, n/GS groups):
 // exact int32 sum per group of GS, then accumulated in float, group by group in order.
-// Shared by matmul (GEMV) and matmul_batch (GEMM) so both give bit-identical results.
+// Shared by the GEMV (matvec_rows) and the generic GEMM (gemm_item) so both give bit-identical results.
 static inline float dot_q8(const int8_t *wq, const float *ws, const int8_t *xq, const float *xs, int n) { RQ_FP_EXACT
     float val = 0;
     for (int j = 0; j <= n - GS; j += GS) {
@@ -463,7 +462,7 @@ static inline float dot_q8(const int8_t *wq, const float *ws, const int8_t *xq, 
     return val;
 }
 
-// Decode GEMV, in pieces: forward() runs all of a token in one parallel region, with the rows
+// Decode GEMV, in pieces: decode_step runs all of a token in one parallel region, with the rows
 // of each matrix split into work items. matvec_prep: the VNNI kernel's activation corrections for
 // x[i0 .. i0+n) (one per GS-group; nothing to do for the generic kernel), and with K-quant weights
 // (xf != NULL) the activation group sums xf of kquants.h, plus for the AVX-512 K-quant GEMV the
@@ -546,7 +545,7 @@ NO_FP_CONTRACT static inline void dot_q8_x4(float *o, const int8_t *w0, const fl
 
 typedef struct { float *out; int ldo; QuantizedTensor *w; int d; } MatJob; // one GEMM of a Gemm phase
 
-// One batched-matmul phase of forward_batch: up to 3 GEMMs on the same nb quantized activation rows
+// One batched-matmul phase of a batched pass: up to 3 GEMMs on the same nb quantized activation rows
 // (q / k / v, w1 / w3), out[b * ldo + i] = W[i, :] . x[b, :] (W d x k; x row b at x->q + b * ldx,
 // its k / GS scales at x->s + b * ldx / GS), as work items of one phase:
 //   AVX-512 build: (32-row tile, chunk of nbi activation rows), Q8P (q8p_gemm_item) or Q4P / Q6P
@@ -1045,7 +1044,7 @@ static inline QuantizedTensor qsub(QuantizedTensor *t, int i0) {
 
 // ---------------------------------------------------------------------------------------- decode
 
-typedef struct { RqCtx *c; RqSeq *s; int token, pos; float *logits; } DecodeJob;
+typedef struct { RqCtx *c; RqSeq *s; int pos; float *logits; } DecodeJob;
 
 // phases of a decode job: per layer 4 (qkv + attention, wo, w1 + w3, w2), the classifier, the KV
 // tile pre-fault every ATT_T positions; dependency counters: per (layer, kv head) its qkv items
@@ -1220,7 +1219,7 @@ static int decode_step(RqCtx *c, RqSeq *s, int token, float *logits) {
 
     if (rq_begin(&c->sync, decode_phases(p), decode_counters(p), rq_nthreads(), rq_spin_dec) != 0)
         return ctx_fail(c, RQ_ERR_NOMEM, "malloc failed!");
-    DecodeJob job = { c, s, token, pos, logits };
+    DecodeJob job = { c, s, pos, logits };
     rq_parallel(decode_worker, &job);
     s->tokens[pos] = token;
     s->len = pos + 1;
@@ -1526,11 +1525,11 @@ int rq_forward_batch(RqCtx *c, const RqSegment *sg, int nseg, float *out, float 
         int e = s ? ctx_check_seq(c, s) : ctx_fail(c, RQ_ERR_ARG, "segment %d: no sequence", i);
         if (e != RQ_OK) return e;
         if (sg[i].n < 1 || n + sg[i].n > c->nb_max || sg[i].logits < RQ_LOGITS_NONE || sg[i].logits > RQ_LOGITS_ALL)
-            return ctx_fail(c, RQ_ERR_ARG, "forward_batch: bad chunk n=%d pos0=%d (nb_max %d, seq_len %d)", sg[i].n, s->len,
-                            c->nb_max, s->cap);
+            return ctx_fail(c, RQ_ERR_ARG, "rq_forward_batch: bad segment %d (n %d, %d rows so far, max_batch %d)", i,
+                            sg[i].n, n, c->nb_max);
         if (s->len + sg[i].n > s->cap)
-            return ctx_fail(c, RQ_ERR_CONTEXT, "forward_batch: bad chunk n=%d pos0=%d (nb_max %d, seq_len %d)", sg[i].n,
-                            s->len, c->nb_max, s->cap);
+            return ctx_fail(c, RQ_ERR_CONTEXT, "rq_forward_batch: %d tokens at position %d past the capacity %d", sg[i].n,
+                            s->len, s->cap);
         for (int j = 0; j < i; j++)
             if (sg[j].seq == s) return ctx_fail(c, RQ_ERR_ARG, "sequence in segments %d and %d", j, i);
         for (int j = 0; j < sg[i].n; j++)

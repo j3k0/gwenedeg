@@ -1,9 +1,9 @@
-/* AVX-512 VNNI Q8_0 kernels for runq.c (GEMM for the batched prefill, GEMV for decode); further down
+/* AVX-512 VNNI Q8_0 kernels for the forward passes (forward.c: GEMM for the batched prefill, GEMV for decode); further down
  * the same for the K-quants (Q4_K / Q6_K on the Q4P / Q6P layouts of kquants.h) and the attention.
  *
  * Enabled when the compiler targets AVX-512 F/BW/VNNI (e.g. -march=native on Zen 4 / Ice Lake+)
  * and RUNQ_GENERIC is not defined; it then defines RUNQ_VNNI. Otherwise this header is empty and
- * runq.c uses its generic C kernels (dot_q8, dot_q8_x4).
+ * forward.c uses its generic C kernels (dot_q8, dot_q8_x4).
  *
  * Weights are repacked once at load ("Q8P" layout) so that the 16 dword lanes of a zmm hold 16
  * different weight rows: no horizontal reductions at all. For a (d, k) Q8_0 matrix with group size
@@ -20,7 +20,7 @@
  * vpdpbusd multiplies u8 x s8: the weights are stored offset by +128 (u8), the activations stay
  * s8 and are broadcast 4 bytes at a time; the offset is removed exactly with the activation
  * group sums: isum = sum((w+128) * x) - 128 * sum(x) (accumulators start at -128 * sum(x)).
- * The per-group int32 sums are exact, and the float fold is the one of dot_q8 in runq.c, per
+ * The per-group int32 sums are exact, and the float fold is the one of dot_q8 in forward.c, per
  * output and group in order: val = val + (ws * xs) * (float) isum, rounded after every operation
  * (explicit-rounding intrinsics, which gcc can neither contract into an FMA nor reassociate under
  * -Ofast). So the results are bit-identical to the generic kernels.
@@ -28,7 +28,7 @@
 #ifndef RUNQ_KERNELS_AVX512_H
 #define RUNQ_KERNELS_AVX512_H
 
-// Attention constants, shared by the AVX-512 attention below and the generic C one in runq.c
+// Attention constants, shared by the AVX-512 attention below and the generic C one in forward.c
 // (attention_vec): the same constants and operations give the same results
 #define ATT_T 16                       // positions per K/V cache tile
 #ifndef ATT_P
@@ -127,7 +127,7 @@ static inline __m512i q8p_bcast4(const int8_t *p) {
 }
 
 static inline __m512 q8p_fold(__m512 acc, __m512 ws, float xs, __m512i isum) {
-    // acc + (ws * xs) * (float) isum, each operation rounded (as dot_q8 in runq.c)
+    // acc + (ws * xs) * (float) isum, each operation rounded (as dot_q8 in forward.c)
     __m512 sc = _mm512_mul_round_ps(ws, _mm512_set1_ps(xs), Q8P_RND);
     __m512 p = _mm512_mul_round_ps(sc, _mm512_cvtepi32_ps(isum), Q8P_RND); // exact: |isum| < 2^24
     return _mm512_add_round_ps(acc, p, Q8P_RND);
@@ -594,7 +594,7 @@ static void kq512_gemm_item(float *out, int ldo, const uint8_t *kp, int type, in
     }
 }
 
-// the K-quant SIMD kernel interface of runq.c (kernels_neon.h implements the same on AArch64)
+// the K-quant SIMD kernel interface of forward.c (kernels_neon.h implements the same on AArch64)
 #define RUNQ_KQX 1
 #define kqx_c16 kq512_c16
 #define kqx_gemv_rows kq512_gemv_rows
@@ -614,8 +614,8 @@ static void kq512_gemm_item(float *out, int ldo, const uint8_t *kp, int type, in
 #endif // AVX-512 VNNI
 
 /* ---------------------------------------------------------------------------------------------
- * fp32 attention (AVX-512F), for decode (forward) and prefill (forward_batch) alike, through
- * attention_kv() in runq.c; RUNQ_GENERIC or a CPU without AVX-512F uses the generic C version
+ * fp32 attention (AVX-512F), for decode (rq_decode) and prefill (rq_forward_batch) alike, through
+ * attention_kv() in forward.c; RUNQ_GENERIC or a CPU without AVX-512F uses the generic C version
  * there (attention_vec), which computes the same operations in the same order, so all give
  * bit-identical results.
  *
@@ -631,7 +631,7 @@ static void kq512_gemm_item(float *out, int ldo, const uint8_t *kp, int type, in
  * per head instead (2 MB per head and layer at -c 4096) was as fast but made the pre-fault ~2x as
  * slow: 8 ranges, no huge pages)
  * bf16 cache (-k bf16, Step 7b): the same tiles with 2-byte elements, stored as fp32 -> bf16 with
- * round-to-nearest-even (f32_bf16 in runq.c), and inside a tile the dims paired so that one 64-byte
+ * round-to-nearest-even (f32_bf16 in forward.c), and inside a tile the dims paired so that one 64-byte
  * load gives two zmm of fp32 by a shift / a mask (bf16 -> fp32 is exact: the bits << 16):
  *   K: dims 2p, 2p + 1 of position j at 32 p + 2 j and 32 p + 2 j + 1 (dword lane j: low / high half)
  *   V: position j, dims 32 c + l and 32 c + 16 + l (l < 16) at j * head_dim + 32 c + 2 l and + 1
@@ -652,7 +652,7 @@ static void kq512_gemm_item(float *out, int ldo, const uint8_t *kp, int type, in
  *   nb = 1: out[i] = o_0[i] * inv, inv = 1 / l_0 (one division). (Up to 256 positions this is
  *        exactly the Step 3b definition: same results as before for every prompt that short)
  *   nb > 1: M = max of the m_b; c_b = exp_att(m_b - M); L = fma chain over b of c_b * l_b, from 0;
- *        out[i] = (fma chain over b of c_b * o_b[i], from 0) * (1 / L)   (runq.c: att_combine)
+ *        out[i] = (fma chain over b of c_b * o_b[i], from 0) * (1 / L)   (forward.c: att_combine)
  * The blocks let decode split a long context over threads (flash-decoding: one work item per kv
  * head and block, the last one to finish combines), with the same results as the prefill, which
  * runs all blocks of a vector in one work item.

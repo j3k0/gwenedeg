@@ -1,4 +1,4 @@
-/* Threading for runq.c: phase synchronization that tolerates a preempted thread, and the parallel
+/* Threading for the forward passes (forward.c): phase synchronization that tolerates a preempted thread, and the parallel
  * region the phases run in (a small persistent thread pool, or OpenMP). Measurements: TODO.md Step 7a.
  *
  * Why not OpenMP's barriers: decode runs ~100-200 synchronization points per token (~25 us apart).

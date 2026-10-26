@@ -3,7 +3,7 @@
 # Usage: scripts/bench_prefill.sh [-l "450 1500"] [-b "1 64 256 512"] [-t "8"] [-r REPS] [-m model.bin]
 #        scripts/bench_prefill.sh -P 450    # only print the prompt of that length
 #   -l  target prompt lengths in tokens (incl. the chat template), approximate (+-10)
-#   -b  chunk sizes; 1 = token-by-token forward() (the old path)
+#   -b  chunk sizes; 1 = token by token through the decode path (the old path)
 #   -t  OMP_NUM_THREADS values
 #   -r  runs per cell, best kept (default 3)
 # Chat mode, greedy, -n 16, -c 4096. The prompt is a fixed paragraph repeated and cut to length,

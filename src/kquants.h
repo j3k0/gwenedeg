@@ -1,4 +1,4 @@
-/* K-quants (GGUF Q4_K and Q6_K, as in llama.cpp's Q4_K_M files) for runq.c: the block formats,
+/* K-quants (GGUF Q4_K and Q6_K, as in llama.cpp's Q4_K_M files) for the forward passes (forward.c): the block formats,
  * their dequantization, the repacked layouts (Q4P, Q6P) the matmul kernels read, and the generic C
  * kernels. The arithmetic of a matmul output is defined here (below); the generic kernels follow
  * it, and so do the AVX-512 ones (kernels_avx512.h: kq4_gemv_rows / kq6_gemv_rows, kq512_gemm_item),
@@ -79,7 +79,7 @@
 #include <string.h>
 
 // clang has no per-function optimize attribute: the exact functions (the generic kernels here, the
-// attention and Q8_0 dot products in runq.c, the NEON kernels) start their body with RQ_FP_EXACT, which
+// attention and Q8_0 dot products in forward.c, the NEON kernels) start their body with RQ_FP_EXACT, which
 // turns off FP contraction and reassociation for that body (-ffast-math otherwise fuses a * b + c into
 // an FMA and vectorizes the in-order float folds). gcc: the KQ_EXACT / ATT_EXACT / NO_FP_CONTRACT
 // attributes do this

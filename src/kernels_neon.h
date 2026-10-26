@@ -27,7 +27,7 @@
 
 #if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD) && !defined(RUNQ_GENERIC) && !defined(RUNQ_KQX)
 #define RUNQ_NEON 1
-#define RUNQ_KQX 1 // K-quant SIMD kernels: kqx_* (runq.c)
+#define RUNQ_KQX 1 // K-quant SIMD kernels: kqx_* (forward.c)
 // clang's arm_neon.h defines vmulq_f32, vaddq_f32, ... as inline functions with plain C operators,
 // which take the FP options of the place the header is included at, not of their callers: under
 // -ffast-math they would be fused into fmla / fmls and reassociated after inlining, even inside
@@ -421,14 +421,14 @@ static void kqx_gemm_item(float *out, int ldo, const uint8_t *kp, int type, int 
  * group) gs / 4 steps of 64 bytes (lane r = bytes 4 r .. 4 r + 3 = 4 consecutive columns of row r of
  * the block), then the 16 rows' fp32 scales. A quad (4 rows) of a step = 16 bytes at 16 q.
  *
- * Arithmetic: dot_q8 / dot_q8_x4 in runq.c as written, per output and group in order:
+ * Arithmetic: dot_q8 / dot_q8_x4 in forward.c as written, per output and group in order:
  *   val = val + ((float) isum * ws) * xs     (each operation rounded; isum exact in int32)
  * so the results are bit-identical to the generic build on the same compiler (make test: the kernels group).
  * (gcc -Ofast on x86 reassociates that expression to (ws * xs) * isum, which the AVX-512 Q8P kernels
  * follow: arm64 and x86 Q8_0 logits differ in the last bits, as they already did with the generic
  * kernels.)
  */
-#define RUNQ_Q8X 1 // Q8_0 SIMD kernels: q8x_* (runq.c)
+#define RUNQ_Q8X 1 // Q8_0 SIMD kernels: q8x_* (forward.c)
 #define Q8N_ROWS 16
 #define Q8X_GROUP(gs) (Q8N_ROWS * (gs) + Q8N_ROWS * 4) // bytes per (block, group): 16 x gs + 64
 // GEMM register tile: Q8N_RQ quads (1, 2 or 4) x Q8N_C activation rows (1..Q8N_CMAX)
@@ -603,7 +603,7 @@ static void q8x_gemm_item(float *out, int ldo, const uint8_t *wp, int d, int t, 
  * chunks added in order, times scale; per block of ATT_P positions max, exp_att, 16 lane sums in
  * tile order then the fixed tree j + 8, + 4, + 2, + 1; P.V as one fma chain per output from 0), as
  * att512_group computes it with 4-lane vectors: a 16-position tile = 4 registers. Bit-identical to
- * attention_vec (runq.c) and att512_kv. Cache layout (kernels_avx512.h): per kv head and block of
+ * attention_vec (forward.c) and att512_kv. Cache layout (kernels_avx512.h): per kv head and block of
  * ATT_P positions ATT_PT contiguous tiles (kt / vt: tile 0 of block 0, block b at + b * bs elements):
  * K transposed in a tile (dim i, position j at i * 16 + j), V rows contiguous in a block. All three
  * cache types (-k f32 / bf16 / f16): the 16-bit elements are converted to fp32 in registers (exact:
@@ -923,7 +923,7 @@ static inline int attn_ok(int hd) { return hd % 64 == 0 && hd <= ATTN_HDMAX; }
 static void attn_kv(int kvt, int nv, const float *const *q, float *const *out, float *const *part, const int *np, int b0,
                     int b1, const void *kt, const void *vt, size_t bs, int hd, float scale, float *s) {
     // nv query vectors of one kv head (any nv), in groups of ATTN_NV (attn_group_t); kvt: cache type, 0
-    // fp32, 1 bf16, 2 f16 (runq.c's KV_F32, KV_BF16, KV_F16); bs: elements from a head's block to its next
+    // fp32, 1 bf16, 2 f16 (KV_F32, KV_BF16, KV_F16: RQ_KV_* of runq.h); bs: elements from a head's block to its next
     for (int g = 0; g < nv; g += ATTN_NV) {
         int gn = nv - g < ATTN_NV ? nv - g : ATTN_NV;
         (kvt == 2 ? attn_group_f16 : kvt ? attn_group_bf16 : attn_group_f32)(gn, q + g, out + g, part ? part + g : NULL,

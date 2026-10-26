@@ -1,0 +1,80 @@
+{"tier": "SIMPLE", "prompt": "Hi!"}
+{"tier": "SIMPLE", "prompt": "Good morning, how are you doing today?"}
+{"tier": "SIMPLE", "prompt": "What is the capital of Canada?"}
+{"tier": "SIMPLE", "prompt": "How many days are in a leap year?"}
+{"tier": "SIMPLE", "prompt": "Who wrote Pride and Prejudice?"}
+{"tier": "SIMPLE", "prompt": "What's 15 + 27?"}
+{"tier": "SIMPLE", "prompt": "Thanks, that's all I needed."}
+{"tier": "SIMPLE", "prompt": "What is the chemical symbol for gold?"}
+{"tier": "SIMPLE", "prompt": "Translate 'thank you' into Spanish."}
+{"tier": "SIMPLE", "prompt": "What year did the Berlin Wall fall?"}
+{"tier": "SIMPLE", "prompt": "What does CPU stand for?"}
+{"tier": "SIMPLE", "prompt": "How do you say hello in Japanese?"}
+{"tier": "SIMPLE", "prompt": "What is the boiling point of water in Fahrenheit?"}
+{"tier": "SIMPLE", "prompt": "Is Mount Everest the tallest mountain on Earth?"}
+{"tier": "SIMPLE", "prompt": "In Python, how do I get the length of a list?", "note": "technical words, one obvious answer"}
+{"tier": "SIMPLE", "prompt": "Think step by step and reason very carefully before answering: what is 6 times 7?", "note": "the framing does not change the task"}
+{"tier": "SIMPLE", "prompt": "I'm planning a trip next month with my family. We're flying out of Chicago and staying for a week, and since my kids are 6 and 9 we'll mostly do museums, parks and the aquarium. My husband would love to catch a hockey game if there is one, and I'd like at least one nice dinner somewhere with a view. We've never been abroad together before, so I'm a little nervous about the logistics. Anyway, one quick question before I book anything: what currency do they use in Canada?", "note": "looks long, a lookup"}
+{"tier": "SIMPLE", "prompt": "Here is the email from my manager: 'Hi team, as discussed on Friday's call, the quarterly review has moved from Tuesday to Thursday, March 14, at 10am in room 4B. Please bring your updated slides, the revised budget sheet and any open questions about the hiring plan. Lunch will be provided afterwards, so let Priya know about dietary restrictions by Wednesday. Thanks, Dana.' What day is the meeting now?", "note": "looks long, the answer is in the text"}
+{"tier": "SIMPLE", "prompt": "What language is this written in?\n\nfn main() {\n    let names = vec![\"ada\", \"grace\", \"linus\"];\n    for (i, name) in names.iter().enumerate() {\n        println!(\"{}: {}\", i, name.to_uppercase());\n    }\n    let total: usize = names.iter().map(|n| n.len()).sum();\n    println!(\"total length {}\", total);\n}", "note": "looks long and technical, a lookup"}
+{"tier": "SIMPLE", "prompt": "lol that's funny, tell me another joke"}
+{"tier": "MEDIUM", "prompt": "Explain how a refrigerator keeps food cold."}
+{"tier": "MEDIUM", "prompt": "Write a regular expression that matches a US ZIP code, including the optional +4 extension."}
+{"tier": "MEDIUM", "prompt": "What's the difference between TCP and UDP, and when would I use each?"}
+{"tier": "MEDIUM", "prompt": "Write a Python function that checks whether a string is a palindrome, ignoring case and spaces."}
+{"tier": "MEDIUM", "prompt": "Summarize the main causes of World War I in a short paragraph."}
+{"tier": "MEDIUM", "prompt": "Give me a 3-day itinerary for Rome for a first-time visitor."}
+{"tier": "MEDIUM", "prompt": "Explain what a SQL JOIN does, with a small example."}
+{"tier": "MEDIUM", "prompt": "Draft a polite email asking my landlord to fix a leaking kitchen faucet."}
+{"tier": "MEDIUM", "prompt": "Why do we have seasons on Earth?"}
+{"tier": "MEDIUM", "prompt": "Convert 0, 25 and 100 degrees Celsius to Fahrenheit and explain the formula."}
+{"tier": "MEDIUM", "prompt": "How does compound interest work? Show an example with $1,000 at 5% for 3 years."}
+{"tier": "MEDIUM", "prompt": "Write a bash one-liner that counts the lines in all .txt files in a directory."}
+{"tier": "MEDIUM", "prompt": "Explain the main differences between a virus and a bacterium."}
+{"tier": "MEDIUM", "prompt": "Explain recursion to a beginner programmer with a small example."}
+{"tier": "MEDIUM", "prompt": "Why does this JavaScript print 5 five times, and how do I fix it? for (var i = 0; i < 5; i++) { setTimeout(() => console.log(i), 100); }"}
+{"tier": "MEDIUM", "prompt": "Rewrite this to sound more professional: 'hey guys, the thing broke again, gonna look at it tmrw, chill.'"}
+{"tier": "MEDIUM", "prompt": "How do I make a sourdough starter from scratch?"}
+{"tier": "MEDIUM", "prompt": "Explain the difference between git merge and git rebase."}
+{"tier": "MEDIUM", "prompt": "What should I look for when choosing a laptop for college?"}
+{"tier": "MEDIUM", "prompt": "Write a short cover letter for a junior data analyst position."}
+{"tier": "COMPLEX", "prompt": "Implement a thread-safe LRU cache in Java with O(1) get and put, and explain how you keep lock contention low."}
+{"tier": "COMPLEX", "prompt": "Design the database schema and REST API for a multi-tenant SaaS invoicing system with role-based access control."}
+{"tier": "COMPLEX", "prompt": "Write a Rust parser for arithmetic expressions with operator precedence and parentheses that returns an AST, with unit tests."}
+{"tier": "COMPLEX", "prompt": "Our Kubernetes pods get OOM-killed only under peak load even though average memory use is low. Walk me through diagnosing and fixing this."}
+{"tier": "COMPLEX", "prompt": "Implement Raft leader election and log replication in Go, handling network partitions."}
+{"tier": "COMPLEX", "prompt": "Explain the molecular mechanism of CRISPR-Cas9 editing and the main strategies used to reduce off-target effects."}
+{"tier": "COMPLEX", "prompt": "Write a CUDA kernel for tiled matrix multiplication using shared memory and explain the occupancy considerations."}
+{"tier": "COMPLEX", "prompt": "We want to split our monolithic Django app into services. Propose the service boundaries, data ownership and a step-by-step migration plan."}
+{"tier": "COMPLEX", "prompt": "Implement a B-tree with insertion and deletion in C."}
+{"tier": "COMPLEX", "prompt": "Set up a CI/CD pipeline with GitHub Actions that builds a Docker image, runs integration tests against Postgres and deploys to AWS ECS with blue-green deployment."}
+{"tier": "COMPLEX", "prompt": "Write an LLVM pass that removes redundant loads within a basic block."}
+{"tier": "COMPLEX", "prompt": "Explain how the Black-Scholes model prices a European call option and implement it with the Greeks in Python."}
+{"tier": "COMPLEX", "prompt": "Design the backend of a real-time collaborative text editor, including conflict resolution, persistence and presence."}
+{"tier": "COMPLEX", "prompt": "fix the race in our double-checked locking singleton (C++11)", "note": "short, but non-trivial code"}
+{"tier": "COMPLEX", "prompt": "Write a SQL query that computes 7-day rolling retention by signup cohort from a raw events table, handling users with gaps in activity."}
+{"tier": "COMPLEX", "prompt": "Make this Python function that finds all pairs summing to a target fast enough for 10 million integers, and explain the memory cost: def pairs(xs, t): return [(a, b) for i, a in enumerate(xs) for b in xs[i+1:] if a + b == t]"}
+{"tier": "COMPLEX", "prompt": "Implement JWT authentication with refresh-token rotation and revocation in a Node.js Express API."}
+{"tier": "COMPLEX", "prompt": "Explain in detail how the TLS 1.3 handshake differs from TLS 1.2, including the key exchange and the cryptographic primitives."}
+{"tier": "COMPLEX", "prompt": "Write a Python scraper for paginated search results that respects robots.txt and rate limits, retries with exponential backoff and stores the results in SQLite."}
+{"tier": "COMPLEX", "prompt": "A 60-year-old has ST elevation in leads II, III and aVF with reciprocal depression in I and aVL. What does this indicate and what is the immediate management?", "note": "specialized domain depth"}
+{"tier": "REASONING", "prompt": "Prove that the square root of 2 is irrational."}
+{"tier": "REASONING", "prompt": "Prove that there are infinitely many primes of the form 4k+3."}
+{"tier": "REASONING", "prompt": "Is P equal to NP?", "note": "short, a famous hard problem"}
+{"tier": "REASONING", "prompt": "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost?", "note": "short, a trap"}
+{"tier": "REASONING", "prompt": "I'm 30 with $50k of student debt at 6% interest. Should I pay it off first or invest in an index fund? Weigh the tradeoffs and commit to an answer."}
+{"tier": "REASONING", "prompt": "Three gods A, B and C are True, False and Random, in some order. They answer yes/no questions in their own language with 'da' and 'ja', and you don't know which word means yes. Determine their identities with three yes/no questions."}
+{"tier": "REASONING", "prompt": "Why does switching doors in the Monty Hall problem win two thirds of the time? Convince a skeptic rigorously."}
+{"tier": "REASONING", "prompt": "Should a mid-sized city ban cars from its downtown core? Analyze the economic, environmental and equity effects and give a recommendation."}
+{"tier": "REASONING", "prompt": "Prove that every planar graph is 5-colorable."}
+{"tier": "REASONING", "prompt": "If our team of five could keep only unit tests or only integration tests for a payments product, which should it keep? Argue it carefully."}
+{"tier": "REASONING", "prompt": "Find all integer solutions of x^2 - y^2 = 2026.", "note": "short, needs an argument (none exist)"}
+{"tier": "REASONING", "prompt": "What is the expected number of fair coin flips until two heads in a row? Derive it."}
+{"tier": "REASONING", "prompt": "Is it ethical to sell products made with AI-generated art without disclosing it? Analyze several perspectives and take a position."}
+{"tier": "REASONING", "prompt": "Prove that the 1/e stopping rule is asymptotically optimal for the secretary problem."}
+{"tier": "REASONING", "prompt": "You have 12 coins, one of which is counterfeit and either heavier or lighter. With three weighings on a balance, find it and tell whether it is heavier or lighter."}
+{"tier": "REASONING", "prompt": "Is 2^61 - 1 prime?", "note": "short, needs real work"}
+{"tier": "REASONING", "prompt": "We have 7 months of runway. Raise a Series A now at a lower valuation, or wait 9 months for better metrics? Analyze the risks and commit to a decision."}
+{"tier": "REASONING", "prompt": "Prove that the halting problem is undecidable."}
+{"tier": "REASONING", "prompt": "Why does 0.999... equal 1? Address the usual objections rigorously."}
+{"tier": "REASONING", "prompt": "Why has nobody proved Goldbach's conjecture, and what would a proof most likely need?"}

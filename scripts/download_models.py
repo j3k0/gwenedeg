@@ -94,11 +94,35 @@ SETS = {
     "8b-q4km": ("unsloth/Qwen3-8B-GGUF", "a6adef130ffb23ddaf1a62fec9dced968c9bc482", "Qwen3-8B-GGUF", [
         ("Qwen3-8B-Q4_K_M.gguf", 5027784512, "sha256", "120307ba529eb2439d6c430d94104dabd578497bc7bfe7e322b5d9933b449bd4"),
     ]),
+
+    # Qwen3.5-0.8B: the hybrid architecture (GGUF qwen35: Gated DeltaNet + gated attention, partial RoPE), not
+    # supported by runq yet: docs/qwen35.md. 24 layers, dim 1024, vocab 248,320, tied. The HF checkpoint
+    # (bf16, with the vision tower and the MTP head) is the input of the goldens (.venv-hf5: transformers 5.x).
+    "3.5-0.8b-hf": ("Qwen/Qwen3.5-0.8B", "2fc06364715b967f1860aea9cf38778875588b17", "Qwen3.5-0.8B", [
+        ("LICENSE", 11544, "blob", "f938136e3adacfd92be087f6e113b5d6d97f678f"),
+        ("README.md", 61705, "blob", "5824f1761b2b3a55a2141a9a1172a7f92c7c2ad9"),
+        ("config.json", 2907, "blob", "715f0448b9d38103211f0ad88bbb4d6e4f4be8c9"),
+        ("chat_template.jinja", 7755, "blob", "0ef09f214eaa6d9bca297988afc1454b5827b2c7"),
+        ("merges.txt", 3353259, "blob", "a494e019ca1502219fd0128658b979e5f05ae8e8"),
+        ("tokenizer_config.json", 16709, "blob", "fae3ce993e07c092ad024dde45e592379fde91bb"),
+        ("vocab.json", 6722759, "blob", "0aa0ce0658d60ac4a5d609f4eadb0e8e43514176"),
+        ("tokenizer.json", 12807982, "sha256", "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"),
+        ("model.safetensors.index.json", 50900, "blob", "f691cefdb79d73270895ebd6d9594ddcecfc1838"),
+        ("model.safetensors-00001-of-00001.safetensors", 1746942600, "sha256", "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"),
+    ]),
+    "3.5-0.8b-q8": ("unsloth/Qwen3.5-0.8B-GGUF", "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0", "Qwen3.5-0.8B-GGUF", [
+        ("Qwen3.5-0.8B-Q8_0.gguf", 811843840, "sha256", "0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c"),
+    ]),
+    # (Q4_K / Q6_K, plus Q5_K for attn_qkv and ssm_out: needs Q5_K support)
+    "3.5-0.8b-q4km": ("unsloth/Qwen3.5-0.8B-GGUF", "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0", "Qwen3.5-0.8B-GGUF", [
+        ("Qwen3.5-0.8B-Q4_K_M.gguf", 532517120, "sha256", "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517"),
+    ]),
 }
 DEFAULT_SETS = ["hf", "q4km", "q8gguf"]
 # names that stand for several sets
 GROUPS = {
     "family": ["1.7b-q8", "1.7b-q4km", "1.7b-hf", "4b-q4km", "4b-q8", "4b-2507i-q4km", "8b-q4km"],
+    "qwen35": ["3.5-0.8b-hf", "3.5-0.8b-q8", "3.5-0.8b-q4km"],
 }
 CHUNK = 1 << 20
 

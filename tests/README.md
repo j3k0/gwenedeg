@@ -40,6 +40,7 @@ python3 tests/make_dequant_golden.py  # golden/dequant/q4_k_m.npz (needs numpy +
 .venv/bin/python tests/make_chat_golden.py   # golden/chat_render.json (HF apply_chat_template of the 3 templates, ~2 s)
 .venv/bin/python tests/make_golden.py --model-dir models/Qwen3-1.7B --out-dir tests/golden/models/1.7b-hf  # HF fp32 (~8 GB)
 .venv/bin/python tests/make_model_ref.py TAG FILE.gguf   # golden/models/TAG: dequantized-weights reference (numpy, 15-95 s)
+.venv-hf5/bin/python tests/make_model_ref.py 3.5-0.8b-q8 FILE.gguf   # a qwen35 file: tests/ref_qwen35.py (docs/qwen35.md; ~40 s)
 python3 tests/make_synth.py [--force] # build/synth: the synthetic models of the synth group (check.py runs it; ~1 s)
 .venv/bin/python tests/fuzz_tokenizer.py                 # on-demand tokenizer fuzz vs HF (~12 s)
 .venv/bin/python tests/fuzz_tokenizer.py --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf   # GGUF tokenizer (~20 s)
@@ -310,7 +311,8 @@ canonical rendering (text, ids) and whether it equals HF's `apply_chat_template`
 `make_golden.py --model-dir`), the others the file's dequantized-weights reference (`make_model_ref.py`:
 `tests/ref_forward.py`, fp32 numpy, layer by layer, ~1 GB peak for 8B; checked on 0.6B Q4_K_M against
 `golden/logits_q4`: cos 1.0, max |diff| 0.008 = the goldens' float16 rounding); `greedy/<tag>.txt` the
-greedy texts (`--models --update-models`). Thresholds vs HF fp32 for 1.7B (measured, golden vs golden): the Q8_0
+greedy texts (`--models --update-models`). Also `3.5-0.8b-hf` / `3.5-0.8b-q8` (Qwen3.5-0.8B, transformers 5.21 in `.venv-hf5`;
+not checked yet: runq does not load `qwen35`, see [docs/qwen35.md](../docs/qwen35.md)). Thresholds vs HF fp32 for 1.7B (measured, golden vs golden): the Q8_0
 reference is within 0.9985-0.9998 (mean per prompt, min 0.9955, pos0 0.994), so `q8_hf` = the 0.6B Q8_0
 thresholds; the Q4_K_M reference has cos mean 0.890 on `en` (position 8 at -0.137: the whole logit vector shifted,
 top-1 still right), 0.977-0.997 on the others, pos0 0.95, top-1 56/61, pooled 0.967: so `q4_hf` has no per-position

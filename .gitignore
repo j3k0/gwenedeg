@@ -12,3 +12,4 @@ __pycache__/
 /tests/kernels/kq_neon_test
 /build/
 .pi/
+/.venv-hf5/

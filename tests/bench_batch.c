@@ -5,13 +5,15 @@
  * (build/bench_batch); scripts/bench_batch.sh runs it over models and thread counts.
  *
  *   build/bench_batch MODEL [-N 1,2,4,8] [-L 50,500,2000] [-s STEPS] [-r REPS] [-k f16] [-t TEMP]
- *                     [-m MAXGB] [-d] [-q] [-S]
+ *                     [-m MAXGB] [-P CHUNK] [-d] [-q] [-S]
  *
  * Per context length L, one sequence is prefilled with L tokens of text and copied into the N
  * sequences (rq_seq_copy); every rep truncates them back to L and decodes STEPS tokens each (the first
  * one different per sequence). Reported: the best and the median rep (the machine is shared). -d adds
  * N = 1 through rq_decode (the single-sequence decode path) as the reference line "dec". -m skips
- * configurations whose KV cache would exceed MAXGB (default 6). A -DRUNQ_PROFILE build also prints
+ * configurations whose KV cache would exceed MAXGB (default 6). -P CHUNK: every pass also prefills CHUNK
+ * tokens of another sequence (a mixed pass, as a scheduler interleaving a prompt with decode rows: the
+ * prompt's first chunk, positions 0..CHUNK-1, every pass; N may be 0; its prefill tok/s in a last column). A -DRUNQ_PROFILE build also prints
  * the time per phase type and pass of the best rep. Threads: OMP_NUM_THREADS (else the default). */
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,7 +43,7 @@ static void die(const char *what, int e, RqCtx *c) {
 
 int main(int argc, char **argv) {
     int Ns[64] = { 1, 2, 3, 4, 6, 8, 12, 16, 32, 64 }, nN = 10, Ls[16] = { 50, 500, 2000 }, nL = 3;
-    int steps = 32, reps = 3, kvt = RQ_KV_DEFAULT, dec = 0, quiet = 0, serial = 0;
+    int steps = 32, reps = 3, kvt = RQ_KV_DEFAULT, dec = 0, quiet = 0, serial = 0, chunk = 0;
     float temp = 0, maxgb = 6;
     const char *path = NULL;
     for (int i = 1; i < argc; i++) {
@@ -59,10 +61,11 @@ int main(int argc, char **argv) {
             case 'k': kvt = rq_kv_parse(v); break;
             case 't': temp = atof(v); break;
             case 'm': maxgb = atof(v); break;
+            case 'P': chunk = atoi(v); break;
             default: goto usage;
         }
     }
-    if (!path || steps < 1 || reps < 1 || kvt < 0) goto usage;
+    if (!path || steps < 1 || reps < 1 || kvt < 0 || chunk < 0) goto usage;
 
     const char *w = rq_threads_init(0);
     if (w) fprintf(stderr, "%s\n", w);
@@ -73,11 +76,14 @@ int main(int argc, char **argv) {
     rq_model_info(m, &I);
     int V = I.vocab_size, nmax = 1, e;
     for (int i = 0; i < nN; i++) nmax = Ns[i] > nmax ? Ns[i] : nmax;
-    RqCtx *c = rq_ctx_new(m, nmax > 1 ? (nmax > 64 ? nmax : 64) : 64, 0, &e);
+    int nb = nmax + chunk > 64 ? nmax + chunk : 64;
+    RqCtx *c = rq_ctx_new(m, nb > RQ_BATCH_MAX ? RQ_BATCH_MAX : nb, 0, &e);
     if (!c) die("rq_ctx_new", e, NULL);
     float *out = malloc((size_t)nmax * V * sizeof(float));
     RqSeq **sq = calloc(nmax, sizeof(RqSeq *));
-    RqSegment *sg = calloc(nmax, sizeof(RqSegment));
+    RqSegment *sg = calloc(nmax + 1, sizeof(RqSegment));
+    RqSeq *pf = NULL; // -P: the prefilled sequence
+    if (chunk && !(pf = rq_seq_new(m, chunk, kvt, &e))) die("rq_seq_new", e, NULL);
     int *tok = calloc(nmax, sizeof(int));
     RqSampling smp = { temp, temp > 0 ? 0.9f : 0, NULL };
     const char *pn[16];
@@ -88,7 +94,8 @@ int main(int argc, char **argv) {
     if (lf) { if (!fgets(load, sizeof(load), lf)) load[0] = 0; fclose(lf); load[strcspn(load, " ")] = 0; }
     printf("# %s, %d threads, KV %s, %d steps x %d reps, %s%s, load %s\n", path, rq_threads(), rq_kv_name(kvt), steps, reps,
            temp > 0 ? "top-p 0.9 sampling" : "greedy", serial ? " (rq_sample per row)" : "", load);
-    printf("# %5s %4s %9s %10s %9s %10s\n", "L", "N", "ms/pass", "agg tok/s", "per-seq", "median agg");
+    if (chunk) printf("# every pass: + a prefill chunk of %d tokens of another sequence\n", chunk);
+    printf("# %5s %4s %9s %10s %9s %10s%s\n", "L", "N", "ms/pass", "agg tok/s", "per-seq", "median agg", chunk ? "  prefill tok/s" : "");
 
     RqTokens text = { 0 }, para = { 0 };
     rq_tokenize(m, "The keeper of the lighthouse rose before dawn, trimmed the wicks, polished the great lens and "
@@ -96,14 +103,14 @@ int main(int argc, char **argv) {
     for (int li = 0; li < nL; li++) {
         int L = Ls[li] < 1 ? 1 : Ls[li], cap = L + steps + 1;
         text.n = 0;
-        while (text.n < L) rq_tokens_push(&text, para.v, para.n);
+        while (text.n < L || text.n < chunk) rq_tokens_push(&text, para.v, para.n);
         RqSeq *base = rq_seq_new(m, cap, kvt, &e);
         if (!base) die("rq_seq_new", e, NULL);
         if ((e = rq_prefill(c, base, text.v, L, RQ_LOGITS_NONE, NULL, NULL)) != RQ_OK) die("prefill", e, c);
         for (int ni = -dec; ni < nN; ni++) {
             int N = ni < 0 ? 1 : Ns[ni], viadec = ni < 0;
             double gb = (double)N * cap * I.n_layers * 2 * I.n_kv_heads * I.head_dim * (kvt == RQ_KV_F32 ? 4 : 2) / 1e9;
-            if (N < 1 || N > nmax || gb > maxgb) {
+            if (N < (chunk ? 0 : 1) || N > nmax || N + chunk > RQ_BATCH_MAX || gb > maxgb) {
                 printf("  %5d %4d   (skipped: %.1f GB of KV cache)\n", L, N, gb);
                 continue;
             }
@@ -133,7 +140,12 @@ int main(int argc, char **argv) {
                     }
                     for (int i = 0; i < N; i++)
                         sg[i] = (RqSegment) { sq[i], &tok[i], 1, RQ_LOGITS_LAST };
-                    if ((e = rq_forward_batch(c, sg, N, out, NULL)) != RQ_OK) die("rq_forward_batch", e, c);
+                    if (chunk) { // (always the first chunk of a prompt: positions 0..CHUNK-1)
+                        rq_seq_reset(pf);
+                        sg[N] = (RqSegment) { pf, text.v, chunk, RQ_LOGITS_NONE };
+                    }
+                    if ((e = rq_forward_batch(c, sg, N + !!chunk, out, NULL)) != RQ_OK) die("rq_forward_batch", e, c);
+                    if (N == 0) continue;
                     if (serial)
                         for (int i = 0; i < N; i++)
                             tok[i] = rq_sample(c, sq[i], out + (size_t)i * V, &smp);
@@ -150,8 +162,10 @@ int main(int argc, char **argv) {
             }
             qsort(t, reps, sizeof(double), cmp_d);
             double med = t[reps / 2];
-            printf("  %5d %4d%s %9.2f %10.1f %9.1f %10.1f\n", L, N, viadec ? "d" : " ", best / steps * 1e3,
+            printf("  %5d %4d%s %9.2f %10.1f %9.1f %10.1f", L, N, viadec ? "d" : " ", best / steps * 1e3,
                    N * steps / best, steps / best, N * steps / med);
+            if (chunk && !viadec) printf("  %13.1f", (double)chunk * steps / best);
+            printf("\n");
             if (np && !viadec && !quiet) {
                 printf("        profile ms/pass:");
                 for (int k = 0; k < np; k++) printf(" %s %.3f", pn[k], pbest[k] / steps * 1e3);
@@ -163,6 +177,7 @@ int main(int argc, char **argv) {
         rq_seq_free(base);
     }
     for (int i = 0; i < nmax; i++) rq_seq_free(sq[i]);
+    rq_seq_free(pf);
     rq_tokens_free(&text);
     rq_tokens_free(&para);
     free(out);
@@ -174,6 +189,6 @@ int main(int argc, char **argv) {
     return 0;
 usage:
     fprintf(stderr, "usage: bench_batch MODEL [-N 1,2,4,8] [-L 50,500,2000] [-s STEPS] [-r REPS] [-k f16|bf16|f32] "
-                    "[-t TEMP] [-m MAXGB] [-d] [-q] [-S]\n");
+                    "[-t TEMP] [-m MAXGB] [-P CHUNK] [-d] [-q] [-S]\n");
     return 2;
 }

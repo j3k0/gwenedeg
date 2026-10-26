@@ -180,6 +180,11 @@ int main(int argc, char **argv) {
     if (only_digest) { // the batched passes of section 9 only
         rq_tokens_push(&C, dC, 7);
         batch_tests(c, A, B, C, NULL, only_digest);
+        rq_tokens_free(&A);
+        rq_tokens_free(&B);
+        rq_tokens_free(&C);
+        rq_ctx_free(c);
+        rq_model_free(M);
         return 0;
     }
     float *refA = logits_alone(c, A.v, A.n, dA, 3), *refB = logits_alone(c, B.v, B.n, dB, 3);

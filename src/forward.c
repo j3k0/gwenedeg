@@ -1467,23 +1467,25 @@ static void prefill_worker(void *arg, int tid, int nt) {
         }
         PPROF(PF_QKV);
 
-        // QK-norm + RoPE, each row at its own position, and the K / V rows into the cache: one
-        // 16-position cache tile of one segment per item (its rows, all heads)
-        PH_BEGIN(job->ntile, 1)
+        // QK-norm + RoPE, each row at its own position, and the K / V rows into the cache: one item per
+        // (16-position cache tile of one segment, kv head): its rows' query heads of that kv head, its key
+        // head (+ store) and value head (store). (Per tile only: a short chunk, e.g. 16 rows next to decode
+        // rows, ran on one thread, ~1.5 ms of a 16-row pass at 12 threads)
+        PH_BEGIN(job->ntile * nkv, 1)
         for (int it = lo; it < hi; it++) {
-            const PfSeg *sg = &seg[c->tile_seg[it]];
+            const PfSeg *sg = &seg[c->tile_seg[it / nkv]];
             RqSeq *sq = sg->seq;
             char *kl = (char *)sq->key_cache + loff * sq->kv_len * sq->kv_esz;
             char *vl = (char *)sq->value_cache + loff * sq->kv_len * sq->kv_esz;
-            int tb = c->tile_tb[it], pos0 = sg->pos0;
+            int tb = c->tile_tb[it / nkv], pos0 = sg->pos0, g = it % nkv;
             int t1 = (tb + 1) * ATT_T < pos0 + sg->n ? (tb + 1) * ATT_T : pos0 + sg->n;
             for (int t = tb * ATT_T > pos0 ? tb * ATT_T : pos0; t < t1; t++) {
                 int b = sg->b0 + t - pos0;
                 const float *cs = c->rope_b + (size_t)b * hd;
-                qk_norm_rope(c->q_b + (size_t)b * all_heads_dim, p->n_heads, w->q_norm_weights + l * hd, hd, cs);
-                qk_norm_rope(c->k_b + (size_t)b * kv_dim, nkv, w->k_norm_weights + l * hd, hd, cs);
-                for (int h = 0; h < nkv; h++)
-                    kv_store(sq->kvt, kl, vl, t, h, nkv, hd, c->k_b + (size_t)b * kv_dim + h * hd, c->v_b + (size_t)b * kv_dim + h * hd);
+                float *kr = c->k_b + (size_t)b * kv_dim + g * hd;
+                qk_norm_rope(c->q_b + (size_t)b * all_heads_dim + g * kv_mul * hd, kv_mul, w->q_norm_weights + l * hd, hd, cs);
+                qk_norm_rope(kr, 1, w->k_norm_weights + l * hd, hd, cs);
+                kv_store(sq->kvt, kl, vl, t, g, nkv, hd, kr, c->v_b + (size_t)b * kv_dim + g * hd);
             }
         }
         PH_END_NOEPI
@@ -1804,6 +1806,8 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
         // RoPE and the K / V stores of every row, then the attention items of that kv head may start
         PH_BEGIN_DYN(nkv * ng + nkv * nat, 1)
         for (int it = lo; it < hi; it++) {
+            // (the attention items of each kv head interleaved after the next head's q / k / v items instead:
+            // ~5-10% slower at 8 decode rows, 8 and 14 threads)
             if (it < nkv * ng) {
                 int g = it / ng, r = (it % ng) * qr, nq = kv_mul * hd; // r: row offset in [q heads | k | v] of head g
                 if (r < nq)

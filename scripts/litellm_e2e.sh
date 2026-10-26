@@ -9,19 +9,26 @@
 # byte what LiteLLM's own code builds, the per-request routing and the classification latencies (the
 # first one cold, the others with the rubric prefix cached), then stops both.
 # Usage: scripts/litellm_e2e.sh [MODEL]   (default the Q8_0 GGUF)
-# Env:   LITELLM_VENV (default /opt/litellm/venv-1.105.0: used read-only), WORK (default /tmp/cw9/e2e),
+# Env:   LITELLM_VENV (required: a Python venv with LiteLLM's proxy installed, tested with 1.105.0; used
+#        read-only), WORK (default /tmp/gwenedeg-e2e),
 #        THREADS (runq serve, default 8), RUBRIC (legacy | chat | agentic | business, default legacy),
 #        CONCURRENT (requests at once in the second pass, default 16)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 MODEL="${1:-models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf}"
-VENV="${LITELLM_VENV:-/opt/litellm/venv-1.105.0}"
-WORK="${WORK:-/tmp/cw9/e2e}"
+VENV="${LITELLM_VENV:-}"
+WORK="${WORK:-/tmp/gwenedeg-e2e}"
 THREADS="${THREADS:-8}"
 RUBRIC="${RUBRIC:-legacy}"
 PY="$VENV/bin/python"
-[[ -x "$PY" ]] || { echo "no LiteLLM venv at $VENV" >&2; exit 2; }
+if [[ -z "$VENV" ]]; then
+    echo "set LITELLM_VENV to a Python venv with LiteLLM's proxy (tested with 1.105.0), e.g." >&2
+    echo "  python3 -m venv /tmp/litellm && /tmp/litellm/bin/pip install 'litellm[proxy]==1.105.0'" >&2
+    echo "  LITELLM_VENV=/tmp/litellm $0 [MODEL]" >&2
+    exit 2
+fi
+[[ -x "$PY" && -x "$VENV/bin/litellm" ]] || { echo "no LiteLLM proxy in the venv $VENV (need bin/python and bin/litellm)" >&2; exit 2; }
 [[ -x ./runq ]] || make -s runq
 mkdir -p "$WORK/home"
 free_port() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }

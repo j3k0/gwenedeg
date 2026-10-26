@@ -12,9 +12,9 @@ recall, the confusion matrix, how often a COMPLEX / REASONING prompt is rated SI
 of the gold label, latency; and the per-label probabilities at the one decision step (the masked softmax
 over the allowed tokens, from the logprobs: every allowed token is a prefix of one label).
 
-Usage (with the LiteLLM venv's Python):
-  /opt/litellm/venv-1.105.0/bin/python -I scripts/eval_router.py [--models a.gguf,b.gguf] [--rubrics legacy,chat]
-      [--threads 8] [--out /tmp/cw9/eval.json] [--check-log /tmp/cw9/e2e/runq.log] [--show-probs]
+Usage (with the Python of a venv that has LiteLLM installed, tested with 1.105.0; see scripts/litellm_e2e.sh):
+  $LITELLM_VENV/bin/python -I scripts/eval_router.py [--models a.gguf,b.gguf] [--rubrics legacy,chat]
+      [--threads 8] [--out /tmp/eval.json] [--check-log /tmp/gwenedeg-e2e/runq.log] [--show-probs]
 """
 import argparse
 import json
@@ -118,6 +118,12 @@ def main():
     ap.add_argument("--check-log", default="", help="a runq serve --verbose log of LiteLLM's classifier calls (litellm_e2e.sh)")
     ap.add_argument("--show-probs", action="store_true", help="per prompt: the label probabilities")
     a = ap.parse_args()
+    try:
+        import litellm  # noqa: F401
+    except ImportError:
+        print("eval_router.py needs LiteLLM: run it with the Python of a venv that has it (tested with 1.105.0), "
+              "e.g. $LITELLM_VENV/bin/python -I scripts/eval_router.py", file=sys.stderr)
+        return 2
     data = [json.loads(l) for l in open(a.data) if l.strip()]
     if a.check_log:
         logged = [json.loads(m) for m in re.findall(r"^\[request\] \S+ /v1/chat/completions (.*)$", open(a.check_log).read(), re.M)]

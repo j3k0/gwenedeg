@@ -313,17 +313,19 @@ int main(int argc, char **argv) {
     }
 
     // 6. chat rendering: a message list == the pieces the CLI's chat uses; thinking: earlier replies
-    // without their reasoning
+    // without their reasoning (Instruct-2507: never thinks, replies verbatim; Thinking-2507: an answered
+    // turn without its "<think>\n", rq_chat_user_history)
     {
         RqMessage msgs[4] = { { RQ_ROLE_SYSTEM, "Be brief." }, { RQ_ROLE_USER, "Hi" },
                               { RQ_ROLE_ASSISTANT, "<think>\nhmm\n</think>\n\nHello!" }, { RQ_ROLE_USER, "Bye" } };
         int ok = 1;
         for (int th = 0; th < 2; th++) {
             RqTokens r = { 0 }, x = { 0 };
+            int eff = I.chat == RQ_CHAT_INSTRUCT ? 0 : th; // (the mode rendered)
             ok &= rq_chat_render(M, msgs, 4, th, &r) == RQ_OK;
             rq_chat_system(M, "Be brief.", th, &x);
-            rq_chat_user(M, "Hi", th, &x);
-            RqTokens h = toks(th ? "Hello!" : "<think>\nhmm\n</think>\n\nHello!");
+            rq_chat_user_history(M, "Hi", th, &x);
+            RqTokens h = toks(eff ? "Hello!" : "<think>\nhmm\n</think>\n\nHello!");
             rq_tokens_push(&x, h.v, h.n);
             rq_chat_end(M, &x);
             rq_chat_user(M, "Bye", th, &x);
@@ -331,6 +333,14 @@ int main(int argc, char **argv) {
             // the history form from the generated tokens equals the one from the text
             RqTokens g = toks("<think>\nhmm\n</think>\n\nHello!"), hg = { 0 };
             ok &= rq_chat_reply_history(M, g.v, g.n, th, &hg) == RQ_OK && hg.n == h.n && !memcmp(hg.v, h.v, h.n * sizeof(int));
+            // the generation prompt alone: the end of the user turn's piece
+            RqTokens u = { 0 }, ua = { 0 }, ga = { 0 };
+            rq_chat_user(M, "Hi", th, &u);
+            rq_tokenize(M, "<|im_start|>user\nHi<|im_end|>\n", -1, &ua);
+            ok &= rq_chat_assistant(M, th, &ga) == RQ_OK && ua.n + ga.n == u.n && !memcmp(u.v + ua.n, ga.v, ga.n * sizeof(int));
+            rq_tokens_free(&u);
+            rq_tokens_free(&ua);
+            rq_tokens_free(&ga);
             rq_tokens_free(&r);
             rq_tokens_free(&x);
             rq_tokens_free(&h);
@@ -341,7 +351,9 @@ int main(int argc, char **argv) {
         RqTokens r = { 0 };
         ok &= rq_chat_render(M, badm, 2, 0, &r) == RQ_ERR_ARG;
         rq_tokens_free(&r);
-        report(ok, "chat_render", "system, user, assistant, user; thinking off / on");
+        report(ok, "chat_render", I.chat == RQ_CHAT_HYBRID ? "system, user, assistant, user; thinking off / on"
+                                  : I.chat == RQ_CHAT_INSTRUCT ? "system, user, assistant, user (instruct-2507: no thinking)"
+                                  : "system, user, assistant, user (thinking-2507)");
     }
 
     // 7. incremental detokenization: the chunks are whole UTF-8 characters and concatenate to the text

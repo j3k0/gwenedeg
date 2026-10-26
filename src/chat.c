@@ -15,8 +15,19 @@
  * thinking on: R_i after its last </think>, leading newlines stripped, as the template renders
  * earlier assistant turns (it drops their reasoning). Text pieces are encoded separately; they are
  * separated by added tokens (<|im_start|>, <|im_end|>), so this is the same as encoding the whole
- * rendered string. */
+ * rendered string.
+ * Variants (runq.h, RQ_CHAT_*): Instruct-2507 has no think block (G is empty in both modes, thinking is
+ * treated as off everywhere: replies stay verbatim in the history, as its template renders them);
+ * Thinking-2507's P_i ends with "<think>\n" with thinking on (G = "<think>\n\n</think>\n\n" with it off,
+ * not in its template), history as the hybrid's, except that an answered turn's P_i loses the "<think>\n"
+ * (rq_chat_user_history: HF renders earlier assistant turns without it; the reply is re-prefilled from its
+ * answer anyway, as with the hybrid's thinking). */
 #include "internal.h"
+
+static int chat_mode(const RqModel *m, int thinking) {
+    // the thinking mode a call renders: Instruct-2507 has none
+    return m->chat == RQ_CHAT_INSTRUCT ? 0 : thinking != 0;
+}
 
 const char *rq_strerror(int err) {
     switch (err) {
@@ -52,24 +63,38 @@ static int tmpl_ok(const RqModel *m, int thinking) {
 }
 
 int rq_chat_system(const RqModel *m, const char *text, int thinking, RqTokens *out) {
-    thinking = thinking != 0;
+    thinking = chat_mode(m, thinking);
     int e = tmpl_ok(m, thinking);
     return e != RQ_OK ? e : render_tokens(m, m->sys_tmpl[thinking], text, out);
 }
 
 int rq_chat_user(const RqModel *m, const char *text, int thinking, RqTokens *out) {
-    thinking = thinking != 0;
+    thinking = chat_mode(m, thinking);
     int e = tmpl_ok(m, thinking);
     return e != RQ_OK ? e : render_tokens(m, m->user_tmpl[thinking], text, out);
 }
 
 int rq_chat_end(const RqModel *m, RqTokens *out) { return rq_tokenize(m, "<|im_end|>\n", -1, out); }
 
+int rq_chat_user_history(const RqModel *m, const char *text, int thinking, RqTokens *out) {
+    thinking = chat_mode(m, thinking);
+    if (m->chat != RQ_CHAT_THINKING || !thinking) return rq_chat_user(m, text, thinking, out);
+    int e = tmpl_ok(m, thinking);
+    return e != RQ_OK ? e : render_tokens(m, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", text, out);
+}
+
+int rq_chat_assistant(const RqModel *m, int thinking, RqTokens *out) {
+    if (!m->has_tok) return RQ_ERR_STATE;
+    char s[64];
+    snprintf(s, sizeof(s), "<|im_start|>assistant\n%s", chat_gen_suffix(m, chat_mode(m, thinking)));
+    return rq_tokenize(m, s, -1, out);
+}
+
 int rq_chat_reply_history(const RqModel *m, const int *r, int n, int thinking, RqTokens *out) {
     // thinking: the reply as the template renders an earlier assistant turn: the text after the last
     // </think> (if any), leading "\n" stripped (content.split('</think>')[-1].lstrip('\n')); a token
     // of newlines + text is re-encoded without the newlines
-    if (!thinking) return rq_tokens_push(out, r, n);
+    if (!chat_mode(m, thinking)) return rq_tokens_push(out, r, n);
     RqTokens te = { 0 };
     int e = rq_tokenize(m, "</think>", -1, &te);
     int think_end = e == RQ_OK && te.n == 1 ? te.v[0] : -1;
@@ -96,12 +121,13 @@ int rq_chat_reply_history(const RqModel *m, const int *r, int n, int thinking, R
 int rq_chat_render(const RqModel *m, const RqMessage *msgs, int n, int thinking, RqTokens *out) {
     // [system] + per user message P_i, per assistant message H_i (from its text) + E
     int i = 0, e = RQ_OK, expect = RQ_ROLE_USER, users = 0;
+    thinking = chat_mode(m, thinking);
     if (n > 0 && msgs[0].role == RQ_ROLE_SYSTEM)
         e = rq_chat_system(m, msgs[i++].content, thinking, out);
     for (; i < n && e == RQ_OK; i++) {
         if (msgs[i].role != expect || !msgs[i].content) return RQ_ERR_ARG;
-        if (expect == RQ_ROLE_USER) {
-            e = rq_chat_user(m, msgs[i].content, thinking, out);
+        if (expect == RQ_ROLE_USER) { // (answered: the history form)
+            e = i + 1 < n ? rq_chat_user_history(m, msgs[i].content, thinking, out) : rq_chat_user(m, msgs[i].content, thinking, out);
             expect = RQ_ROLE_ASSISTANT;
             users++;
             continue;

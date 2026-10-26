@@ -12,6 +12,7 @@
     #include <unistd.h>
 #endif
 #include "runq.h"
+#include "json.h" // (-m render: the messages as JSON)
 
 static int max_new_tokens = 0; // -n: stop after this many generated tokens, 0 = unlimited
 
@@ -191,6 +192,7 @@ static void cdump_write(const int *kv, int n) {
 
 typedef struct {
     RqTokens prompt; // P_i: user message + assistant header (+ empty think block with -r 0)
+    RqTokens phist;  // P_i once answered (rq_chat_user_history: Thinking-2507 without its "<think>\n")
     RqTokens reply;  // R_i: the generated tokens, without the <|im_end|> that ended them
     RqTokens hist;   // H_i: the reply as part of the history
 } ChatTurn;
@@ -215,7 +217,7 @@ static void render_conversation(RqTokens *out, const RqTokens *sys, const ChatTu
     out->n = 0;
     push(out, sys->v, sys->n);
     for (int i = j0; i < k; i++) {
-        push(out, turns[i].prompt.v, turns[i].prompt.n);
+        push(out, turns[i].phist.v, turns[i].phist.n);
         push(out, turns[i].hist.v, turns[i].hist.n);
         push(out, close->v, close->n);
     }
@@ -266,6 +268,7 @@ static void chat(RqModel *m, RqCtx *c, RqSeq *s, const RqSampling *cfg, char *cl
         ChatTurn *tn = &turns[k];
         memset(tn, 0, sizeof(*tn));
         check(rq_chat_user(m, user, enable_thinking, &tn->prompt), NULL);
+        check(rq_chat_user_history(m, user, enable_thinking, &tn->phist), NULL);
         free(user);
 
         // the canonical conversation; context full: drop the oldest turns (see above)
@@ -278,6 +281,7 @@ static void chat(RqModel *m, RqCtx *c, RqSeq *s, const RqSampling *cfg, char *cl
             fprintf(stderr, "(message too long: %d tokens with the template%s, context %d (-c); skipped)\n", want.n,
                     sys.n ? " and the system prompt" : "", seq_len);
             rq_tokens_free(&tn->prompt);
+            rq_tokens_free(&tn->phist);
             continue;
         }
         n_turns++;
@@ -294,6 +298,8 @@ static void chat(RqModel *m, RqCtx *c, RqSeq *s, const RqSampling *cfg, char *cl
         check(rq_seq_truncate(s, L), c);
         ReplyOut ro = { m, &tn->reply };
         RqCallbacks cb = { on_reply_token, on_reply_logits, &ro };
+        if (info.chat == RQ_CHAT_THINKING && enable_thinking)
+            printf("<think>\n"); // (Thinking-2507: the prompt opened the block, the reply starts inside it)
         RqGenStats st;
         check(rq_generate(c, s, want.v + L, want.n - L, cfg, max_new_tokens, &cb, &st), c);
         if (st.stop == RQ_STOP_CONTEXT)
@@ -305,6 +311,7 @@ static void chat(RqModel *m, RqCtx *c, RqSeq *s, const RqSampling *cfg, char *cl
     cdump_write(rq_seq_tokens(s), rq_seq_len(s));
     for (int i = 0; i < n_turns; i++) {
         rq_tokens_free(&turns[i].prompt);
+        rq_tokens_free(&turns[i].phist);
         rq_tokens_free(&turns[i].reply);
         rq_tokens_free(&turns[i].hist);
     }
@@ -332,6 +339,53 @@ static void tokenize(const RqModel *m, char *text, double t_load) {
     fprintf(stderr, "[tokenize] %zu bytes -> %d tokens, encode %.3f ms, tokenizer load %.1f ms\n",
             strlen(text), t.n, t_enc * 1e3, t_load * 1e3);
     rq_tokens_free(&t);
+}
+
+static void render_chat(const RqModel *m, const char *json, int thinking) {
+    // -m render (test hook): the token ids of the conversation -i (a JSON array of {"role": system / user /
+    // assistant, "content": text}) rendered by rq_chat_render with -r, space-separated on stdout
+    char err[256];
+    JsDoc *d = json_parse(json, strlen(json), err, sizeof(err));
+    if (!d) { fprintf(stderr, "-m render: invalid JSON: %s\n", err); exit(EXIT_FAILURE); }
+    const Js *a = json_root(d);
+    if (a->t != JS_ARR) die("-m render: -i must be a JSON array of messages");
+    RqMessage *msg = calloc(a->n + 1, sizeof(RqMessage));
+    if (!msg) die("malloc failed!");
+    for (int i = 0; i < a->n; i++) {
+        const Js *r = json_get(a->v[i], "role"), *c = json_get(a->v[i], "content");
+        if (!r || !c || c->t != JS_STR) die("-m render: each message needs a role and a string content");
+        msg[i].role = json_str_eq(r, "system") ? RQ_ROLE_SYSTEM : json_str_eq(r, "user") ? RQ_ROLE_USER
+                    : json_str_eq(r, "assistant") ? RQ_ROLE_ASSISTANT : -1;
+        msg[i].content = c->s;
+    }
+    RqTokens t = { 0 };
+    int e = rq_chat_render(m, msg, a->n, thinking, &t);
+    if (e != RQ_OK) { fprintf(stderr, "-m render: %s\n", rq_strerror(e)); exit(EXIT_FAILURE); }
+    for (int i = 0; i < t.n; i++)
+        printf(i ? " %d" : "%d", t.v[i]);
+    printf("\n");
+    RqModelInfo info;
+    rq_model_info(m, &info);
+    fprintf(stderr, "[render] chat template %s, thinking %d: %d tokens\n", rq_chat_name(info.chat), thinking, t.n);
+    rq_tokens_free(&t);
+    free(msg);
+    json_free(d);
+}
+
+static int thinking_for(const RqModel *m, int thinking, int given) {
+    // -r for the template variant: Instruct-2507 has no thinking mode, Thinking-2507 always thinks (a note
+    // when -r asked for the other)
+    RqModelInfo info;
+    rq_model_info(m, &info);
+    if (info.chat == RQ_CHAT_INSTRUCT && thinking) {
+        fprintf(stderr, "note: this model (chat template %s) has no thinking mode: -r 1 ignored\n", rq_chat_name(info.chat));
+        return 0;
+    }
+    if (info.chat == RQ_CHAT_THINKING && !thinking) {
+        if (given) fprintf(stderr, "note: this model (chat template %s) always thinks: -r 0 ignored\n", rq_chat_name(info.chat));
+        return 1;
+    }
+    return thinking;
 }
 
 static void dump_logits(const RqModel *m, RqCtx *c, RqSeq *s, char *text, char *out_path) {
@@ -408,17 +462,20 @@ static void error_usage(void) {
     fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1], default 0.9\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
-    fprintf(stderr, "  -c <int>    context window size, 0 (default) = max_seq_len; chat: holds the whole conversation,\n");
+    fprintf(stderr, "  -c <int>    context window size, 0 (default) = the model's maximum, at most %d; chat: holds the whole conversation,\n", RQ_CTX_DEFAULT_MAX);
     fprintf(stderr, "              when full the oldest turns are dropped (the system prompt is kept)\n");
-    fprintf(stderr, "  -m <string> mode: generate|chat|tokenize|logits|dequant, default: chat\n");
+    fprintf(stderr, "  -m <string> mode: generate|chat|tokenize|logits|dequant|render, default: chat\n");
     fprintf(stderr, "              tokenize: print the token ids of -i (raw text, no template)\n");
+    fprintf(stderr, "              render (test hook): the token ids of the chat template rendering of -i, a JSON array of\n");
+    fprintf(stderr, "              messages ({\"role\": \"user\", \"content\": \"...\"}), with -r\n");
     fprintf(stderr, "              logits: write the logits at every position of -i to -o (binary)\n");
     fprintf(stderr, "  -i <string> input prompt (chat: one turn, then exit; without -i, one turn per stdin line,\n");
     fprintf(stderr, "              the conversation is kept until an empty line or EOF)\n");
     fprintf(stderr, "              dequant (GGUF, test hook): rows of the matrix -i NAME[:ROW0[:NROWS]] to -o (binary)\n");
     fprintf(stderr, "  -o <string> output file for -m logits / dequant\n");
     fprintf(stderr, "  -y <string> system prompt in chat mode, default is none\n");
-    fprintf(stderr, "  -r <int>    reasoning mode, 0 (default) = no thinking, 1 = thinking\n");
+    fprintf(stderr, "  -r <int>    reasoning mode, 0 (default) = no thinking, 1 = thinking (Qwen3-*-Instruct-2507: never,\n");
+    fprintf(stderr, "              -Thinking-2507: always; the chat template variant is read from the GGUF)\n");
     fprintf(stderr, "  -n <int>    max new tokens per response, 0 (default) = unlimited\n");
     fprintf(stderr, "  -b <int>    prefill chunk size (batched prompt processing), default %d, max %d;\n", RQ_BATCH_MAX, RQ_BATCH_MAX);
     fprintf(stderr, "              0 or 1 = one token at a time\n");
@@ -440,6 +497,7 @@ int main(int argc, char *argv[]) {
     char *mode = "chat";        // generate|chat
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
     int enable_thinking = 0;    // 1 enables thinking
+    int thinking_given = 0;     // -r given (Thinking-2507: a note for -r 0)
     int ctx_length = 0;         // context length
     char *out_path = NULL;      // output file for -m logits
     int prefill_chunk = RQ_BATCH_MAX; // -b: rows per batched prefill chunk (0 / 1: token by token)
@@ -460,7 +518,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'i') { prompt = argv[i + 1]; }
         else if (argv[i][1] == 'm') { mode = argv[i + 1]; }
         else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
-        else if (argv[i][1] == 'r') { enable_thinking = atoi(argv[i + 1]); }
+        else if (argv[i][1] == 'r') { enable_thinking = atoi(argv[i + 1]); thinking_given = 1; }
         else if (argv[i][1] == 'n') { max_new_tokens = atoi(argv[i + 1]); }
         else if (argv[i][1] == 'o') { out_path = argv[i + 1]; }
         else if (argv[i][1] == 'b') { prefill_chunk = atoi(argv[i + 1]); }
@@ -475,7 +533,7 @@ int main(int argc, char *argv[]) {
     if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
     if (temperature < 0) temperature = 0;
     if (topp < 0 || 1.0 < topp) topp = 0.9;
-    if ((strcmp(mode, "tokenize") == 0 || strcmp(mode, "logits") == 0) && !prompt) { error_usage(); }
+    if ((strcmp(mode, "tokenize") == 0 || strcmp(mode, "logits") == 0 || strcmp(mode, "render") == 0) && !prompt) { error_usage(); }
     if ((strcmp(mode, "logits") == 0 || strcmp(mode, "dequant") == 0) && (!out_path || !prompt)) { error_usage(); }
     if (prefill_chunk < 0) prefill_chunk = 0;
     if (prefill_chunk > RQ_BATCH_MAX) prefill_chunk = RQ_BATCH_MAX;
@@ -483,7 +541,7 @@ int main(int argc, char *argv[]) {
     enable_thinking = enable_thinking != 0;
 
     char err[512];
-    if (strcmp(mode, "tokenize") == 0) {
+    if (strcmp(mode, "tokenize") == 0 || strcmp(mode, "render") == 0) {
         // only the header and the tokenizer (GGUF: the metadata, the tensor data stays unread), on one
         // thread (one light process: the tests run many in parallel)
         rq_threads_init(1);
@@ -491,11 +549,16 @@ int main(int argc, char *argv[]) {
         RqModelOpts o = { 0, 1, 0 };
         RqModel *m = rq_model_load(checkpoint_path, &o, err, sizeof(err));
         if (!m) die(err);
+        // (-m render: the library's rendering for -r as given, e.g. Thinking-2507 with thinking off as runq serve
+        // renders a constrained request; the chat forces the variant's mode: thinking_for)
         if (rq_chat_check(m, enable_thinking, err, sizeof(err)) == RQ_ERR_LOAD) {
             fprintf(stderr, "Couldn't load prompt template %s\n", err);
             exit(EXIT_FAILURE);
         }
-        tokenize(m, prompt, rq_now() - t0);
+        if (strcmp(mode, "render") == 0)
+            render_chat(m, prompt, enable_thinking);
+        else
+            tokenize(m, prompt, rq_now() - t0);
         rq_model_free(m);
         return 0;
     }
@@ -517,6 +580,8 @@ int main(int argc, char *argv[]) {
         rq_model_free(m);
         return 0;
     }
+    if (strcmp(mode, "chat") == 0)
+        enable_thinking = thinking_for(m, enable_thinking, thinking_given);
     if (rq_chat_check(m, enable_thinking, err, sizeof(err)) == RQ_ERR_LOAD) {
         fprintf(stderr, "Couldn't load prompt template %s\n", err);
         exit(EXIT_FAILURE);

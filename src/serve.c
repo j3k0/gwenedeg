@@ -187,12 +187,14 @@ static const char *after_think(const char *s) {
     return s + strspn(s, "\n");
 }
 
-static int render(const RqModel *m, const Msg *msg, int n, int thinking, RqTokens *out) {
+static int render(const RqModel *m, int chat, const Msg *msg, int n, int thinking, RqTokens *out) {
     // Qwen3's template in the CLI chat's canonical form (rq_chat_render: [system] then user / assistant
     // turns, the empty think block with thinking off kept in every user turn); other sequences as HF's
     // template renders them: a later system message as a system block, a user message not followed
     // by an assistant one as a plain block, an assistant message not after a user one with its own
-    // header; ends with the assistant header (+ empty think block with thinking off)
+    // header; ends with the assistant header (+ empty think block with thinking off). The variants (runq.h):
+    // Instruct-2507 keeps assistant messages verbatim (its template does), no think block anywhere;
+    // Thinking-2507's generation prompt opens the think block
     int i = 0, e = RQ_OK, open = 0; // open: the last piece ends with the assistant header
     if (n > 0 && msg[0].role == 0) {
         e = rq_chat_system(m, msg[0].text, thinking, out);
@@ -201,14 +203,14 @@ static int render(const RqModel *m, const Msg *msg, int n, int thinking, RqToken
     for (; i < n && e == RQ_OK; i++) {
         const Msg *x = &msg[i];
         if (x->role == 1) {
-            if (i == n - 1 || msg[i + 1].role == 2) {
-                e = rq_chat_user(m, x->text, thinking, out);
+            if (i == n - 1 || msg[i + 1].role == 2) { // (answered: the history form, rq_chat_user_history)
+                e = i == n - 1 ? rq_chat_user(m, x->text, thinking, out) : rq_chat_user_history(m, x->text, thinking, out);
                 open = 1;
                 continue;
             }
             e = tok_text(m, "<|im_start|>user\n", x->text, "<|im_end|>\n", out);
         } else if (x->role == 2) {
-            const char *t = after_think(x->text);
+            const char *t = chat == RQ_CHAT_INSTRUCT ? x->text : after_think(x->text);
             e = open ? rq_tokenize(m, t, -1, out) : tok_text(m, "<|im_start|>assistant\n", t, "", out);
             if (e == RQ_OK) e = rq_chat_end(m, out);
         } else {
@@ -216,7 +218,7 @@ static int render(const RqModel *m, const Msg *msg, int n, int thinking, RqToken
         }
         open = 0;
     }
-    if (e == RQ_OK && !open) e = tok_text(m, "<|im_start|>assistant\n", thinking ? "" : "<think>\n\n</think>\n\n", "", out);
+    if (e == RQ_OK && !open) e = rq_chat_assistant(m, thinking, out);
     return e;
 }
 
@@ -369,7 +371,7 @@ static int parse_chat(App *a, const Js *root, Chat *ch, Job *j, ReqErr *e) {
                 return bad(e, "response_format", "unsupported json_schema: %s (runq serve constrains the output only to schemas "
                            "with a finite set of outputs: enum, const, boolean, null, bounded integer, objects of those)", err);
             j->con = ch->con;
-            thinking = 0; // (a constrained reply has no reasoning block)
+            thinking = 0; // (a constrained reply has no reasoning block; Thinking-2507: the empty think block)
         } else if (json_str_eq(ty, "json_object")) {
             return bad(e, "response_format", "response_format json_object is not supported: use json_schema with a schema that "
                        "has a finite set of outputs (enum, const, boolean, objects of those)%s", NULL);
@@ -377,6 +379,9 @@ static int parse_chat(App *a, const Js *root, Chat *ch, Job *j, ReqErr *e) {
             return bad(e, "response_format", "unknown response_format type '%.40s'", ty->s);
         }
     }
+    // the template variant: Instruct-2507 never thinks, Thinking-2507 always (but under a constraint)
+    if (a->info.chat == RQ_CHAT_INSTRUCT) thinking = 0;
+    else if (a->info.chat == RQ_CHAT_THINKING && !j->con) thinking = 1;
     j->thinking = thinking;
     return 0;
 }
@@ -543,7 +548,7 @@ static void post_chat(App *a, HttpConn *c, HttpReq *r) {
         return;
     }
     if (parse_chat(a, json_root(doc), &ch, j, &e) == 0) {
-        int rc = render(a->m, ch.msgs, ch.n_msgs, j->thinking, &j->prompt);
+        int rc = render(a->m, a->info.chat, ch.msgs, ch.n_msgs, j->thinking, &j->prompt);
         if (rc != RQ_OK) {
             e.status = rc == RQ_ERR_NOMEM ? 500 : 400;
             snprintf(e.msg, sizeof(e.msg), "cannot render the conversation: %s", rq_strerror(rc));
@@ -701,7 +706,7 @@ int serve_main(int argc, char **argv) {
     const char *warn = rq_threads_init(threads);
     if (warn) fprintf(stderr, "%s\n", warn);
     char err[512];
-    RqModelOpts mo = { 0, 0, 0 };
+    RqModelOpts mo = { ctx, 0, 0 }; // (positions up to -c: the default cap of 40,960 would clamp a larger -c)
     RqModel *m = rq_model_load(path, &mo, err, sizeof(err));
     if (!m) { fprintf(stderr, "%s\n", err); return 1; }
     App a;
@@ -742,8 +747,8 @@ int serve_main(int argc, char **argv) {
     if (lfd < 0) { fprintf(stderr, "runq serve: %s\n", err); return 1; }
     char desc[512];
     engine_describe(a.eng, desc, sizeof(desc));
-    fprintf(stderr, "runq serve: %s as '%s' (context %d, KV %s, %d threads, vocab index %.0f ms)\nrunq serve: %s\n", path, a.model_id, ctx,
-            rq_kv_name(kv), rq_threads(), (rq_now() - t0) * 1e3, desc);
+    fprintf(stderr, "runq serve: %s as '%s' (context %d of %d, KV %s, %d threads, chat template %s, vocab index %.0f ms)\nrunq serve: %s\n",
+            path, a.model_id, ctx, a.info.ctx_max, rq_kv_name(kv), rq_threads(), rq_chat_name(a.info.chat), (rq_now() - t0) * 1e3, desc);
     fprintf(stderr, "runq serve: listening on http://%s%s%s:%d\n", strchr(host, ':') ? "[" : "", host, strchr(host, ':') ? "]" : "", bound);
     fflush(stderr);
     http_run(lfd, &ho, handle, &a);

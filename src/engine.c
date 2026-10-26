@@ -62,7 +62,7 @@ struct Engine {
     EngineOpts o;
     size_t kv_pos;        // KV bytes per position
     ConVocab *vocab;
-    int V, eos, think_start, think_end;
+    int V, eos, think_start, think_end, chat; // chat: the template variant (RQ_CHAT_*)
     Run **run;            // running jobs, in admission order
     int nrun;
     // per pass
@@ -481,6 +481,8 @@ static void start_run(Engine *e, Job *j, int si, int src, int L) {
     r->row = -1;
     r->o.e = e;
     r->o.j = j;
+    if (j->thinking && e->chat == RQ_CHAT_THINKING)
+        r->o.mode = 1; // (Thinking-2507: the prompt opened the <think> block, the reply starts in the reasoning)
     for (int i = 0; i < j->nstop; i++)
         if ((int)strlen(j->stop[i]) > r->o.maxstop) r->o.maxstop = (int)strlen(j->stop[i]);
     sl->run = r;
@@ -814,6 +816,7 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
     rq_model_info(m, &info);
     e->V = info.vocab_size;
     e->eos = info.eos;
+    e->chat = info.chat;
     e->think_start = single_token(m, "<think>");
     e->think_end = single_token(m, "</think>");
     // the pool: --slots sequences of -c positions (default --parallel + 4), within --kv-mem (default: half the RAM)

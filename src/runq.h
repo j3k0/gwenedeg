@@ -50,8 +50,13 @@ int rq_threads(void);
 // ------------------------------------------------------------------------------------------ model
 typedef struct RqModel RqModel;
 
+// The default context length cap (RqModelOpts.ctx_len 0): the model's maximum, at most this many positions
+// (Qwen3's 40,960; the 2507 models' 262,144 would reserve 38.6 GB of KV cache address space per sequence)
+#define RQ_CTX_DEFAULT_MAX 40960
+
 typedef struct {
-    int ctx_len;        // context length cap (0 = the model's maximum): the default sequence capacity
+    int ctx_len;        // context length cap (0 = the model's maximum, at most RQ_CTX_DEFAULT_MAX; larger
+                        // values up to the model's maximum are taken as given): the default sequence capacity
     int tokenizer_only; // only the header / metadata and the tokenizer (no weights, no forward passes)
     int no_tokenizer;   // only the weights (rq_dequant_rows)
 } RqModelOpts;
@@ -64,11 +69,14 @@ void rq_model_free(RqModel *m);
 typedef struct {
     int dim, hidden_dim, n_layers, n_heads, n_kv_heads, head_dim, vocab_size;
     int seq_len;           // context length (the ctx_len cap applied)
+    int ctx_max;           // the model's context length (metadata), before the cap
     int group_size;        // activation quantization group (64 .bin, 32 GGUF)
     int shared_classifier; // classifier tied to the token embeddings
     int gguf;              // loaded from a GGUF file
     int bos, eos;          // generation ends at either
     const char *warning;   // a load-time warning to show (e.g. weights not packable), or NULL
+    int chat;              // chat template variant, RQ_CHAT_* (below)
+    float rope_theta;      // RoPE base
 } RqModelInfo;
 void rq_model_info(const RqModel *m, RqModelInfo *info);
 
@@ -182,12 +190,30 @@ int rq_detok_flush(RqDetok *d, char *out, size_t cap);
 //                  part after the last </think>, leading newlines stripped)
 //   end            "<|im_end|>\n" after every message
 // (.bin files: the templates come from the .template* side files, GGUF: built in, identical)
+// Variants (RqModelInfo.chat, detected from a GGUF's tokenizer.chat_template; .bin: hybrid):
+//   RQ_CHAT_HYBRID    Qwen3 (0.6B .. 8B): as above, thinking on or off per call
+//   RQ_CHAT_INSTRUCT  Qwen3-*-Instruct-2507: no think block ever; thinking is ignored (0), replies verbatim
+//                     in the history
+//   RQ_CHAT_THINKING  Qwen3-*-Thinking-2507: the user turn ends with "<think>\n" (the reply starts inside
+//                     the reasoning, it has no opening tag; answered turns lose it: rq_chat_user_history);
+//                     history as the hybrid with thinking. thinking 0
+//                     gives the hybrid's empty think block instead, which is not in this model's template
+//                     (runq serve uses it only for a constrained reply)
+enum { RQ_CHAT_HYBRID = 0, RQ_CHAT_INSTRUCT = 1, RQ_CHAT_THINKING = 2 };
+const char *rq_chat_name(int variant); // "qwen3", "instruct-2507", "thinking-2507"
 enum { RQ_ROLE_SYSTEM = 0, RQ_ROLE_USER = 1, RQ_ROLE_ASSISTANT = 2 };
 typedef struct { int role; const char *content; } RqMessage;
 
 int rq_chat_system(const RqModel *m, const char *text, int thinking, RqTokens *out);
 int rq_chat_user(const RqModel *m, const char *text, int thinking, RqTokens *out);
 int rq_chat_end(const RqModel *m, RqTokens *out);
+// a user turn as it stays in the history once answered: rq_chat_user's piece without Thinking-2507's
+// "<think>\n" (it opened the reasoning, which the history drops; HF's template renders earlier turns so).
+// The same as rq_chat_user for the other variants (the hybrid's empty think block stays, as the CLI keeps it)
+int rq_chat_user_history(const RqModel *m, const char *text, int thinking, RqTokens *out);
+// the generation prompt alone: "<|im_start|>assistant\n" + what the variant adds for this thinking mode (the
+// end of rq_chat_user's piece; e.g. after a message sequence rq_chat_user cannot express)
+int rq_chat_assistant(const RqModel *m, int thinking, RqTokens *out);
 // the history form of a reply generated as tokens (thinking: without its reasoning block)
 int rq_chat_reply_history(const RqModel *m, const int *reply, int n, int thinking, RqTokens *out);
 // a whole conversation: an optional system message, then user / assistant alternating, ending with

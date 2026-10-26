@@ -177,6 +177,10 @@ struct RqModel {
     int ff_rows;                // hidden rows per decode ffn work item (w1 + w3 + swiglu + quantize)
     int att_rows;               // query rows per prefill attention work item
     float att_scale;            // 1 / sqrt(head_dim)
+    float rope_theta;           // RoPE base (GGUF qwen3.rope.freq_base: Qwen3 1e6, the 2507 models 5e6; .bin 1e6)
+    float rope_log_theta;       // (float)ln(rope_theta), the form rope_row uses
+    int ctx_max;                // the model's context length (metadata) before the ctx_len cap
+    int chat;                   // chat template variant (RQ_CHAT_*): from the GGUF's tokenizer.chat_template
     // chat templates per thinking mode (0 off, 1 on): the user turn + assistant header with one %s
     // (.template / .template.with-thinking), the system block with one %s (the start of
     // .template.with-system[-and-thinking]); tmpl_missing: the .bin side file that could not be read
@@ -193,8 +197,10 @@ const char *gguf_get_str(const Gguf *g, const char *key, uint64_t *len);
 const GgufKV *gguf_get_array(const Gguf *g, const char *key, uint32_t type);
 const GgufTensor *gguf_tensor(const Gguf *g, const char *name);
 const uint8_t *gguf_weight(const Gguf *g, const char *name, uint32_t type, uint64_t ne0, uint64_t ne1);
-void gguf_config(const Gguf *g, Config *c);
+void gguf_config(const Gguf *g, Config *c, float *rope_theta);
+int gguf_chat_variant(const Gguf *g); // RQ_CHAT_* from tokenizer.chat_template (hybrid if absent / unknown)
 // model.c
+const char *chat_gen_suffix(const RqModel *m, int thinking); // after the assistant header (the variant's)
 void *alloc_big(size_t n);
 void free_big(void *p, size_t n);
 // tokenizer.c (errors: load_fail / gguf_fail)

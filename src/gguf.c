@@ -225,10 +225,10 @@ const uint8_t *gguf_weight(const Gguf *g, const char *name, uint32_t type, uint6
     return g->map + t->off;
 }
 
-void gguf_config(const Gguf *g, Config *c) {
+void gguf_config(const Gguf *g, Config *c, float *rope_theta) {
     // the hyperparameters from the metadata (llama.cpp's qwen3 keys), checked against what this
-    // engine implements: Qwen3 with RoPE theta 1e6 and RMSNorm eps 1e-6 (constants in rope_row /
-    // rmsnorm); Q8_0 / Q4_K / Q6_K weights (gguf_matrices)
+    // engine implements: Qwen3 (any RoPE theta: 1e6, the 2507 models 5e6; no RoPE scaling) with RMSNorm
+    // eps 1e-6 (the constant in rmsnorm); Q8_0 / Q4_K / Q6_K weights (gguf_matrices)
     uint64_t n;
     const char *arch = gguf_get_str(g, "general.architecture", &n);
     if (!arch || n != 5 || memcmp(arch, "qwen3", 5)) {
@@ -248,8 +248,8 @@ void gguf_config(const Gguf *g, Config *c) {
         if (v[i] < 1 || v[i] > (1 << 20)) gguf_fail(g, "metadata %s out of range", keys[i]);
     }
     float theta = 0, eps = 0;
-    if (!gguf_get_float(g, "qwen3.rope.freq_base", &theta) || theta != 1e6f)
-        gguf_fail(g, "qwen3.rope.freq_base must be 1e6 (the engine's RoPE)%s", NULL);
+    if (!gguf_get_float(g, "qwen3.rope.freq_base", &theta) || !(theta >= 1e3f && theta <= 1e9f))
+        gguf_fail(g, "qwen3.rope.freq_base missing or out of range (1e3 .. 1e9)%s", NULL);
     if (!gguf_get_float(g, "qwen3.attention.layer_norm_rms_epsilon", &eps) || eps != 1e-6f)
         gguf_fail(g, "qwen3.attention.layer_norm_rms_epsilon must be 1e-6 (the engine's RMSNorm)%s", NULL);
     const char *rs = gguf_get_str(g, "qwen3.rope.scaling.type", &n);
@@ -272,4 +272,30 @@ void gguf_config(const Gguf *g, Config *c) {
     c->vocab_size = (int)emb->ne[1];
     c->shared_classifier = gguf_tensor(g, "output.weight") == NULL; // absent: tied to token_embd
     c->group_size = 32; // activation groups: Q8_0 blocks, Q4_K sub-blocks, 2 Q6_K sub-blocks
+    *rope_theta = theta;
+}
+
+static int has_text(const char *s, uint64_t n, const char *pat) {
+    size_t k = strlen(pat);
+    for (uint64_t i = 0; k <= n && i <= n - k; i++)
+        if (!memcmp(s + i, pat, k)) return 1;
+    return 0;
+}
+
+int gguf_chat_variant(const Gguf *g) {
+    // The Qwen3 chat template variant, from the Jinja source in tokenizer.chat_template (not interpreted:
+    // the renderings are built in, model.c). The Qwen3 / Qwen3-2507 templates (HF's and Unsloth's
+    // rewrites in their GGUFs) differ in the generation prompt:
+    //   hybrid (Qwen3-0.6B .. 14B): enable_thinking; '<|im_start|>assistant\n' + '<think>\n\n</think>\n\n'
+    //     when thinking is off
+    //   thinking only (Qwen3-*-Thinking-2507): '<|im_start|>assistant\n<think>\n', no enable_thinking
+    //   instruct (Qwen3-*-Instruct-2507): '<|im_start|>assistant\n', no think block at all
+    // Absent, or not a ChatML template: hybrid (the built-in templates, as before)
+    uint64_t n = 0;
+    const char *t = gguf_get_str(g, "tokenizer.chat_template", &n);
+    if (!t || !has_text(t, n, "<|im_start|>") || has_text(t, n, "enable_thinking")) return RQ_CHAT_HYBRID;
+    if (has_text(t, n, "<|im_start|>assistant\\n<think>\\n'") || has_text(t, n, "<|im_start|>assistant\n<think>\n'") ||
+        has_text(t, n, "<|im_start|>assistant\\n<think>\\n\"") || has_text(t, n, "<|im_start|>assistant\n<think>\n\""))
+        return RQ_CHAT_THINKING;
+    return RQ_CHAT_INSTRUCT;
 }

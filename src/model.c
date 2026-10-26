@@ -386,6 +386,18 @@ static void prepare_weights(RqModel *m, int fd, LoadErr *e, char *warning, size_
 #define QWEN3_TMPL_SYS "<|im_start|>system\n%s<|im_end|>\n"
 #define QWEN3_TMPL_USER "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n"
 #define QWEN3_TMPL_NOTHINK "<think>\n\n</think>\n\n"
+#define QWEN3_TMPL_THINK "<think>\n" // Thinking-2507's generation prompt opens the reasoning block
+
+const char *rq_chat_name(int v) {
+    return v == RQ_CHAT_INSTRUCT ? "instruct-2507" : v == RQ_CHAT_THINKING ? "thinking-2507" : "qwen3";
+}
+
+const char *chat_gen_suffix(const RqModel *m, int thinking) {
+    // what the generation prompt adds after "<|im_start|>assistant\n" (chat.c, load_templates)
+    if (m->chat == RQ_CHAT_INSTRUCT) return "";
+    if (m->chat == RQ_CHAT_THINKING) return thinking ? QWEN3_TMPL_THINK : QWEN3_TMPL_NOTHINK;
+    return thinking ? "" : QWEN3_TMPL_NOTHINK;
+}
 
 static int read_template(const char *path, const char *suffix, char *out, char *missing) {
     // <path><suffix> (at most TMPL_MAX - 1 bytes); 0 and its name in missing if it cannot be read
@@ -408,8 +420,8 @@ static void load_templates(RqModel *m, const char *path) {
     // system block + the user turn: its start, if it ends with the user template)
     for (int t = 0; t < 2; t++) {
         m->tmpl_missing[t][0] = 0;
-        if (m->is_gguf) {
-            strcpy(m->user_tmpl[t], t ? QWEN3_TMPL_USER : QWEN3_TMPL_USER QWEN3_TMPL_NOTHINK);
+        if (m->is_gguf) { // (the variant's generation prompt: chat_gen_suffix)
+            snprintf(m->user_tmpl[t], TMPL_MAX, "%s%s", QWEN3_TMPL_USER, chat_gen_suffix(m, t));
             strcpy(m->sys_tmpl[t], QWEN3_TMPL_SYS);
             continue;
         }
@@ -489,7 +501,8 @@ static void load_tokenizer_only(RqModel *m, const char *path, Loader *ld) {
         m->gguf.path = path;
         m->gguf.err = e;
         gguf_parse(&m->gguf);
-        gguf_config(&m->gguf, &m->config);
+        gguf_config(&m->gguf, &m->config, &m->rope_theta);
+        m->chat = gguf_chat_variant(&m->gguf);
         build_tokenizer_gguf(&m->tok, &m->gguf, m->config.vocab_size);
         m->has_tok = 1;
         unmap_file(m); // (the tokenizer copied what it needs)
@@ -530,7 +543,8 @@ static void load_model(RqModel *m, const char *path, const RqModelOpts *o, Loade
         m->gguf.path = path;
         m->gguf.err = e;
         gguf_parse(&m->gguf);
-        gguf_config(&m->gguf, c);
+        gguf_config(&m->gguf, c, &m->rope_theta);
+        m->chat = gguf_chat_variant(&m->gguf);
     } else {
         // checkpoint format is 256-byte header, and then the model weights
         memcpy(c, map, sizeof(Config));
@@ -546,8 +560,11 @@ static void load_model(RqModel *m, const char *path, const RqModelOpts *o, Loade
                   c->group_size, GS);
     GS = c->group_size; // (process-wide: the kernels read it)
     if (o->ctx_len < 0) load_fail(e, "bad context length %d", o->ctx_len);
+    m->ctx_max = c->seq_len;
     if (o->ctx_len != 0 && o->ctx_len <= c->seq_len)
         c->seq_len = o->ctx_len;
+    else if (o->ctx_len == 0 && c->seq_len > RQ_CTX_DEFAULT_MAX) // (Qwen3: 40,960 = the cap; 2507: 262,144)
+        c->seq_len = RQ_CTX_DEFAULT_MAX;
     if (!forward_model_init(m))
         load_fail(e, "unsupported model shape (heads %d / %d, head_dim %d, dim %d, hidden %d, GS %d)", c->n_heads,
                   c->n_kv_heads, c->head_dim, c->dim, c->hidden_dim, GS);
@@ -605,6 +622,7 @@ RqModel *rq_model_load(const char *path, const RqModelOpts *opts, char *err, siz
         snprintf(err, errlen, "malloc failed!");
         return NULL;
     }
+    m->rope_theta = 1e6f; // (.bin files: Qwen3's; GGUF: gguf_config)
     ld->e.msg = err;
     ld->e.len = errlen;
     int ok = load_guarded(m, ld, path, opts ? opts : &defaults);
@@ -615,6 +633,8 @@ RqModel *rq_model_load(const char *path, const RqModelOpts *opts, char *err, siz
         return NULL;
     }
     m->gguf.err = NULL;
+    m->rope_log_theta = (float)log((double)m->rope_theta);
+    if (!m->ctx_max) m->ctx_max = m->config.seq_len; // (tokenizer only)
     return m;
 }
 
@@ -658,6 +678,9 @@ void rq_model_info(const RqModel *m, RqModelInfo *info) {
     info->bos = m->has_tok ? (int)m->tok.bos_token_id : -1;
     info->eos = m->has_tok ? (int)m->tok.eos_token_id : -1;
     info->warning = m->warning[0] ? m->warning : NULL;
+    info->ctx_max = m->ctx_max;
+    info->chat = m->chat;
+    info->rope_theta = m->rope_theta;
 }
 
 // ---------------------------------------------------------------------------- test hook

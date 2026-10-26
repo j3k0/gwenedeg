@@ -345,10 +345,10 @@ RqCtx *rq_ctx_new(const RqModel *mc, int nb_max, int max_ctx, int *err) {
     }
 
     c->x = calloc(p->dim, sizeof(float));
-    c->xb = calloc(all_heads_dim, sizeof(float));
+    c->xb = calloc(ad, sizeof(float)); // (dim and all_heads_dim values: max of both, ad; Qwen3: all_heads_dim >= dim)
     c->hb = calloc(p->hidden_dim, sizeof(float));
     c->hb2 = calloc(p->hidden_dim, sizeof(float));
-    c->xq = (QuantizedTensor) { .q = calloc(all_heads_dim, sizeof(int8_t)), .s = calloc(all_heads_dim / GS, sizeof(float)) };
+    c->xq = (QuantizedTensor) { .q = calloc(ad, sizeof(int8_t)), .s = calloc(ad / GS, sizeof(float)) };
     c->hq = (QuantizedTensor) { .q = calloc(p->hidden_dim, sizeof(int8_t)), .s = calloc(p->hidden_dim / GS, sizeof(float)) };
     c->q = calloc(all_heads_dim, sizeof(float));
     c->xq_corr = calloc(ad / GS + 1, sizeof(int32_t));
@@ -480,7 +480,10 @@ void embed_row(float *x, const QuantizedTensor *t, int token, int dim) {
     // as the whole dequantized table upstream kept in memory. GGUF: from its blocks, the same
     // expression with the fp16 scale as a float (dim % 32 == 0, checked at load)
     size_t e0 = (size_t)token * dim;
-    if (t->kp) { // GGUF Q4_K / Q6_K: ggml's dequantization of the row's blocks (dim % 256 == 0)
+    if (t->b && t->type != GGML_Q8_0) {
+        // GGUF Q4_K / Q6_K: ggml's dequantization of the row's blocks (dim % 256 == 0). By the tensor's
+        // type, not by t->kp: an untied embedding table (Qwen3-8B: Q4_K, output.weight Q6_K) is never
+        // repacked (only the matmul weights are), so it has no kp and used to be read as Q8_0 blocks (NaN)
         kq_dequant_row(t->type, t->b + (size_t)token * (dim / QK_K) * kq_block_bytes(t->type), dim, x);
         return;
     }
@@ -516,7 +519,11 @@ void rmsnorm(float *o, float *x, float *weight, int size) {
     for (int j = 0; j < size; j++)
         ss += x[j] * x[j];
 
-    ss = 1.0f / sqrtf((ss / size) + 1e-6f);
+    // (an explicit reciprocal: with ss / size, -Ofast (reciprocal math) multiplied by a hoisted 1 / size
+    // where rmsnorm is inlined into a per-row loop but divided in the single decode call, which rounds
+    // differently unless size is a power of two: Qwen3-4B's dim 2560 broke the bit-identity of batched
+    // vs sequential vs generic. For power-of-two sizes both are exact: the same bits as before)
+    ss = 1.0f / sqrtf((ss * (1.0f / size)) + 1e-6f);
 
     // normalize and scale
     for (int j = 0; j < size; j++)
@@ -787,12 +794,16 @@ NO_FP_CONTRACT static void gemm_item(const Gemm *g, int it, uint8_t *scr, const 
     }
 }
 
-static void rope_row(float *cs, int head_dim, int pos) {
+static void rope_row(float *cs, int head_dim, int pos, float log_theta) {
     // RoPE rotation of position pos: cs[j] = cos, cs[j + head_dim/2] = sin of pos * freq_j, computed
     // once per position (was: in qk_norm_rope for every layer and head, ~6% of a 451-token
-    // prefill), with the original expressions, so the values are the same
+    // prefill), with the original expressions, so the values are the same. freq_j = theta^(-j / (hd/2))
+    // as exp(ln(theta) * x): the form gcc -Ofast made of the constant powf(1e6, x) before (vectorized
+    // expf), so theta 1e6 (log_theta = (float)ln(1e6)) gives the same bits; with a variable base, powf
+    // would be the vector powf (other bits). theta: the model's (RqModel.rope_log_theta; Qwen3 1e6,
+    // the 2507 models 5e6)
     for (int j = 0; j < head_dim/2; j++) {
-        float freq = powf(1e6, -(float)j / (head_dim/2));
+        float freq = expf(log_theta * (-(float)j / (head_dim/2)));
         float cos_freq = cosf(pos * freq), sin_freq = sinf(pos * freq);
         cs[j] = cos_freq;
         cs[j + head_dim/2] = sin_freq;
@@ -1349,7 +1360,7 @@ static int decode_step(RqCtx *c, RqSeq *s, int token, float *logits) {
     int pos = s->len;
     // the token embedding into x
     embed_row(c->x, c->m->weights.q_tokens, token, p->dim);
-    rope_row(c->rope, p->head_dim, pos);
+    rope_row(c->rope, p->head_dim, pos, c->m->rope_log_theta);
     decode_norm(c, p, &c->m->weights, 0, 0); // layer 0's attention rmsnorm + quantize
 
     if (rq_begin(&c->sync, decode_phases(p), decode_counters(p), rq_nthreads(), rq_spin_dec) != 0)
@@ -1444,7 +1455,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
         float *x = c->x_b + (size_t)b * dim, *xb = c->xb_b + (size_t)b * xs;
         QuantizedTensor xq = qrow(&c->xq_b, b, xs);
         embed_row(x, w->q_tokens, c->row_tok[b], dim);
-        rope_row(c->rope_b + (size_t)b * hd, hd, c->row_pos[b]);
+        rope_row(c->rope_b + (size_t)b * hd, hd, c->row_pos[b], m->rope_log_theta);
         rmsnorm(xb, x, w->rms_att_weight, dim);
         quantize(&xq, xb, dim);
         act_prep_row(&xq, dim, c->bq_corr, c->bq_xf, c->bq_c16, b);
@@ -1807,7 +1818,7 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
             continue;
         }
         embed_row(c->x_b + (size_t)it * dim, w->q_tokens, c->row_tok[it], dim);
-        rope_row(c->rope_b + (size_t)it * hd, hd, c->row_pos[it]);
+        rope_row(c->rope_b + (size_t)it * hd, hd, c->row_pos[it], m->rope_log_theta);
         bd_norm_row(c, p, w, it, 0, 0, it);
     }
     PH_END_NOEPI
@@ -1959,10 +1970,11 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
     }
 
     if (job->nsel > 0) { // classifier over the rows with logits (xq_b rows 0..nsel-1)
-        int nblk = p->vocab_size / 16, cc = nblk / (8 * nt) > 1 ? nblk / (8 * nt) : 1;
+        // (a vocabulary that is not a multiple of 16: the generic kernels' last block is partial, as in decode)
+        int nblk = (p->vocab_size + 15) / 16, cc = nblk / (8 * nt) > 1 ? nblk / (8 * nt) : 1;
         PH_BEGIN(nblk, cc)
             rows_mm(w->wcls, job->out, p->vocab_size, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, job->nsel, dim, lo * 16,
-                    hi * 16);
+                    hi * 16 < p->vocab_size ? hi * 16 : p->vocab_size);
         PH_END_NOEPI
         PPROF(PF_CLS);
     }

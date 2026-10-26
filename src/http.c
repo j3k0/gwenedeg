@@ -87,6 +87,7 @@ const char *http_reason(int s) {
         case 411: return "Length Required";
         case 413: return "Payload Too Large";
         case 414: return "URI Too Long";
+        case 417: return "Expectation Failed";
         case 431: return "Request Header Fields Too Large";
         case 499: return "Client Closed Request";
         case 500: return "Internal Server Error";

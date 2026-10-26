@@ -301,8 +301,8 @@ static int pick_slot(Engine *e, const Job *j) {
         }
         if (e->slot_used[i] < e->slot_used[lru]) lru = i;
     }
-    if (e->o.slots == 1 || bestL >= 32 || (bestL > 0 && 2 * bestL >= j->prompt.n)) return best;
-    return lru;
+    if (e->o.slots == 1 || (!j->no_cache && (bestL >= 32 || (bestL > 0 && 2 * bestL >= j->prompt.n)))) return best;
+    return lru; // (a no_cache job too: it keeps the useful caches)
 }
 
 static int interrupted(Engine *e, Job *j, int *status) {

@@ -173,6 +173,10 @@ KV_BATCHED = [(THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG3, BATCH)]
 KV_KERNELS = [(THREADS_PROMPT, SEQ), (BATCH_LONG3, BATCH)]
 GEN_THREADS = 4          # all generic-build runs (kernels/*, gguf_kernels/*, q4_kernels/*), in the
                          # background (results do not depend on the thread count)
+SEQ_THREADS = 4          # the sequential (-b 1) runs unless a test names a thread count: token by token,
+                         # 113 phases each (decode is memory-bound: 4 threads ~ 8 alone), the longest runs
+                         # of the suite (long2: 297 tokens with every row's logits), 3 at a time next to the
+                         # background work: at 8 threads ~8 s each, at 4 ~3 s (Step 10a)
 PREFETCH_JOBS = 3        # runq -m logits runs at OMP_NUM_THREADS in parallel (prefetch_all), next to the
                          # background generic runs: the suite's ~60 logits runs, ~0.1 s of startup each
 GGUF_TEMPLATES = [("plain", [], ".template"), ("thinking", ["-r", "1"], ".template.with-thinking"),
@@ -264,7 +268,7 @@ PENDING = {}  # logits file path -> future of the run writing it (prefetch_all)
 
 def logits_file(a, tmp, name, text, chunk, threads=None):
     """runq -m logits for (prompt, chunk, threads), cached in tmp across tests (and prefetched)."""
-    t = threads or int(os.environ["OMP_NUM_THREADS"])
+    t = threads or (SEQ_THREADS if chunk == SEQ else int(os.environ["OMP_NUM_THREADS"]))
     path = os.path.join(tmp, f"logits_{name}_b{chunk}_t{t}.bin")
     fut = PENDING.get(path)
     if fut is not None:
@@ -283,7 +287,7 @@ def prefetch_all(a, tmp, only, fg, bg):
     nd = int(os.environ["OMP_NUM_THREADS"])
     def sub(ex, var, d, name, chunk, threads=None):
         os.makedirs(d, exist_ok=True)
-        t = threads or nd
+        t = threads or (SEQ_THREADS if chunk == SEQ else nd)
         path = os.path.join(d, f"logits_{name}_b{chunk}_t{t}.bin")
         if path not in PENDING and not os.path.exists(path):
             PENDING[path] = ex.submit(runq_logits_run, var, texts[name], path, t, chunk)
@@ -360,25 +364,56 @@ def prefetch_all(a, tmp, only, fg, bg):
             sub(fg, q4, qt, n, c, THREADS_LONG if nd != THREADS_LONG else 8)
 
 
-API_THREADS = 4  # the API test's runs (in the background from the start; results do not depend on it)
+API_THREADS = {"bin": 3, "gguf": 4, "q4": 4}  # the API test's runs (in the background from the start)
+# the batched passes again (api_test --digest: their logits hashes only) at other thread counts (Q4_K_M, else
+# the .bin; 8 and 16 threads: the short passes) and on the generic build (--digest-small, 3 threads: the .bin with
+# the long passes, Q4_K_M the short ones): the same DIGEST lines. 65 sequences in one pass (--n65): Q4_K_M
+# only; a bf16 KV cache (--kv): the .bin
+API_DIGEST_THREADS = (1, 8, 16)
+API_GENERIC_THREADS = 3
 
 
-def api_runs(a, ex):
-    """Start tests/api_test (the library API: src/runq.h) on each model; futures by tag."""
+def api_runs(a, ex, gx):
+    """Start tests/api_test (the library API: src/runq.h) on each model, and its digest runs; futures by tag
+    (digest runs: (tag, label) -> future)."""
     if not a.api_test:
-        return {}
+        return {}, {}
     models = [("bin", a.model), ("gguf", a.gguf), ("q4", a.q4)]
-    return {tag: ex.submit(run, [a.api_test, m], API_THREADS) for tag, m in models if m}
+    n65 = {"q4": ["--n65"]} if a.q4 else {"bin": ["--n65"]}
+    main = {tag: ex.submit(run, [a.api_test, m] + n65.get(tag, []) + (["--kv"] if tag == "bin" else []), API_THREADS[tag])
+            for tag, m in models if m}
+    dg = {}
+    gen = a.api_test + "-generic"
+    if os.path.exists(gen):
+        for tag, m in models:
+            if m and tag != "gguf":
+                dg[(tag, "generic")] = gx.submit(run, [gen, m, "--digest-small"] + (["--long"] if tag == "bin" else []),
+                                                 API_GENERIC_THREADS)
+    tag, m = ("q4", a.q4) if a.q4 else ("bin", a.model)
+    for t in API_DIGEST_THREADS:
+        mode = ["--digest"] + n65.get(tag, []) if t == 1 else ["--digest-small"]
+        dg[(tag, f"t{t}")] = ex.submit(run, [a.api_test, m] + mode, t)
+    return main, dg
 
 
-def test_api(a, res, futs):
+def digests(p):
+    """DIGEST name hash lines of an api_test run -> dict"""
+    return dict(l.split()[1:3] for l in p.stdout.decode(errors="replace").splitlines() if l.startswith("DIGEST "))
+
+
+def test_api(a, res, runs):
     """tests/api_test.c per model: sequences interleaved / batched in one pass / truncated and
     re-prefilled give bit-identical logits, rq_generate == a hand-written loop, error codes, chat
-    rendering, incremental detokenization, the sampler's token mask"""
+    rendering, incremental detokenization, the sampler's token mask; batched decode rows == each
+    sequence alone, mixed passes, batched sampling; the batched passes' digests equal at other thread
+    counts and on the generic build"""
+    futs, dfuts = runs
     if not futs:
         print("   (skipped: no --api-test binary)")
+    ref = {}
     for tag, fut in futs.items():
         p = fut.result()
+        ref[tag] = digests(p)
         lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
         for l in lines:
             ok, rest = l.startswith("PASS "), l[5:]
@@ -386,6 +421,16 @@ def test_api(a, res, futs):
             res.report(ok, f"api_{tag}/{name.strip()}", detail.strip())
         if p.returncode not in (0, 1) or not lines:
             res.report(False, f"api_{tag}/run", f"exit status {p.returncode}: {p.stderr.decode(errors='replace')[-300:]}")
+    for (tag, label), fut in dfuts.items():
+        p, r = fut.result(), ref.get(tag, {})
+        d = digests(p)
+        common = [n for n in d if n in r]
+        bad = [n for n in common if d[n] != r[n]]
+        ok = p.returncode == 0 and len(common) >= 2 and not bad
+        what = "the generic build" if label == "generic" else f"{label[1:]} thread(s)"
+        res.report(ok, f"api_{tag}/batch_digest_{label}",
+                   f"{len(common)} batched passes on {what} == {API_THREADS[tag]} threads" + (f"; differ: {', '.join(bad)}" if bad
+                   else "" if p.returncode == 0 else f"; exit status {p.returncode}"))
 
 
 SERVER_THREADS = 2  # runq serve and its CLI reference runs (in the background from the start)
@@ -1135,9 +1180,10 @@ def main():
         only = {"greedy", "chat"}
     with tempfile.TemporaryDirectory(prefix="cwayn-test-") as tmp, \
             cf.ThreadPoolExecutor(max_workers=PREFETCH_JOBS) as fg, cf.ThreadPoolExecutor(max_workers=2) as bg, \
-            cf.ThreadPoolExecutor(max_workers=1) as ax, cf.ThreadPoolExecutor(max_workers=1) as sx:
+            cf.ThreadPoolExecutor(max_workers=1) as ax, cf.ThreadPoolExecutor(max_workers=1) as sx, \
+            cf.ThreadPoolExecutor(max_workers=1) as gx:
         server = server_run(a, sx) if "server" in only and not a.update_greedy else None
-        api = api_runs(a, ax) if "api" in only else {}
+        api = api_runs(a, ax, gx) if "api" in only else ({}, {})
         if not a.update_greedy:
             prefetch_all(a, tmp, only, fg, bg)
         for name, fn in [("tokenizer", lambda: test_tokenizer(a, res)),

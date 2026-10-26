@@ -594,6 +594,200 @@ static void kq512_gemm_item(float *out, int ldo, const uint8_t *kp, int type, in
     }
 }
 
+/* ---------------------------------------------------------------------------------------------
+ * Small-batch matmul kernels (Step 10a: a few rows, e.g. decode rows of several sequences in one
+ * rq_forward_batch pass): out[b * ldo + i] = W[i, :] . x[b, :] for the rows i of 16-row blocks
+ * rb0..rb1-1 and all nb activation rows. Like the GEMV, each thread streams its blocks once, the
+ * 4 / 6-bit data unpacked in registers (no scratch tile: the GEMM's per-tile unpacking costs as much
+ * as the arithmetic at a few rows); each unpacked group is used for up to SMB_C activation rows
+ * (more rows: the block again from L1 for the next SMB_C). The integer sums are exact and the folds
+ * the same functions in the same order per (block, row, group) as the GEMV / GEMM / generic kernels,
+ * so every row's result is bit-identical to them, whatever rows it is batched with.
+ * Activation side per row b: xq + b * ldx, xs + b * ldx / gs; Q8P corr + b * k / gs; K-quants xf +
+ * b * k / 32, c16 + b * k / 16 (the strides of the GEMM's act_prep_row in forward.c).
+ */
+#ifndef SMB_C
+#define SMB_C 8 // activation rows per pass over an unpacked group (register tile 1 block x SMB_C rows)
+#endif
+#if SMB_C < 1 || SMB_C > 8
+#error "SMB_C must be in 1..8"
+#endif
+
+static inline __attribute__((always_inline))
+void q8p_smb_block(const int C, const int GSZ, const uint8_t *wb, int ng, const int8_t *x, size_t ldx, const float *xs,
+                   size_t ldxs, const int32_t *corr, size_t ldc, float *out, size_t ldo) {
+    // one Q8P block (wb: its ng groups) x C activation rows; two chains per row (even / odd steps, as the
+    // GEMV: vpdpbusd's latency)
+    __m512 f[8];
+    for (int c = 0; c < C; c++)
+        f[c] = _mm512_setzero_ps();
+    for (int g = 0; g < ng; g++) {
+        const uint8_t *wg = wb + (size_t)g * Q8P_GROUP(GSZ);
+        __m512i a[8], b[8];
+        for (int c = 0; c < C; c++) {
+            a[c] = _mm512_set1_epi32(corr[(size_t)c * ldc + g]);
+            b[c] = _mm512_setzero_si512();
+        }
+        #pragma GCC unroll 16
+        for (int st = 0; st < GSZ / 4; st++) {
+            __m512i w = _mm512_load_si512((const void *)(wg + st * 64));
+            for (int c = 0; c < C; c++) {
+                __m512i xv = q8p_bcast4(x + (size_t)c * ldx + (size_t)g * GSZ + st * 4);
+                if (st & 1)
+                    b[c] = _mm512_dpbusd_epi32(b[c], w, xv);
+                else
+                    a[c] = _mm512_dpbusd_epi32(a[c], w, xv);
+            }
+        }
+        __m512 ws = _mm512_load_ps((const float *)(wg + Q8P_ROWS * GSZ));
+        for (int c = 0; c < C; c++)
+            f[c] = q8p_fold(f[c], ws, xs[(size_t)c * ldxs + g], _mm512_add_epi32(a[c], b[c]));
+    }
+    for (int c = 0; c < C; c++)
+        _mm512_storeu_ps(out + (size_t)c * ldo, f[c]);
+}
+
+static inline __attribute__((always_inline))
+void kq4_smb_block(const int C, const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs,
+                   const float *xf, size_t ldxf, float *out, size_t ldo) {
+    // one Q4P block (wb: its nsb super-blocks) x C activation rows: per group the 8 steps unpacked once
+    const __m512i m4 = _mm512_set1_epi8(0x0f);
+    __m512 f[8];
+    for (int c = 0; c < C; c++)
+        f[c] = _mm512_setzero_ps();
+    for (int s = 0; s < nsb; s++) {
+        const uint8_t *o = wb + (size_t)s * Q4P_SB;
+        __m512 d = _mm512_cvtph_ps(_mm256_load_si256((const __m256i *)o));
+        __m512 dmin = _mm512_cvtph_ps(_mm256_load_si256((const __m256i *)(o + 32)));
+        for (int j = 0; j < 8; j++) {
+            int g = 8 * s + j;
+            const uint8_t *qs = o + 320 + 256 * j;
+            __m512i w[8];
+            for (int cc = 0; cc < 4; cc++) {
+                __m512i v = _mm512_load_si512((const void *)(qs + 64 * cc));
+                w[2 * cc] = _mm512_and_si512(v, m4);
+                w[2 * cc + 1] = _mm512_and_si512(_mm512_srli_epi16(v, 4), m4);
+            }
+            __m512 ds = _mm512_mul_round_ps(d, kq512_u8ps(o + 64 + 16 * j), Q8P_RND);
+            __m512 dm = _mm512_mul_round_ps(dmin, kq512_u8ps(o + 192 + 16 * j), Q8P_RND);
+            for (int c = 0; c < C; c++) {
+                const int8_t *xg = x + (size_t)c * ldx + 32 * g;
+                __m512i a0 = _mm512_setzero_si512(), a1 = _mm512_setzero_si512();
+                for (int cc = 0; cc < 4; cc++) {
+                    a0 = _mm512_dpbusd_epi32(a0, w[2 * cc], q8p_bcast4(xg + 8 * cc));
+                    a1 = _mm512_dpbusd_epi32(a1, w[2 * cc + 1], q8p_bcast4(xg + 8 * cc + 4));
+                }
+                f[c] = kq4_fold(f[c], ds, dm, xs[(size_t)c * ldxs + g], xf[(size_t)c * ldxf + g], _mm512_add_epi32(a0, a1));
+            }
+        }
+    }
+    for (int c = 0; c < C; c++)
+        _mm512_storeu_ps(out + (size_t)c * ldo, f[c]);
+}
+
+static inline __attribute__((always_inline))
+void kq6_smb_block(const int C, const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs,
+                   const int32_t *c16, size_t ldc, float *out, size_t ldo) {
+    // one Q6P block x C activation rows: per sub-block the 4 steps unpacked once
+    __m512 f[8];
+    for (int c = 0; c < C; c++)
+        f[c] = _mm512_setzero_ps();
+    for (int s = 0; s < nsb; s++) {
+        const uint8_t *o = wb + (size_t)s * Q6P_SB;
+        __m512 d = _mm512_load_ps((const float *)o);
+        for (int g8 = 0; g8 < 8; g8++) {
+            int g = 8 * s + g8;
+            __m512i I[8];
+            for (int c = 0; c < C; c++)
+                I[c] = _mm512_setzero_si512();
+            for (int h = 0; h < 2; h++) {
+                int j = 2 * g8 + h;
+                __m512i q[4];
+                kq6_unpack4(o + 320 + 192 * j, o + 448 + 192 * j, q);
+                __m512i sc = _mm512_cvtepi8_epi32(_mm_load_si128((const __m128i *)(o + 64 + 16 * j)));
+                for (int c = 0; c < C; c++) {
+                    const int8_t *xg = x + (size_t)c * ldx + 32 * g + 16 * h;
+                    __m512i t0 = _mm512_set1_epi32(c16[(size_t)c * ldc + 2 * g + h]), t1 = _mm512_setzero_si512();
+                    t0 = _mm512_dpbusd_epi32(t0, q[0], q8p_bcast4(xg));
+                    t1 = _mm512_dpbusd_epi32(t1, q[1], q8p_bcast4(xg + 4));
+                    t0 = _mm512_dpbusd_epi32(t0, q[2], q8p_bcast4(xg + 8));
+                    t1 = _mm512_dpbusd_epi32(t1, q[3], q8p_bcast4(xg + 12));
+                    I[c] = _mm512_add_epi32(I[c], _mm512_mullo_epi32(_mm512_add_epi32(t0, t1), sc));
+                }
+            }
+            for (int c = 0; c < C; c++)
+                f[c] = kq6_fold(f[c], d, xs[(size_t)c * ldxs + g], I[c]);
+        }
+    }
+    for (int c = 0; c < C; c++)
+        _mm512_storeu_ps(out + (size_t)c * ldo, f[c]);
+}
+
+// instances per row count C = 1..SMB_C (and Q8P group size)
+#define SMB_INST(NAME, BODY) \
+    static void NAME##_1 BODY(1) static void NAME##_2 BODY(2) static void NAME##_3 BODY(3) static void NAME##_4 BODY(4) \
+    static void NAME##_5 BODY(5) static void NAME##_6 BODY(6) static void NAME##_7 BODY(7) static void NAME##_8 BODY(8)
+#define SMB_Q8_64(C) (const uint8_t *wb, int ng, const int8_t *x, size_t ldx, const float *xs, size_t ldxs, const int32_t *corr, \
+    size_t ldc, float *out, size_t ldo) { q8p_smb_block(C, 64, wb, ng, x, ldx, xs, ldxs, corr, ldc, out, ldo); }
+#define SMB_Q8_32(C) (const uint8_t *wb, int ng, const int8_t *x, size_t ldx, const float *xs, size_t ldxs, const int32_t *corr, \
+    size_t ldc, float *out, size_t ldo) { q8p_smb_block(C, 32, wb, ng, x, ldx, xs, ldxs, corr, ldc, out, ldo); }
+#define SMB_KQ4(C) (const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs, const float *xf, \
+    size_t ldxf, float *out, size_t ldo) { kq4_smb_block(C, wb, nsb, x, ldx, xs, ldxs, xf, ldxf, out, ldo); }
+#define SMB_KQ6(C) (const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs, const int32_t *c16, \
+    size_t ldc, float *out, size_t ldo) { kq6_smb_block(C, wb, nsb, x, ldx, xs, ldxs, c16, ldc, out, ldo); }
+SMB_INST(q8p_smb64, SMB_Q8_64)
+SMB_INST(q8p_smb32, SMB_Q8_32)
+SMB_INST(kq4_smb, SMB_KQ4)
+SMB_INST(kq6_smb, SMB_KQ6)
+#undef SMB_INST
+#undef SMB_Q8_64
+#undef SMB_Q8_32
+#undef SMB_KQ4
+#undef SMB_KQ6
+
+typedef void (*SmbQ8Fn)(const uint8_t *, int, const int8_t *, size_t, const float *, size_t, const int32_t *, size_t, float *, size_t);
+typedef void (*SmbKq4Fn)(const uint8_t *, int, const int8_t *, size_t, const float *, size_t, const float *, size_t, float *, size_t);
+typedef void (*SmbKq6Fn)(const uint8_t *, int, const int8_t *, size_t, const float *, size_t, const int32_t *, size_t, float *, size_t);
+static const SmbQ8Fn smb_q8_64[8] = { q8p_smb64_1, q8p_smb64_2, q8p_smb64_3, q8p_smb64_4, q8p_smb64_5, q8p_smb64_6, q8p_smb64_7, q8p_smb64_8 };
+static const SmbQ8Fn smb_q8_32[8] = { q8p_smb32_1, q8p_smb32_2, q8p_smb32_3, q8p_smb32_4, q8p_smb32_5, q8p_smb32_6, q8p_smb32_7, q8p_smb32_8 };
+static const SmbKq4Fn smb_kq4[8] = { kq4_smb_1, kq4_smb_2, kq4_smb_3, kq4_smb_4, kq4_smb_5, kq4_smb_6, kq4_smb_7, kq4_smb_8 };
+static const SmbKq6Fn smb_kq6[8] = { kq6_smb_1, kq6_smb_2, kq6_smb_3, kq6_smb_4, kq6_smb_5, kq6_smb_6, kq6_smb_7, kq6_smb_8 };
+
+static void smb512_rows(int type, float *out, size_t ldo, const int8_t *xq, size_t ldx, const float *xs, const int32_t *corr,
+                        const float *xf, const int32_t *c16, int nb, const uint8_t *wp, int k, int gs, int rb0, int rb1) {
+    // the small-batch kernel over blocks rb0..rb1-1 of W (Q4P / Q6P by type; any other type: Q8P with
+    // group size gs) and activation rows 0..nb-1, SMB_C rows per pass over a block
+    size_t ldxs = (size_t)ldx / gs;
+    if (type != GGML_Q4_K && type != GGML_Q6_K) {
+        int ng = k / gs;
+        size_t bstride = (size_t)ng * Q8P_GROUP(gs);
+        const SmbQ8Fn *fn = gs == 64 ? smb_q8_64 : smb_q8_32;
+        for (int rb = rb0; rb < rb1; rb++)
+            for (int b = 0; b < nb; b += SMB_C) {
+                int c = nb - b < SMB_C ? nb - b : SMB_C;
+                fn[c - 1](wp + (size_t)rb * bstride, ng, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
+                          corr + (size_t)b * ng, ng, out + (size_t)b * ldo + (size_t)rb * Q8P_ROWS, ldo);
+            }
+        return;
+    }
+    int nsb = k / QK_K, ng = k / 32, n16 = k / 16;
+    size_t bstride = (size_t)nsb * kq_sb_bytes(type);
+    for (int rb = rb0; rb < rb1; rb++)
+        for (int b = 0; b < nb; b += SMB_C) {
+            int c = nb - b < SMB_C ? nb - b : SMB_C;
+            if (type == GGML_Q4_K)
+                smb_kq4[c - 1](wp + (size_t)rb * bstride, nsb, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
+                               xf + (size_t)b * ng, ng, out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo);
+            else
+                smb_kq6[c - 1](wp + (size_t)rb * bstride, nsb, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
+                               c16 + (size_t)b * n16, n16, out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo);
+        }
+}
+
+// the small-batch interface of forward.c (AVX-512 only: other builds keep the GEMM, the same results)
+#define RUNQ_SMB 1
+#define smb_rows smb512_rows
+
 // the K-quant SIMD kernel interface of forward.c (kernels_neon.h implements the same on AArch64)
 #define RUNQ_KQX 1
 #define kqx_c16 kq512_c16

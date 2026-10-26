@@ -66,7 +66,11 @@ debug: runq-debug
 $(B)/api_test: tests/api_test.c src/runq.h $(LIB:%=$(B)/native/%.o)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
 
-api-test: $(B)/api_test
+# the same on the generic kernels (make test compares the batched passes' digests with the native build's)
+$(B)/api_test-generic: tests/api_test.c src/runq.h $(LIB:%=$(B)/generic/%.o)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DRUNQ_GENERIC $< $(LIB:%=$(B)/generic/%.o) $(LDLIBS) -o $@
+
+api-test: $(B)/api_test $(B)/api_test-generic
 
 # the batched decode benchmark (tests/bench_batch.c; scripts/bench_batch.sh)
 $(B)/bench_batch: tests/bench_batch.c src/runq.h $(LIB:%=$(B)/native/%.o)

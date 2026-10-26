@@ -211,8 +211,8 @@ int sample(Sampler *sampler, float *logits) {
     }
 }
 
-int rq_sample(RqCtx *c, RqSeq *s, float *logits, const RqSampling *cfg) {
-    int V = ctx_vocab(c);
+static int sample_row(int V, void *scratch, RqSeq *s, float *logits, const RqSampling *cfg) {
+    // rq_sample with the candidate scratch given (vocab_size * 8 bytes)
     if (cfg->temperature < 0 || cfg->temperature != cfg->temperature) return RQ_ERR_ARG;
     if (cfg->allow) {
         // constrained decoding: the disallowed logits become a large negative finite value (no
@@ -225,8 +225,44 @@ int rq_sample(RqCtx *c, RqSeq *s, float *logits, const RqSampling *cfg) {
         for (int i = 0; i < V; i++)
             if (!cfg->allow[i]) logits[i] = low;
     }
-    Sampler smp = { V, ctx_sampler_scratch(c), cfg->temperature, cfg->topp, s->rng };
+    Sampler smp = { V, scratch, cfg->temperature, cfg->topp, s->rng };
     int token = sample(&smp, logits);
     s->rng = smp.rng_state;
     return token;
+}
+
+int rq_sample(RqCtx *c, RqSeq *s, float *logits, const RqSampling *cfg) {
+    return sample_row(ctx_vocab(c), ctx_sampler_scratch(c), s, logits, cfg);
+}
+
+typedef struct {
+    int V, n, ncfg, next;
+    char *scratch;
+    RqSeq *const *seqs;
+    float *logits;
+    const RqSampling *cfg;
+    int *tokens;
+} SampleJob;
+
+static void sample_worker(void *arg, int tid, int nt) {
+    // rows claimed one at a time from a shared counter, each sampled with this thread's scratch
+    (void)nt;
+    SampleJob *j = arg;
+    for (int i; (i = __atomic_fetch_add(&j->next, 1, __ATOMIC_RELAXED)) < j->n;)
+        j->tokens[i] = sample_row(j->V, j->scratch + (size_t)tid * j->V * 8, j->seqs[i], j->logits + (size_t)i * j->V,
+                                  &j->cfg[j->ncfg > 1 ? i : 0]);
+}
+
+int rq_sample_batch(RqCtx *c, RqSeq *const *seqs, float *logits, int n, const RqSampling *cfg, int ncfg, int *tokens) {
+    int V = ctx_vocab(c), nt = rq_threads();
+    if (n < 1 || (ncfg != 1 && ncfg != n)) return RQ_ERR_ARG;
+    if (n == 1 || nt == 1) {
+        for (int i = 0; i < n; i++)
+            tokens[i] = sample_row(V, ctx_sampler_scratch(c), seqs[i], logits + (size_t)i * V, &cfg[ncfg > 1 ? i : 0]);
+        return RQ_OK;
+    }
+    SampleJob j = { V, n, ncfg, 0, ctx_sampler_scratch_threads(c, nt), seqs, logits, cfg, tokens };
+    if (!j.scratch) return RQ_ERR_NOMEM;
+    rq_parallel(sample_worker, &j);
+    return RQ_OK;
 }

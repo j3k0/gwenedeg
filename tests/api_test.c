@@ -1,11 +1,18 @@
 /* Tests of the library API (src/runq.h), run by `make test` (tests/check.py, group api) on each model:
- *   tests/api_test MODEL
+ *   tests/api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv]
  * Prints PASS / FAIL lines, exit status 1 if any failed. The forward-pass checks are bitwise: a
  * sequence's logits must not depend on what else the context ran in between or batched with it
  * (sequences interleaved, several sequences in one rq_forward_batch, a prefill chunk next to decode
- * rows, positions past one attention block of 256), nor on truncating and re-prefilling. */
+ * rows, positions past one attention block of 256), nor on truncating and re-prefilling.
+ * Batched decode (section 9): N sequences decoding together, one row each, == each alone (rq_decode);
+ * the batched passes also print DIGEST lines (a hash of their logits), which must be the same for any
+ * thread count and build (check.py compares runs at other thread counts and of the generic build);
+ * --digest: only those passes (no references, no PASS / FAIL lines); --digest-small: only the short
+ * ones (for the slow generic build; --long: and the long ones); --n65: also 65 sequences in one pass
+ * (references for 48 more sequences: one model is enough); --kv: also a bf16 KV cache. */
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include "../src/runq.h"
 
@@ -55,18 +62,93 @@ static float *logits_alone(RqCtx *c, const int *t, int n, const int *dec, int nd
     return out;
 }
 
+static uint64_t hash_f(const float *x, size_t n) {
+    // FNV-1a over the bytes: bitwise comparisons of logits vectors without keeping them
+    const unsigned char *b = (const unsigned char *)x;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n * sizeof(float); i++)
+        h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+
+// Batched decode rows. Sequence i of a set: the first plen(i) positions of a base sequence (rq_seq_copy:
+// prefixes of different lengths, so the rows sit at different positions), then the tokens tk(i, 0),
+// tk(i, 1) (sequences i >= BD_TWO: tk(i, 0) only), decoded together with the set's other sequences (one
+// row each per rq_forward_batch pass)
+#define BD_STEPS 2
+#define BD_TWO 9
+#define BD_SEQS 65
+static int plen(int i, int lo, int span) { return lo + (i * 7) % span; }
+static int tk(int i, int t) { return 1000 + 37 * i + 11 * t; }
+
+static void bd_refs(RqCtx *c, RqSeq *base, int lo, int span, int n, int kvt, uint64_t (*h)[BD_STEPS]) {
+    // each sequence alone: copy, then rq_decode per token (the single-sequence decode path)
+    int e;
+    RqSeq *s = rq_seq_new(M, 0, kvt, &e);
+    if (!s) die("rq_seq_new", e);
+    for (int i = 0; i < n; i++) {
+        if ((e = rq_seq_copy(s, base, plen(i, lo, span))) != RQ_OK) die("rq_seq_copy", e);
+        for (int t = 0; t < (i < BD_TWO ? BD_STEPS : 1); t++) {
+            float *lg;
+            if ((e = rq_decode(c, s, tk(i, t), &lg)) != RQ_OK) die("rq_decode", e);
+            h[i][t] = hash_f(lg, V);
+        }
+    }
+    rq_seq_free(s);
+}
+
+static uint64_t digest = 0; // (of every batched pass of section 9, in order)
+static int bd_long = 0, bd_n65 = 0, bd_kv = 0; // --long, --n65, --kv
+
+static int bd_batch(RqCtx *c, RqSeq **sq, RqSeq *base, int lo, int span, int n, uint64_t (*h)[BD_STEPS], float *out,
+                    const char *name) {
+    // the n sequences decoded together (sq[0..n-1] reused), compared with the references h (NULL: digest only)
+    int ok = 1, tok[BD_SEQS];
+    RqSegment sg[BD_SEQS];
+    uint64_t dg = 0;
+    for (int i = 0; i < n; i++)
+        ok &= rq_seq_copy(sq[i], base, plen(i, lo, span)) == RQ_OK;
+    for (int t = 0; t < (n <= BD_TWO ? BD_STEPS : 1) && ok; t++) {
+        for (int i = 0; i < n; i++) {
+            tok[i] = tk(i, t);
+            sg[i] = (RqSegment) { sq[i], &tok[i], 1, RQ_LOGITS_LAST };
+        }
+        ok &= rq_forward_batch(c, sg, n, out, NULL) == RQ_OK;
+        for (int i = 0; i < n && ok; i++) {
+            uint64_t x = hash_f(out + (size_t)i * V, V);
+            dg = dg * 31 + x;
+            ok &= !h || x == h[i][t];
+        }
+    }
+    printf("DIGEST %s %016llx\n", name, (unsigned long long)dg);
+    digest = digest * 31 + dg;
+    return ok;
+}
+
 static int on_tok(void *u, int t) {
     RqTokens *r = u;
     rq_tokens_push(r, &t, 1);
     return 0;
 }
 
+static void batch_tests(RqCtx *c, RqTokens A, RqTokens B, RqTokens C, const float *refB, int only_digest);
+
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: api_test MODEL\n");
+    int only_digest = 0;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--digest")) only_digest = 1;
+        else if (!strcmp(argv[i], "--digest-small")) only_digest = 2;
+        else if (!strcmp(argv[i], "--long")) bd_long = 1;
+        else if (!strcmp(argv[i], "--n65")) bd_n65 = 1;
+        else if (!strcmp(argv[i], "--kv")) bd_kv = 1;
+        else argc = 0;
+    }
+    if (argc < 2) {
+        fprintf(stderr, "usage: api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv]\n");
         return 2;
     }
     char err[512];
+    setvbuf(stdout, NULL, _IOLBF, 0);
     rq_threads_init(0);
     RqModel *bad = rq_model_load("models/no-such-file.gguf", NULL, err, sizeof(err));
     report(!bad && strstr(err, "Couldn't open checkpoint"), "load_error", err);
@@ -95,6 +177,11 @@ int main(int argc, char **argv) {
     }
     int dA[3] = { 279, 6722, 13 }, dB[3] = { 198, 262, 470 }, dC[24];
     for (int i = 0; i < 24; i++) dC[i] = 1000 + 37 * i;
+    if (only_digest) { // the batched passes of section 9 only
+        rq_tokens_push(&C, dC, 7);
+        batch_tests(c, A, B, C, NULL, only_digest);
+        return 0;
+    }
     float *refA = logits_alone(c, A.v, A.n, dA, 3), *refB = logits_alone(c, B.v, B.n, dB, 3);
     float *refC = logits_alone(c, C.v, C.n, dC, 24);
     char d[256];
@@ -308,6 +395,10 @@ int main(int argc, char **argv) {
         rq_seq_free(s);
     }
 
+    // 9. batched decode rows (above bd_refs / bd_batch); C + 7 tokens: the long base (260 positions)
+    rq_tokens_push(&C, dC, 7);
+    batch_tests(c, A, B, C, refB, 0);
+
     free(refA);
     free(refB);
     free(refC);
@@ -317,4 +408,141 @@ int main(int argc, char **argv) {
     rq_ctx_free(c);
     rq_model_free(M);
     return failed;
+}
+
+static void batch_tests(RqCtx *c, RqTokens A, RqTokens B, RqTokens C, const float *refB, int only_digest) {
+    // short set: prefixes of A (8..32 positions); long set: prefixes of C (248..259 positions: the rows cross
+    // the first attention block of 256 at different steps). only_digest 2: the short passes (bd_long: and
+    // the long ones)
+    static uint64_t hs[BD_SEQS][BD_STEPS], hl[BD_SEQS][BD_STEPS];
+    int e, ns = bd_n65 ? BD_SEQS : 17, nl = 9, small = only_digest == 2, lng = !small || bd_long;
+    char d[256];
+    RqSeq *bs = seq_new(0), *bl = seq_new(0), *sq[BD_SEQS];
+    for (int i = 0; i < BD_SEQS; i++) sq[i] = seq_new(0);
+    if ((e = rq_prefill(c, bs, A.v, A.n, RQ_LOGITS_NONE, NULL, NULL)) != RQ_OK) die("prefill", e);
+    if (lng && (e = rq_prefill(c, bl, C.v, C.n, RQ_LOGITS_NONE, NULL, NULL)) != RQ_OK) die("prefill", e);
+    if (!only_digest) {
+        bd_refs(c, bs, 8, 25, ns, RQ_KV_DEFAULT, hs);
+        bd_refs(c, bl, 248, 12, nl, RQ_KV_DEFAULT, hl);
+    }
+    float *out = malloc((size_t)BD_SEQS * V * sizeof(float));
+    uint64_t (*rs)[BD_STEPS] = only_digest ? NULL : hs, (*rl)[BD_STEPS] = only_digest ? NULL : hl;
+
+    // N decode rows per pass: the batched decode path (rows of one token each, up to 64), its small-batch
+    // kernels (one row: like the GEMV; 2-8 rows: one register tile; 9 and 17: more than one); short and long
+    int Ns[] = { 1, 2, 3, 5, 8, 9, 17 }, ok;
+    for (unsigned k = 0; k < sizeof(Ns) / sizeof(Ns[0]); k++) {
+        if (small && Ns[k] != 3 && Ns[k] != 9) continue;
+        snprintf(d, sizeof(d), "batch_decode_n%d", Ns[k]);
+        ok = bd_batch(c, sq, bs, 8, 25, Ns[k], rs, out, d);
+        if (!only_digest) report(ok, d, "N sequences (8..32 positions), 2 steps together == each alone");
+    }
+    int Nl[] = { 3, 9 };
+    for (unsigned k = 0; k < sizeof(Nl) / sizeof(Nl[0]); k++) {
+        if (!lng || (small && Nl[k] != 3)) continue;
+        snprintf(d, sizeof(d), "batch_decode_long_n%d", Nl[k]);
+        ok = bd_batch(c, sq, bl, 248, 12, Nl[k], rl, out, d);
+        if (!only_digest) report(ok, d, "positions 248..260: across the first attention block (split / not)");
+    }
+
+    // 65 rows: more than the batched decode path takes, so the prefill path (GEMM tiles) on a wider context
+    if (!small && bd_n65) {
+        RqCtx *c80 = rq_ctx_new(M, 80, 0, &e);
+        if (!c80) die("rq_ctx_new", e);
+        ok = bd_batch(c80, sq, bs, 8, 25, 65, rs, out, "batch_decode_n65");
+        if (!only_digest) report(ok, "batch_decode_n65", "65 sequences in one pass (the prefill path's GEMM) == each alone");
+        rq_ctx_free(c80);
+    }
+
+    // mixed passes: a prefill chunk of a new sequence next to decode rows of others (the prefill path):
+    // (a) B's first 20 rows (all logits) + 3 long and 2 short decode rows (or 5 short), (b) a 2-row chunk +
+    // 2 decode rows (few items: long rows' attention split over its blocks)
+    for (int nlr = lng ? 3 : 0; nlr >= 0; nlr -= 3) { // nlr: rows from the long set (else all short); long, then short
+        RqSeq *p = seq_new(0);
+        int tok[8], okm = 1;
+        RqSegment sg[8];
+        uint64_t dg = 0;
+        for (int i = 0; i < 5; i++) {
+            okm &= rq_seq_copy(sq[i], i < nlr ? bl : bs, i < nlr ? plen(i, 248, 12) : plen(i, 8, 25)) == RQ_OK;
+            tok[i] = tk(i, 0);
+        }
+        sg[0] = (RqSegment) { sq[0], &tok[0], 1, RQ_LOGITS_LAST };
+        sg[1] = (RqSegment) { p, B.v, 20, RQ_LOGITS_ALL };
+        for (int i = 1; i < 5; i++) sg[i + 1] = (RqSegment) { sq[i], &tok[i], 1, RQ_LOGITS_LAST };
+        okm &= rq_forward_batch(c, sg, 6, out, NULL) == RQ_OK;
+        for (int r = 0; r < 25 && okm; r++) { // rows: sq[0], B[0..19], sq[1..4]
+            uint64_t x = hash_f(out + (size_t)r * V, V);
+            dg = dg * 31 + x;
+            if (only_digest) continue;
+            if (r >= 1 && r <= 20) okm &= !memcmp(out + (size_t)r * V, refB + (size_t)(r - 1) * V, V * sizeof(float));
+            else { int i = r == 0 ? 0 : r - 20; okm &= x == (i < nlr ? hl[i][0] : hs[i][0]); }
+        }
+        // (b): B[20..21] of p + 2 long rows (their second token)
+        tok[5] = tk(0, 1);
+        tok[6] = tk(1, 1);
+        RqSegment sb[3] = { { sq[0], &tok[5], 1, RQ_LOGITS_LAST }, { p, B.v + 20, 2, RQ_LOGITS_LAST }, { sq[1], &tok[6], 1, RQ_LOGITS_LAST } };
+        okm &= rq_forward_batch(c, sb, 3, out, NULL) == RQ_OK;
+        for (int r = 0; r < 3 && okm; r++) {
+            uint64_t x = hash_f(out + (size_t)r * V, V);
+            dg = dg * 31 + x;
+            if (only_digest) continue;
+            if (r == 1) okm &= !memcmp(out + (size_t)r * V, refB + (size_t)21 * V, V * sizeof(float));
+            else okm &= x == (nlr ? hl : hs)[r == 0 ? 0 : 1][1];
+        }
+        printf("DIGEST batch_mixed%s %016llx\n", nlr ? "" : "_short", (unsigned long long)dg);
+        digest = digest * 31 + dg;
+        if (!only_digest) report(okm, nlr ? "batch_mixed" : "batch_mixed_short",
+                                 "a 20-row prefill chunk + 5 decode rows; a 2-row chunk + 2 decode rows");
+        rq_seq_free(p);
+    }
+    printf("DIGEST all%s %016llx\n", small ? "_small" : "", (unsigned long long)digest);
+
+    if (!only_digest) {
+        // batched sampling == rq_sample per row (tokens and RNG states), mixed settings per row
+        RqSampling cf[4] = { { 0, 0, NULL }, { 0.8f, 0.9f, NULL }, { 1.5f, 0.95f, NULL }, { 1.0f, 1.0f, NULL } }, cfg[9];
+        float *l2 = malloc((size_t)9 * V * sizeof(float));
+        int t1[9], t2[9], oks = bd_batch(c, sq, bs, 8, 25, 9, NULL, out, "batch_sample_rows");
+        unsigned long long rng[9];
+        for (int i = 0; i < 9; i++) {
+            cfg[i] = cf[i % 4];
+            rq_seq_seed(sq[i], 77 + i);
+        }
+        memcpy(l2, out, (size_t)9 * V * sizeof(float));
+        oks &= rq_sample_batch(c, sq, out, 9, cfg, 9, t1) == RQ_OK;
+        for (int i = 0; i < 9; i++) {
+            rng[i] = *rq_seq_rng(sq[i]);
+            rq_seq_seed(sq[i], 77 + i);
+            t2[i] = rq_sample(c, sq[i], l2 + (size_t)i * V, &cfg[i]);
+            oks &= t1[i] == t2[i] && t1[i] >= 0 && rng[i] == *rq_seq_rng(sq[i]);
+        }
+        oks &= rq_sample_batch(c, sq, out, 9, cfg, 2, t1) == RQ_ERR_ARG;
+        report(oks, "batch_sample", "rq_sample_batch == rq_sample per row (greedy, top-p, full distribution)");
+        free(l2);
+
+        // KV bf16 (f16 above; f32: the plain fp32 tile layout of the same kernels): 3 long sequences
+        for (int kvt = RQ_KV_BF16; kvt <= RQ_KV_BF16 && bd_kv; kvt++) {
+            RqSeq *b2 = rq_seq_new(M, 0, kvt, &e), *q2[3];
+            if (!b2) die("rq_seq_new", e);
+            if ((e = rq_prefill(c, b2, C.v, C.n, RQ_LOGITS_NONE, NULL, NULL)) != RQ_OK) die("prefill", e);
+            uint64_t h2[3][BD_STEPS];
+            bd_refs(c, b2, 248, 12, 3, kvt, h2);
+            for (int i = 0; i < 3; i++)
+                if (!(q2[i] = rq_seq_new(M, 0, kvt, &e))) die("rq_seq_new", e);
+            snprintf(d, sizeof(d), "batch_decode_long_%s", rq_kv_name(kvt));
+            ok = bd_batch(c, q2, b2, 248, 12, 3, h2, out, d);
+            report(ok, d, "3 long sequences, KV cache type");
+            for (int i = 0; i < 3; i++) rq_seq_free(q2[i]);
+            rq_seq_free(b2);
+        }
+        // copies: a copied prefix continues exactly as the original (and errors)
+        RqSeq *f32 = rq_seq_new(M, 0, RQ_KV_F32, &e);
+        ok = rq_seq_copy(sq[0], bl, rq_seq_len(bl) + 1) == RQ_ERR_ARG && rq_seq_copy(f32, bl, 4) == RQ_ERR_ARG &&
+             rq_seq_copy(sq[0], sq[0], 0) == RQ_ERR_ARG && rq_seq_copy(sq[0], bl, 0) == RQ_OK && rq_seq_len(sq[0]) == 0;
+        rq_seq_free(f32);
+        report(ok, "seq_copy_errors", "past the source length, another KV type, itself");
+    }
+    free(out);
+    for (int i = 0; i < BD_SEQS; i++) rq_seq_free(sq[i]);
+    rq_seq_free(bs);
+    rq_seq_free(bl);
 }

@@ -208,6 +208,7 @@ int encode(const Tokenizer *t, const char *text, size_t len, int *tokens, int *n
 // forward.c
 void embed_row(float *x, const QuantizedTensor *t, int token, int dim);
 void *ctx_sampler_scratch(RqCtx *c); // vocab_size * 8 bytes
+void *ctx_sampler_scratch_threads(RqCtx *c, int nt); // nt x vocab_size * 8 bytes (rq_sample_batch), NULL: no memory
 int ctx_vocab(const RqCtx *c);
 // sampler.c
 float random_f32(unsigned long long *state);

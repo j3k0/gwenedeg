@@ -1,10 +1,11 @@
 /* Batched decode benchmark (the library API, src/runq.h): N independent sequences decoding together,
  * one row per sequence per rq_forward_batch pass, the logits of every row, greedy (or seeded top-p)
- * sampling per row; aggregate and per-sequence tok/s per (context, N). Built by `make bench-batch`
+ * sampling per row (rq_sample_batch; -S: rq_sample row by row); aggregate and per-sequence tok/s per
+ * (context, N). Built by `make bench-batch`
  * (build/bench_batch); scripts/bench_batch.sh runs it over models and thread counts.
  *
  *   build/bench_batch MODEL [-N 1,2,4,8] [-L 50,500,2000] [-s STEPS] [-r REPS] [-k f16] [-t TEMP]
- *                     [-m MAXGB] [-d] [-q]
+ *                     [-m MAXGB] [-d] [-q] [-S]
  *
  * Per context length L, one sequence is prefilled with L tokens of text and copied into the N
  * sequences (rq_seq_copy); every rep truncates them back to L and decodes STEPS tokens each (the first
@@ -40,13 +41,14 @@ static void die(const char *what, int e, RqCtx *c) {
 
 int main(int argc, char **argv) {
     int Ns[64] = { 1, 2, 3, 4, 6, 8, 12, 16, 32, 64 }, nN = 10, Ls[16] = { 50, 500, 2000 }, nL = 3;
-    int steps = 32, reps = 3, kvt = RQ_KV_DEFAULT, dec = 0, quiet = 0;
+    int steps = 32, reps = 3, kvt = RQ_KV_DEFAULT, dec = 0, quiet = 0, serial = 0;
     float temp = 0, maxgb = 6;
     const char *path = NULL;
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-') { path = argv[i]; continue; }
         if (!strcmp(argv[i], "-d")) { dec = 1; continue; }
         if (!strcmp(argv[i], "-q")) { quiet = 1; continue; }
+        if (!strcmp(argv[i], "-S")) { serial = 1; continue; }
         if (i + 1 >= argc) goto usage;
         const char *v = argv[++i];
         switch (argv[i - 1][1]) {
@@ -84,8 +86,8 @@ int main(int argc, char **argv) {
     char load[64] = "";
     FILE *lf = fopen("/proc/loadavg", "r");
     if (lf) { if (!fgets(load, sizeof(load), lf)) load[0] = 0; fclose(lf); load[strcspn(load, " ")] = 0; }
-    printf("# %s, %d threads, KV %s, %d steps x %d reps, %s, load %s\n", path, rq_threads(), rq_kv_name(kvt), steps, reps,
-           temp > 0 ? "top-p 0.9 sampling" : "greedy", load);
+    printf("# %s, %d threads, KV %s, %d steps x %d reps, %s%s, load %s\n", path, rq_threads(), rq_kv_name(kvt), steps, reps,
+           temp > 0 ? "top-p 0.9 sampling" : "greedy", serial ? " (rq_sample per row)" : "", load);
     printf("# %5s %4s %9s %10s %9s %10s\n", "L", "N", "ms/pass", "agg tok/s", "per-seq", "median agg");
 
     RqTokens text = { 0 }, para = { 0 };
@@ -132,8 +134,11 @@ int main(int argc, char **argv) {
                     for (int i = 0; i < N; i++)
                         sg[i] = (RqSegment) { sq[i], &tok[i], 1, RQ_LOGITS_LAST };
                     if ((e = rq_forward_batch(c, sg, N, out, NULL)) != RQ_OK) die("rq_forward_batch", e, c);
-                    for (int i = 0; i < N; i++)
-                        tok[i] = rq_sample(c, sq[i], out + (size_t)i * V, &smp);
+                    if (serial)
+                        for (int i = 0; i < N; i++)
+                            tok[i] = rq_sample(c, sq[i], out + (size_t)i * V, &smp);
+                    else if ((e = rq_sample_batch(c, sq, out, N, &smp, 1, tok)) != RQ_OK)
+                        die("rq_sample_batch", e, c);
                 }
                 t[r] = rq_now() - t0;
                 if (np) {
@@ -169,6 +174,6 @@ int main(int argc, char **argv) {
     return 0;
 usage:
     fprintf(stderr, "usage: bench_batch MODEL [-N 1,2,4,8] [-L 50,500,2000] [-s STEPS] [-r REPS] [-k f16|bf16|f32] "
-                    "[-t TEMP] [-m MAXGB] [-d] [-q]\n");
+                    "[-t TEMP] [-m MAXGB] [-d] [-q] [-S]\n");
     return 2;
 }

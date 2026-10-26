@@ -147,6 +147,11 @@ typedef struct {
 // The next token from logits (modified in place when temperature > 0), with the sequence's RNG
 // (one draw when temperature > 0). RQ_ERR_ARG if the mask allows no token
 int rq_sample(RqCtx *c, RqSeq *s, float *logits, const RqSampling *cfg);
+// The same for n rows at once, e.g. the logits of an rq_forward_batch pass: row i (logits + i * vocab_size,
+// modified in place as by rq_sample) with seqs[i]'s RNG and cfg[i] (ncfg == n) or cfg[0] (ncfg == 1), on the
+// thread pool; tokens[i] = rq_sample's result for that row (a token, or RQ_ERR_ARG). Returns RQ_OK, or an
+// error for the call (RQ_ERR_ARG: n < 1 or ncfg not 1 / n; RQ_ERR_NOMEM)
+int rq_sample_batch(RqCtx *c, RqSeq *const *seqs, float *logits, int n, const RqSampling *cfg, int ncfg, int *tokens);
 
 // ------------------------------------------------------------------------------- tokens, tokenizer
 typedef struct { int *v; int n, cap; } RqTokens; // growable token array (zero-initialize; rq_tokens_free)

@@ -28,6 +28,11 @@ Batched decode (Step 10a): N sequences decoding together in one `rq_forward_batc
 alone: Q4_K_M, short contexts, best of 4 rounds, 8 / 12 threads: N=8 1,003 / 1,214 tok/s in aggregate (3.1x /
 3.3x of single-sequence decode at 326 / 366; was 758 / 897), N=16 1,091 / 1,449; Q8_0 GGUF N=8 976 / 1,107
 (4.6x / 5.0x). Long contexts are KV-bandwidth bound (2,000 positions: ~350-480 tok/s for any N >= 8).
+Continuous batching (Step 10b): `runq serve` runs every request in one batched pass per step (up to `--parallel`
+16; prompts prefilled in 64-token chunks next to decoding requests), outputs bit-identical to each request
+alone: 0.6B, 12 threads, 128-token replies, 16 clients ~1,185 / 1,223 tok/s in aggregate (Q4_K_M / Q8_0; one at
+a time before: ~300 / ~200), time to first token ~0.1 s (was 3.5-5.7 s); LiteLLM-judge-like load 1.3-1.4x
+(prefill-bound); streams keep flowing (<= ~70-90 ms gaps) while a 2,000-token prompt is prefilled.
 
 Status: `[ ]` todo · `[~]` in progress · `[x]` done
 
@@ -1372,6 +1377,158 @@ the KV pre-fault of every segment every pass, sampling row by row.
     judge's rubric for several concurrent requests
   - Threads: 12-14 for throughput (the batched passes are compute-bound at 8 threads from N ~ 8)
 
+## Step 10b: continuous batching in `runq serve`
+Goal: concurrent requests share the forward passes (as vLLM / llama.cpp's server), each request's output
+unchanged. Before (Step 9): one engine thread ran one Job at a time from a FIFO (6 concurrent 60-token requests
+2.3-2.7 s instead of ~0.4 s each); a long prefill blocked everything behind it.
+- [x] Scheduler (`engine.c`; the Job interface, serve.c and http.c unchanged but for the flags, the startup line and
+  the `[response]` log line naming the client). Job states queued -> running (prefilling -> decoding) -> done. Each
+  engine step: (1) queued jobs whose client left / whose deadline passed are finished (499 / 504); (2) admission,
+  FIFO, while fewer than `--parallel` run (a job waiting for a shared prefix keeps its place, later ones may pass
+  it); (3) one `rq_forward_batch` over every running job: the decode rows first (each decoding job's last sampled
+  token, plus a constrained job's forced tokens as a multi-row segment with the last row's logits), then prompt
+  tokens within a budget (`--chunk` 64 while any job decodes, `-b` 512 when none does), shared by the prefilling
+  jobs: first up to an equal share each (FIFO), then the rest FIFO, so a short prompt never waits for a long
+  one's whole prefill; a prompt's last chunk asks for its last row's logits (its first token is sampled in the
+  same step); (4) `rq_sample_batch` over the rows with logits, each with its job's temperature / top-p / token
+  mask and its own sequence's RNG; then per job what Step 9's loop did after a sample (output, logprobs, stop
+  strings, end token, max tokens, context end, constraint advance, the next forced tokens and mask). A single
+  decode row runs `rq_decode` (the decode path). Interruptions (client gone, deadline, shutdown past the grace
+  period) are checked per job before every step; a failed pass is re-run segment by segment (the passes
+  validate everything before computing), so only the failing job gets its 500. The engine holds no lock during a
+  pass; connection threads see output under each job's mutex as before
+- [x] Flags (`runq serve`): `--parallel` 16 (jobs running at once; 10a: aggregate throughput grows to N ~ 16 at 8
+  threads, ~32 at 12-14, per-sequence speed falls: 16 keeps ~75 tok/s per stream), `--slots` (default parallel +
+  4: the running jobs' sequences plus idle prefix caches), `--kv-mem` GiB (default half the RAM: slots x `-c` x KV
+  bytes per position at most; slots, then parallel, lowered to fit; reported at startup: `16 running at most, 20
+  slot(s) of 4096 positions (KV 115 KB per position, 0.44 GiB per slot, 8.8 GiB at most, touched as used; --kv-mem
+  15.3 GiB)`), `-b` 512 / `--chunk` 64 (prompt tokens per pass without / with decoding jobs), `--prefix-copy` 32
+  (0: never), `--queue` 64 = jobs waiting beyond the free running places (a burst of `parallel` requests never
+  sees a 503 while the engine is mid-pass). With the defaults (`-c 8192`) this 30 GB box gets 17 slots (0.88 GiB each, 14.9 GiB at most)
+- [x] KV memory and prefix reuse: a pool of sequences; a running job owns one, idle ones keep their tokens. A new
+  job takes the idle slot with the longest common prefix if it saves >= 32 tokens or half the prompt (Step 9's
+  rule), else the least recently used idle slot (LRU eviction); if a busy slot shares a prefix >= `--prefix-copy`
+  tokens longer, it is copied (`rq_seq_copy`) into the LRU idle slot; if a job being prefilled will share a
+  longer prefix than anything cached, the new job waits until that part is in its slot and copies it then (a
+  burst of LiteLLM classifications prefills the 253-token rubric once instead of 16 times). Measured: a cold burst
+  of 16 classifications at once (0.6B Q4_K_M, 12 threads) 1.76-1.79 s with `--prefix-copy 0` (each prefills the
+  rubric) vs 0.61-0.68 s with copies, then 0.41-0.42 s after making the copy fast: `rq_seq_copy` now runs on the
+  thread pool and pre-faults the destination tiles (`kv_populate_one`, as the prefill does): 253 positions into a
+  fresh sequence 14.5 -> 1.6 ms, into a touched one 2.1 -> 0.6 ms (a prefill of them: ~110 ms). Context and
+  errors per job: a request's tokens are capped to its sequence (max_tokens <= the rest of the context, forced
+  runs checked before feeding), others are not affected
+- [x] Measured while tuning (0.6B Q4_K_M, 12 threads, `scripts/bench_serve.py --only mix`: 8 streams of 256-token
+  replies + 4 prompts of ~2,000 tokens): `--chunk` 32 / 64 / 128: the long prompts' time to first token 1,762 /
+  1,386 / 1,224 ms, the streams' token gaps p99 48 / 66 / 122 ms, max 147 / 71 / 144 ms, the streams' tok/s
+  meanwhile 423 / 412 / 395: 64 kept. Before the budget was shared (FIFO only), with `--chunk 32` the max gap was
+  825 ms: when every stream ended at once, nothing decoded, so the long prompt took the full `-b` 512 budget and
+  the streams' new short prompts waited for its whole prefill. `--parallel` 16 vs 32 at 32 clients (128 tokens
+  each): 1,139-1,206 vs 1,218-1,250 tok/s, time to first token p50 1.7-1.8 s (half of them queued) vs 0.22-0.24 s;
+  16 kept as the default (memory: 32 slots of 8,192 positions would be 29 GiB here)
+- [x] Benchmark (`scripts/bench_serve.py`, new: stdlib Python, a thread and a connection per client, a fresh
+  server per load): streamed requests, a distinct short prompt each (`Write a long, detailed story about ...`, 22
+  tokens), 128-token replies, temperature 0; 2 requests per client up to 4 clients, else 1; before = `b0d9f35`'s
+  binary (Step 10a: the FIFO engine) built in a scratch worktree, interleaved, 2 rounds, best by aggregate tok/s,
+  12 threads, load 13-19 (2026-10-26). Aggregate tok/s, request latency p50, time to first token (first content
+  delta) p50 / p95:
+
+  | Qwen3-0.6B Q4_K_M | 1 | 2 | 4 | 8 | 16 | 32 clients |
+  |---|---|---|---|---|---|---|
+  | before: tok/s | 265 | 250 | 290 | 289 | 298 | 297 |
+  | after: tok/s | **309** | **460** (1.8x) | **740** (2.6x) | **914** (3.2x) | **1,185** (4.0x) | **1,169** (3.9x) |
+  | latency p50 before / after (s) | 0.46 / 0.41 | 0.96 / 0.56 | 1.64 / 0.69 | 2.14 / 1.12 | 3.97 / 1.72 | 6.95 / 3.45 |
+  | TTFT p50 / p95 before (ms) | 15 / 28 | 525 / 605 | 1,233 / 1,290 | 1,781 / 3,099 | 3,546 / 6,052 | 6,584 / 12,444 |
+  | TTFT p50 / p95 after (ms) | 16 / 26 | 28 / 30 | 41 / 55 | 82 / 92 | 97 / 103 | 1,671 / 1,787 |
+  | tok/s per request after | 323 | 239 | 195 | 123 | 78 | 76 |
+
+  | Qwen3-0.6B Q8_0 GGUF | 1 | 2 | 4 | 8 | 16 | 32 clients |
+  |---|---|---|---|---|---|---|
+  | before: tok/s | 201 | 217 | 219 | 198 | 193 | 205 |
+  | after: tok/s | **184** | **299** (1.4x) | **577** (2.6x) | **911** (4.6x) | **1,223** (6.3x) | **1,219** (5.9x) |
+  | latency p50 before / after (s) | 0.63 / 0.67 | 1.21 / 0.89 | 2.20 / 0.89 | 3.20 / 1.12 | 6.45 / 1.67 | 10.15 / 3.30 |
+  | TTFT p50 / p95 before (ms) | 14 / 30 | 628 / 633 | 1,660 / 1,845 | 2,615 / 4,517 | 5,747 / 9,641 | 9,508 / 18,099 |
+  | TTFT p50 / p95 after (ms) | 17 / 25 | 25 / 31 | 40 / 55 | 78 / 90 | 79 / 103 | 1,643 / 1,741 |
+
+  One client: the same within noise (4 interleaved rounds of 4 requests, Q8_0: 165-197 before, 175-185 after).
+  32 clients: 16 run, 16 wait (`--parallel`), hence the TTFT. The decode rate at 16 streams (~75-80 tok/s each,
+  ~1,200-1,280 in all) is the library's (`bench_batch -N 16`, 12 threads, the same hour: 1,124-1,157): the server
+  adds no measurable overhead per token. Mixed load (8 streams of 256-token replies, 4 prompts of ~2,000 tokens
+  one after the other): before, a long prompt waited for the queue and then stalled every stream for its whole
+  prefill; after, it is prefilled 64 tokens per pass next to the streams:
+
+  | mixed load, 2 rounds | long prompt TTFT p50 / max (ms) | stream token gaps p50 / p99 / max (ms) | stream tok/s meanwhile |
+  |---|---|---|---|
+  | Q4_K_M before | 7,353-7,368 / 7,532-7,826 | 3 / 8 / 7,515-7,772 | 261-262 |
+  | Q4_K_M after | 1,370-1,409 / 1,410-1,438 | 8-9 / 64-70 / 69-88 | 414-427 |
+  | Q8_0 before | 10,428-10,931 / 10,833-12,083 | 5 / 11-12 / 11,206-11,694 | 175-183 |
+  | Q8_0 after | 1,293-1,304 / 1,305-1,322 | 10 / 62-63 / 72 | 411-416 |
+
+  LiteLLM-judge-like load: classifications as LiteLLM 1.105 sends them (the legacy rubric as the system message,
+  `\nClassify this message:\n` + one of the 80 prompts of `scripts/router_eval.jsonl`, the TierClassification
+  schema, temperature 0), 64 per configuration after one warm-up (the rubric cached), then requests/s and
+  latency p50 / p95 (ms); first a cold burst on the fresh server (16 at once: wall / p50 / p95). Best of 2 rounds,
+  final binary, interleaved, 12 threads:
+
+  | judge load | 1 client | 4 | 8 | 16 | cold burst of 16 (ms) |
+  |---|---|---|---|---|---|
+  | 0.6B Q4_K_M before | 45.4/s, 19 / 39 | 46.6/s, 79 / 139 | 45.3/s, 174 / 230 | 46.5/s, 334 / 407 | 473-525 / 298-330 / 412-460 |
+  | 0.6B Q4_K_M after | **47.6/s**, 18 / 39 | **62.0/s**, 56 / 132 | **64.4/s**, 122 / 211 | **62.4/s**, 253 / 289 | 413-427 / 405-415 / 410-418 |
+  | 0.6B Q8_0 before | 49.3/s, 17 / 38 | 51.0/s, 77 / 130 | 52.0/s, 157 / 224 | 51.2/s, 311 / 363 | 457-482 / 298-313 / 429-452 |
+  | 0.6B Q8_0 after | **51.0/s**, 18 / 41 | **64.5/s**, 55 / 111 | **68.3/s**, 114 / 193 | **68.9/s**, 233 / 272 | 408-414 / 390-402 / 395-408 |
+  | 1.7B Q8_0 before | 22.8/s, 39 / 84 | 24.4/s, 151 / 283 | 23.9/s, 320 / 527 | 23.6/s, 676 / 781 | 954-1,002 / 614-665 / 896-905 |
+  | 1.7B Q8_0 after | **24.7/s**, 37 / 76 | **29.6/s**, 121 / 243 | **33.7/s**, 246 / 357 | **30.5/s**, 517 / 607 | 795-821 / 786-800 / 792-808 |
+
+  The judge load gains much less than generation (1.3-1.4x): a classification is ~30-60 uncached prompt tokens
+  (the user message, the template, the forced `{"tier": "`) and no decode step at all (the decision is sampled
+  from the prompt's last row, the rest is forced and never fed), so it is prefill-bound already; batching helps
+  because several small prefills make one larger pass (a 16-row pass runs at ~1,400-1,700 tok/s, 64 rows at
+  ~1,700-2,350: Step 10a's mixed-pass table). In a cold burst every job completes in the same pass, so p50 rises
+  (~300 -> ~400 ms) while the wall time and p95 fall
+- [x] Bit-identity: each job has its own sequence (KV cache, RNG), every row's logits are what its sequence
+  alone would give (runq.h; Step 10a) and `rq_sample_batch` == `rq_sample` row by row, so a request's tokens do not
+  depend on what it is batched with, the chunking of its prompt or the pass it joined. Tests (`tests/server_test.py`,
+  group `batch`; the server at `--parallel 4 --slots 6 --chunk 16`): 7 requests at once (constrained greedy with
+  20 logprobs, two sampled classifications, a sampled nested schema, free greedy with logprobs, a stream with a
+  stop string, seeded with logprobs) == each alone (text and logprobs, 9 significant digits); three requests
+  (greedy with a system prompt, seeded, thinking) joining a running stream == `runq -m chat`; a client leaving a
+  long sampled stream while three others run: theirs == `runq -m chat`, the cancel logged 499; four requests
+  sharing a new 90-token system prompt at once (wait + copy: cached 91 / 1 / 91 / 91) == the same with
+  `cache_prompt: false`. The queue / cancel / prefix-reuse checks of Step 9 still pass (with 4 running).
+  Breakage: one job's sampling settings for every row (`rq_sample_batch(..., ncfg = 1)`) fails the batch checks.
+  `make test` 427 -> 430 checks (server 48 -> 52: +4 batch; kernels -1, below)
+- [x] `make test` time: ~33 s -> ~28.5 s (interleaved, the same checks in the previous order vs now: 32.5 / 33.0 /
+  32.6 vs 28.6 / 28.3 / 28.7 s at load 18-31; Step 10a's suite 31.5-36 s). The suite is bound by CPU time (~360
+  core-seconds in ~310 processes; each runq start costs ~0.5-0.9 core-s of weight loading at 8 threads), and a
+  timeline of the processes' CPU (a wrapper logging rusage) showed the first ~16 s at 13-15 busy cores but the
+  last ~5 s at 1-5: the greedy runs, the chat cases, the GGUF template and Q4_K_M dequant runs only started at
+  their group's turn, and the API tests ran on one worker in a ~31 s serial chain. Now all of them start with
+  the suite (their results are checked in the usual order), the API tests on two workers. Also dropped: the
+  generic build's `long -b 64` run (`kernels/long_b64`; `long2` = `long` + `all` + `code` takes the same paths and
+  is checked too, ~6 core-s) and `batch/concurrent_eq_cli` (the join / cancel checks run the same requests
+  concurrently). No other coverage change
+- [x] Sanitizers (scratch builds of all sources: `-O1 -g -fsanitize=address,undefined -fopenmp`; `-fsanitize=thread`
+  without OpenMP, the pool / engine / connection threads instrumented; reports to files with `log_path`):
+  `server_test.py --slow` 52-53 / 52-53 under ASan + UBSan on the Q8_0 GGUF, Q4_K_M and the .bin, and under TSan
+  on the Q8_0 GGUF; plus `bench_serve.py` against both (ASan: 8 / 24 clients at `--chunk 16 --slots 18`, a cold
+  judge burst of 16 with copies, the mixed load; TSan: 12 clients at `--parallel 8 --queue 8`, a cold burst of 8):
+  no reports, no leaks at exit
+- [x] Verification: `tests/compare_bins.sh -j 4 /tmp/cwref .` (CLI outputs vs the pre-Step-8 binaries, 360 jobs):
+  all 360 jobs identical (294 s; `rq_seq_copy`, the only library change, is not used by the CLI). Builds: `-Wall -Wextra` on engine.c / serve.c: no new warnings
+- [x] End to end (`scripts/litellm_e2e.sh`, own scratch LiteLLM 1.105.0 proxy as in Step 9, now with a second pass
+  of 16 requests at once through the proxy): Q8_0 GGUF judge and tier models on one
+  runq serve (8 threads, defaults: 16 running, 17 slots of 8,192 positions within the default `--kv-mem` 15.3 GiB),
+  8 prompts one at a time as before (judge 161 ms cold, then 15-26 ms with the rubric cached; end to end 99-185 ms),
+  then 16 at once: all 16 classified and routed (tier-complex x4, tier-medium x8, tier-simple x4), every tier ==
+  the sequential pass's for the same prompt, 715-835 ms for all 16 end to end (164-828 ms each), judge latency
+  p50 / max 93-166 / 186-210 ms (two runs); LiteLLM's classifier prompt and response_format still byte-identical
+  to its own builders
+- Open: the KV pool is fixed (no paging, no preemption: a request keeps its slot to the end; `--kv-mem` bounds
+  the worst case, so with long contexts fewer requests run); a shared prefix is copied, not shared (paged KV
+  would let concurrent requests read one copy of the rubric); in a cold burst all deferred jobs finish in one
+  pass (p50 up, p95 down); the decision step of a classification still computes the full classifier row (Step 9's
+  subset classifier); `json_object` / free strings in schemas; logprobs with streaming; per-request priorities;
+  the HTTP layer is one thread per connection (fine up to `--max-conns` 128)
+
 ## Known bugs
 Found by the tests.
 - [x] Tokenizer: no NFC normalizer (HF's tokenizer.json normalizer is NFC); the input was assumed
@@ -1418,10 +1575,12 @@ this box runs 1.105.0 (`/opt/litellm/venv-1.105.0`; never touch the running prox
   decoding, FIFO), tests, end-to-end with a scratch LiteLLM instance, judge-quality evaluation: done, see above
 - [x] Step 10a: multi-sequence (batched) decode in the library: small-batch kernels, a decode-rows
   worker, attention for decode rows, batched sampling, benchmarks, tests: done, see above
-- [ ] Step 10b: continuous batching in `runq serve` (a scheduler: several jobs' decode rows per pass, prefill
-  chunks interleaved; notes at the end of Step 10a)
-- [ ] Step 11: other models that should run on this engine (Qwen3 dense family: 1.7B, 4B, 8B; other
-  GGUF quant types of them), pinned downloads, correctness vs HF, speed
+- [x] Step 10b: continuous batching in `runq serve` (a scheduler: every running job's decode row and prompt
+  chunks in one pass per step, a slot pool with prefix reuse / copies, benchmarks, bit-identity tests): done,
+  see above
+- [ ] Step 11 (next): other models that should run on this engine (Qwen3 dense family: 1.7B, 4B, 8B; other
+  GGUF quant types of them), pinned downloads, correctness vs HF, speed. (`runq serve` open items after Step 10b:
+  the end of its section: paged / shared KV, priorities, the subset classifier, json_object)
 
 ## Later / ideas
 - [x] 16-thread collapse: phase synchronization that waits for the work, not for every thread, on a

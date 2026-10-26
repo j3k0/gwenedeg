@@ -123,10 +123,14 @@ curl -s localhost:8080/v1/chat/completions -d '{"messages": [{"role": "user", "c
 | `--host`, `--port` | 127.0.0.1, 8080 | `--port 0`: any free port (printed: `listening on http://...`) |
 | `--api-key KEY` | none | require `Authorization: Bearer KEY` (not on `/health`) |
 | `--name ID` | the file name | the model id in `/v1/models` and responses (the request's `model` is accepted whatever it is) |
-| `-c`, `--ctx N` | 8192 | positions per cached sequence (the context limit of a request) |
-| `--slots N` | 4 | cached sequences for prefix reuse (KV memory is touched only as used: 115 KB per position) |
-| `-k`, `-b` | f16, 512 | KV cache type, prefill chunk (as for the CLI) |
-| `--queue N` | 64 | requests waiting at most (more: 503, `Retry-After: 1`) |
+| `-c`, `--ctx N` | 8192 | positions per sequence (the context limit of a request) |
+| `--parallel N` | 16 | requests running at once (their rows batched in each forward pass); more wait in the queue |
+| `--slots N` | parallel + 4 | sequences in the pool: one per running request, the idle ones keep their tokens as prefix caches |
+| `--kv-mem GiB` | half the RAM | bound for slots x ctx x KV bytes per position (115 KB f16): `--slots` (and `--parallel`) are lowered to fit; the memory is touched only as used |
+| `-b N`, `--chunk N` | 512, 64 | prompt tokens per forward pass when no request is decoding / while others decode |
+| `--prefix-copy N` | 32 | copy a running request's cached prompt prefix into a new request's slot if that saves N tokens (0: never) |
+| `-k` | f16 | KV cache type (as for the CLI) |
+| `--queue N` | 64 | requests waiting beyond the free running places at most (more: 503, `Retry-After: 1`) |
 | `--max-conns N`, `--max-body B` | 128, 4 MB | connections (more: 503), request body size (more: 413) |
 | `--timeout S` | 600 | per request incl. queueing (504; 0 = none) |
 | `-t`, `-p`, `-n` | 1.0, 1.0, 0 | defaults for requests without temperature / top_p / max_tokens (0: up to the context) |
@@ -150,10 +154,13 @@ down), 504. Not supported: tools / function calls, images, `n > 1`, `json_object
 - **Conversation**: rendered with Qwen3's template in the CLI chat's form (`runq -m chat`), so a greedy
   request gives the same text as the CLI for the same messages (tested bitwise, also with a seed: the RNG
   draws as the CLI's chat does for a first turn). Earlier assistant messages lose their `<think>` block.
-- **Prefix reuse**: the cached sequence (slot) with the longest common token prefix is truncated to it
-  and only the rest is prefilled (a slot is reused if that saves at least 32 tokens or half the prompt,
-  else the least recently used one is taken). Logits are bit-identical to a fresh prefill (tested). A
-  second turn re-prefills only the new message; LiteLLM's classifier rubric (253 tokens) stays cached.
+- **Prefix reuse**: a new request takes the idle slot with the longest common token prefix, truncated
+  to it, and prefills only the rest (if that saves at least 32 tokens or half the prompt; else the least
+  recently used idle slot). If a running request's slot shares a longer prefix, it is copied
+  (`rq_seq_copy`, ~0.6-1.6 ms for LiteLLM's 253-token rubric vs ~110 ms to prefill it); if a request still
+  being prefilled will share it, the new one waits for that part and copies it then (a burst of
+  classifications prefills the rubric once). Logits are bit-identical to a fresh prefill (tested). A second
+  turn re-prefills only the new message; LiteLLM's classifier rubric stays cached.
 - **Constrained decoding** (`response_format: json_schema`), for schemas with a finite set of outputs:
   `enum`, `const`, `boolean`, `null`, `integer` with `minimum` / `maximum` (up to 256 values), objects of
   those (nested; `required`, optional properties; property order as in the schema; no additional
@@ -164,10 +171,23 @@ down), 504. Not supported: tools / function calls, images, `n > 1`, `json_object
   decisions are masked at the byte level (every token whose bytes keep the output a prefix of a valid
   one), so a LiteLLM classification is one prefill: ~20 ms with the rubric cached. Other schemas get a
   400 naming the unsupported part.
-- **Concurrency**: one engine thread runs the requests one at a time from a FIFO queue (one forward pass at
-  a time per process); connections have their own threads, so `/health` and queueing never wait on a
-  generation. A client that disconnects cancels its request at the next step. SIGINT / SIGTERM: stop
-  accepting, reject the queue (503), let the running request finish (up to 10 s), exit.
+- **Concurrency** (continuous batching, Step 10b): one engine thread runs every request; each step is one
+  batched forward pass over the next token of every decoding request plus prompt chunks of requests being
+  prefilled (up to `--chunk` 64 tokens while others decode, so streams keep flowing: gaps between tokens
+  p99 ~60-70 ms, at most ~90 ms, while a 2,000-token prompt is prefilled, where they used to stop for 7-12 s; `-b` 512 when nothing decodes; the budget is
+  shared, so a short prompt does not wait for a long one), then the sampling of every row with each
+  request's settings and token mask. Requests join at the next step (FIFO, at most `--parallel`) and leave
+  when done; a request's output does not depend on what it is batched with (each has its own sequence and
+  RNG; tested against `runq -m chat` and against the same request alone). Connections have their own
+  threads, so `/health` and queueing never wait on a forward pass. A client that disconnects cancels its
+  request at the next step (the others continue). SIGINT / SIGTERM: stop accepting, reject the queue
+  (503), let the running requests finish (up to 10 s), exit.
+- **Throughput** (`scripts/bench_serve.py`, 12 threads, streamed 128-token replies, before = Step 9's
+  one-at-a-time engine): Qwen3-0.6B Q4_K_M 1 / 4 / 8 / 16 clients 309 / 740 / 914 / 1,185 tok/s in
+  aggregate (before ~265-300 whatever the count), time to first token at 16 clients ~0.1 s (before 3.5 s);
+  Q8_0 184 / 577 / 911 / 1,223 (before ~200). LiteLLM-judge-like load (rubric cached, 16 clients): 0.6B
+  ~62-69 classifications/s (before ~46-51), 1.7B Q8_0 ~30-34 (before ~24): a classification is ~30-60
+  prompt tokens and no decode step, so prefill-bound; batching helps by making the passes larger.
 - **Logging**: one line per request on stderr: time, client, method, path, status, prompt / cached /
   completion tokens, queue wait, prefill and total time (`--verbose`: the bodies too).
 
@@ -197,8 +217,8 @@ model_list:
 ```
 
 `scripts/litellm_e2e.sh` runs this chain with a scratch LiteLLM proxy (runq as the judge and as the tier
-models). Judge latency on the 16-vCPU box (8 threads, Q8_0 GGUF): ~180 ms for the first request (the
-265-token prompt), then 15-27 ms (the rubric cached). Quality (`scripts/eval_router.py`, 80 labeled
+models; a second pass sends the same prompts concurrently). Judge latency on the 16-vCPU box (8 threads,
+Q8_0 GGUF): ~180 ms for the first request (the 265-token prompt), then 15-27 ms (the rubric cached). Quality (`scripts/eval_router.py`, 80 labeled
 prompts, TODO.md Step 9): Qwen3-0.6B is a weak judge, 51-71% depending on rubric and quantization (it
 almost never says REASONING); Qwen3-1.7B Q8_0 79-88% at ~55 ms per classification; Qwen3-4B Q4_K_M
 79-92% at ~150 ms.
@@ -275,7 +295,7 @@ rq_generate(c, s, t.v, t.n, &cfg, 256, &cb, &stats);
 | `src/kernels_avx512.h`, `src/kernels_neon.h`, `src/kquants.h` | SIMD kernels, K-quant formats and arithmetic definitions |
 | `src/internal.h` | the structures shared by the modules |
 | `src/cli.c` | the `runq` command line and its test hooks |
-| `src/serve.c`, `src/engine.c`, `src/http.c`, `src/constrain.c`, `src/json.c` | `runq serve` (not part of the library; `src/serve.h`): the OpenAI layer, the engine thread and queue, HTTP/1.1, constrained decoding, JSON |
+| `src/serve.c`, `src/engine.c`, `src/http.c`, `src/constrain.c`, `src/json.c` | `runq serve` (not part of the library; `src/serve.h`): the OpenAI layer, the engine (queue, continuous-batching scheduler, slot pool), HTTP/1.1, constrained decoding, JSON |
 
 Each module is its own translation unit (objects in `build/native`, `build/generic`, `build/debug`).
 All numeric code of the forward passes stays in `forward.c`, so the `-Ofast` code generation of the
@@ -353,7 +373,8 @@ float folds in the GEMM), decode ~5% (the packed weights are ~6% larger: fp32 sc
   `runq serve` (Step 9): an OpenAI-compatible HTTP server with prefix KV reuse and constrained decoding
   for finite JSON schemas (a hand-written HTTP/1.1 server and JSON parser / writer, no dependencies);
   batched decode of several sequences (Step 10a): small-batch AVX-512 kernels, a decode-rows worker,
-  batched sampling, bit-identical to decoding each sequence alone.
+  batched sampling, bit-identical to decoding each sequence alone; continuous batching in `runq serve`
+  (Step 10b).
 - `src/kquants.h`: the Q4_K / Q6_K block formats, their dequantization, the repacked layouts (Q4P,
   Q6P) and the generic kernels; the arithmetic of a K-quant matmul output is defined there.
 - `src/kernels_avx512.h`: the AVX-512 VNNI Q8_0 GEMM / GEMV (group size 64 or 32) and the weight
@@ -409,10 +430,10 @@ vs the f32 cache +8-10% / +17-22% / +23-29% after 451 / 1,500 / 3,000-token prom
 
 ## Known limitations
 
-- `runq serve` runs one request at a time (a FIFO queue; the library decodes several sequences in one pass
-  since Step 10a, the server's scheduler for it is Step 10b),
-  constrains output only to JSON schemas with a finite set of outputs (no `json_object`, no free strings),
-  has no tools / images / `n > 1`, no TLS; bind it to localhost or a trusted network.
+- `runq serve` constrains output only to JSON schemas with a finite set of outputs (no `json_object`, no
+  free strings), has no tools / images / `n > 1`, no TLS; bind it to localhost or a trusted network. Its KV
+  memory is a fixed pool (`--slots` x `-c`, no paging or preemption): a request keeps its slot until it
+  ends.
 
 - Q8_0 (.bin or GGUF) and Q4_K_M GGUF (any mix of Q8_0 / Q4_K / Q6_K matrices). Other GGUF types
   (F16, Q5_K, IQ*, ...) are rejected with a clean error. Without AVX-512 VNNI (or `make generic`)

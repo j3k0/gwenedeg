@@ -875,7 +875,7 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
 void engine_describe(Engine *e, char *buf, size_t n) {
     snprintf(buf, n, "%d running at most, %d slot(s) of %d positions (KV %.0f KB per position, %.2f GiB per slot, %.1f GiB at most, "
              "touched as used; --kv-mem %.1f GiB), prefill chunks %d / %d tokens per pass (others decoding / not)",
-             e->parallel, e->nslot, e->o.ctx, e->kv_pos / 1024.0, (double)e->kv_pos * e->o.ctx / 1073741824.0,
+             e->parallel, e->nslot, e->o.ctx, e->kv_pos / 1000.0, (double)e->kv_pos * e->o.ctx / 1073741824.0,
              (double)e->kv_pos * e->o.ctx * e->nslot / 1073741824.0, e->o.kv_mem, e->o.chunk, e->o.batch);
 }
 

@@ -28,7 +28,7 @@ HDR = $(wildcard src/*.h)
 Q8  = models/Qwen3-0.6B-q8.bin
 B   = build
 
-.PHONY: all debug generic clean test bench bench-prefill models kq-neon-test api-test bench-batch FORCE
+.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test api-test bench-batch FORCE
 
 all: runq
 
@@ -90,6 +90,10 @@ clean:
 # (run_tests.sh builds runq and runq-generic itself, in parallel)
 test:
 	@if [ -f tests/run_tests.sh ]; then bash tests/run_tests.sh; else echo "no tests yet"; fi
+
+# the bigger Qwen3 models (tests/check_models.py, group models): every downloaded family file, minutes
+test-models:
+	@bash tests/run_tests.sh --models
 
 bench: runq
 	scripts/bench_qwen3c.sh

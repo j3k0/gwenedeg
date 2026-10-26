@@ -34,6 +34,12 @@ Tests (see tests/README.md):
   kv         the KV cache types other than the default f16 (-k f32, -k bf16): logits vs HF (en, code,
              long2), batched vs sequential, threads and AVX-512 vs generic bitwise; their greedy goldens
              (f32_generate, bf16_generate) run in the greedy group
+  synth      synthetic GGUF models cut out of the Q4_K_M file (tests/make_synth.py; the shapes of the bigger
+             Qwen3 models: dim 768, GQA 4, untied Q4_K embedding, RoPE theta 5e6, the 2507 templates): logits vs a
+             numpy reference, batched / threads / generic bitwise, api_test, chat template renderings
+             (tests/check_models.py; in the background from the start)
+  models     (not in the default set: run_tests.sh --models) every downloaded Qwen3 family model: logits vs
+             HF / the dequantized-weights reference, bitwise invariants, greedy goldens, templates, runq serve
   api        the library API (tests/api_test.c per model, in the background from the start): sequences
              interleaved / batched / truncated == alone, batched decode of N sequences (1..17, 65) ==
              each alone incl. past 256 positions and mixed passes, rq_sample_batch, errors, chat
@@ -73,6 +79,9 @@ import time
 import unicodedata
 
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import check_models  # noqa: E402  (groups synth and models: tests/check_models.py)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GOLDEN = os.path.join(ROOT, "tests", "golden")
@@ -1188,8 +1197,9 @@ def main():
     ap.add_argument("--gguf", default="", help="GGUF Q8_0 file for the gguf tests and greedy goldens (empty: skip)")
     ap.add_argument("--q4", default="", help="GGUF Q4_K_M file for the q4 tests and greedy goldens (empty: skip)")
     ap.add_argument("--api-test", default="", help="tests/api_test binary for the api group (empty: skip)")
-    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv,api,server",
-                    help="comma-separated subset of tests to run")
+    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv,api,server,synth",
+                    help="comma-separated subset of tests to run (models: the bigger Qwen3 models, opt-in)")
+    ap.add_argument("--update-models", action="store_true", help="write the models group's greedy goldens")
     ap.add_argument("--update-greedy", action="store_true", help="regenerate the greedy goldens")
     ap.add_argument("--jobs", type=int, default=8, help="parallel runq processes for the tokenizer test")
     ap.add_argument("-v", "--verbose", action="store_true", help="per-position logits metrics")
@@ -1206,7 +1216,7 @@ def main():
             cf.ThreadPoolExecutor(max_workers=PREFETCH_JOBS) as fg, cf.ThreadPoolExecutor(max_workers=2) as bg, \
             cf.ThreadPoolExecutor(max_workers=2) as ax, cf.ThreadPoolExecutor(max_workers=1) as sx, \
             cf.ThreadPoolExecutor(max_workers=1) as gx, cf.ThreadPoolExecutor(max_workers=3) as cx, \
-            cf.ThreadPoolExecutor(max_workers=2) as tx:
+            cf.ThreadPoolExecutor(max_workers=2) as tx, cf.ThreadPoolExecutor(max_workers=2) as yx:
         # started first, checked at their group's turn: the server and API tests, the greedy runs, the chat cases,
         # the GGUF template and Q4_K_M dequant runs (their processes then overlap the logits runs: the suite is
         # bound by CPU time, and in group order they ran with the CPUs half idle at the end, Step 10b)
@@ -1216,6 +1226,8 @@ def main():
         chats = chat_start(a, tmp, cx) if "chat" in only else []
         tmpl = templates_start(a, tmp, tx) if "gguf" in only and a.gguf and not a.update_greedy else {}
         deq = dequant_start(a, tmp, tx) if "q4" in only and a.q4 and not a.update_greedy else []
+        texts = dict(batched_prompts())
+        synth = check_models.synth_start(a, tmp, yx, bg, texts) if "synth" in only and not a.update_greedy else None
         if not a.update_greedy:
             prefetch_all(a, tmp, only, fg, bg)
         for name, fn in [("tokenizer", lambda: test_tokenizer(a, res)),
@@ -1231,7 +1243,9 @@ def main():
                          ("q4", lambda: test_q4(a, res, tmp, deq)),
                          ("kv", lambda: test_kv(a, res, tmp)),
                          ("api", lambda: test_api(a, res, api)),
-                         ("server", lambda: test_server(a, res, server))]:
+                         ("server", lambda: test_server(a, res, server)),
+                         ("synth", lambda: check_models.test_synth(a, res, synth, texts)),
+                         ("models", lambda: check_models.test_models(a, res, tmp, texts, a.update_models))]:
             if name in only:
                 t = time.time()
                 print(f"== {name}")

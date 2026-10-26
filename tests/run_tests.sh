@@ -3,6 +3,8 @@
 # batched vs sequential logits, thread invariance, VNNI vs generic kernels, greedy tripwire, the
 # library API (tests/api_test.c, built as build/api_test).
 # Usage: tests/run_tests.sh [--update-greedy] [other tests/check.py options, e.g. -v, --only logits]
+#        tests/run_tests.sh --models   the bigger Qwen3 models only (group models: every downloaded family file,
+#                                      scripts/download_models.py family; slow, minutes; make test-models)
 # Env:   OMP_NUM_THREADS (default 8), RUNQ (binary to test, default ./runq, built with make),
 #        RUNQ_GENERIC (generic-kernel build to compare with, default ./runq-generic when RUNQ is
 #        not set; with RUNQ set and RUNQ_GENERIC unset the kernels test is skipped; with RUNQ set the
@@ -45,5 +47,10 @@ else
 fi
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+ARGS=()
+for x in "$@"; do
+    if [[ "$x" == "--models" ]]; then ARGS+=(--only models); else ARGS+=("$x"); fi
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
 exec "${PY[@]}" tests/check.py --runq "$RUNQ" --generic "${RUNQ_GENERIC:-}" --model "$MODEL" --gguf "$GGUF" --q4 "$Q4" \
     --api-test "$API_TEST" "$@"

@@ -17,6 +17,10 @@ tests/check.py (the logits prompts joined: all twice + en, all, code), HF logits
 from 248 on, i.e. mostly past runq's first attention block of 256 positions (ATT_P, see
 src/kernels_avx512.h): the same format with a `positions` array (int32 (m,)): row j is position
 positions[j]; `ids` holds all n prompt ids.
+--model-dir DIR --out-dir OUT writes HF fp32 goldens of another Qwen3 model (e.g. models/Qwen3-1.7B ->
+tests/golden/models/1.7b-hf, for tests/check_models.py): en, code, chat at every position and long2 at
+positions 248, 256, .., 296, with a 1,024-id vocab subset (small files; --subset to change). Qwen3-1.7B in
+fp32 peaks at ~8 GB of anonymous memory (+ the mapped safetensors).
 The greedy goldens (our own engine) are made by `tests/run_tests.sh --update-greedy` instead.
 
 Output format
@@ -180,7 +184,12 @@ def main():
     ap.add_argument("--q4ref", action="store_true", help="only write golden/logits_q4 (HF with the Q4_K_M weights)")
     ap.add_argument("--gguf-py", default="", help="directory containing the gguf package (--q4ref)")
     ap.add_argument("--long", action="store_true", help="only write golden/logits_long (positions past 256)")
+    ap.add_argument("--model-dir", default="", help="another HF Qwen3 model: its goldens into --out-dir")
+    ap.add_argument("--out-dir", default="", help="(--model-dir) output directory")
+    ap.add_argument("--subset", type=int, default=1024, help="(--model-dir) vocab subset size")
     a = ap.parse_args()
+    if a.model_dir:
+        return write_model(a.model_dir, a.out_dir, a.subset)
     torch.manual_seed(0)
     tok = AutoTokenizer.from_pretrained(MODEL_DIR, local_files_only=True)
     meta = {"model": "Qwen/Qwen3-0.6B", "torch": torch.__version__,
@@ -253,6 +262,34 @@ def write_logits(tok, log_dir, q4_weights=None, gguf_py=""):
                             top_ids=top_ids, top_logits=top_logits)
         print(f"wrote {path} ({len(ids)} tokens, {os.path.getsize(path)} bytes, "
               f"top-1 after last token: {tok.decode([int(top_ids[-1, 0])])!r})")
+    return 0
+
+
+def write_model(model_dir, out, subset_size, names=("en", "code", "chat")):
+    """HF fp32 goldens of another model (tests/check_models.py): names at every position, long2 at 248..296 step 8"""
+    tok = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+    model = AutoModelForCausalLM.from_pretrained(model_dir, local_files_only=True, torch_dtype=torch.float32,
+                                                 attn_implementation="eager", low_cpu_mem_usage=True)
+    model.eval()
+    vocab = model.config.vocab_size
+    subset_ids = np.sort(np.random.default_rng(0).choice(vocab, subset_size, replace=False)).astype(np.int32)
+    os.makedirs(out, exist_ok=True)
+    texts = dict(LOGITS_PROMPTS)
+    for name in list(names) + ["long2"]:
+        text = long_prompt() if name == "long2" else texts[name]
+        ids = tok.encode(text, add_special_tokens=False)
+        with torch.no_grad():
+            logits = model(torch.tensor([ids])).logits[0].float().numpy()
+        extra = {}
+        if name == "long2":
+            pos = np.arange(248, len(ids), 8, dtype=np.int32)
+            logits, extra = logits[pos], {"positions": pos}
+        top_ids = np.argsort(-logits, axis=1, kind="stable")[:, :TOPK].astype(np.int32)
+        top_logits = np.take_along_axis(logits, top_ids, axis=1).astype(np.float32)
+        path = os.path.join(out, f"{name}.npz")
+        np.savez_compressed(path, text=np.array(text), ids=np.array(ids, dtype=np.int32), subset_ids=subset_ids,
+                            subset=logits[:, subset_ids].astype(np.float16), top_ids=top_ids, top_logits=top_logits, **extra)
+        print(f"wrote {path} ({len(ids)} tokens, {os.path.getsize(path)} bytes)")
     return 0
 
 

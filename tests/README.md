@@ -1,8 +1,8 @@
 # Tests
 
 `make test` (or `tests/run_tests.sh`) builds `./runq`, `./runq-generic` and `build/api_test` if needed
-(in parallel) and runs everything in about 30 s on the 16-vCPU dev box (333 checks; the box is shared,
-so the time varies: ~29 s at load 8-12). Every `-m logits` run the selected groups need starts up front, 3 at a time, the generic
+(in parallel) and runs everything in about 32 s on the 16-vCPU dev box (381 checks; the box is shared,
+so the time varies: 31.6-32.4 s at load 8-22, 29.4-30.3 s without the `server` group). Every `-m logits` run the selected groups need starts up front, 3 at a time, the generic
 build's at 4 threads in the background (`prefetch_all` in `check.py`); the tests then read the
 files in their usual order. Greedy and chat cases run 3 at a time (their outputs do not depend on
 the thread count or the timing). It needs `models/Qwen3-0.6B-q8.bin`, plus numpy
@@ -16,7 +16,7 @@ scratch venv) only for the Q4_K_M goldens.
 ```sh
 tests/run_tests.sh                    # all tests, OMP_NUM_THREADS=8 unless set
 tests/run_tests.sh -v                 # + per-position logits metrics and a summary table
-tests/run_tests.sh --only logits      # subset: tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv,api
+tests/run_tests.sh --only logits      # subset: tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv,api,server
 GGUF=other.gguf tests/run_tests.sh    # the gguf group on another Q8_0 GGUF file (GGUF= skips it)
 Q4= tests/run_tests.sh                # without the Q4_K_M group
 RUNQ=/path/to/other-binary tests/run_tests.sh   # test another build (no make; kernels and api tests skipped)
@@ -33,6 +33,7 @@ python3 tests/make_dequant_golden.py  # golden/dequant/q4_k_m.npz (needs numpy +
 .venv/bin/python tools/gen_unicode_tables.py --check-hf  # HF's NFC data vs Unicode 15.1 (~1 s)
 tests/compare_bins.sh REF_DIR NEW_DIR # two builds' outputs byte for byte (below; ~3-6 min)
 build/api_test MODEL                  # the library API tests alone (make api-test; ~1.3 s per model)
+tests/server_test.py --runq ./runq --model MODEL [--threads 4] [--slow] [-v]   # runq serve alone (~5 s; 2 threads ~8 s)
 ```
 
 Exit status is non-zero if any test fails. XFAIL = known engine bug, reported but not failing;
@@ -99,6 +100,7 @@ All hooks work the same on a GGUF file (tokenizer and templates from the file an
 | `greedy/f32_generate`, `greedy/bf16_generate` | exact stdout of `generate` (the `generate` prompt) with `-k f32` (the text the default gave before Step 7b) and `-k bf16` | `golden/greedy/{f32,bf16}_generate.txt` |
 | `chat/long_context`, `chat/long_context_generic` | the same checks on a 411-token conversation (a 374-token system prompt, `-n 12`) decoded at OMP_NUM_THREADS=16: the reply's positions are past one attention block, so decode splits each kv head's attention over threads per block and combines (Step 7a); its sampled logits equal the batched prefill's (`-m logits`, 8 threads) bit for bit, and the generic build's run (4 threads: C attention, generic kernels) gives the same cache ids and logits file | `-m logits`, `./runq-generic` |
 | `api_bin/*`, `api_gguf/*`, `api_q4/*` | the library API (`src/runq.h`) per model, `tests/api_test.c`, 11 checks each: `interleaved_bitwise` (2 sequences prefilled and decoded alternately on one context == each alone), `batch_prefill_bitwise` (chunks of 2 sequences in one `rq_forward_batch`: all rows / last row / no logits), `batch_decode_bitwise` (decode rows of 3 sequences per pass, one at positions 250+: classifier GEMM over the selected rows), `batch_past_block_bitwise` (a chunk at positions 256..276), `truncate_reprefill_bitwise` (truncate + re-prefill == fresh prefill), `generate_loop` (`rq_generate` == a hand-written sample / decode loop, stats, the reply limit), `errors` (prompt past the capacity: `RQ_ERR_CONTEXT` with nothing prefilled, bad token, a sequence twice in a pass, logits rows without a buffer, a batch larger than the context's), `chat_render` (a message list == the CLI's pieces, thinking off / on), `detok_utf8` (incremental detokenization: whole UTF-8 characters, the text back), `sample_mask` (token mask: greedy and sampled), `load_error`. Runs in the background from the start (4 threads per model). Breakage (scratch builds): one sequence's KV cache for every attention row block, or the first position for later segments: the batch checks fail | other runs of the same binary |
+| `server/*` | `runq serve` over HTTP (`tests/server_test.py`, Python stdlib only, no network beyond 127.0.0.1, no LiteLLM), on the Q8_0 GGUF (else the .bin), 48 checks; the server (`--port 0 -c 2048 --slots 2 --queue 4 --max-body 65536`) and five `runq -m chat` reference runs at 2 threads, in the background from the start. `basic/*`: `/health`, `/v1/models`, a model by id (404 for another), 6 requests on one keep-alive connection. `chat/*`: greedy completions == the CLI's stdout bitwise (single turn, a system prompt, a second turn with the history re-sent as messages, whose `cached_tokens` must be the first turn's prompt + reply), seeded `-t 0.8 -p 0.9 -s 42` == the CLI's, thinking (`reasoning_effort`): `reasoning_content` == the CLI's `<think>` text. `cache/*`: the same request repeated (all but one prompt token cached), one sharing only the system prompt, and `cache_prompt: false`: identical text and logprobs (9 significant digits: bit-identical logits). `stream/*`: SSE == non-streaming text, finish reason, usage chunk, `[DONE]`; stop strings (stream and not); thinking streamed. `schema/*`: LiteLLM 1.105's `TierClassification` request (rubric + `response_format` verbatim) at temperature 1 over 8 seeds, the same schema as `$ref` into `$defs` (greedy: the decision step's alternatives are allowed tokens only, forced tokens logprob 0, tokens concatenate to the text), the rubric prefix cached on a later request, a nested schema (object, boolean, integer range, optional property, `anyOf` null, `const`; 6 seeds; each output validates and is `json.dumps`-formatted), a single-output schema (all forced). `errors/*`: 17 OpenAI error objects (400 malformed JSON, invalid UTF-8, missing / empty messages, bad role, image part, `n: 2`, string schema, bad `$ref`, `json_object`, temperature, max_tokens, tools, context too long with `context_length_exceeded`; 404, 405, 413), 411 on a chunked upload, 400 / 505 on bad request lines. `queue/*`: 4 concurrent requests == each alone, `/health` answers while they run, 10 concurrent with `--queue 4` give 503 `overloaded`, a client disconnecting (stream and not) cancels its generation (the next request is served at once; logged 499). `fuzz/server_alive`: 150 mutated / random requests on raw sockets, then `/health`. `shutdown/sigterm`: exit status 0 | the `runq -m chat` runs |
 
 Logits metrics, per position, over the union of a fixed 4096-id vocab subset and HF's top-64 ids:
 cosine similarity, top-1 agreement (runq argmax vs HF top-1), top-5 overlap. Position 0 has its
@@ -309,6 +311,16 @@ opposite (0 differences from `unicodedata`, the same counts from HF).
 Invalid UTF-8 has no HF reference (a Python str cannot hold it). runq keeps every invalid byte
 (byte-level fallback, as before) and its normalizer does not reorder or compose across one (each
 acts like U+FFFD, a starter composing with nothing); `tokenizer/nfc_invalid_utf8` tests that.
+
+## Server tests under sanitizers (on demand)
+
+`tests/server_test.py --slow` relaxes the latency bounds for slow builds. Step 9 (2026-10-26): ASan + UBSan
+(`-O1 -g -fsanitize=address,undefined -fopenmp -march=native`, all sources compiled together, AVX-512 and
+`-DRUNQ_GENERIC`) on the Q8_0 GGUF, the AVX-512 build also on the .bin and Q4_K_M: 48 / 48 each, no
+reports (incl. the leak check at the server's exit after SIGTERM); ThreadSanitizer (`-O1 -g
+-fsanitize=thread`, no `-fopenmp`: the thread pool, the engine thread and the connection threads all
+instrumented): 48 / 48, no reports (after making the shutdown flag atomic: it found the signal handler's
+write racing the connection threads' reads). The ASan builds take ~40 s (AVX-512) and ~6 min (generic), TSan ~4 min.
 
 ## Comparing two builds (`tests/compare_bins.sh`, on demand)
 

@@ -21,6 +21,9 @@ KV cache (Step 7b): f16 by default (`-k f16|bf16|f32`): half the memory, as accu
 103 -> 158), prefill unchanged within -0..+7%.
 Architecture (Step 8): a library (`src/runq.h`: model / sequence / compute context, multi-sequence batched
 passes, errors returned, no printing) in modules, the CLI on top; outputs byte-identical, same speed.
+Server (Step 9): `runq serve`, OpenAI-compatible (chat completions incl. streaming, models, health), prefix
+KV reuse across requests (bit-identical), constrained decoding for finite JSON schemas; as LiteLLM's
+complexity-router judge ~20 ms per classification with the rubric cached (0.6B; 1.7B ~55 ms, 4B ~150 ms).
 
 Status: `[ ]` todo · `[~]` in progress · `[x]` done
 
@@ -1011,6 +1014,164 @@ generate print and sample inside the loops; 66 `exit()` calls (62 in runq.c, 4 i
   assistant message (HF keeps it for messages after the last user message; only matters when continuing an
   assistant message); `rq_detok_push` passes invalid UTF-8 through (a JSON writer must replace it)
 
+## Step 9: `runq serve`, an OpenAI-compatible HTTP server
+Goal: a local OpenAI-compatible endpoint, usable as LiteLLM's complexity-router judge. One binary: `runq serve
+<model> [flags]` (a subcommand dispatched first thing in cli.c's `main`; nothing else in the CLI changed).
+- [x] Layers (`src/serve.h`), each its own file, not part of the library: `http.c` (HTTP/1.1), `serve.c` (the
+  OpenAI layer), `engine.c` (the engine thread and queue), `constrain.c` (constrained decoding), `json.c`: ~3,000
+  lines of C with the headers. Threads: the main thread accepts (poll on the socket + a self-pipe for SIGINT / SIGTERM); one
+  detached thread per connection (at most `--max-conns` 128, more get a 503; SIGINT / SIGTERM blocked in them);
+  one engine thread running `Job`s from a FIFO ring (`--queue` 64 waiting, more get 503 `overloaded`). The Job is
+  the interface between the layers: in, the prompt tokens, sampling, seed, max tokens, stop strings, constraint,
+  logprobs, deadline; out, under the job's mutex + condition variable, the content / reasoning text so far, the
+  logprobs, usage, finish reason or error; a cancel flag the connection sets when its client goes away (checked
+  by the engine before every forward pass). serve.c / http.c never call the model; Step 10 replaces
+  `engine_main` / `run_job` with a scheduler behind `engine_submit` and the same Job
+- [x] HTTP (`http.c`, POSIX sockets): request line + headers up to 16 KB (431), bodies by Content-Length only (a
+  `Transfer-Encoding` gets 411, before the body), `--max-body` 4 MB (413), `Expect: 100-continue`, keep-alive
+  (HTTP/1.1 default, `Connection: close` honoured, HTTP/1.0 keep-alive on request), sequential pipelined requests,
+  30 s to finish a started request (408), 120 s idle keep-alive, responses with Content-Length or chunked (SSE),
+  `MSG_NOSIGNAL` + `SO_SNDTIMEO`; client gone = `poll` POLLRDHUP / HUP or a 0-byte peek. Shutdown: stop
+  accepting, reject the queue (503), the running job may finish for 10 s, idle connections close, everything
+  freed (a second signal exits at once). Windows: `serve.c` compiles to a stub that says the server is not
+  available (http.c / engine.c are `#ifndef _WIN32`; json.c / constrain.c are plain C)
+- [x] JSON (`json.c`, hand-written): DOM in an arena, strict RFC 8259 (no NaN / comments / trailing commas;
+  raw control characters and invalid UTF-8 in strings are errors), `\uXXXX` with surrogate pairs (a lone
+  surrogate becomes U+FFFD), depth 64, member order kept, duplicates: the last wins; the writer escapes and
+  replaces every byte that is not part of a well-formed UTF-8 character (overlongs, surrogates, truncated
+  sequences: `rq_detok_push` passes them through) with U+FFFD, so responses are always valid JSON / UTF-8
+- [x] OpenAI layer (`serve.c`): `POST /v1/chat/completions` (+ `/chat/completions`), `GET /v1/models`,
+  `/v1/models/{id}`, `/health` (+ `/v1/health`); 404 / 405 otherwise; `--api-key` (Bearer, constant-time
+  compare, not on /health). Messages system / developer / user / assistant, content a string or text parts
+  (joined with "\n"; images, tools, tool calls, `n > 1`, NUL characters: 400). Rendering: Qwen3's template in
+  the CLI chat's canonical form (`rq_chat_system` / `rq_chat_user` / `rq_chat_end` pieces: the empty think block
+  stays in every user turn with thinking off), so the server's greedy text equals `runq -m chat`'s; sequences the
+  CLI cannot produce as HF's template renders them (a later system message, two user messages in a row, an
+  assistant message first); earlier assistant messages lose their `<think>` block; the prompt ends with the
+  assistant header. Sampling: `temperature` 0-2 (0 greedy), `top_p`, `seed` (positive seeds as `runq -s`; others
+  and none: splitmix64 of the value / time + a counter), server defaults `-t 1 -p 1` (OpenAI's); `max_tokens` /
+  `max_completion_tokens` (default and cap: the rest of the context; a prompt that does not fit: 400
+  `context_length_exceeded` with OpenAI's message); `stop` (up to 16, held back while a match is possible, cut
+  before it; whole UTF-8 characters); `stream` (SSE chunks with `role`, `content` / `reasoning_content` deltas,
+  a final chunk with `finish_reason`, `stream_options.include_usage`: `usage: null` on each chunk and a last one
+  with `choices: []`; errors after the start: a `data: {"error": ...}` event; then `[DONE]`); `logprobs` /
+  `top_logprobs` (0-20, not with stream): log-softmax of the raw logits (no temperature), renormalized over the
+  allowed tokens under a constraint, forced tokens 0; thinking (`reasoning_effort` low / medium / high,
+  `chat_template_kwargs.enable_thinking`; off by default and under a constraint): the `<think>` block's text as
+  `reasoning_content` (leading / trailing newlines stripped), the rest as `content` (leading newlines stripped);
+  `cache_prompt: false` (llama.cpp's name): no prefix reuse. Usage: prompt, completion (sampled + forced, not the
+  end token), total, `prompt_tokens_details.cached_tokens`. Errors: OpenAI objects (`message`, `type`, `param`,
+  `code`) with 400 / 401 / 404 / 405 / 411 / 413 / 431 / 499 (logged only) / 500 / 503 (`Retry-After: 1`) / 504.
+  Log: one line per request on stderr (time, client, method, path, status, prompt / cached / completion tokens,
+  queue, prefill, total); `--verbose` adds the request and response bodies (up to 64 KB)
+- [x] Engine (`engine.c`): `--slots` 4 cached sequences of `-c` 8192 positions (address space; 115 KB per
+  position touched). A job takes the slot with the longest common token prefix if it saves >= 32 tokens or half
+  the prompt (else the least recently used slot: LiteLLM's judge calls and the routed tier calls then keep one
+  slot each, as the e2e run shows), truncates it (`rq_seq_truncate`; the whole prompt cached: its last token is
+  prefilled again, for the logits) and prefills the rest in chunks of `-b` (a cancel is seen between chunks).
+  The RNG is seeded per request and drawn once per prompt token but the last however much was cached, as
+  `rq_generate` does for a first turn: a seeded request == `runq -m chat -s` (tested). Generation: sample (the
+  sampler's token mask under a constraint), the end token ends it (not fed), else it is fed with the next step
+  (`rq_decode`, or one `rq_prefill` together with forced tokens); a reply cut by `max_tokens` does not feed its
+  last token. Bit-identity of reuse: the same positions and tokens, and the forward passes do not depend on the
+  chunking, so a cached prefix gives the same logits as a fresh prefill (tested through 9-digit logprobs)
+- [x] Constrained decoding (`constrain.c`), `response_format: json_schema` with a finite set of outputs: the schema
+  -> every valid output as canonical text -> a byte trie. Supported: `enum` (any JSON values), `const`,
+  `boolean`, `null`, `integer` with `minimum` / `maximum` (exclusive too, <= 256 values), objects (nested,
+  `properties` in schema order, `required` / optional, additional properties never), `anyOf` / `oneOf`, one
+  `allOf`, `$ref` (any local JSON pointer: `#/$defs/..`, `#/definitions/..`; recursion depth 32), annotations
+  ignored; <= 4096 outputs, 1 MB; anything else is a 400 naming the part (e.g. `type "string" without enum /
+  const has no finite set of outputs at /properties/a`). Formatting: Python's `json.dumps` (`": "`, `", "`, one
+  line, non-ASCII as UTF-8): asked for `{"tier": ...}` Qwen3-0.6B writes exactly `{"tier": "MEDIUM"}` (in a
+  ```` ```json ```` fence: the fence is not part of the output). Unconstrained, with LiteLLM's prompt, it answers a
+  bare `MEDIUM` (the prompt does not ask for JSON), so the schema has to come from the decoder. Per step: if all
+  candidate outputs share the next bytes, the longest common prefix of their suffixes' canonical tokenizations is
+  forced (over 64 candidates: the single-path run's tokens minus the last); else a decision, masked at the byte
+  level: every vocab token (not added tokens) whose bytes keep the output a prefix of a valid string, found by a
+  trie walk with binary search in the vocabulary sorted by bytes (pruned where no token continues; the end token
+  too where a complete output can also continue, e.g. enum [1, 12]). Why byte level and not a trie of canonical
+  token sequences: the model keeps every way of spelling a valid output (`M` + `EDIUM` and `MED` + `IUM`; `S`,
+  `SI`, `SIM`), so the masked distribution is its distribution over the valid strings; measured, the
+  non-canonical first tokens carry at most 0.2% (0.6B) / 1.1% (1.7B) of the mass on the eval set. Forced tokens
+  get no forward pass of their own: the initial ones (`{"`, `tier`, `":`, ` "`) go into the prompt's prefill, the
+  ones after a decision are fed with the next decision's pass, and the last run (`PLE`, `"}`) is never fed; a
+  single-output schema runs no forward pass at all. A TierClassification classification is thus one prefill (+
+  the decision's sampling). Temperature / top-p work under the mask (the sampler's large finite negative logits)
+- [x] Measured, not done: computing only the allowed classifier rows at a decision (~13 of 151,936 for the tiers).
+  The last-row classifier costs 1.2 ms (8 threads; 1.8 at 4) of a 16.6 ms cached classification step (20 new
+  tokens after 260), ~7%; worth it only with a subset-classifier kernel in `forward.c` (new numeric code under
+  the bit-identity tests), so left for later. `json_object` (a JSON grammar over bytes, ~400 lines): not done, 400
+- [x] Tests (`tests/server_test.py`, group `server`, 48 checks, details in tests/README.md): the server and its 5
+  CLI reference runs at 2 threads in the background from the start; `make test` 333 -> 381 checks, ~30 -> ~32 s
+  (interleaved runs at load 8-22 with and without the group: 32.4 / 31.6 / 31.6 vs 29.4 / 29.9 / 30.3 s). The
+  cost is CPU contention (~19 core-seconds of decoding next to the logits prefetch), so the generation lengths
+  were cut to what the checks need (~8 s alone at 2 threads); at 1 thread it is cheaper (~16 core-s) but takes
+  ~12 s and sometimes became the critical path (35.7 s once)
+- [x] Sanitizers (scratch builds, `tests/server_test.py --slow`): ASan + UBSan, AVX-512 (Q8_0 GGUF, .bin, Q4_K_M)
+  and generic (Q8_0 GGUF): 48 / 48 each, no reports, leak check clean at exit; ThreadSanitizer (no OpenMP: pool,
+  engine and connection threads instrumented): 48 / 48, clean after one fix (the shutdown flag written by the
+  signal handler and read by the connection threads: now atomic). The fuzz check (150 mutated / random requests)
+  runs in all of them
+- [x] End to end (`scripts/litellm_e2e.sh`): an own LiteLLM 1.105.0 proxy from `/opt/litellm/venv-1.105.0` (read
+  only; `env -i`, scratch HOME, random master key, no database, telemetry and remote cost map off, free localhost
+  ports) with `auto_router/complexity_router`, `classifier_type: llm`, `classifier_context_window_size: 0`, the
+  judge and the four tier models all on one runq serve (tier models by model name), 8 prompts through the openai
+  client. What LiteLLM sends: `{"messages": [{"role": "system", "content": <rubric, 1,142 chars>}, {"role": "user",
+  "content": "\nClassify this message:\nHi there!"}], "model": "judge", "response_format": {"type": "json_schema",
+  "json_schema": {"schema": {"description": ..., "properties": {"tier": {"enum": ["SIMPLE", "MEDIUM", "COMPLEX",
+  "REASONING"], "title": "Tier", "type": "string"}}, "required": ["tier"], "title": "TierClassification", "type":
+  "object", "additionalProperties": false}, "name": "TierClassification", "strict": true}}, "temperature": 0}`
+  (temperature from the model_list entry; the enum is inline, not a `$ref`; both tested). Its prompt and
+  response_format are byte-identical to `classification_system_prompt(0)` + `_build_classifier_user_payload` +
+  `type_to_response_format_param(TierClassification)` from LiteLLM's code. LiteLLM facts that differ from IDEAS.md:
+  the rubric is the system message (stable: cacheable), the caller's text is the user message (`Caller system
+  prompt, quoted as task context:` if any, prior turns with the default context window 3, then `Classify this
+  message:`); the reply is parsed from its first JSON object (`extract_classifier_json`, then the label); timeout
+  `timeout_ms` 3,000 by default with `asyncio.wait_for`, no retries, a timeout opens a 30 s circuit breaker
+  (fallback: the heuristic scorer); rubrics legacy (the default) / chat / agentic / business. Result: every request
+  classified and routed to its tier's model; judge latency (runq's log, 8 threads, Q8_0 GGUF) 176-182 ms for the
+  first (265 tokens, nothing cached), then 15-27 ms with the 253-token rubric prefix cached; end to end through the
+  proxy ~120-235 ms (incl. LiteLLM and the tier model's 24-token answer). The openai package (2.54.0, from the
+  venv): models, chat, streaming with usage, `beta.chat.completions.parse` with a Pydantic `Literal` model, errors
+  (`BadRequestError`), keep-alive: all work
+- [x] Judge quality (`scripts/eval_router.py`, `scripts/router_eval.jsonl`: 80 prompts written for this, 20 per tier
+  following the legacy rubric's definitions, incl. lookups that look long (a trip story ending in a currency
+  question, an email ending in "what day", pasted Rust code + "what language") and hard ones that look short (`Is P
+  equal to NP?`, `Is 2^61 - 1 prime?`, the bat and ball); the request built with LiteLLM's own code and checked
+  against a logged one; temperature 0; label probabilities = the masked softmax at the decision step summed per
+  label). 8 threads, 2026-10-26:
+
+  | model | legacy | chat | agentic | business | p(gold), legacy | latency first / median (legacy) |
+  |---|---|---|---|---|---|---|
+  | Qwen3-0.6B Q8_0 GGUF | 51% | 62% | 64% | 64% | 0.53 | 172 / 26 ms |
+  | Qwen3-0.6B Q4_K_M | 51% | 68% | 71% | 60% | 0.54 | 185 / 27 ms |
+  | Qwen3-1.7B Q8_0 | 88% | 82% | 86% | 79% | 0.84 | 399 / 51 ms |
+  | Qwen3-4B Q4_K_M | 91% | 88% | 92% | 79% | 0.90 | 963 / 139 ms |
+
+  (The longer rubrics cost more cold: chat / agentic / business 298 / 334 / 528 ms first for 0.6B, the median
+  only +3-8 ms.) 0.6B is not a usable judge: with the legacy rubric it never says REASONING (19 of 20 go to
+  COMPLEX) and rates most lookups MEDIUM (13 of 20; SIMPLE recall 25%); its probabilities are confident when
+  wrong (`What is the capital of Canada?` MEDIUM 0.71). LiteLLM's warning ("rated hard prompts SIMPLE") does not
+  reproduce under constrained decoding: 0 of 40 COMPLEX / REASONING prompts rated SIMPLE for any 0.6B setup; its
+  errors are within one tier 94-98% of the time, so as a two-way splitter (SIMPLE + MEDIUM vs COMPLEX +
+  REASONING) it gets 69-75 of 80 right (Q8_0 legacy 73; 1.7B 70-75, 4B 77-79), the only use it supports. Q4_K_M is no
+  worse than Q8_0 here. 1.7B Q8_0 is the smallest usable one (88% legacy, REASONING recall 75%, ~50-60 ms); 4B
+  Q4_K_M is the best (88-92% except business) at ~140-160 ms. The business rubric moves REASONING to "committing
+  to a decision", so its lower scores partly measure our legacy-based labels
+- [x] Verification: `make test` green (381); `tests/compare_bins.sh -j 4 /tmp/cwref .`: all 360 jobs identical to
+  the pre-Step-8 binaries (296 s); CLI speed, interleaved with /tmp/cwref/runq, best of 6, 8 threads, Q8_0 GGUF,
+  312-token chat prompt, `-n 128`: prefill 1,953 / 1,986 tok/s (before / now), decode 180 / 190 (load 6-10; within
+  the noise)
+- Open for Step 10: the engine runs one job at a time: concurrent requests queue (6 concurrent 60-token
+  generations: 2.3-2.7 s instead of ~0.4 s each); continuous batching = several jobs' decode rows in one
+  `rq_forward_batch` per step, prefill chunks of new jobs next to them, each job's sampling / constraint / stop
+  logic per row (the Job keeps its interface; `run_job` becomes per-step state), needs the small-B kernels for
+  speed. Slots then become the batch's sequences (one per running job + idle cached ones); slot choice could
+  prefer a prefix shared by several queued jobs. Also: a decision step's subset classifier (above);
+  `json_object` / free-form strings in schemas (a byte-level JSON grammar); logprobs with streaming; prefill of a
+  long prompt blocks the queue (chunked: a cancel is seen, but other jobs wait: interleave chunks with decode
+  rows in Step 10); tools / function calling are not planned
+
 ## Known bugs
 Found by the tests.
 - [x] Tokenizer: no NFC normalizer (HF's tokenizer.json normalizer is NFC); the input was assumed
@@ -1052,9 +1213,9 @@ this box runs 1.105.0 (`/opt/litellm/venv-1.105.0`; never touch the running prox
   scratch; a request-level API (tokens in, logits / tokens out, callbacks instead of printing);
   errors returned instead of `exit()` in request paths; runq.c split into modules; docs updated: done,
   see above
-- [ ] Step 9: `runq serve`: OpenAI-compatible HTTP server (non-streaming chat completions, models,
+- [x] Step 9: `runq serve`: OpenAI-compatible HTTP server (chat completions incl. streaming, models,
   prefix KV reuse across requests, `response_format` json_schema with finite outputs by constrained
-  decoding, FIFO), tests, end-to-end with a scratch LiteLLM instance, judge-quality evaluation
+  decoding, FIFO), tests, end-to-end with a scratch LiteLLM instance, judge-quality evaluation: done, see above
 - [ ] Step 10: multi-sequence (batched) decode: per-sequence KV and positions in one forward pass,
   small-B kernels, continuous batching in the server, bit-identical to separate runs
 - [ ] Step 11: other models that should run on this engine (Qwen3 dense family: 1.7B, 4B, 8B; other

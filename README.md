@@ -2,7 +2,8 @@
 
 Personal experiment: running Qwen3-0.6B from plain C on the CPU.
 The engine is a small C library (`src/runq.h`, see Architecture below) with the `runq` command line on
-top, derived from qwen3.c. Roadmap and status: [TODO.md](TODO.md).
+top, derived from qwen3.c, and `runq serve`, an OpenAI-compatible HTTP server (see Server below; e.g. the
+LLM judge of LiteLLM's complexity router). Roadmap and status: [TODO.md](TODO.md).
 
 ## Quick start
 
@@ -13,6 +14,7 @@ make                                  # -> ./runq  (make debug -> ./runq-debug, 
 G=models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf
 ./runq $G -c 4096                     # interactive chat
 ./runq $G -c 4096 -t 0 -n 200 -i "Why is the sky blue?"
+./runq serve $G                       # OpenAI-compatible server on http://127.0.0.1:8080/v1 (see Server)
 ```
 
 On macOS (Apple Silicon) `make` uses Apple clang (no OpenMP, no extra packages); every format and
@@ -51,7 +53,7 @@ scripts/export_q8.sh                  # -> models/Qwen3-0.6B-q8.bin (Q8_0, ~630 
 # (or: make models, which runs download + export if the .bin is missing)
 ./runq models/Qwen3-0.6B-q8.bin -c 4096
 
-make test                             # regression suite, ~30 s (tests/README.md)
+make test                             # regression suite, ~32 s (tests/README.md)
 make bench                            # thread sweep, prefill/decode tok/s (scripts/bench_qwen3c.sh)
 make bench-prefill                    # prefill tok/s vs prompt length and -b (scripts/bench_prefill.sh)
 scripts/bench_all.sh                  # all runq speed tables of BENCHMARKS.md (~8 min)
@@ -105,6 +107,101 @@ splits each kv head's attention over threads per 256 positions (3,000 tokens at 
 ~70 -> ~100 tok/s in Step 7a, ~150 since Step 7b's cache layout and f16). Pass `-c` (context size):
 without it the KV cache is sized for the full 40,960-token context, 4.7 GB of address space (9.4 GB with
 `-k f32`), touched only as far as the conversation goes.
+
+## Server (`runq serve`)
+
+An OpenAI-compatible HTTP server in the same binary (POSIX sockets; on Windows it reports that it is not
+available). One model per process, bound to 127.0.0.1 by default, no auth unless `--api-key`:
+
+```sh
+./runq serve models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf             # http://127.0.0.1:8080/v1
+curl -s localhost:8080/v1/chat/completions -d '{"messages": [{"role": "user", "content": "Hi!"}], "max_tokens": 32}'
+```
+
+| flag | default | |
+|---|---|---|
+| `--host`, `--port` | 127.0.0.1, 8080 | `--port 0`: any free port (printed: `listening on http://...`) |
+| `--api-key KEY` | none | require `Authorization: Bearer KEY` (not on `/health`) |
+| `--name ID` | the file name | the model id in `/v1/models` and responses (the request's `model` is accepted whatever it is) |
+| `-c`, `--ctx N` | 8192 | positions per cached sequence (the context limit of a request) |
+| `--slots N` | 4 | cached sequences for prefix reuse (KV memory is touched only as used: 115 KB per position) |
+| `-k`, `-b` | f16, 512 | KV cache type, prefill chunk (as for the CLI) |
+| `--queue N` | 64 | requests waiting at most (more: 503, `Retry-After: 1`) |
+| `--max-conns N`, `--max-body B` | 128, 4 MB | connections (more: 503), request body size (more: 413) |
+| `--timeout S` | 600 | per request incl. queueing (504; 0 = none) |
+| `-t`, `-p`, `-n` | 1.0, 1.0, 0 | defaults for requests without temperature / top_p / max_tokens (0: up to the context) |
+| `--threads N` | `OMP_NUM_THREADS`, else nproc - nproc/8 | threads per forward pass |
+| `-v`, `--verbose` | off | log request bodies and responses |
+
+Endpoints: `POST /v1/chat/completions` (also `/chat/completions`), `GET /v1/models`, `GET /v1/models/{id}`,
+`GET /health` (also `/v1/health`: status, running and queued requests). Chat completions take `messages`
+(system / developer / user / assistant; content a string or an array of `{"type": "text"}` parts),
+`max_tokens` / `max_completion_tokens`, `temperature` (0 = greedy), `top_p`, `seed`, `stop` (a string or
+up to 16), `n` (1 only), `stream` (SSE `data:` chunks, `data: [DONE]`, a final usage chunk with
+`stream_options.include_usage`), `logprobs` / `top_logprobs` (up to 20; not with `stream`), `response_format`
+(`text`; `json_schema`, below; `json_object` is rejected with a message), thinking with `reasoning_effort`
+low / medium / high or `chat_template_kwargs.enable_thinking` (off by default; the reasoning comes back as
+`reasoning_content`), and `cache_prompt: false` (llama.cpp's flag: prefill from scratch). `usage` counts
+prompt, completion and cached prompt tokens (`prompt_tokens_details.cached_tokens`); `finish_reason` is
+`stop` or `length`. Errors are OpenAI error objects: 400 (invalid request; a prompt longer than the context
+has `code: context_length_exceeded`), 401, 404, 405, 411 (chunked uploads), 413, 503 (queue full / shutting
+down), 504. Not supported: tools / function calls, images, `n > 1`, `json_object`, penalties (ignored).
+
+- **Conversation**: rendered with Qwen3's template in the CLI chat's form (`runq -m chat`), so a greedy
+  request gives the same text as the CLI for the same messages (tested bitwise, also with a seed: the RNG
+  draws as the CLI's chat does for a first turn). Earlier assistant messages lose their `<think>` block.
+- **Prefix reuse**: the cached sequence (slot) with the longest common token prefix is truncated to it
+  and only the rest is prefilled (a slot is reused if that saves at least 32 tokens or half the prompt,
+  else the least recently used one is taken). Logits are bit-identical to a fresh prefill (tested). A
+  second turn re-prefills only the new message; LiteLLM's classifier rubric (253 tokens) stays cached.
+- **Constrained decoding** (`response_format: json_schema`), for schemas with a finite set of outputs:
+  `enum`, `const`, `boolean`, `null`, `integer` with `minimum` / `maximum` (up to 256 values), objects of
+  those (nested; `required`, optional properties; property order as in the schema; no additional
+  properties), `anyOf` / `oneOf`, `$ref` into `$defs` / `definitions`; up to 4096 outputs. Each output is
+  written as Python's `json.dumps` writes it (`{"tier": "SIMPLE"}`: what Qwen3 itself writes for a small
+  object). Where all valid continuations agree, their canonical tokens are forced without a forward pass
+  of their own (`{"tier": "` goes into the prompt's prefill, `PLE"}` after the decision is never fed);
+  decisions are masked at the byte level (every token whose bytes keep the output a prefix of a valid
+  one), so a LiteLLM classification is one prefill: ~20 ms with the rubric cached. Other schemas get a
+  400 naming the unsupported part.
+- **Concurrency**: one engine thread runs the requests one at a time from a FIFO queue (one forward pass at
+  a time per process); connections have their own threads, so `/health` and queueing never wait on a
+  generation. A client that disconnects cancels its request at the next step. SIGINT / SIGTERM: stop
+  accepting, reject the queue (503), let the running request finish (up to 10 s), exit.
+- **Logging**: one line per request on stderr: time, client, method, path, status, prompt / cached /
+  completion tokens, queue wait, prefill and total time (`--verbose`: the bodies too).
+
+As the judge of LiteLLM's complexity router (`auto_router/complexity_router`, `classifier_type: llm`,
+LiteLLM 1.105): LiteLLM sends the rubric as the system message, `\nClassify this message:\n<prompt>` as the
+user message, and `response_format` = its `TierClassification` model's JSON schema (an inline enum of the
+four tiers); runq answers `{"tier": "..."}`. The judge needs no thinking and `temperature: 0`:
+
+```yaml
+model_list:
+  - model_name: smart-router
+    litellm_params:
+      model: auto_router/complexity_router
+      complexity_router_config:
+        classifier_type: llm
+        classifier_context_window_size: 0     # judge the current message only (shorter prompts)
+        classifier_llm_config:
+          model: runq-judge
+          timeout_ms: 10000                    # default 3000; a timeout opens a 30 s circuit breaker
+        tiers: { SIMPLE: small-model, MEDIUM: small-model, COMPLEX: big-model, REASONING: big-model }
+  - model_name: runq-judge
+    litellm_params:
+      model: openai/runq                       # any name
+      api_base: http://127.0.0.1:8080/v1
+      api_key: none
+      temperature: 0
+```
+
+`scripts/litellm_e2e.sh` runs this chain with a scratch LiteLLM proxy (runq as the judge and as the tier
+models). Judge latency on the 16-vCPU box (8 threads, Q8_0 GGUF): ~180 ms for the first request (the
+265-token prompt), then 15-27 ms (the rubric cached). Quality (`scripts/eval_router.py`, 80 labeled
+prompts, TODO.md Step 9): Qwen3-0.6B is a weak judge, 51-71% depending on rubric and quantization (it
+almost never says REASONING); Qwen3-1.7B Q8_0 79-88% at ~55 ms per classification; Qwen3-4B Q4_K_M
+79-92% at ~150 ms.
 
 ## Architecture
 
@@ -160,6 +257,7 @@ rq_generate(c, s, t.v, t.n, &cfg, 256, &cb, &stats);
 | `src/kernels_avx512.h`, `src/kernels_neon.h`, `src/kquants.h` | SIMD kernels, K-quant formats and arithmetic definitions |
 | `src/internal.h` | the structures shared by the modules |
 | `src/cli.c` | the `runq` command line and its test hooks |
+| `src/serve.c`, `src/engine.c`, `src/http.c`, `src/constrain.c`, `src/json.c` | `runq serve` (not part of the library; `src/serve.h`): the OpenAI layer, the engine thread and queue, HTTP/1.1, constrained decoding, JSON |
 
 Each module is its own translation unit (objects in `build/native`, `build/generic`, `build/debug`).
 All numeric code of the forward passes stays in `forward.c`, so the `-Ofast` code generation of the
@@ -233,7 +331,9 @@ float folds in the GEMM), decode ~5% (the packed weights are ~6% larger: fp32 sc
   bit-identical to the generic C kernels, embedding rows dequantized with ggml's expressions
   (bit-identical to gguf-py), test hook `-m dequant`;
   the library API (Step 8: model / sequence / compute context, multi-sequence batched passes, errors
-  returned instead of `exit()`, no printing in the library), split into modules.
+  returned instead of `exit()`, no printing in the library), split into modules;
+  `runq serve` (Step 9): an OpenAI-compatible HTTP server with prefix KV reuse and constrained decoding
+  for finite JSON schemas (a hand-written HTTP/1.1 server and JSON parser / writer, no dependencies).
 - `src/kquants.h`: the Q4_K / Q6_K block formats, their dequantization, the repacked layouts (Q4P,
   Q6P) and the generic kernels; the arithmetic of a K-quant matmul output is defined there.
 - `src/kernels_avx512.h`: the AVX-512 VNNI Q8_0 GEMM / GEMV (group size 64 or 32) and the weight
@@ -288,6 +388,10 @@ vs the f32 cache +8-10% / +17-22% / +23-29% after 451 / 1,500 / 3,000-token prom
 ~4%. Not comparable with the EPYC table above (other CPU).
 
 ## Known limitations
+
+- `runq serve` runs one request at a time (a FIFO queue; batched decode of several requests is Step 10),
+  constrains output only to JSON schemas with a finite set of outputs (no `json_object`, no free strings),
+  has no tools / images / `n > 1`, no TLS; bind it to localhost or a trusted network.
 
 - Q8_0 (.bin or GGUF) and Q4_K_M GGUF (any mix of Q8_0 / Q4_K / Q6_K matrices). Other GGUF types
   (F16, Q5_K, IQ*, ...) are rejected with a clean error. Without AVX-512 VNNI (or `make generic`)

@@ -127,8 +127,8 @@ not comparable with each other:
   - Against upstream qwen3.c, Qwen3-0.6B Q8_0 `.bin`, one session (2026-10-25), 8 / 12 threads:
     prefill of 451 tokens 2,058 / 2,758 tok/s, where qwen3.c prefills token by token at ~99 tok/s
     (short prompt); decode 148 / 170 tok/s against qwen3.c's 101 / 106.
-  - Later steps (TODO.md, Steps 6-7): decode of the Q8_0 GGUF ~190 / ~210 tok/s at 8 / 12 threads, of
-    Q4_K_M ~280 / ~350. After a 3,000-token prompt, decode is ~130 / ~150 (Q8_0 GGUF) and ~160 / ~180
+  - Later steps ([docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#benchmark-notes-per-step)): decode of the Q8_0
+    GGUF ~190 / ~210 tok/s at 8 / 12 threads, of Q4_K_M ~280 / ~350. After a 3,000-token prompt, decode is ~130 / ~150 (Q8_0 GGUF) and ~160 / ~180
     (Q4_K_M) with the f16 KV cache.
   - Batched decode (0.6B Q4_K_M, short contexts, 8 / 12 threads): 8 sequences 1,003 / 1,214 tok/s in
     aggregate, 16 sequences 1,091 / 1,449 (single sequence: 326 / 366).
@@ -247,9 +247,10 @@ Every kernel family follows one arithmetic definition: int8 activations in group
 (`.bin`), with the float folds in a fixed order and without FMA contraction. The kernels are
 interchangeable bit for bit, but logits differ slightly from fp32 engines; the tests bound the
 differences against HF. The activation group size is a process-wide kernel setting: load one model,
-or models with the same group size, per process. The changes relative to qwen3.c, step by step, are listed in
-[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md); the full development log with every design decision and
-measurement is [TODO.md](TODO.md).
+or models with the same group size, per process. The changes relative to qwen3.c, step by step, the design notes
+and the experiments that were not kept are in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md); the full development log
+with every measurement is in the git history ([History](docs/DEVELOPMENT.md#history)). Open work:
+[TODO.md](TODO.md), [IDEAS.md](IDEAS.md).
 
 ## Testing
 

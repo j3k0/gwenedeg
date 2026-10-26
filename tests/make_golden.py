@@ -163,7 +163,7 @@ TOKENIZER_CASES = [
     ("nfc_hf_compat", "a\u1df6\u0301 a\u0301\u1df6 \U00011935\U00011930 x\u0d3b\u0323"),  # HF's Unicode 9.0 data
 ]
 
-# Known runq tokenizer limitations (TODO.md): reported as XFAIL, do not fail the suite.
+# Known runq tokenizer limitations: reported as XFAIL, do not fail the suite.
 # (none since Step 5: the two NFC cases above pass)
 TOKENIZER_XFAIL = {}
 

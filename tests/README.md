@@ -150,16 +150,16 @@ Measured 2026-10-24 (Q8_0 engine at the commit adding this suite, unchanged from
 | count | 15 | 0.8653 | 0.99941 | 0.99901 | 14/15 | 0.907 |
 | pooled | 84 | | 0.99909 | | 76/84 = 0.905 | |
 
-Since the SwiGLU NaN fix (2026-10-25, see `../TODO.md` Known bugs; it changed the last layer of
+Since the SwiGLU NaN fix (2026-10-25, `7b2b034`: `expf` overflow under `-Ofast`; it changed the last layer of
 `zh` and `chat`): zh top-5 0.893, chat cos mean 0.99891, pooled cos mean 0.99910; the rest is
 unchanged. The batched path gives exactly the same numbers.
 Since the Step 3b attention (pooled numbers unchanged, per-prompt values moved slightly, e.g. en
 top-5 0.907, code top-1 22/24): current per-prompt table in `../BENCHMARKS.md` (Quality).
 The GGUF Q8_0 file (Step 6a, group 32 with fp16 scales) is closer to HF under the same thresholds:
 pooled cos mean 0.99939 (1-cos 6.1e-4 vs 9.0e-4), top-1 79/84, pos 0 cos 0.92-0.98 (per-prompt table
-in `../TODO.md`, Step 6a).
+in Step 6a of the development log: [History](../docs/DEVELOPMENT.md#history)).
 
-Q4_K_M (Step 6b-1; per-prompt table in `../TODO.md`): vs HF, pooled cos 0.98402 (1-cos 1.6e-2, ~25x
+Q4_K_M (Step 6b-1; per-prompt table in the development log): vs HF, pooled cos 0.98402 (1-cos 1.6e-2, ~25x
 Q8_0), top-1 69/84, per-prompt cos mean 0.967-0.992, every position >= 0.940, pos 0 0.35-0.46. That
 is the 4-bit weights' own error: HF fp32 with the GGUF's weights dequantized (the "Q4 reference",
 `make_golden.py --q4ref`) gives pooled cos 0.98459, top-1 67/84 against HF. runq vs the Q4 reference:
@@ -256,7 +256,7 @@ goldens, the greedy goldens) gives the same bits as before. Past it: `logits_lon
 KV cache types (Step 7b): the default is the f16 cache (`-k f16`), so every test above runs on it; the
 greedy and seeded goldens were regenerated for it (7 texts changed, all read fine) and `-k f32` still
 reproduces every earlier golden exactly (checked once; `greedy/f32_generate` keeps one). The logits
-thresholds are the same for all three types (measured, `../TODO.md` Step 7b: pooled cos .bin f32 / bf16 /
+thresholds are the same for all three types (measured in Step 7b: pooled cos .bin f32 / bf16 /
 f16 0.99910 / 0.99900 / 0.99905, long2 cos mean 0.99927 / 0.99909 / 0.99921). The 16-bit caches round at
 the store (integer operations in C, the same in both builds) and convert exactly at the load, so the
 AVX-512 and generic attentions still compute the same fp32 operations: `kernels/*` and `kv_*_kernels/*`
@@ -316,7 +316,8 @@ thresholds; the Q4_K_M reference has cos mean 0.890 on `en` (position 8 at -0.13
 top-1 still right), 0.977-0.997 on the others, pos0 0.95, top-1 56/61, pooled 0.967: so `q4_hf` has no per-position
 bound, cos mean >= 0.85, pos0 >= 0.90, top-1 >= 0.75, pooled >= 0.95 (runq: 0.928 / 0.995-0.998, pooled 0.979).
 
-Known engine bugs found by these tests are listed in `../TODO.md` ("Known bugs").
+Engine bugs found by these tests so far (the missing NFC normalizer, the SwiGLU NaN, a division by a zero
+scale in `quantize()`) are fixed; open problems go to [`../TODO.md`](../TODO.md).
 
 ## Tokenizer fuzz test (on demand, not in `make test`)
 

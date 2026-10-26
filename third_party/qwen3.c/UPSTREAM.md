@@ -6,7 +6,7 @@
 
 This directory is kept pristine (identical to upstream, apart from this file) so that
 our changes can be diffed against it. Gwenedeg's engine started as a copy of `runq.c` (`src/runq.c`,
-until Step 8 of TODO.md split it into the modules of `src/`; the single file is in git history):
+until Step 8 (`dfed67f`) split it into the modules of `src/`; the single file is in git history):
 
     git show 87e08aa:src/runq.c | diff -u third_party/qwen3.c/runq.c -   # upstream + the -n / [timing] patch
 

@@ -248,7 +248,7 @@ FAMILY = [
     ("8b-q4km", "Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf", "qwen3", [("8b-q4km", "ref")]),
 ]
 # thresholds (per prompt: cos mean / every position >= 1 / position 0, top-1 fraction; pooled cos), measured in
-# Step 11 (TODO.md): vs the dequantized-weights reference only runq's int8 activations differ (as Q8_0 vs HF
+# Step 11 (docs/DEVELOPMENT.md, History): vs the dequantized-weights reference only runq's int8 activations differ (as Q8_0 vs HF
 # for 0.6B); Q8_0 vs HF fp32 as 0.6B's Q8_0 thresholds; Q4_K_M vs HF fp32 is the 4-bit weights' own error,
 # which the reference has too: the 1.7B Q4_K_M reference vs HF fp32 (golden vs golden) has cos means 0.890 (en:
 # position 8, cos -0.137, the whole logit vector shifted, top-1 still right) / 0.997 / 0.992 / 0.977 (code, chat,

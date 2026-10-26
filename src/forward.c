@@ -2,7 +2,7 @@
  * activation and scratch buffers, synchronization, profiling) and every numeric part of the decode
  * step and the batched prefill (quantization, norms, matmul and attention dispatch, KV cache).
  * All of it is one translation unit: the exact arithmetic (dot_q8, the attention, the quantizer)
- * depends on gcc -Ofast's code generation in this context (inlining; TODO.md Steps 3-7). */
+ * depends on gcc -Ofast's code generation in this context (inlining; Steps 3-7 of the development log). */
 #include "internal.h"
 
 #ifndef ATT_ROWS
@@ -651,7 +651,7 @@ typedef struct {
 
 // Small-batch kernels (AVX-512, kernels_avx512.h smb_rows): in prefill_worker's GEMM phases for a matmul
 // over at most smb_max rows of its weight type (else the GEMM's tiles), and always in batch_decode_worker.
-// Crossover (one thread, TODO.md Step 10a): Q4_K / Q6_K faster than the GEMM up to ~24 rows (1.6-2.3x at
+// Crossover (one thread, measured in Step 10a): Q4_K / Q6_K faster than the GEMM up to ~24 rows (1.6-2.3x at
 // 1-4 rows: no tile unpacking), equal at 32, ~4% slower at 48-64; Q8_0 equal (the GEMM tile streams the
 // packed weights too). RUNQ_SMB=Q8,Q4,Q6 overrides them (tuning; 0 = never). Results never depend on it
 enum { SMB_Q8, SMB_Q4, SMB_Q6 };

@@ -2,7 +2,10 @@
 
 The reference for [Gwenedeg](../README.md)'s server: flags, endpoints, behaviour, the LiteLLM
 router setup and measurements (on the 16-vCPU AMD EPYC Genoa VM of [BENCHMARKS.md](../BENCHMARKS.md),
-shared, so the numbers are noisy). Design and measurement details: [TODO.md](../TODO.md), Steps 9 and 10b.
+shared, so the numbers are noisy). The design is described in the header comments of `src/engine.c` (scheduler,
+slot pool) and `src/constrain.c` (constrained decoding); the full measurements are in Steps 9 and 10b of the
+development log ([DEVELOPMENT.md, History](DEVELOPMENT.md#history)), the tuning of the defaults in
+[DEVELOPMENT.md](DEVELOPMENT.md#design-notes-and-rejected-experiments) (Server).
 
 An OpenAI-compatible HTTP server in the same binary (POSIX sockets; on Windows it reports that it is not
 available). One model per process, bound to 127.0.0.1 by default, no auth unless `--api-key`:
@@ -113,9 +116,9 @@ model_list:
 `LITELLM_VENV=/path/to/venv scripts/litellm_e2e.sh` runs this chain with a scratch LiteLLM proxy from a venv
 with LiteLLM's proxy installed (tested with 1.105.0; runq as the judge and as the tier models; a second pass sends the same prompts concurrently). Judge latency on the 16-vCPU VM (8 threads,
 Q8_0 GGUF): ~180 ms for the first request (the 265-token prompt), then 15-27 ms (the rubric cached). Quality (`scripts/eval_router.py`, 80 labeled
-prompts, `scripts/router_eval.jsonl`, written for this project; TODO.md Step 9): Qwen3-0.6B is a weak judge, 51-71% depending on rubric and quantization (it
+prompts, `scripts/router_eval.jsonl`, written for this project; Step 9): Qwen3-0.6B is a weak judge, 51-71% depending on rubric and quantization (it
 almost never says REASONING); Qwen3-1.7B Q8_0 79-88% at ~55 ms per classification; Qwen3-4B Q4_K_M
-79-92% at ~150 ms. Later, with the bigger models (TODO.md Step 11): 1.7B Q8_0 88% at ~50 ms, Qwen3-4B-Instruct-2507
+79-92% at ~150 ms. Later, with the bigger models (Step 11): 1.7B Q8_0 88% at ~50 ms, Qwen3-4B-Instruct-2507
 Q4_K_M 88-92% at ~130 ms, Qwen3-8B Q4_K_M 92% at ~260 ms.
 
 ## Limitations

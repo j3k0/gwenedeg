@@ -29,7 +29,7 @@ if [[ -n "$Q4" && ! -f "$Q4" ]]; then
 fi
 
 if [[ -z "${RUNQ:-}" ]]; then
-    make -s -j2 runq runq-generic
+    make -s -j8 runq runq-generic
     RUNQ="$ROOT/runq"
     RUNQ_GENERIC="${RUNQ_GENERIC:-$ROOT/runq-generic}"
 fi

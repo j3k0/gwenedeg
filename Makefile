@@ -1,4 +1,4 @@
-# cwayn: Qwen3-0.6B inference in C (engine: src/runq.c, derived from qwen3.c)
+# cwayn: Qwen3-0.6B inference in C (engine: src/*.c, derived from qwen3.c; modules: README.md)
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
@@ -19,25 +19,44 @@ endif
 CPPFLAGS += -D_FILE_OFFSET_BITS=64
 LDLIBS  += -lm -lpthread
 
-SRC = src/runq.c
-HDR = src/unicode_tables.h src/unicode_nfc.h src/kernels_avx512.h src/kernels_neon.h src/kquants.h src/threads.h
+# the library modules (runq.h) and the CLI; each module is its own translation unit, all numeric code
+# of the forward passes is in forward.c (README.md, Architecture)
+LIB = model gguf forward tokenizer sampler threads
+HDR = $(wildcard src/*.h)
 Q8  = models/Qwen3-0.6B-q8.bin
+B   = build
 
-.PHONY: all debug generic clean test bench bench-prefill models kq-neon-test
+.PHONY: all debug generic clean test bench bench-prefill models kq-neon-test FORCE
 
 all: runq
 
-runq: $(SRC) $(HDR)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LDLIBS) -o $@
+# objects per build flavour: $(B)/native (CFLAGS), $(B)/generic (+ -DRUNQ_GENERIC), $(B)/debug
+# (DBGFLAGS); a .flags stamp per flavour rebuilds its objects when the flags change
+$(B)/native/.flags: FORCE
+	@mkdir -p $(@D); f='$(CC) $(CFLAGS) $(CPPFLAGS)'; echo "$$f" | cmp -s - $@ || echo "$$f" > $@
+$(B)/generic/.flags: FORCE
+	@mkdir -p $(@D); f='$(CC) $(CFLAGS) $(CPPFLAGS) -DRUNQ_GENERIC'; echo "$$f" | cmp -s - $@ || echo "$$f" > $@
+$(B)/debug/.flags: FORCE
+	@mkdir -p $(@D); f='$(CC) $(DBGFLAGS) $(CPPFLAGS)'; echo "$$f" | cmp -s - $@ || echo "$$f" > $@
 
-runq-debug: $(SRC) $(HDR)
-	$(CC) $(DBGFLAGS) $(CPPFLAGS) $< $(LDLIBS) -o $@
+$(B)/native/%.o: src/%.c $(HDR) $(B)/native/.flags
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+$(B)/generic/%.o: src/%.c $(HDR) $(B)/generic/.flags
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DRUNQ_GENERIC -c $< -o $@
+$(B)/debug/%.o: src/%.c $(HDR) $(B)/debug/.flags
+	$(CC) $(DBGFLAGS) $(CPPFLAGS) -c $< -o $@
+
+runq: $(LIB:%=$(B)/native/%.o) $(B)/native/cli.o
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
+runq-debug: $(LIB:%=$(B)/debug/%.o) $(B)/debug/cli.o
+	$(CC) $(DBGFLAGS) $^ $(LDLIBS) -o $@
 
 # Same flags, but the generic C kernels instead of the AVX-512 VNNI ones (kernels_avx512.h);
 # `make test` checks that both give bit-identical logits. (On a CPU without AVX-512 VNNI,
 # plain `make` already builds the generic kernels: the selection is at compile time.)
-runq-generic: $(SRC) $(HDR)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DRUNQ_GENERIC $< $(LDLIBS) -o $@
+runq-generic: $(LIB:%=$(B)/generic/%.o) $(B)/generic/cli.o
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
 debug: runq-debug
 
@@ -48,7 +67,7 @@ kq-neon-test: tests/kernels/kq_neon_test.c src/kernels_neon.h src/kquants.h
 generic: runq-generic
 
 clean:
-	rm -rf runq runq-debug runq-generic runq-debug.dSYM tests/kernels/kq_neon_test
+	rm -rf runq runq-debug runq-generic runq-debug.dSYM tests/kernels/kq_neon_test $(B)
 
 # (run_tests.sh builds runq and runq-generic itself, in parallel)
 test:

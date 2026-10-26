@@ -10,3 +10,4 @@ __pycache__/
 *.o
 /runq-debug.dSYM/
 /tests/kernels/kq_neon_test
+/build/

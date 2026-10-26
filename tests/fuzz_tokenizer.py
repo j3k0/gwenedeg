@@ -47,7 +47,7 @@ import unicodedata
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_DIR = os.path.join(ROOT, "models", "Qwen3-0.6B")
-FILES = ["README.md", "TODO.md", "tests/README.md", "src/runq.c", "src/win.c", "tests/check.py",
+FILES = ["README.md", "TODO.md", "tests/README.md", "src/forward.c", "src/tokenizer.c", "src/win.c", "tests/check.py",
          "tests/make_golden.py", "tests/fuzz_tokenizer.py", "tools/gen_unicode_tables.py",
          "scripts/download_models.py", "third_party/qwen3.c/export.py",
          "models/Qwen3-0.6B/README.md", "models/Qwen3-0.6B/LICENSE"]

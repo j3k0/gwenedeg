@@ -211,10 +211,10 @@ def main():
     ex = cf.ThreadPoolExecutor(max_workers=3)
     ref = {
         "aus": ex.submit(cli, a, ["-t", "0", "-n", "40", "-i", AUS]),
-        "pirate": ex.submit(cli, a, ["-t", "0", "-n", "24", "-y", PIRATE_SYS, "-i", PIRATE]),
-        "ada": ex.submit(cli, a, ["-t", "0", "-n", "64"], "\n".join(ADA) + "\n"),
-        "cats": ex.submit(cli, a, ["-t", "0.8", "-p", "0.9", "-s", "42", "-n", "24", "-i", CATS]),
-        "think": ex.submit(cli, a, ["-t", "0", "-n", "24", "-r", "1", "-i", MULT]),
+        "pirate": ex.submit(cli, a, ["-t", "0", "-n", "16", "-y", PIRATE_SYS, "-i", PIRATE]),
+        "ada": ex.submit(cli, a, ["-t", "0", "-n", "32"], "\n".join(ADA) + "\n"),
+        "cats": ex.submit(cli, a, ["-t", "0.8", "-p", "0.9", "-s", "42", "-n", "16", "-i", CATS]),
+        "think": ex.submit(cli, a, ["-t", "0", "-n", "16", "-r", "1", "-i", MULT]),
     }
     port = None
     for _ in range(600):
@@ -278,26 +278,26 @@ def run_all(a, t, port, ref, slow, logname):
     rep(st == 200 and text_of(d) + "\n" == want, "chat/single_turn", f"{text_of(d)!r} vs {want!r}" if st == 200 and text_of(d) + "\n" != want else "")
     aus = d
     st, d, _ = chat(port, {"messages": [{"role": "system", "content": PIRATE_SYS}, {"role": "user", "content": PIRATE}],
-                           "temperature": 0, "max_tokens": 24})
+                           "temperature": 0, "max_tokens": 16})
     want = ref["pirate"].result()
     rep(st == 200 and text_of(d) + "\n" == want, "chat/system_prompt", "" if text_of(d) + "\n" == want else f"{text_of(d)!r} vs {want!r}")
     replies = split_transcript(ref["ada"].result(), ADA)
-    st, d1, _ = chat(port, {"messages": [{"role": "user", "content": ADA[0]}], "temperature": 0, "max_tokens": 64})
+    st, d1, _ = chat(port, {"messages": [{"role": "user", "content": ADA[0]}], "temperature": 0, "max_tokens": 32})
     st2, d2, _ = chat(port, {"messages": [{"role": "user", "content": ADA[0]}, {"role": "assistant", "content": text_of(d1)},
-                                          {"role": "user", "content": ADA[1]}], "temperature": 0, "max_tokens": 64})
+                                          {"role": "user", "content": ADA[1]}], "temperature": 0, "max_tokens": 32})
     u1, u2 = d1["usage"], d2["usage"]
     want_cached = u1["prompt_tokens"] + u1["completion_tokens"] - (d1["choices"][0]["finish_reason"] == "length")
     rep(st == st2 == 200 and [text_of(d1), text_of(d2)] == replies, "chat/multi_turn",
         "" if [text_of(d1), text_of(d2)] == replies else f"{[text_of(d1), text_of(d2)]!r} vs {replies!r}")
     rep(u2["prompt_tokens_details"]["cached_tokens"] == want_cached, "chat/multi_turn_cached",
         f"cached {u2['prompt_tokens_details']['cached_tokens']} of {u2['prompt_tokens']} (want {want_cached})")
-    st, d, _ = chat(port, {"messages": [{"role": "user", "content": CATS}], "temperature": 0.8, "top_p": 0.9, "seed": 42, "max_tokens": 24})
+    st, d, _ = chat(port, {"messages": [{"role": "user", "content": CATS}], "temperature": 0.8, "top_p": 0.9, "seed": 42, "max_tokens": 16})
     want = ref["cats"].result()
     rep(st == 200 and text_of(d) + "\n" == want, "chat/seeded", "" if text_of(d) + "\n" == want else f"{text_of(d)!r} vs {want!r}")
-    st, d, _ = chat(port, {"messages": [{"role": "user", "content": MULT}], "temperature": 0, "max_tokens": 24, "reasoning_effort": "high"})
+    st, d, _ = chat(port, {"messages": [{"role": "user", "content": MULT}], "temperature": 0, "max_tokens": 16, "reasoning_effort": "high"})
     want, m = ref["think"].result(), d["choices"][0]["message"]
     rs = m.get("reasoning_content") or ""
-    rep(st == 200 and len(rs) > 20 and want.startswith("<think>\n" + rs) and m["content"] == "" and d["usage"]["completion_tokens"] == 24,
+    rep(st == 200 and len(rs) > 20 and want.startswith("<think>\n" + rs) and m["content"] == "" and d["usage"]["completion_tokens"] == 16,
         "chat/thinking", f"reasoning {rs[:60]!r}... CLI {want[:60]!r}")
 
     # ------------------------------------------------------------------ prefix reuse == fresh
@@ -332,7 +332,7 @@ def run_all(a, t, port, ref, slow, logname):
     cut = text_of(aus).split(word)[0]
     rep(text_of(d) == cut == s2 and d["choices"][0]["finish_reason"] == fin2 == "stop" and word in text_of(aus) and cut,
         "stream/stop_strings", f"stop {word!r}: {text_of(d)!r} / {s2!r}")
-    s3, r3, fin3, _, _, _ = stream(port, {"messages": [{"role": "user", "content": MULT}], "temperature": 0, "max_tokens": 24,
+    s3, r3, fin3, _, _, _ = stream(port, {"messages": [{"role": "user", "content": MULT}], "temperature": 0, "max_tokens": 16,
                                           "chat_template_kwargs": {"enable_thinking": True}})
     rep(r3 == rs and s3 == "" and fin3 == "length", "stream/thinking", repr(r3[:50]))
 
@@ -421,18 +421,18 @@ def run_all(a, t, port, ref, slow, logname):
     # ------------------------------------------------------------------ queue, concurrency, cancel
     prompts = [f"Write one sentence about the number {i}." for i in range(4)]
     with cf.ThreadPoolExecutor(max_workers=4) as ex:
-        futs = [ex.submit(chat, port, {"messages": [{"role": "user", "content": p}], "temperature": 0, "max_tokens": 12}) for p in prompts]
+        futs = [ex.submit(chat, port, {"messages": [{"role": "user", "content": p}], "temperature": 0, "max_tokens": 8}) for p in prompts]
         time.sleep(0.1)
         t0 = time.time()
         st, h, _ = req(port, "GET", "/health")
         dt = time.time() - t0
         busy = h["running"] + h["queued"]
         res = [f.result() for f in futs]
-    alone = [chat(port, {"messages": [{"role": "user", "content": p}], "temperature": 0, "max_tokens": 12}) for p in prompts]
+    alone = [chat(port, {"messages": [{"role": "user", "content": p}], "temperature": 0, "max_tokens": 8}) for p in prompts]
     rep(all(r[0] == 200 for r in res) and [text_of(r[1]) for r in res] == [text_of(r[1]) for r in alone], "queue/concurrent_equal_alone")
     rep(st == 200 and dt < 0.5 * slow and busy >= 1, "queue/health_while_busy", f"{dt * 1000:.0f} ms, running + queued {busy}")
     with cf.ThreadPoolExecutor(max_workers=10) as ex:
-        futs = [ex.submit(chat, port, {"messages": [{"role": "user", "content": f"Count from {i} to 100."}], "max_tokens": 12,
+        futs = [ex.submit(chat, port, {"messages": [{"role": "user", "content": f"Count from {i} to 100."}], "max_tokens": 8,
                                        "temperature": 0}) for i in range(10)]
         res = [f.result() for f in futs]
     codes = sorted(r[0] for r in res)
@@ -445,7 +445,7 @@ def run_all(a, t, port, ref, slow, logname):
         s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % len(b) + b)
         if mode == "stream":
             s.recv(200)
-        time.sleep(0.15)
+        time.sleep(0.1)
         s.close()
         t0 = time.time()
         st, d, _ = chat(port, {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 2})

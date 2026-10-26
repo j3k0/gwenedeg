@@ -517,7 +517,7 @@ static void run_once(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const ch
         return;
     }
     http_respond(c, r, 200, "application/json", b.p, b.n, NULL);
-    if (a->verbose) fprintf(stderr, "[response] %.*s\n", (int)(b.n < 65536 ? b.n : 65536), b.p);
+    if (a->verbose) fprintf(stderr, "[response] %s %.*s\n", r->peer, (int)(b.n < 65536 ? b.n : 65536), b.p);
     logline(a, r, 200, j, finish_name(j->finish));
     jb_free(&b);
 }

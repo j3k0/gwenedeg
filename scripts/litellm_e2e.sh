@@ -10,7 +10,8 @@
 # first one cold, the others with the rubric prefix cached), then stops both.
 # Usage: scripts/litellm_e2e.sh [MODEL]   (default the Q8_0 GGUF)
 # Env:   LITELLM_VENV (default /opt/litellm/venv-1.105.0: used read-only), WORK (default /tmp/cw9/e2e),
-#        THREADS (runq serve, default 8), RUBRIC (legacy | chat | agentic | business, default legacy)
+#        THREADS (runq serve, default 8), RUBRIC (legacy | chat | agentic | business, default legacy),
+#        CONCURRENT (requests at once in the second pass, default 16)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -95,7 +96,7 @@ curl -s -o /dev/null "http://127.0.0.1:$LL_PORT/health/liveliness" || { tail -30
 echo "LiteLLM $("$PY" -I -c 'import importlib.metadata as m; print(m.version("litellm"))') proxy on :$LL_PORT, runq serve on :$RQ_PORT"
 
 # 4. requests through the router (openai package from the LiteLLM venv), then the checks
-RQ_LOG="$WORK/runq.log" LL_PORT=$LL_PORT LL_KEY="$KEY" RUBRIC=$RUBRIC "$PY" -I - <<'PYEOF'
+RQ_LOG="$WORK/runq.log" LL_PORT=$LL_PORT LL_KEY="$KEY" RUBRIC=$RUBRIC CONCURRENT="${CONCURRENT:-16}" "$PY" -I - <<'PYEOF'
 import json, os, re, time
 import openai
 from litellm.router_strategy.complexity_router import complexity_router as cr
@@ -114,16 +115,18 @@ prompts = [
 ]
 log = os.environ["RQ_LOG"]
 def runq_log():
-    """runq serve's chat requests in order: (request body, response body or None, log line)"""
-    out, cur = [], None
+    """runq serve's chat requests in arrival order: (request body, response body or None, log line), paired by
+    the client address (concurrent requests interleave in the log; one connection's requests are sequential)"""
+    out, cur = [], {}
     for line in open(log).read().splitlines():
         if line.startswith("[request] ") and " /v1/chat/completions " in line:
-            cur = [json.loads(line.split(" ", 3)[3]), None, None]
-            out.append(cur)
-        elif line.startswith("[response] ") and cur:
-            cur[1] = json.loads(line[11:])
-        elif re.match(r"^\[[0-9-]+ [0-9:]+\] \S+ POST /v1/chat/completions ", line) and cur:
-            cur[2] = line
+            peer = line.split(" ", 3)[1]
+            cur[peer] = [json.loads(line.split(" ", 3)[3]), None, None]
+            out.append(cur[peer])
+        elif line.startswith("[response] ") and line.split(" ", 2)[1] in cur:
+            cur[line.split(" ", 2)[1]][1] = json.loads(line.split(" ", 2)[2])
+        elif re.match(r"^\[[0-9-]+ [0-9:]+\] \S+ POST /v1/chat/completions ", line) and line.split(" ")[2] in cur:
+            cur[line.split(" ")[2]][2] = line
     return out
 print(f"\n{'prompt':58s} {'judge says':11s} {'routed to':15s} {'judge ms':>9s} {'cached':>7s} {'end-to-end ms':>14s}")
 for p in prompts:
@@ -140,6 +143,37 @@ for p in prompts:
         m = re.search(r"cached=(\d+) .* total=([0-9.]+)s", judge[0][2])
         jc, jt = m.group(1), f"{float(m.group(2)) * 1000:.0f}"
     print(f"{p[:57]:58s} {tier:11s} {routed:15s} {jt:>9s} {jc:>7s} {dt * 1000:14.0f}")
+
+seq_tier = {}
+for x in runq_log():
+    if x[0].get("response_format") and x[1]:
+        seq_tier[x[0]["messages"][-1]["content"]] = json.loads(x[1]["choices"][0]["message"]["content"])["tier"]
+
+# the same prompts again, CONCURRENT at once through the proxy (each twice): every request classified and
+# routed, the same tier as in the sequential pass (temperature 0; a request's output does not depend on what
+# runq batches it with), judge latency per request from runq's log
+import concurrent.futures as cf
+nconc = int(os.environ.get("CONCURRENT", "16"))
+batch = [prompts[i % len(prompts)] for i in range(nconc)]
+n0 = len(runq_log())
+t0 = time.time()
+def one(p):
+    t = time.time()
+    r = client.chat.completions.create(model="smart-router", messages=[{"role": "user", "content": p}])
+    return time.time() - t, r.choices[0].message.content
+with cf.ThreadPoolExecutor(max_workers=nconc) as ex:
+    res = list(ex.map(one, batch))
+wall = time.time() - t0
+new = runq_log()[n0:]
+judge = [x for x in new if x[0].get("response_format")]
+tiers = [(x[0]["messages"][-1]["content"], json.loads(x[1]["choices"][0]["message"]["content"])["tier"]) for x in judge if x[1]]
+same = all(seq_tier.get(u) == t for u, t in tiers)
+jl = sorted(float(re.search(r"total=([0-9.]+)s", x[2]).group(1)) * 1000 for x in judge if x[2])
+routed = sorted(x[0]["model"] for x in new if not x[0].get("response_format"))
+print(f"\n{nconc} requests at once through the proxy: {wall * 1000:.0f} ms wall, end-to-end per request "
+      f"{min(r[0] for r in res) * 1000:.0f}-{max(r[0] for r in res) * 1000:.0f} ms; {len(tiers)} classified, {len(routed)} routed "
+      f"({', '.join(f'{m} x{routed.count(m)}' for m in sorted(set(routed)))}); every answer non-empty: {all(r[1] for r in res)}")
+print(f"judge latency (runq log) p50 / max {jl[len(jl) // 2]:.0f} / {jl[-1]:.0f} ms; tiers == the sequential pass: {same}")
 
 bodies = [x[0] for x in runq_log()]
 judge_bodies = [b for b in bodies if b.get("response_format")]

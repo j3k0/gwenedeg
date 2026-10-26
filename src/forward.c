@@ -187,25 +187,41 @@ int rq_seq_common_prefix(const RqSeq *s, const int *tokens, int n) {
 }
 
 static inline size_t kv_tile(int t, int h, int n_kv, int hd); // (the cache layout, below)
+static void kv_populate_one(const RqSeq *s, const Config *p, int pos0, int n, int it);
+
+typedef struct { RqSeq *dst; const RqSeq *src; int n, next; } CopyJob;
+
+static void copy_worker(void *arg, int tid, int nt) {
+    // rq_seq_copy's items (layer, K / V) claimed from a shared counter: the destination's tiles pre-faulted
+    // (a first copy into a fresh sequence was ~85% page faults: 14.5 vs 2.1 ms for 253 positions), then the
+    // whole blocks of ATT_P positions below n as one range and the last block's tiles up to position n - 1
+    // per kv head (the layout: kv_tile)
+    (void)tid; (void)nt;
+    CopyJob *j = arg;
+    const Config *p = &j->src->m->config;
+    int nkv = p->n_kv_heads, hd = p->head_dim, kv_dim = j->src->m->kv_dim, full = j->n / ATT_P, rem = j->n % ATT_P;
+    size_t esz = j->src->kv_esz, ntl = (size_t)(rem + ATT_T - 1) / ATT_T;
+    for (int it; (it = __atomic_fetch_add(&j->next, 1, __ATOMIC_RELAXED)) < 2 * p->n_layers;) {
+        int l = it / 2, kv = it % 2;
+        kv_populate_one(j->dst, p, 0, j->n, it);
+        const char *s = (const char *)(kv ? j->src->value_cache : j->src->key_cache) + (size_t)l * j->src->kv_len * kv_dim * esz;
+        char *d = (char *)(kv ? j->dst->value_cache : j->dst->key_cache) + (size_t)l * j->dst->kv_len * kv_dim * esz;
+        memcpy(d, s, (size_t)full * ATT_P * kv_dim * esz);
+        for (int h = 0; h < nkv && rem; h++) {
+            size_t o = kv_tile(full * ATT_P, h, nkv, hd) * esz;
+            memcpy(d + o, s + o, ntl * ATT_T * hd * esz);
+        }
+    }
+}
 
 int rq_seq_copy(RqSeq *dst, const RqSeq *src, int n) {
-    // per layer and K / V: the whole blocks of ATT_P positions below n as one range, then the last
-    // block's tiles up to position n - 1 per kv head (the layout: kv_tile)
+    // (on the thread pool: one parallel job between forward passes, as rq_sample_batch)
     if (!dst || !src || dst == src || dst->m != src->m || dst->kvt != src->kvt || n < 0 || n > src->len || n > dst->cap)
         return RQ_ERR_ARG;
-    const Config *p = &src->m->config;
-    int nkv = p->n_kv_heads, hd = p->head_dim, kv_dim = src->m->kv_dim, full = n / ATT_P, rem = n % ATT_P;
-    size_t esz = src->kv_esz, ntl = (size_t)(rem + ATT_T - 1) / ATT_T;
-    for (int l = 0; l < p->n_layers; l++)
-        for (int kv = 0; kv < 2; kv++) {
-            const char *s = (const char *)(kv ? src->value_cache : src->key_cache) + (size_t)l * src->kv_len * kv_dim * esz;
-            char *d = (char *)(kv ? dst->value_cache : dst->key_cache) + (size_t)l * dst->kv_len * kv_dim * esz;
-            memcpy(d, s, (size_t)full * ATT_P * kv_dim * esz);
-            for (int h = 0; h < nkv && rem; h++) {
-                size_t o = kv_tile(full * ATT_P, h, nkv, hd) * esz;
-                memcpy(d + o, s + o, ntl * ATT_T * hd * esz);
-            }
-        }
+    if (n > 0) {
+        CopyJob j = { dst, src, n, 0 };
+        rq_parallel(copy_worker, &j);
+    }
     memcpy(dst->tokens, src->tokens, (size_t)n * sizeof(int));
     dst->len = n;
     return RQ_OK;

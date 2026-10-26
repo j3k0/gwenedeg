@@ -225,12 +225,30 @@ split over threads per 256 positions), `rq_prefill` (a sequence's tokens in chun
 chunk next to decode rows of other sequences, logits of the selected rows). Results are bit-identical
 whatever the thread count, chunk size or batch composition (`tests/api_test.c` checks sequences
 interleaved and batched together against each alone). On top: `rq_sample` (per-call temperature /
-top-p, the sequence's RNG, an optional token mask for constrained decoding), `rq_generate` (the chat
+top-p, the sequence's RNG, an optional token mask for constrained decoding), `rq_sample_batch` (the rows
+of a batched pass on the thread pool, each with its own settings: the same tokens as `rq_sample`),
+`rq_seq_copy` (a sequence's first n positions into another: a shared prompt prefix), `rq_generate` (the chat
 loop: prefill, sample, decode; callbacks per token and per logits vector; timing in a struct),
 `rq_tokenize`, `rq_detok_push` (incremental, never splits a UTF-8 character: streaming),
 `rq_chat_render` (system / user / assistant messages in Qwen3's template, thinking on or off, as the
 CLI's chat keeps the conversation). Errors are `RQ_ERR_*` codes (e.g. `RQ_ERR_CONTEXT` for a prompt
 longer than the sequence's capacity); the library never prints or exits.
+
+Batched decode (Step 10a): N sequences decoding together, one row each per `rq_forward_batch` pass, share
+every weight read. Passes of decode rows only (up to 64) run the decode step's structure for all rows with
+small-batch AVX-512 kernels (each weight block streamed once and unpacked in registers for up to 8 rows), each
+row's attention on its own cache (split per 256 positions when the rows are few). Q4_K_M, short contexts, 8 / 12
+threads: 8 sequences 1,003 / 1,214 tok/s in aggregate (single-sequence decode 326 / 366), 16 sequences 1,091 /
+1,449; long contexts are bound by the KV cache bandwidth (115 KB per position and sequence per token: ~350-480
+tok/s at 2,000 positions). `tests/bench_batch.c` (`make bench-batch`, `scripts/bench_batch.sh`) measures it;
+TODO.md Step 10a has the tables.
+
+```c
+RqSegment sg[N];                                  // one decode row per sequence
+for (int i = 0; i < N; i++) sg[i] = (RqSegment) { seq[i], &tok[i], 1, RQ_LOGITS_LAST };
+rq_forward_batch(c, sg, N, logits, NULL);         // logits: N x vocab_size floats
+rq_sample_batch(c, seq, logits, N, cfg, N, tok);  // the next token of each, per-row settings
+```
 
 ```c
 rq_threads_init(0);
@@ -333,7 +351,9 @@ float folds in the GEMM), decode ~5% (the packed weights are ~6% larger: fp32 sc
   the library API (Step 8: model / sequence / compute context, multi-sequence batched passes, errors
   returned instead of `exit()`, no printing in the library), split into modules;
   `runq serve` (Step 9): an OpenAI-compatible HTTP server with prefix KV reuse and constrained decoding
-  for finite JSON schemas (a hand-written HTTP/1.1 server and JSON parser / writer, no dependencies).
+  for finite JSON schemas (a hand-written HTTP/1.1 server and JSON parser / writer, no dependencies);
+  batched decode of several sequences (Step 10a): small-batch AVX-512 kernels, a decode-rows worker,
+  batched sampling, bit-identical to decoding each sequence alone.
 - `src/kquants.h`: the Q4_K / Q6_K block formats, their dequantization, the repacked layouts (Q4P,
   Q6P) and the generic kernels; the arithmetic of a K-quant matmul output is defined there.
 - `src/kernels_avx512.h`: the AVX-512 VNNI Q8_0 GEMM / GEMV (group size 64 or 32) and the weight
@@ -389,7 +409,8 @@ vs the f32 cache +8-10% / +17-22% / +23-29% after 451 / 1,500 / 3,000-token prom
 
 ## Known limitations
 
-- `runq serve` runs one request at a time (a FIFO queue; batched decode of several requests is Step 10),
+- `runq serve` runs one request at a time (a FIFO queue; the library decodes several sequences in one pass
+  since Step 10a, the server's scheduler for it is Step 10b),
   constrains output only to JSON schemas with a finite set of outputs (no `json_object`, no free strings),
   has no tools / images / `n > 1`, no TLS; bind it to localhost or a trusted network.
 

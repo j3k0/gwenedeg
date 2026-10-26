@@ -34,6 +34,11 @@ Tests (see tests/README.md):
   kv         the KV cache types other than the default f16 (-k f32, -k bf16): logits vs HF (en, code,
              long2), batched vs sequential, threads and AVX-512 vs generic bitwise; their greedy goldens
              (f32_generate, bf16_generate) run in the greedy group
+  api        the library API (tests/api_test.c per model, in the background from the start): sequences
+             interleaved / batched / truncated == alone, batched decode of N sequences (1..17, 65) ==
+             each alone incl. past 256 positions and mixed passes, rq_sample_batch, errors, chat
+             rendering, detokenization; the batched passes' digests at 1 / 8 / 16 threads and on the
+             generic build == the main runs
 
 Logits metrics, per position, over U = (fixed 4096-id vocab subset) + (HF top-64 ids):
   cos   cosine similarity of runq vs HF logits on U
@@ -366,8 +371,9 @@ def prefetch_all(a, tmp, only, fg, bg):
 
 API_THREADS = {"bin": 3, "gguf": 4, "q4": 4}  # the API test's runs (in the background from the start)
 # the batched passes again (api_test --digest: their logits hashes only) at other thread counts (Q4_K_M, else
-# the .bin; 8 and 16 threads: the short passes) and on the generic build (--digest-small, 3 threads: the .bin with
-# the long passes, Q4_K_M the short ones): the same DIGEST lines. 65 sequences in one pass (--n65): Q4_K_M
+# the .bin; 8 and 16 threads: the short passes) and on the generic build (--digest-small, 3 threads: the short
+# passes of the .bin and Q4_K_M; the long ones' generic attention: chat/long_context_generic): the same DIGEST
+# lines. 65 sequences in one pass (--n65): Q4_K_M
 # only; a bf16 KV cache (--kv): the .bin
 API_DIGEST_THREADS = (1, 8, 16)
 API_GENERIC_THREADS = 3
@@ -387,8 +393,7 @@ def api_runs(a, ex, gx):
     if os.path.exists(gen):
         for tag, m in models:
             if m and tag != "gguf":
-                dg[(tag, "generic")] = gx.submit(run, [gen, m, "--digest-small"] + (["--long"] if tag == "bin" else []),
-                                                 API_GENERIC_THREADS)
+                dg[(tag, "generic")] = gx.submit(run, [gen, m, "--digest-small"], API_GENERIC_THREADS)
     tag, m = ("q4", a.q4) if a.q4 else ("bin", a.model)
     for t in API_DIGEST_THREADS:
         mode = ["--digest"] + n65.get(tag, []) if t == 1 else ["--digest-small"]

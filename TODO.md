@@ -24,6 +24,10 @@ passes, errors returned, no printing) in modules, the CLI on top; outputs byte-i
 Server (Step 9): `runq serve`, OpenAI-compatible (chat completions incl. streaming, models, health), prefix
 KV reuse across requests (bit-identical), constrained decoding for finite JSON schemas; as LiteLLM's
 complexity-router judge ~20 ms per classification with the rubric cached (0.6B; 1.7B ~55 ms, 4B ~150 ms).
+Batched decode (Step 10a): N sequences decoding together in one `rq_forward_batch` pass, bit-identical to each
+alone: Q4_K_M, short contexts, best of 4 rounds, 8 / 12 threads: N=8 1,003 / 1,214 tok/s in aggregate (3.1x /
+3.3x of single-sequence decode at 326 / 366; was 758 / 897), N=16 1,091 / 1,449; Q8_0 GGUF N=8 976 / 1,107
+(4.6x / 5.0x). Long contexts are KV-bandwidth bound (2,000 positions: ~350-480 tok/s for any N >= 8).
 
 Status: `[ ]` todo · `[~]` in progress · `[x]` done
 
@@ -1172,6 +1176,202 @@ Goal: a local OpenAI-compatible endpoint, usable as LiteLLM's complexity-router 
   long prompt blocks the queue (chunked: a cancel is seen, but other jobs wait: interleave chunks with decode
   rows in Step 10); tools / function calling are not planned
 
+## Step 10a: multi-sequence (batched) decode in the library
+Goal: N independent sequences decoding together, one row each per `rq_forward_batch` pass, as fast as the
+weights allow, each sequence's results bit-identical to decoding it alone. Before (Step 8): such passes
+already worked and were bit-identical, but ran as a prefill chunk: the GEMM (K-quants: each 32-row weight
+tile unpacked into a per-thread scratch per pass), 9 phases per layer, one attention item per (row, kv head),
+the KV pre-fault of every segment every pass, sampling row by row.
+- [x] Benchmark first (`tests/bench_batch.c`, `make bench-batch`, `scripts/bench_batch.sh`): one base sequence
+  prefilled with L tokens is copied into the N sequences (`rq_seq_copy`, new API: the first n positions of a
+  sequence into another, the same bits; also the scheduler's way to share a cached prompt prefix); each rep
+  truncates them to L and decodes STEPS tokens together (different first tokens), logits of every row, greedy
+  (`-t`: top-p 0.9) sampling; best / median rep; `-d` adds `rq_decode` (N = 1, the decode path); `-P CHUNK` adds
+  a prompt's first chunk of CHUNK tokens to every pass (mixed passes); a `-DRUNQ_PROFILE` build prints the time
+  per phase type and pass (`scripts/bench_batch.sh -p`)
+- [x] Baseline profile (Q4_K_M, 8 threads, 50 positions, ms per pass): N = 1: 6.7 (decode path: 3.9): GEMMs
+  qkv 1.0 + wo 0.54 + w1/w3 1.38 + w2 0.94 (tile unpacking: ~2x the GEMV), classifier 1.68 (the GEMM over 1
+  row), norm / rope / swiglu phases 0.9 (5 extra phases per layer, ~5 us each); N = 8: 10.4 (GEMMs 5.7,
+  classifier 2.1, attention 0.9 for 50 positions, rest 1.5); at 2,000 positions the attention 2.6 (N = 1: 8
+  items for 8 threads) to 14.7 ms (N = 8: 1.8 GB of KV cache per pass, ~120 GB/s: at the bandwidth limit)
+- [x] Small-batch kernels (`kernels_avx512.h`, `smb512_rows`; forward.c `rows_mm`, `smb_use`): per 16-row block
+  of W, streamed once by the thread owning it (per-thread block ranges, as the GEMV), the 4 / 6-bit data
+  unpacked in registers once per group (Q4_K: 8 steps; Q6_K: 4 steps per sub-block) and used for up to SMB_C =
+  8 activation rows (more rows: the block again from L1/L2, 8 at a time); two vpdpbusd chains per row (Q8_0
+  too: with one chain per row at 3-8 rows the latency bound it below the GEMM tile); no scratch, no tile
+  unpacking. The folds are the existing functions (`q8p_fold`, `kq4_fold`, `kq6_fold`) per (block, row, group)
+  in group order, the integer sums exact: every row's result is the GEMV's / GEMM's / generic kernel's, whatever
+  it is batched with. One thread, L2-resident 512 x 1024 matrix, GMAC/s (`/tmp` microbenchmark):
+
+  | rows | 1 | 2 | 4 | 8 | 16 | 24 | 32 | 48 | 64 |
+  |---|---|---|---|---|---|---|---|---|---|
+  | Q8_0 small-batch / GEMM | 97 / 95 | 165 / 175 | 183 / 183 | 183 / 182 | 159 / 183 | 183 / 184 | 183 / 183 | 169 / 184 | 183 / 184 |
+  | Q4_K small-batch / GEMM | 95 / 41 | 124 / 73 | 142 / 101 | 151 / 125 | 152 / 142 | 152 / 149 | 152 / 151 | 152 / 157 | 152 / 158 |
+  | Q6_K small-batch / GEMM | 69 / 30 | 101 / 57 | 125 / 83 | 130 / 105 | 130 / 121 | 130 / 127 | 129 / 130 | 130 / 134 | 129 / 135 |
+
+  Crossovers: K-quants faster up to ~24 rows (2.3x at 1 row, 1.4x at 4), equal at 32, ~4% slower at 48-64; Q8_0
+  equal (the Q8 GEMM tile streams the packed weights without unpacking: it already was a small-batch kernel).
+  Dispatch: `rq_forward_batch`'s GEMM phases use them for at most 32 rows per weight type (`smb_max`,
+  `RUNQ_SMB=Q8,Q4,Q6` to tune), the batched decode worker always. NEON keeps its GEMM (no small-batch kernels
+  there yet, `RUNQ_SMB` undefined; same results by definition); the generic build runs the decode GEMV per row
+- [x] `batch_decode_worker` (forward.c), for passes whose segments are all single rows, N <= 64 (`BD_MAX`;
+  `RUNQ_BD=max,epi,split`): the decode step's structure for N rows, 4 phases per layer: [q / k / v in items of
+  64 weight rows over all rows (8 per kv head; the last of a kv head's items to finish runs its QK-norm + RoPE
+  and K / V stores for every row, into each row's own sequence cache at its own position); attention items
+  per (row, kv head) or (row, kv head, block of 256), each waiting for its kv head (dependency counters); the
+  last kv head of a row quantizes it for wo] [wo; residual + rmsnorm + quantize per row] [w1 + w3 + SwiGLU +
+  quantize per 64 hidden rows, all rows] [w2; residual + the next rmsnorm], then the classifier (small-batch,
+  the rows with logits). The per-row norms are the phase epilogue up to `bd_epi` = 2 rows, else a phase of
+  their own (epilogue at 4: within noise; at 8 / 16: ~10% slower). The KV tile pre-fault only for rows starting
+  a tile (was every segment, every pass: 56 madvise calls per row). Measured and not kept: the attention items
+  of each kv head after the next head's q / k / v items (~5-10% slower at N = 8); the norms as the first items
+  of the next phase with the matmul items waiting on a counter (one sync point less per norm, but the w1 / w3
+  items then come from one shared counter instead of per-thread ranges: ~10% slower at N = 8); q / k / v items
+  of 32 / 64 / 128 rows: within noise; 64 rows per pass the limit (above it the prefill path's GEMM: at 96-256
+  rows ~10% faster, at 48-64 equal)
+- [x] Attention for decode rows: a row's attention split over its blocks of ATT_P = 256 positions (one item per
+  (row, kv head, block), the last block to finish combines with `att_combine`: the decode path's definition and
+  order, so the same bits) when the pass has fewer than `bd_split` (8) x threads (row, kv head) items; else one
+  item per (row, kv head) over all its blocks (attention_kv, as the prefill). At 2,000 positions, Q4_K_M,
+  aggregate tok/s, 8 threads N = 1 / 2 / 4: never split 133-188 / 193-258 / 262-324, split as above 177-199 /
+  256-260 / 304-322; from N = 8 within noise (the KV traffic is at the bandwidth limit either way). Mixed passes
+  (`prefill_worker`): the same split for single-row row blocks (`prefill_plan`), row blocks ordered by the cost of
+  their items; the QK-norm + RoPE + K / V store items per (cache tile, kv head) instead of per tile (a 16-row
+  chunk ran on one thread: 1.5 -> 0.75 ms of a 16-row pass at 12 threads); the KV pre-fault only for segments
+  that start a tile
+- [x] Sampling: `rq_sample_batch` (new API): the rows of a pass on the pool (one row per claim, a candidate scratch
+  per thread), each with its sequence's RNG and its own settings; the same tokens and RNG states as `rq_sample` row
+  by row (tested). Greedy argmax is ~20 us per row (not visible at N <= 16); at -t 0.8 -p 0.9 the softmax over the
+  vocabulary per row: N = 64 pass + sampling 63-64 -> 56 ms (8 threads), N = 8 9.5-10 -> 8.1-9.2
+- [x] Results, aggregate tok/s, best of 4 interleaved rounds per binary (2026-10-26, load 6-12; 50 positions per
+  sequence; "decode" = `rq_decode`, one sequence):
+
+  | | decode | N=1 | N=2 | N=4 | N=8 | N=16 |
+  |---|---|---|---|---|---|---|
+  | Q4_K_M 8 threads, before | 315 | 186 | 330 | 526 | 758 | 942 |
+  | Q4_K_M 8 threads, now | 326 | 311 | 515 | 813 | **1,003** (3.1x decode) | 1,091 |
+  | Q4_K_M 12 threads, before | 345 | 215 | 378 | 619 | 897 | 1,164 |
+  | Q4_K_M 12 threads, now | 366 | 332 | 552 | 965 | **1,214** (3.3x) | 1,449 |
+  | Q8_0 GGUF 8 threads, before | 207 | 212 | 372 | 627 | 931 | 1,105 |
+  | Q8_0 GGUF 8 threads, now | 210 | 216 | 340 | 647 | **976** (4.6x) | 1,146 |
+  | Q8_0 GGUF 12 threads, before | 195 | 180 | 371 | 690 | 978 | 1,343 |
+  | Q8_0 GGUF 12 threads, now | 223 | 252 | 403 | 705 | **1,107** (5.0x) | 1,446 |
+
+  The 3x target at N = 8 is met at 8-12 threads for Q4_K_M, with less margin than the Mac proxy suggested for
+  the EPYC: Q4_K_M decode is already fast (0.4 GB per token), and at N = 8 the pass is compute-bound at 8
+  threads (~0.55 ms per row of arithmetic: the K-quant folds, 6 float ops per 8 vpdpbusd, cost about as much
+  as the dot products; the small-batch kernels run at ~80% of the measured vpdpbusd peak with them). Per pass
+  at N = 8 (profile, 8 threads): q / k / v + attention 2.9 ms, w1 / w3 2.0, classifier 1.9, w2 1.0, wo 0.7,
+  norms 0.4. Q8_0 gains more (its decode reads 0.67 GB per token); for it the small-batch kernel is no faster
+  than the GEMM tile, the gain is the phases.
+  Full table, one interleaved run per (model, threads) with both binaries (load 8-16, so single runs; tok/s
+  before / **now**, contexts of 50 / 500 / 2,000 positions per sequence; per-sequence tok/s = aggregate / N):
+
+  | Q4_K_M: threads, context | decode | N=1 | N=2 | N=4 | N=8 | N=16 | N=32 | N=64 |
+  |---|---|---|---|---|---|---|---|---|
+  | 8, 50 | 165 / 242 | 132 / **247** | 272 / **424** | 487 / **714** | 725 / **1028** | 935 / **1126** | 1047 / **1165** | 1150 / **1158** |
+  | 8, 500 | 233 / 261 | 172 / **253** | 287 / **390** | 422 / **443** | 586 / **591** | 658 / **698** | 724 / **813** | 782 / **775** |
+  | 8, 2000 | 162 / 192 | 134 / **195** | 196 / **235** | 236 / **326** | 333 / **306** | 338 / **364** | | |
+  | 12, 50 | 234 / 258 | 183 / **250** | 356 / **482** | 567 / **945** | 813 / **1292** | 1040 / **1454** | 1406 / **1569** | 1499 / **1644** |
+  | 12, 500 | 210 / 274 | 147 / **230** | 312 / **434** | 487 / **678** | 670 / **851** | 855 / **914** | 850 / **971** | 1012 / **1075** |
+  | 12, 2000 | 212 / 178 | 128 / **172** | 225 / **218** | 308 / **314** | 328 / **412** | 422 / **468** | | |
+  | 14, 50 | 222 / 269 | 179 / **255** | 299 / **399** | 501 / **821** | 800 / **1285** | 1142 / **1475** | 1448 / **1565** | 1504 / **1645** |
+  | 14, 500 | 285 / 318 | 163 / **288** | 244 / **441** | 529 / **635** | 735 / **888** | 901 / **1016** | 1038 / **972** | 1108 / **1148** |
+  | 14, 2000 | 244 / 203 | 134 / **192** | 228 / **319** | 319 / **387** | 384 / **358** | 460 / **486** | | |
+
+  | Q8_0 GGUF: threads, context | decode | N=1 | N=2 | N=4 | N=8 | N=16 | N=32 | N=64 |
+  |---|---|---|---|---|---|---|---|---|
+  | 8, 50 | 236 / 211 | 219 / **204** | 386 / **371** | 641 / **548** | 946 / **842** | 1179 / **1209** | 1245 / **1325** | 1312 / **1433** |
+  | 8, 500 | 179 / 181 | 185 / **206** | 318 / **338** | 500 / **519** | 702 / **737** | 773 / **806** | 819 / **902** | 870 / **831** |
+  | 8, 2000 | 164 / 139 | 158 / **147** | 193 / **199** | 279 / **242** | 288 / **309** | 372 / **402** | | |
+  | 12, 50 | 198 / 223 | 210 / **232** | 366 / **415** | 627 / **615** | 982 / **831** | 1132 / **1243** | 1532 / **1514** | 1727 / **1760** |
+  | 12, 500 | 162 / 220 | 157 / **205** | 333 / **354** | 483 / **447** | 688 / **638** | 818 / **883** | 923 / **970** | 1101 / **1118** |
+  | 12, 2000 | 145 / 174 | 104 / **166** | 188 / **261** | 264 / **326** | 378 / **390** | 448 / **452** | | |
+  | 14, 50 | 180 / 164 | 156 / **171** | 327 / **328** | 497 / **690** | 632 / **1136** | 1054 / **1492** | 1408 / **1800** | 1666 / **1944** |
+  | 14, 500 | 176 / 240 | 161 / **251** | 292 / **359** | 474 / **576** | 685 / **528** | 912 / **751** | 970 / **905** | 1075 / **1083** |
+  | 14, 2000 | 169 / 147 | 108 / **142** | 179 / **253** | 330 / **334** | 379 / **403** | 416 / **467** | | |
+
+  (2,000 positions x N = 32 / 64: skipped, 7.4 / 14.9 GB of KV cache.) Run-to-run noise on this box is +-15-30%
+  (the Q8_0 cells where "now" is lower, e.g. 8 threads N = 4 / 8, are faster in the best-of-4 table above).
+  Long contexts are KV-bandwidth bound: each row reads 115 KB per position (f16) per token, 230 MB at 2,000
+  positions vs 0.4 GB of Q4_K_M weights shared by the pass, so batching gains at most ~2x there (aggregate
+  ~350-480 tok/s from N = 8 on, 8-14 threads).
+- [x] Mixed passes (a prompt's first chunk of C tokens next to N decode rows at 500 positions; Q4_K_M, best of 5,
+  `bench_batch -P C`): ms per pass / prefill tok/s:
+
+  | C \ N | 0 (prefill only) | 1 | 4 | 8 | 16 |
+  |---|---|---|---|---|---|
+  | 16, 8 / 12 threads | 11.4 / 9.6 ms (1,403 / 1,669 tok/s) | 13.6 / 12.1 | 17.3 / 14.4 | 21.5 / 18.1 | 32.1 / 22.5 |
+  | 64 | 37.1 / 27.2 (1,724 / 2,350) | 39.3 / 30.4 | 41.7 / 32.8 | 45.9 / 36.4 | 55.8 / 42.4 |
+  | 128 | 69.2 / 53.7 (1,850 / 2,383) | 73.2 / 53.5 | 74.8 / 54.7 | 79.4 / 58.8 | 88.2 / 67.0 |
+  | 256 | 140 / 106 (1,828 / 2,414) | 145 / 106 | 147 / 108 | 152 / 113 | 161 / 121 |
+  | decode rows alone | | 4.2 / 3.3 | 7.8 / 5.5 | 13.0 / 10.7 | 22.2 / 19.8 |
+
+  A decode row next to a chunk adds ~0.6-1.3 ms to the pass (a decode-only pass of 8 rows: 1.3-1.6 ms per row),
+  but every decode row then advances one token per pass of the chunk's length
+- [x] Prefill and single-sequence decode unchanged (interleaved with the previous binary, best of 4, chat
+  `-c 4096 -n 128`, load 7-11): prefill 451 / 1,500 tokens Q8_0 GGUF 8 threads 1,873 / 1,415 -> 1,883 / 1,421,
+  12 threads 2,511 / 1,976 -> 2,605 / 1,964; Q4_K_M 8 threads 1,739 / 1,314 -> 1,736 / 1,321, 12 threads 2,269 /
+  1,830 -> 2,374 / 1,812 tok/s; decode (`rq_decode`, untouched) within noise (`bench_batch -d`, 6 rounds, Q4_K_M 8
+  threads: best 310 / 281 vs 298 / 284 at 50 / 500 positions). Again after the per-(tile, kv head) RoPE items
+  (best of 3-5): prefill within noise (e.g. Q8_0 GGUF 1,500 tokens 12 threads 1,876 -> 1,905, Q4_K_M 1,500 tokens 8
+  threads 1,307 -> 1,328)
+- [x] Bit-identity: every output is computed whole by one thread with the functions of the decode / prefill
+  paths (the small-batch kernels with the folds of the GEMV), so a sequence's logits do not depend on the other
+  rows, the row count, the path (batch_decode_worker, prefill_worker with the small-batch kernel or the GEMM),
+  the attention split or the thread count. `tests/compare_bins.sh -j 4 /tmp/cwref .` (CLI outputs, 360 jobs, incl.
+  prefill chunks of 7 rows that now use the small-batch kernels): all identical, after each commit. Builds with
+  -DRUNQ_NO_POOL, without -fopenmp, -march=x86-64-v3, -O0: the api tests pass (each its own digests: other
+  non-kernel float code); -DRUNQ_PROFILE -Wall -Wextra: no warnings. NEON / Windows not compiled here (no
+  toolchain): the small-batch code is under `RUNQ_SMB` (AVX-512 only), the decode-rows worker off on NEON
+  (`bd_max` 0), so both keep their previous paths
+- [x] Tests (`tests/api_test.c`, group `api`; `make test` 381 -> 427 checks): N = 1, 2, 3, 5, 8, 9, 17 sequences
+  (prefixes of 8-32 positions of one prompt, 2 steps) decoded together == each alone through `rq_decode`
+  (bitwise, via 64-bit hashes of the logits), N = 3 and 9 at positions 248-260 (across the first attention block,
+  split and not split at 4 threads), 65 sequences in one pass (Q4_K_M: more than the decode-rows worker takes, the
+  prefill path's GEMM), mixed passes (a 20-row prefill chunk of a new sequence with all logits + 5 decode rows,
+  and a 2-row chunk + 2 rows: split attention in prefill_worker; with long or short rows), `rq_sample_batch` ==
+  `rq_sample` (greedy, top-p, full distribution, per-row settings; RNG states), a bf16 KV cache (.bin), copy
+  errors; per model (.bin group 64, GGUF Q8_0 group 32, Q4_K_M). Every batched pass also prints a DIGEST line:
+  `check.py` runs `api_test --digest` at 1, 8 and 16 threads (Q4_K_M; the main runs use 3 / 4 threads) and the
+  generic build (`build/api_test-generic --digest-small`: the short passes, .bin and Q4_K_M; checked once by hand
+  with `--long` on all three models: identical) and compares them (5 checks). Breakage (scratch builds): an FMA in the small-batch fold of Q8_0, Q4_K or Q6_K
+  fails 14 api checks of each affected model (batch_prefill / batch_decode / past_block / n1..n17 / long /
+  mixed). Time: the api runs ~4 s per model at 3-4 threads in the background (was ~1.3), the digests ~6 s on
+  one thread and ~2-3 s generic; to stay near ~32 s, the sequential (`-b 1`) logits runs of `check.py` now use 4
+  threads instead of 8 (token by token they are memory-bound; the three `long2 -b 1` runs took ~8 s each next to
+  the other jobs at 8 threads, ~3 s at 4): `make test` 31.5-34 s vs 29.6-35.9 s for the Step 9 suite,
+  interleaved, at load 8-22 (the box's load dominates: within ~1-2 s)
+- [x] Sanitizers (scratch builds): ASan + UBSan (`-O1 -g -fsanitize=address,undefined`): api_test on the 3 models
+  (all checks, `--n65 --kv`, digests at 1 and 16 threads, the generic build's), bench_batch (N up to 70, 20 /
+  600 positions, top-p sampling, 3 and 16 threads, `RUNQ_BD=0`), the CLI (logits -b 1 / 7 / 64 / 512 on a 390-token
+  prompt, identical; generate -b 7; chat at -c 200): no reports, no leaks (one leak in api_test's digest mode
+  fixed). ThreadSanitizer (no OpenMP: the pool): api_test on Q4_K_M and the .bin at 6 threads, bench_batch at 16
+  threads (N up to 24, 600 positions, sampling) and 5 threads through prefill_worker: no reports. Again after the
+  per-(tile, kv head) RoPE items: api_test (.bin `--n65 --kv`, Q4_K_M) and `bench_batch -P 37` (mixed passes)
+  under both: clean
+- Notes for Step 10b (the scheduler in `runq serve`):
+  - One pass per step: every running job's next token as a one-row segment (`RQ_LOGITS_LAST`), in one
+    `rq_forward_batch`; then `rq_sample_batch` with each job's sampling settings and token mask (rows are
+    independent: constrained jobs mix with free ones). A sequence may appear once per pass. The context's
+    `max_batch` must cover the rows (decode rows + a prefill chunk); passes of single rows up to 64 take the
+    decode-rows worker, anything with a multi-row segment the prefill path
+  - Batch sizes: aggregate throughput keeps growing to N ~ 16 at 8 threads and ~32 at 12-14 (short contexts:
+    ~1,100 / ~1,450-1,650 tok/s), per-sequence speed falls (N = 8: ~130-160 tok/s each, N = 16 ~70-90, N = 32 ~35-50);
+    for a judge / router workload of short replies, take every queued job up to ~16-32 rows. At long contexts
+    the KV traffic dominates (115 KB per position and row per token): at 2,000 positions little is gained past
+    N = 4-8
+  - Prompts: prefill in chunks interleaved with the decode rows; a chunk of C tokens takes ~C / 1,700-2,400 s and
+    stalls the decode rows for that long (table above). For interactive streams chunks of 32-64 (decode rows at
+    ~25-45 tok/s each meanwhile), for throughput 256-512 when nothing is decoding. A prompt's last chunk with
+    `RQ_LOGITS_LAST` gives its first token's logits in the same pass
+  - Memory per sequence: KV 115 KB per position (f16 / bf16; f32 229 KB), address space up to the capacity, touched
+    per 16-position tile (1.8 MB for all layers); a context with `max_batch` 64 ~4 MB of activation buffers (512:
+    ~30 MB); the split attention's partials grow with rows x blocks (~1 MB at 14 rows x 2,000 positions)
+  - Prefix sharing: `rq_seq_copy` copies a cached prefix into another slot (bit-identical continuation), e.g. the
+    judge's rubric for several concurrent requests
+  - Threads: 12-14 for throughput (the batched passes are compute-bound at 8 threads from N ~ 8)
+
 ## Known bugs
 Found by the tests.
 - [x] Tokenizer: no NFC normalizer (HF's tokenizer.json normalizer is NFC); the input was assumed
@@ -1216,8 +1416,10 @@ this box runs 1.105.0 (`/opt/litellm/venv-1.105.0`; never touch the running prox
 - [x] Step 9: `runq serve`: OpenAI-compatible HTTP server (chat completions incl. streaming, models,
   prefix KV reuse across requests, `response_format` json_schema with finite outputs by constrained
   decoding, FIFO), tests, end-to-end with a scratch LiteLLM instance, judge-quality evaluation: done, see above
-- [ ] Step 10: multi-sequence (batched) decode: per-sequence KV and positions in one forward pass,
-  small-B kernels, continuous batching in the server, bit-identical to separate runs
+- [x] Step 10a: multi-sequence (batched) decode in the library: small-batch kernels, a decode-rows
+  worker, attention for decode rows, batched sampling, benchmarks, tests: done, see above
+- [ ] Step 10b: continuous batching in `runq serve` (a scheduler: several jobs' decode rows per pass, prefill
+  chunks interleaved; notes at the end of Step 10a)
 - [ ] Step 11: other models that should run on this engine (Qwen3 dense family: 1.7B, 4B, 8B; other
   GGUF quant types of them), pinned downloads, correctness vs HF, speed
 

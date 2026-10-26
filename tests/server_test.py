@@ -23,12 +23,18 @@ builds). Checks:
              every output parses and validates, the decision step's top_logprobs are the allowed tokens
              only, forced tokens have logprob 0; a nested schema (objects, boolean, integer range,
              optional property, anyOf null, const); the rubric prefix of a second classification cached
+  batch      continuous batching (the server runs --parallel 4 --chunk 16): 5 requests at once (greedy, a system
+             prompt, seeded, thinking, streamed) == runq -m chat; constrained (greedy with logprobs, sampled, nested),
+             free with logprobs, a stream with a stop string, 7 at once == each alone (text and logprobs); three
+             requests joining a running stream; a client leaving mid-stream (499) while three others run: theirs
+             unchanged; four requests sharing a new system prompt at once (the first prefills it, the others wait
+             and copy it from its slot: cached_tokens) == the same with cache_prompt: false
   errors     malformed JSON, invalid UTF-8, missing / empty messages, bad role, n = 2, bad schema,
              json_object, out-of-range parameters, context too long (code context_length_exceeded),
              unknown path (404), wrong method (405), body too large (413), chunked upload (411), garbage
              request lines (400); OpenAI error objects
   queue      concurrent requests: all answered, each == its result alone; /health answers while they run;
-             a full queue gives 503 (code overloaded); a client that disconnects cancels its generation
+             a full queue gives 503 (code overloaded; --queue 4 waiting beyond the 4 running); a client that disconnects cancels its generation
              (stream and non-stream: the next request is served at once, logged as 499)
   fuzz       ~150 mutated / random requests on raw sockets: the server stays up
   shutdown   SIGTERM: a clean exit (status 0)
@@ -205,7 +211,7 @@ def main():
     slow = 10 if a.slow else 1
     log = tempfile.NamedTemporaryFile(prefix="runq-serve-", suffix=".log", delete=False)
     env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
-    srv = subprocess.Popen([a.runq, "serve", a.model, "--port", "0", "-c", "2048", "--slots", "2", "--queue", "4",
+    srv = subprocess.Popen([a.runq, "serve", a.model, "--port", "0", "-c", "2048", "--parallel", "4", "--slots", "6", "--chunk", "16", "--queue", "4",
                             "--max-body", "65536", "--name", "test-model"], stderr=log, stdout=subprocess.DEVNULL, env=env)
     # the CLI references, in parallel with the server tests
     ex = cf.ThreadPoolExecutor(max_workers=3)
@@ -340,7 +346,7 @@ def run_all(a, t, port, ref, slow, logname):
     def classify(prompt, rf, **kw):
         return chat(port, dict({"model": "classifier", "messages": [{"role": "system", "content": RUBRIC},
                                 {"role": "user", "content": "\nClassify this message:\n" + prompt}], "response_format": rf}, **kw))
-    outs, ok, detail = [], True, ""
+    outs, ok, detail, tier_seq = [], True, "", {}
     for seed in range(8):
         st, d, _ = classify(["What is 2 + 2?", "Prove that sqrt(2) is irrational.", "Write a web server in Rust.",
                              "Hello!"][seed % 4], TIER_RF, temperature=1.0, seed=seed)
@@ -348,12 +354,14 @@ def run_all(a, t, port, ref, slow, logname):
             v = json.loads(text_of(d))
             ok &= st == 200 and list(v) == ["tier"] and v["tier"] in TIERS and d["choices"][0]["finish_reason"] == "stop"
             outs.append(v["tier"])
+            tier_seq[seed] = text_of(d)
         except Exception as e:
             ok, detail = False, f"{e}: {d}"
     rep(ok, "schema/litellm_tier_sampled", detail or " ".join(outs))
     st, d, _ = classify("Design a distributed database.", {"type": "json_schema", "json_schema": {"name": "T", "schema": TIER_REF}},
                         temperature=0, logprobs=True, top_logprobs=20)
     lp = d["choices"][0]["logprobs"]["content"]
+    ref_greedy = d
     dec = [x for x in lp if x["logprob"] != 0 or len(x["top_logprobs"]) > 1]
     v = json.loads(text_of(d))
     toks = "".join(x["token"] for x in lp)
@@ -363,7 +371,7 @@ def run_all(a, t, port, ref, slow, logname):
         "schema/ref_defs_greedy_mask", f"{text_of(d)} tokens {[x['token'] for x in lp]} decision {[x['token'] for x in dec[0]['top_logprobs']] if dec else None}")
     cached = d["usage"]["prompt_tokens_details"]["cached_tokens"]
     rep(cached >= 200, "schema/rubric_prefix_cached", f"{cached} of {d['usage']['prompt_tokens']} prompt tokens cached")
-    ok, seen = True, set()
+    ok, seen, nested_seq = True, set(), {}
     for seed in range(6):
         st, d, _ = chat(port, {"messages": [{"role": "user", "content": "Describe a pet as JSON."}], "seed": seed, "temperature": 1.0,
                                "response_format": {"type": "json_schema", "json_schema": {"name": "pet", "schema": NESTED}}})
@@ -371,6 +379,7 @@ def run_all(a, t, port, ref, slow, logname):
             v = json.loads(text_of(d))
             ok &= validate(v, NESTED, NESTED) and json.dumps(v, ensure_ascii=False) == text_of(d)
             seen.add(text_of(d))
+            nested_seq[seed] = text_of(d)
         except Exception as e:
             ok = False
             seen.add(f"{e}: {d}")
@@ -378,6 +387,117 @@ def run_all(a, t, port, ref, slow, logname):
     st, d, _ = chat(port, {"messages": [{"role": "user", "content": "x"}], "response_format": {"type": "json_schema", "json_schema": {
         "schema": {"type": "object", "properties": {"a": {"const": "é\"\\"}}, "required": ["a"]}}}})
     rep(st == 200 and json.loads(text_of(d)) == {"a": "é\"\\"} and d["usage"]["completion_tokens"] > 0, "schema/single_output_forced", text_of(d))
+
+    # ------------------------------------------------------------------ continuous batching
+    # (the server runs --parallel 4 --chunk 16: up to 4 jobs per pass, prompts prefilled 16 tokens per pass next
+    # to decoding jobs; every output must be what the request gives alone, bitwise)
+    def conc(fns):
+        with cf.ThreadPoolExecutor(max_workers=len(fns)) as ex:
+            futs = [ex.submit(f) for f in fns]
+            return [f.result() for f in futs]
+    want = {k: ref[k].result() for k in ("aus", "pirate", "cats")}
+    B_AUS = {"messages": [{"role": "user", "content": AUS}], "temperature": 0, "max_tokens": 40}
+    B_PIRATE = {"messages": [{"role": "system", "content": PIRATE_SYS}, {"role": "user", "content": PIRATE}], "temperature": 0, "max_tokens": 16}
+    B_CATS = {"messages": [{"role": "user", "content": CATS}], "temperature": 0.8, "top_p": 0.9, "seed": 42, "max_tokens": 16}
+    B_THINK = {"messages": [{"role": "user", "content": MULT}], "temperature": 0, "max_tokens": 16, "reasoning_effort": "high"}
+
+    def cli_ok(r):
+        """[aus, pirate, cats, think] results (status, body) == the CLI's text (thinking: the reasoning seen alone)"""
+        return ([x[0] for x in r] == [200] * 4 and [text_of(x[1]) + "\n" for x in r[:3]] == [want["aus"], want["pirate"], want["cats"]]
+                and r[3][1]["choices"][0]["message"].get("reasoning_content") == rs)
+    r = conc([lambda: chat(port, B_AUS), lambda: chat(port, B_PIRATE), lambda: chat(port, B_CATS), lambda: chat(port, B_THINK),
+              lambda: stream(port, B_AUS)])
+    rep(cli_ok(r[:4]) and r[4][0] == text_of(aus), "batch/concurrent_eq_cli",
+        "greedy, system prompt, seeded, thinking, streamed: 5 at once == runq -m chat" if cli_ok(r[:4]) else
+        f"{[text_of(x[1]) for x in r[:4]]!r}")
+
+    # mixed: constrained (greedy with logprobs, sampled), free with logprobs, a stream with a stop string, at once
+    def cls(prompt, rf, **kw):
+        return lambda: classify(prompt, rf, **kw)
+    fns = [cls("Design a distributed database.", {"type": "json_schema", "json_schema": {"name": "T", "schema": TIER_REF}},
+               temperature=0, logprobs=True, top_logprobs=20),
+           cls("Prove that sqrt(2) is irrational.", TIER_RF, temperature=1.0, seed=1),
+           cls("Write a web server in Rust.", TIER_RF, temperature=1.0, seed=2),
+           lambda: chat(port, {"messages": [{"role": "user", "content": "Describe a pet as JSON."}], "seed": 1, "temperature": 1.0,
+                               "response_format": {"type": "json_schema", "json_schema": {"name": "pet", "schema": NESTED}}}),
+           lambda: chat(port, base),
+           lambda: stream(port, stop),
+           lambda: chat(port, dict(B_CATS, logprobs=True))]
+    r = conc(fns)
+    checks = [r[0][1]["choices"][0]["logprobs"] == ref_greedy["choices"][0]["logprobs"] and text_of(r[0][1]) == text_of(ref_greedy),
+              text_of(r[1][1]) == tier_seq[1], text_of(r[2][1]) == tier_seq[2], text_of(r[3][1]) == nested_seq[1], same(r[4][1], f1),
+              r[5][0] == cut and r[5][2] == "stop", text_of(r[6][1]) + "\n" == want["cats"]]
+    rep(all(checks), "batch/mixed_constrained_free_stream", f"7 at once == alone: {checks}")
+
+    # joining mid-generation: a stream runs, three requests join after its first tokens
+    def stream_events(body, first, close_after=None):
+        """SSE stream; sets `first` at the first content delta; closes the connection after close_after deltas"""
+        s = socket.create_connection(("127.0.0.1", port), timeout=120)
+        b = json.dumps(dict(body, stream=True)).encode()
+        s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % len(b) + b)
+        buf, content, n = b"", "", 0
+        while True:
+            x = s.recv(65536)
+            if not x:
+                break
+            buf += x
+            while b"\n\n" in buf:
+                ev, buf = buf.split(b"\n\n", 1)
+                line = ev.split(b"\r\n")[-1].decode()
+                if "data: " not in line or "[DONE]" in line:
+                    continue
+                d = json.loads(line[line.index("data: ") + 6:])
+                c = (d.get("choices") or [{}])[0].get("delta", {}).get("content")
+                if c:
+                    content += c
+                    n += 1
+                    first.set()
+                    if close_after and n >= close_after:
+                        s.close()
+                        return content, n
+            if b"data: [DONE]" in buf or content and b"[DONE]" in x:
+                break
+        s.close()
+        return content, n
+    ev = threading.Event()
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:
+        long = ex.submit(stream_events, B_AUS, ev)
+        ev.wait(60)
+        joined = [ex.submit(chat, port, b) for b in (B_PIRATE, B_CATS, B_THINK)]
+        js = [f.result() for f in joined]
+        ls, nchunks = long.result()
+    ok = ls == text_of(aus) and cli_ok([(200, aus)] + js)
+    rep(ok, "batch/join_mid_generation", f"3 requests joined a running stream ({nchunks} deltas): all == alone" if ok else
+        f"{ls!r} / {[text_of(x[1]) for x in js]!r}")
+
+    # cancellation of one job (client gone mid-stream) leaves the others unchanged
+    n499 = len(re.findall(r" 499 prompt=", open(logname).read()))
+    ev = threading.Event()
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:
+        gone = ex.submit(stream_events, {"messages": [{"role": "user", "content": "Write a very long story about the sea."}],
+                                         "max_tokens": 1500, "temperature": 0.7}, ev, 4)
+        ev.wait(60)
+        others = [ex.submit(chat, port, b) for b in (B_AUS, B_PIRATE, B_CATS)]
+        st = [f.result() for f in others]
+        gone.result()
+    time.sleep(0.3)
+    ok = [x[0] for x in st] == [200] * 3 and [text_of(x[1]) + "\n" for x in st] == [want["aus"], want["pirate"], want["cats"]]
+    n499b = len(re.findall(r" 499 prompt=", open(logname).read()))
+    rep(ok and n499b > n499, "batch/cancel_one_others_unchanged", f"499 logged {n499b - n499}x; others == alone: {ok}")
+
+    # prefix-cache hits under concurrency == fresh: four requests sharing a new system prompt at once (the first
+    # prefills it, the others wait for it and copy it from its running slot), then each with cache_prompt: false
+    sys2 = ("You are the help desk of a small train company. Trains run hourly from seven to midnight; tickets are "
+            "valid for one day; bicycles travel free outside the rush hours; dogs need a child ticket. ") * 2
+    qs = ["Can I bring my dog?", "When is the last train?", "Is my bike free at 8 am?", "How long is a ticket valid?"]
+    bodies = [{"messages": [{"role": "system", "content": sys2}, {"role": "user", "content": q}], "temperature": 0, "max_tokens": 6,
+               "logprobs": True, "top_logprobs": 2} for q in qs]
+    r = conc([lambda b=b: chat(port, b) for b in bodies])
+    fresh = conc([lambda b=b: chat(port, dict(b, cache_prompt=False)) for b in bodies])
+    cached = [x[1]["usage"]["prompt_tokens_details"]["cached_tokens"] for x in r]
+    ok = all(same(x[1], y[1]) for x, y in zip(r, fresh))
+    rep(ok and sum(c >= 60 for c in cached) >= 3, "batch/shared_prefix_bitwise", f"cached {cached} of "
+        f"{[x[1]['usage']['prompt_tokens'] for x in r]}; == fresh: {ok}")
 
     # ------------------------------------------------------------------ errors
     def err(name, status, code=None, body=None, raw=None, path="/v1/chat/completions", method="POST", headers=None):

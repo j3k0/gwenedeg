@@ -820,7 +820,7 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
     int rc;
     e->c = rq_ctx_new(m, e->maxb, o->ctx, &rc);
     e->slot = calloc(e->nslot, sizeof(Slot));
-    e->q = calloc(e->o.queue, sizeof(Job *));
+    e->q = calloc(e->o.queue + e->parallel, sizeof(Job *));
     e->run = calloc(e->parallel, sizeof(Run *));
     e->seg = calloc(e->parallel, sizeof(RqSegment));
     e->segrun = calloc(e->parallel, sizeof(Run *));
@@ -863,7 +863,7 @@ int engine_submit(Engine *e, Job *j) {
     pthread_mutex_lock(&e->mu);
     int r = 0;
     if (e->stop) r = -2;
-    else if (e->qn >= e->o.queue) r = -1;
+    else if (e->qn >= e->o.queue + (e->parallel - e->running)) r = -1; // (jobs that start at the next step do not wait)
     else {
         j->refs++; // (no other thread knows the job yet)
         j->t_submit = rq_now();

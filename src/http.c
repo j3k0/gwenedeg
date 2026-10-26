@@ -21,6 +21,16 @@
 #include "runq.h"
 #include "http.h"
 
+// Portability: macOS lacks SOCK_CLOEXEC, accept4 and MSG_NOSIGNAL.
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
+static void set_cloexec(int fd) {
+    int f = fcntl(fd, F_GETFD);
+    if (f >= 0) fcntl(fd, F_SETFD, f | FD_CLOEXEC);
+}
+
 #ifndef POLLRDHUP
 #define POLLRDHUP 0
 #endif
@@ -378,8 +388,9 @@ int http_listen(const HttpOpts *o, int *bound_port, char *err, size_t errlen) {
     }
     int fd = -1;
     for (struct addrinfo *a = res; a; a = a->ai_next) {
-        fd = socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC, a->ai_protocol);
+        fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
         if (fd < 0) continue;
+        set_cloexec(fd);
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
         if (bind(fd, a->ai_addr, a->ai_addrlen) == 0 && listen(fd, 128) == 0) break;
@@ -414,8 +425,12 @@ void http_run(int lfd, const HttpOpts *o, HttpHandler h, void *app) {
         if (!(p[0].revents & POLLIN)) continue;
         struct sockaddr_storage ss;
         socklen_t sl = sizeof(ss);
-        int fd = accept4(lfd, (struct sockaddr *)&ss, &sl, SOCK_CLOEXEC);
+        int fd = accept(lfd, (struct sockaddr *)&ss, &sl);
         if (fd < 0) continue;
+        set_cloexec(fd);
+#ifdef SO_NOSIGPIPE
+        { int np = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &np, sizeof(np)); }
+#endif
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         struct timeval tv = { 30, 0 };

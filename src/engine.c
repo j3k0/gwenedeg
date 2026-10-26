@@ -99,11 +99,15 @@ Job *job_new(void) {
         return NULL;
     }
     pthread_mutex_init(&s->mu, NULL);
+#ifdef __APPLE__
+    pthread_cond_init(&s->cv, NULL);  // waits use pthread_cond_timedwait_relative_np
+#else
     pthread_condattr_t ca;
     pthread_condattr_init(&ca);
     pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
     pthread_cond_init(&s->cv, &ca);
     pthread_condattr_destroy(&ca);
+#endif
     j->mu = s;
     j->cv = s;
     j->refs = 1;
@@ -116,12 +120,19 @@ void job_unlock(Job *j) { pthread_mutex_unlock(&((JobSync *)j->mu)->mu); }
 
 int job_wait(Job *j, double seconds) {
     JobSync *s = j->mu;
+#ifdef __APPLE__
+    if (seconds < 0) seconds = 0;
+    long long rel = (long long)(seconds * 1e9);
+    struct timespec rt = { (time_t)(rel / 1000000000LL), (long)(rel % 1000000000LL) };
+    return pthread_cond_timedwait_relative_np(&s->cv, &s->mu, &rt) == 0;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     long long ns = ts.tv_nsec + (long long)(seconds * 1e9);
     ts.tv_sec += ns / 1000000000LL;
     ts.tv_nsec = ns % 1000000000LL;
     return pthread_cond_timedwait(&s->cv, &s->mu, &ts) == 0;
+#endif
 }
 
 static void job_notify(Job *j) { pthread_cond_broadcast(&((JobSync *)j->mu)->cv); }

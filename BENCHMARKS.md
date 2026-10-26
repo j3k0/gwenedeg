@@ -142,7 +142,7 @@ the KV cache types after the rebase onto Step 7b's f16 default and the NEON 16-b
 | sharing | a desktop in use (iTerm, browser, ...): 1-min load before / after the runs 3 / 9.6 (first session), 6.4 / 8.7 (second), 4.3 / 11.1 (third), 10.6 / 12.8 (fourth: right after a test run, Spotlight indexing); the "after" values include the benchmark's own threads |
 | compiler | Apple clang 21.0.0, `-O3 -ffast-math -ffp-contract=on -mcpu=native` (`make`; no OpenMP, the pthread pool) |
 | models | `Qwen3-0.6B-Q4_K_M.gguf` (unsloth @ `50968a4`, 396,705,472 bytes); `Qwen3-0.6B-q8.bin` (633,495,808 bytes, group 64); greedy, `-b 512`, `-c 4096` |
-| runq | first session `bb69e5f`; second `a2ab409` + the Q8_0 kernels, committed unchanged as `14169f4` (both on base `92fe41f`); third `33069be` (on `10211a3`); fourth `59d1e34` (on `989f712`). The branch was rebased twice since the first three, so those commits are no longer on it (the Mac's clone keeps them as tags `mac-m1-pro-pre-step7a` = `f4b8a68` and `mac-m1-pro-on-10211a3` = `2b152b6`) |
+| runq | first session `bb69e5f`; second `a2ab409` + the Q8_0 kernels, committed unchanged as `14169f4` (both on base `92fe41f`); third `33069be` (on `10211a3`); fourth `59d1e34` (on `989f712`). The branch has been rebased since each of them (last onto `caf833e`, Step 7b complete), so these commits are no longer on it; the Mac's clone keeps them as tags `mac-m1-pro-pre-step7a` = `f4b8a68`, `mac-m1-pro-on-10211a3` = `2b152b6`, `mac-m1-pro-on-989f712` = `83e133c`. The fourth session's code is `95ccbb7` on the current branch |
 
 ### Q4_K_M (first session)
 
@@ -311,6 +311,9 @@ Prefill, tok/s (the short prompt is ~25 tokens: left out):
 - Session to session: the before build decodes 218 here (short prompt, Q4_K_M) against 188-193 for
   the same code in the third session: 13-16% between sessions on this desktop (cause not determined;
   on AC power, Low Power Mode off). Only the comparisons within a round are meaningful.
+- After the final rebase onto `caf833e` (Step 7b's generic-attention speedup and docs; the NEON path
+  unchanged): Q4_K_M, 3,000-token prompt, default settings (f16, 8 threads), two interleaved rounds
+  of 3: prefill 745-760 vs 746-774 tok/s, decode 104-111 vs 107-113 for the build measured above.
 - Tests on the new build: `make kq-neon-test` (84 attention cases: bf16 / f16 vs the fp32 cache with
   the same values, bit-identical); `make test` 184 passed, 8 failed (text vs the x86 goldens, README
   Known limitations); 688-position logits, both models, `-k f32 / bf16 / f16`, `-b 512` and `-b 1`:

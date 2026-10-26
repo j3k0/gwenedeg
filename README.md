@@ -233,7 +233,7 @@ vs the f32 cache +8-10% / +17-22% / +23-29% after 451 / 1,500 / 3,000-token prom
   build's.
 - `tests/run_tests.sh` on arm64: everything passes except the tests that depend on the exact
   generated text, recorded with the x86 build; they also fail with the unmodified source built on
-  the Mac. Last full run (`59d1e34`, rebased onto `989f712`): 184 passed, 8 failed: seven `greedy/*`
+  the Mac. Last full run (`95ccbb7`, rebased onto `caf833e`): 184 passed, 8 failed: seven `greedy/*`
   goldens (`chat_system`, `generate`, `generate@b5`, `f32_generate`, `bf16_generate`, `seeded_chat`,
   `seeded_generate`) and `chat/multiturn_golden` (a transcript golden). Unmodified `origin/main`
   (`989f712`) built on the Mac fails 9 (the same 8, at other characters, and `chat/thinking`): its

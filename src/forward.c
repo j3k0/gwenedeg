@@ -172,6 +172,31 @@ int rq_seq_common_prefix(const RqSeq *s, const int *tokens, int n) {
     return L;
 }
 
+static inline size_t kv_tile(int t, int h, int n_kv, int hd); // (the cache layout, below)
+
+int rq_seq_copy(RqSeq *dst, const RqSeq *src, int n) {
+    // per layer and K / V: the whole blocks of ATT_P positions below n as one range, then the last
+    // block's tiles up to position n - 1 per kv head (the layout: kv_tile)
+    if (!dst || !src || dst == src || dst->m != src->m || dst->kvt != src->kvt || n < 0 || n > src->len || n > dst->cap)
+        return RQ_ERR_ARG;
+    const Config *p = &src->m->config;
+    int nkv = p->n_kv_heads, hd = p->head_dim, kv_dim = src->m->kv_dim, full = n / ATT_P, rem = n % ATT_P;
+    size_t esz = src->kv_esz, ntl = (size_t)(rem + ATT_T - 1) / ATT_T;
+    for (int l = 0; l < p->n_layers; l++)
+        for (int kv = 0; kv < 2; kv++) {
+            const char *s = (const char *)(kv ? src->value_cache : src->key_cache) + (size_t)l * src->kv_len * kv_dim * esz;
+            char *d = (char *)(kv ? dst->value_cache : dst->key_cache) + (size_t)l * dst->kv_len * kv_dim * esz;
+            memcpy(d, s, (size_t)full * ATT_P * kv_dim * esz);
+            for (int h = 0; h < nkv && rem; h++) {
+                size_t o = kv_tile(full * ATT_P, h, nkv, hd) * esz;
+                memcpy(d + o, s + o, ntl * ATT_T * hd * esz);
+            }
+        }
+    memcpy(dst->tokens, src->tokens, (size_t)n * sizeof(int));
+    dst->len = n;
+    return RQ_OK;
+}
+
 const char *rq_kv_name(int t) {
     static const char *name[] = { "f32", "bf16", "f16" };
     return t >= KV_F32 && t <= KV_F16 ? name[t] : "?";

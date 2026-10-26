@@ -88,6 +88,10 @@ int rq_seq_len(const RqSeq *s);                // positions in the cache = the n
 int rq_seq_capacity(const RqSeq *s);
 const int *rq_seq_tokens(const RqSeq *s);      // the tokens at positions 0..len-1
 int rq_seq_common_prefix(const RqSeq *s, const int *tokens, int n); // longest common prefix length
+// dst := the first n positions of src (KV entries and tokens; n <= rq_seq_len(src), n <= dst's capacity, the
+// same model and KV type; dst's RNG unchanged): e.g. a cached prompt prefix shared by several sequences.
+// The copied entries are the same bits, so dst continues exactly as src would
+int rq_seq_copy(RqSeq *dst, const RqSeq *src, int n);
 void rq_seq_seed(RqSeq *s, unsigned long long seed);
 unsigned long long *rq_seq_rng(RqSeq *s);      // the sampling RNG state (xorshift)
 

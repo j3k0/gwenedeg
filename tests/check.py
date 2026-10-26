@@ -357,6 +357,34 @@ def prefetch_all(a, tmp, only, fg, bg):
             sub(fg, q4, qt, n, c, THREADS_LONG if nd != THREADS_LONG else 8)
 
 
+API_THREADS = 4  # the API test's runs (in the background from the start; results do not depend on it)
+
+
+def api_runs(a, ex):
+    """Start tests/api_test (the library API: src/runq.h) on each model; futures by tag."""
+    if not a.api_test:
+        return {}
+    models = [("bin", a.model), ("gguf", a.gguf), ("q4", a.q4)]
+    return {tag: ex.submit(run, [a.api_test, m], API_THREADS) for tag, m in models if m}
+
+
+def test_api(a, res, futs):
+    """tests/api_test.c per model: sequences interleaved / batched in one pass / truncated and
+    re-prefilled give bit-identical logits, rq_generate == a hand-written loop, error codes, chat
+    rendering, incremental detokenization, the sampler's token mask"""
+    if not futs:
+        print("   (skipped: no --api-test binary)")
+    for tag, fut in futs.items():
+        p = fut.result()
+        lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
+        for l in lines:
+            ok, rest = l.startswith("PASS "), l[5:]
+            name, _, detail = rest.partition("  ")
+            res.report(ok, f"api_{tag}/{name.strip()}", detail.strip())
+        if p.returncode not in (0, 1) or not lines:
+            res.report(False, f"api_{tag}/run", f"exit status {p.returncode}: {p.stderr.decode(errors='replace')[-300:]}")
+
+
 def read_logits(path):
     raw = np.fromfile(path, dtype=np.int32, count=2)
     n = int(raw[0])
@@ -1063,7 +1091,8 @@ def main():
     ap.add_argument("--generic", default="", help="generic-kernel build for the kernels test (empty: skip)")
     ap.add_argument("--gguf", default="", help="GGUF Q8_0 file for the gguf tests and greedy goldens (empty: skip)")
     ap.add_argument("--q4", default="", help="GGUF Q4_K_M file for the q4 tests and greedy goldens (empty: skip)")
-    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv",
+    ap.add_argument("--api-test", default="", help="tests/api_test binary for the api group (empty: skip)")
+    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv,api",
                     help="comma-separated subset of tests to run")
     ap.add_argument("--update-greedy", action="store_true", help="regenerate the greedy goldens")
     ap.add_argument("--jobs", type=int, default=8, help="parallel runq processes for the tokenizer test")
@@ -1078,7 +1107,9 @@ def main():
     if a.update_greedy:
         only = {"greedy", "chat"}
     with tempfile.TemporaryDirectory(prefix="cwayn-test-") as tmp, \
-            cf.ThreadPoolExecutor(max_workers=PREFETCH_JOBS) as fg, cf.ThreadPoolExecutor(max_workers=2) as bg:
+            cf.ThreadPoolExecutor(max_workers=PREFETCH_JOBS) as fg, cf.ThreadPoolExecutor(max_workers=2) as bg, \
+            cf.ThreadPoolExecutor(max_workers=1) as ax:
+        api = api_runs(a, ax) if "api" in only else {}
         if not a.update_greedy:
             prefetch_all(a, tmp, only, fg, bg)
         for name, fn in [("tokenizer", lambda: test_tokenizer(a, res)),
@@ -1092,7 +1123,8 @@ def main():
                          ("chat", lambda: test_chat(a, res, tmp)),
                          ("gguf", lambda: test_gguf(a, res, tmp)),
                          ("q4", lambda: test_q4(a, res, tmp)),
-                         ("kv", lambda: test_kv(a, res, tmp))]:
+                         ("kv", lambda: test_kv(a, res, tmp)),
+                         ("api", lambda: test_api(a, res, api))]:
             if name in only:
                 t = time.time()
                 print(f"== {name}")

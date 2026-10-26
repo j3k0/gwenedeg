@@ -26,7 +26,7 @@ HDR = $(wildcard src/*.h)
 Q8  = models/Qwen3-0.6B-q8.bin
 B   = build
 
-.PHONY: all debug generic clean test bench bench-prefill models kq-neon-test FORCE
+.PHONY: all debug generic clean test bench bench-prefill models kq-neon-test api-test FORCE
 
 all: runq
 
@@ -59,6 +59,12 @@ runq-generic: $(LIB:%=$(B)/generic/%.o) $(B)/generic/cli.o
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
 debug: runq-debug
+
+# the library API test (tests/api_test.c; make test runs it on each model)
+$(B)/api_test: tests/api_test.c src/runq.h $(LIB:%=$(B)/native/%.o)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
+
+api-test: $(B)/api_test
 
 # NEON kernels (kernels_neon.h: K-quants, Q8_0) vs the generic ones, on random data: bit-identical
 kq-neon-test: tests/kernels/kq_neon_test.c src/kernels_neon.h src/kquants.h

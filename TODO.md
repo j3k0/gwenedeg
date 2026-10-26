@@ -938,7 +938,22 @@ Found by the tests.
 - [x] Step 7b: 16-bit KV cache (f16 default, bf16, f32), cache layout per (block, head), quantizer
   vectorized, prefill attention / rest analysed: done, see above
 
-All steps of the plan are done; further work: Later / ideas.
+Steps 4-7 are done. Next plan (2026-10-26), from IDEAS.md (multi-sequence decode, `runq serve` as the
+LiteLLM auto-router judge) and the user's request: clean up first, then both features, then other models.
+IDEAS.md facts outdated since it was written: the KV cache is f16 by default (115 KB per position, not
+229), Step 7 has landed and the Mac port is merged (NEON Q8_0 kernels exist too). The LiteLLM proxy on
+this box runs 1.105.0 (`/opt/litellm/venv-1.105.0`; never touch the running proxy or its config).
+- [ ] Step 8: cleanup / architecture for batched decode and the server, no change in results:
+  model (weights, read-only, shared) vs sequence state (KV cache, position, tokens, sampler) vs
+  scratch; a request-level API (tokens in, logits / tokens out, callbacks instead of printing);
+  errors returned instead of `exit()` in request paths; runq.c split into modules; docs updated
+- [ ] Step 9: `runq serve`: OpenAI-compatible HTTP server (non-streaming chat completions, models,
+  prefix KV reuse across requests, `response_format` json_schema with finite outputs by constrained
+  decoding, FIFO), tests, end-to-end with a scratch LiteLLM instance, judge-quality evaluation
+- [ ] Step 10: multi-sequence (batched) decode: per-sequence KV and positions in one forward pass,
+  small-B kernels, continuous batching in the server, bit-identical to separate runs
+- [ ] Step 11: other models that should run on this engine (Qwen3 dense family: 1.7B, 4B, 8B; other
+  GGUF quant types of them), pinned downloads, correctness vs HF, speed
 
 ## Later / ideas
 - [x] 16-thread collapse: phase synchronization that waits for the work, not for every thread, on a

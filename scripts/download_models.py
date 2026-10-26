@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download pinned Qwen3-0.6B model files from Hugging Face and verify them.
+"""Download pinned Qwen3 model files from Hugging Face and verify them.
 
 Uses only the Python standard library. Revisions are pinned to fixed commits.
 Every file is checked: LFS files by sha256, small files by their git blob sha1.
@@ -8,6 +8,7 @@ Interrupted downloads resume from the partial .part file.
 Usage:
     scripts/download_models.py                 # default sets: hf q4km q8gguf
     scripts/download_models.py q8gguf          # pick sets explicitly (runq loads this GGUF directly)
+    scripts/download_models.py family          # a group: the bigger Qwen3 models of Step 11 (~21 GB)
     scripts/download_models.py --list
 
 Files go to models/<set-dir>/ (override with --dest or $CWAYN_MODELS).
@@ -49,8 +50,56 @@ SETS = {
     "q8gguf": ("unsloth/Qwen3-0.6B-GGUF", "50968a4468ef4233ed78cd7c3de230dd1d61a56b", "Qwen3-0.6B-GGUF", [
         ("Qwen3-0.6B-Q8_0.gguf", 639447744, "sha256", "e150ed544dfe6016930c026a93913a5e3184181ebfe6ab2223ae01dd0491784c"),
     ]),
+
+    # Step 11: bigger models of the same architecture (Qwen3 dense: QK-norm, GQA 8 kv heads, head_dim
+    # 128, NeoX RoPE, SwiGLU, vocab 151,936). GGUFs from Unsloth (imatrix Q4_K_M, as for 0.6B).
+    # Qwen3-1.7B: 28 layers, dim 2048, 16 / 8 heads, ffn 6144, tied, RoPE theta 1e6.
+    "1.7b-hf": ("Qwen/Qwen3-1.7B", "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e", "Qwen3-1.7B", [
+        ("LICENSE", 11343, "blob", "6634c8cc3133b3848ec74b9f275acaaa1ea618ab"),
+        ("README.md", 13963, "blob", "88aaef81cfe31bcdfe47203649a69ff12042826a"),
+        ("config.json", 726, "blob", "044a86ecf7cb32238f3fae4184e55d354787edec"),
+        ("generation_config.json", 239, "blob", "20a8a9156fc8c3f25295ca067f61fdf120d517c5"),
+        ("merges.txt", 1671853, "blob", "31349551d90c7606f325fe0f11bbb8bd5fa0d7c7"),
+        ("tokenizer_config.json", 9732, "blob", "417d038a63fa3de29cfde265caedae14d1a58d92"),
+        ("vocab.json", 2776833, "blob", "4783fe10ac3adce15ac8f358ef5462739852c569"),
+        ("tokenizer.json", 11422654, "sha256", "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"),
+        ("model.safetensors.index.json", 25605, "blob", "986d7db875b47d21f68530f6baac038f1b297b39"),
+        ("model-00001-of-00002.safetensors", 3441185608, "sha256", "169ad53ec313c3a34b06c0809216e4fc072cce444a5d4ff2b59690d064130ed5"),
+        ("model-00002-of-00002.safetensors", 622329984, "sha256", "912becff8d60672aa8628ef08c05898d9adf17c2ad4ae3caf99b065622fdeff9"),
+    ]),
+    "1.7b-q8": ("unsloth/Qwen3-1.7B-GGUF", "d7f544eead698dbd1f15126ef60b45a1e1933222", "Qwen3-1.7B-GGUF", [
+        ("Qwen3-1.7B-Q8_0.gguf", 1834426944, "sha256", "0becaa825564295d82e9af4d008bca5f8b7f5f73bf1c6a0b58f7c53ef26b47fd"),
+    ]),
+    "1.7b-q4km": ("unsloth/Qwen3-1.7B-GGUF", "d7f544eead698dbd1f15126ef60b45a1e1933222", "Qwen3-1.7B-GGUF", [
+        ("Qwen3-1.7B-Q4_K_M.gguf", 1107409472, "sha256", "b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897"),
+    ]),
+    # Qwen3-4B: 36 layers, dim 2560, 32 / 8 heads (q dim 4096 != dim), ffn 9728, tied, RoPE theta 1e6.
+    "4b-q4km": ("unsloth/Qwen3-4B-GGUF", "22c9fc8a8c7700b76a1789366280a6a5a1ad1120", "Qwen3-4B-GGUF", [
+        ("Qwen3-4B-Q4_K_M.gguf", 2497281312, "sha256", "f6f851777709861056efcdad3af01da38b31223a3ba26e61a4f8bf3a2195813a"),
+    ]),
+    "4b-q8": ("unsloth/Qwen3-4B-GGUF", "22c9fc8a8c7700b76a1789366280a6a5a1ad1120", "Qwen3-4B-GGUF", [
+        ("Qwen3-4B-Q8_0.gguf", 4280405792, "sha256", "eed555233267a33c7e8ee31682762cc7751b3f6d224039086e0e846f05fffa5d"),
+    ]),
+    # Qwen3-4B-Instruct-2507: the 4B shape, RoPE theta 5e6, 262,144 context, no thinking (own template).
+    "4b-2507i-q4km": ("unsloth/Qwen3-4B-Instruct-2507-GGUF", "a06e946bb6b655725eafa393f4a9745d460374c9",
+                      "Qwen3-4B-Instruct-2507-GGUF", [
+        ("Qwen3-4B-Instruct-2507-Q4_K_M.gguf", 2497281120, "sha256", "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597"),
+    ]),
+    # Qwen3-4B-Thinking-2507: as Instruct-2507, always thinking (template opens <think>). Not in "family".
+    "4b-2507t-q4km": ("unsloth/Qwen3-4B-Thinking-2507-GGUF", "f40adb104d4d44aee52f398b60597c5866a973a3",
+                      "Qwen3-4B-Thinking-2507-GGUF", [
+        ("Qwen3-4B-Thinking-2507-Q4_K_M.gguf", 2497281152, "sha256", "ddd52e18200baab281c5c46f70d544ce4d4fe4846eab1608f2fff48a64554212"),
+    ]),
+    # Qwen3-8B: 36 layers, dim 4096, 32 / 8 heads, ffn 12288, untied classifier (output.weight).
+    "8b-q4km": ("unsloth/Qwen3-8B-GGUF", "a6adef130ffb23ddaf1a62fec9dced968c9bc482", "Qwen3-8B-GGUF", [
+        ("Qwen3-8B-Q4_K_M.gguf", 5027784512, "sha256", "120307ba529eb2439d6c430d94104dabd578497bc7bfe7e322b5d9933b449bd4"),
+    ]),
 }
 DEFAULT_SETS = ["hf", "q4km", "q8gguf"]
+# names that stand for several sets
+GROUPS = {
+    "family": ["1.7b-q8", "1.7b-q4km", "1.7b-hf", "4b-q4km", "4b-q8", "4b-2507i-q4km", "8b-q4km"],
+}
 CHUNK = 1 << 20
 
 
@@ -135,9 +184,12 @@ def main():
     if args.list:
         for name, (repo, rev, sub, files) in SETS.items():
             total = sum(f[1] for f in files) / 1e6
-            print(f"{name:8s} {repo}@{rev[:10]} -> {sub}/  ({total:.0f} MB)")
+            print(f"{name:14s} {repo}@{rev[:10]} -> {sub}/  ({total:.0f} MB)")
+        for name, members in GROUPS.items():
+            total = sum(f[1] for m in members for f in SETS[m][3]) / 1e6
+            print(f"{name:14s} group: {' '.join(members)}  ({total:.0f} MB)")
         return
-    names = args.sets or DEFAULT_SETS
+    names = [m for n in (args.sets or DEFAULT_SETS) for m in GROUPS.get(n, [n])]
     unknown = [n for n in names if n not in SETS]
     if unknown:
         ap.error(f"unknown set(s): {', '.join(unknown)} (see --list)")

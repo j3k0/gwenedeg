@@ -592,27 +592,47 @@ static void step(Engine *e, int stopping) {
         int st = __atomic_load_n(&j->cancel, __ATOMIC_ACQUIRE) ? 499 : j->deadline > 0 && now > j->deadline ? 504 : stopping ? 503 : 0;
         if (st) end_run(e, r, 0, st, RQ_OK, NULL);
     }
-    for (int pass = 0; pass < 2; pass++) { // decode rows first, then prompt chunks within the budget
-        int budget = pass == 0 ? e->maxb : ndec ? e->o.chunk : e->o.batch;
-        for (int i = 0; i < e->nrun; i++) {
-            Run *r = e->run[i];
-            if (r->done || r->phase != (pass == 0 ? R_DECODE : R_PREFILL)) continue;
-            RqSeq *s = e->slot[r->si].seq;
-            int left = r->feed.n - r->fed, room = e->maxb - rows;
-            if (pass == 0 && rq_seq_len(s) + left > rq_seq_capacity(s)) {
-                end_run(e, r, FINISH_LENGTH, 0, RQ_OK, NULL);
-                continue;
-            }
-            int k = left < room ? left : room;
-            if (k > budget) k = budget;
-            if (k <= 0) continue;
-            e->seg[nseg] = (RqSegment) { s, r->feed.v + r->fed, k, k == left ? RQ_LOGITS_LAST : RQ_LOGITS_NONE };
-            e->segrun[nseg++] = r;
-            r->seg = k;
-            rows += k;
-            if (pass == 0) ndec++;
-            else budget -= k;
+    int npre = 0;
+    for (int i = 0; i < e->nrun; i++) { // decode rows first: every decoding job's next token(s)
+        Run *r = e->run[i];
+        if (r->done) continue;
+        if (r->phase == R_PREFILL) {
+            npre++;
+            continue;
         }
+        RqSeq *s = e->slot[r->si].seq;
+        int left = r->feed.n - r->fed, k = left < e->maxb - rows ? left : e->maxb - rows;
+        if (rq_seq_len(s) + left > rq_seq_capacity(s)) {
+            end_run(e, r, FINISH_LENGTH, 0, RQ_OK, NULL);
+            continue;
+        }
+        if (k <= 0) continue;
+        r->seg = k;
+        rows += k;
+        ndec++;
+    }
+    // then prompt tokens within the budget (--chunk while jobs decode, else -b): first up to an equal share per
+    // prompt (FIFO; a short prompt does not wait for a long one's whole prefill), then the rest FIFO
+    int budget = ndec ? e->o.chunk : e->o.batch;
+    if (budget > e->maxb - rows) budget = e->maxb - rows;
+    int share = npre ? budget / npre : 0;
+    if (share < 8) share = 8;
+    for (int round = 0; round < 2 && budget > 0; round++)
+        for (int i = 0; i < e->nrun && budget > 0; i++) {
+            Run *r = e->run[i];
+            if (r->done || r->phase != R_PREFILL) continue;
+            int left = r->feed.n - r->fed - r->seg, k = left < budget ? left : budget;
+            if (round == 0 && k > share) k = share;
+            r->seg += k;
+            rows += k;
+            budget -= k;
+        }
+    for (int i = 0; i < e->nrun; i++) { // (the segments in admission order)
+        Run *r = e->run[i];
+        if (r->done || r->seg == 0) continue;
+        e->seg[nseg] = (RqSegment) { e->slot[r->si].seq, r->feed.v + r->fed, r->seg,
+                                     r->fed + r->seg == r->feed.n ? RQ_LOGITS_LAST : RQ_LOGITS_NONE };
+        e->segrun[nseg++] = r;
     }
     if (nseg == 0) return;
 

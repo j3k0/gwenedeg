@@ -106,5 +106,4 @@ and generic kernels, a request batched or alone), and a change of numerics must 
   the thread pool, the f16 KV cache, batched decode and the server); later numbers are in the README and
   [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Rerun `scripts/bench_all.sh`, `scripts/bench_models.py`,
   `scripts/bench_batch.sh` and `scripts/bench_serve.py` with one binary in one session, against qwen3.c and
-  mynah-slm as before, and update its text (e.g. its decode section still calls a 16-bit KV cache the next
-  lever).
+  mynah-slm as before, and update its text.

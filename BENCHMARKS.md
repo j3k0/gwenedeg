@@ -85,7 +85,7 @@ Decode runs at ~100-115 GB/s effective from 4 threads up, i.e. memory-bound; the
 bandwidth test (one streaming loop, `bench/bw.c`) under-reads this machine at 4-8 threads (it gave
 87-100 GB/s at 8 threads in earlier sessions, 60-73 today), so treat its column as a noisy lower
 bound, not a roofline. At 3,000 tokens of context the fp32 KV cache (0.70 GB) is read more than the
-weights, so decode speed halves: a bf16 KV cache would be the next decode lever (TODO.md).
+weights, so decode speed halves: a 16-bit KV cache was the next decode lever (done afterwards: f16 is the default now, see the README).
 
 **Startup** (`-c 4096 -t 0 -n 1 -i "Why is the sky blue?"`, page cache warm, process start to exit
 after the first generated token):

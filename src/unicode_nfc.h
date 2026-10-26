@@ -4,8 +4,8 @@
 // canonical decomposition, 0 or offset << 3 | length into nfc_pool[]; nfc_comp[] = (first << 21 |
 // second) << 21 | composite, sorted; nfc_*_blk = bit per 64-cp block: any entry / ccc or qc entry.
 // Hangul syllables are algorithmic (not listed); the V and T jamo are listed as Maybe.
-#ifndef CWAYN_UNICODE_NFC_H
-#define CWAYN_UNICODE_NFC_H
+#ifndef GWENEDEG_UNICODE_NFC_H
+#define GWENEDEG_UNICODE_NFC_H
 
 #include <stdint.h>
 

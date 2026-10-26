@@ -126,7 +126,7 @@ def main():
     print(f"text {a.text}: {len(text.encode())} bytes, {len(ids)} tokens (HF); "
           f"full: {len(ids) - 1} predictions; win{W}: {len(wins)} windows, {len(wins) * (W - 1)} predictions")
 
-    tmp = tempfile.mkdtemp(prefix="cwayn-ppl-")
+    tmp = tempfile.mkdtemp(prefix="gwenedeg-ppl-")
     engines = []
     if a.hf:
         engines.append(("HF fp32", "hf", hf_engine(a.threads)))

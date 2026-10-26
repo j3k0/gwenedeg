@@ -1,4 +1,5 @@
-# cwayn: Qwen3-0.6B inference in C (engine: src/*.c, derived from qwen3.c; modules: README.md)
+# Gwenedeg: Qwen3 inference in C on the CPU (the runq binary and library: src/*.c, derived from qwen3.c;
+# modules: README.md, Architecture)
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)

@@ -1,6 +1,6 @@
 /* The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens.
  *
- * cwayn rewrite, matching HF tokenizers on Qwen2/Qwen3's tokenizer.json:
+ * Gwenedeg rewrite, matching HF tokenizers on Qwen2/Qwen3's tokenizer.json:
  *   1. added tokens (<|im_start|>, <think>, ...) are split out first, leftmost-longest match
  *   2. normalizer (NFC), on the text between added tokens (nfc_check / nfc_normalize, tables in
  *      unicode_nfc.h: Unicode 15.1 data with the overrides that match HF tokenizers' older data)

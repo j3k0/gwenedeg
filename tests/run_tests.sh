@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cwayn fast regression suite: tokenizer + logits vs HF (sequential and batched prefill),
+# Gwenedeg fast regression suite: tokenizer + logits vs HF (sequential and batched prefill),
 # batched vs sequential logits, thread invariance, VNNI vs generic kernels, greedy tripwire, the
 # library API (tests/api_test.c, built as build/api_test).
 # Usage: tests/run_tests.sh [--update-greedy] [other tests/check.py options, e.g. -v, --only logits]

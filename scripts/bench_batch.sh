@@ -5,7 +5,7 @@
 #   -b BIN   the benchmark binary (default build/bench_batch, built with make bench-batch)
 #   -t LIST  thread counts (default "8 12 14")
 #   -M LIST  models (default: the Q8_0 GGUF and the Q4_K_M GGUF of models/Qwen3-0.6B-GGUF)
-#   -p       a -DRUNQ_PROFILE build (built into /tmp/cwayn-prof; per-phase times per pass)
+#   -p       a -DRUNQ_PROFILE build (built into /tmp/gwenedeg-prof; per-phase times per pass)
 #   the rest goes to bench_batch: -N 1,2,4,8 -L 50,500,2000 -s STEPS -r REPS -k KV -t TEMP -m MAXGB -d
 # The box is shared: compare builds by interleaving runs (two -b invocations in a loop), best of N.
 set -euo pipefail
@@ -26,8 +26,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 if [[ $PROF == 1 ]]; then
-    make -s -j8 B=/tmp/cwayn-prof CFLAGS="-Ofast -fopenmp -march=native -DRUNQ_PROFILE" /tmp/cwayn-prof/bench_batch
-    BIN=/tmp/cwayn-prof/bench_batch
+    make -s -j8 B=/tmp/gwenedeg-prof CFLAGS="-Ofast -fopenmp -march=native -DRUNQ_PROFILE" /tmp/gwenedeg-prof/bench_batch
+    BIN=/tmp/gwenedeg-prof/bench_batch
 elif [[ $BIN == build/bench_batch ]]; then
     make -s -j8 bench-batch
 fi

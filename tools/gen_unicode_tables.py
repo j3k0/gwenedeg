@@ -140,7 +140,7 @@ def write_nfc(out, hf_compat):
               "// canonical decomposition, 0 or offset << 3 | length into nfc_pool[]; nfc_comp[] = (first << 21 |\n"
               "// second) << 21 | composite, sorted; nfc_*_blk = bit per 64-cp block: any entry / ccc or qc entry.\n"
               "// Hangul syllables are algorithmic (not listed); the V and T jamo are listed as Maybe.\n")
-    out.write("#ifndef CWAYN_UNICODE_NFC_H\n#define CWAYN_UNICODE_NFC_H\n\n#include <stdint.h>\n\n")
+    out.write("#ifndef GWENEDEG_UNICODE_NFC_H\n#define GWENEDEG_UNICODE_NFC_H\n\n#include <stdint.h>\n\n")
     out.write(f'#define UNICODE_NFC_VERSION "{ver}"\n')
     out.write(f"#define NFC_MIN_CP 0x{keys[0]:X}\n#define NFC_N {len(keys)}\n#define NFC_NCOMP {len(combo)}\n\n")
 
@@ -224,7 +224,7 @@ def main():
     out.write("// Code point classes for the Qwen2 pre-tokenizer regex: UCLS_L = \\p{L} (Lu Ll Lt Lm Lo),\n")
     out.write("// UCLS_N = \\p{N} (Nd Nl No), UCLS_WS = \\s (Unicode White_Space), anything else UCLS_OTHER.\n")
     out.write("// Sorted, disjoint ranges: hi_cls = hi | cls << 24.\n")
-    out.write("#ifndef CWAYN_UNICODE_TABLES_H\n#define CWAYN_UNICODE_TABLES_H\n\n#include <stdint.h>\n\n")
+    out.write("#ifndef GWENEDEG_UNICODE_TABLES_H\n#define GWENEDEG_UNICODE_TABLES_H\n\n#include <stdint.h>\n\n")
     out.write(f'#define UNICODE_TABLES_VERSION "{unicodedata.unidata_version}"\n')
     out.write("enum { UCLS_OTHER = 0, UCLS_L = 1, UCLS_N = 2, UCLS_WS = 3 };\n\n")
     out.write(f"#define UCLS_NRANGES {len(ranges)}\n")

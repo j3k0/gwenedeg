@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cwayn regression checks (numpy only). Normally run via tests/run_tests.sh.
+"""Gwenedeg regression checks (numpy only). Normally run via tests/run_tests.sh.
 
 Tests (see tests/README.md):
   tokenizer  runq -m tokenize vs HF ids              (tests/golden/tokenizer.json)
@@ -1215,7 +1215,7 @@ def main():
     only = set(a.only.split(","))
     if a.update_greedy:
         only = {"greedy", "chat"}
-    with tempfile.TemporaryDirectory(prefix="cwayn-test-") as tmp, \
+    with tempfile.TemporaryDirectory(prefix="gwenedeg-test-") as tmp, \
             cf.ThreadPoolExecutor(max_workers=PREFETCH_JOBS) as fg, cf.ThreadPoolExecutor(max_workers=2) as bg, \
             cf.ThreadPoolExecutor(max_workers=2) as ax, cf.ThreadPoolExecutor(max_workers=1) as sx, \
             cf.ThreadPoolExecutor(max_workers=1) as gx, cf.ThreadPoolExecutor(max_workers=3) as cx, \

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the HF golden references for the cwayn test suite (run once, commit the output).
+"""Generate the HF golden references for the Gwenedeg test suite (run once, commit the output).
 
 Usage: .venv/bin/python tests/make_golden.py [--tokenizer-only]
        .venv/bin/python tests/make_golden.py --q4ref [--gguf-py DIR]
@@ -179,7 +179,7 @@ LOGITS_PROMPTS = [
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Generate the HF goldens for the cwayn tests.")
+    ap = argparse.ArgumentParser(description="Generate the HF goldens for the Gwenedeg tests.")
     ap.add_argument("--tokenizer-only", action="store_true", help="only rewrite golden/tokenizer.json")
     ap.add_argument("--q4ref", action="store_true", help="only write golden/logits_q4 (HF with the Q4_K_M weights)")
     ap.add_argument("--gguf-py", default="", help="directory containing the gguf package (--q4ref)")

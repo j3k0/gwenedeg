@@ -3,8 +3,8 @@
 // Code point classes for the Qwen2 pre-tokenizer regex: UCLS_L = \p{L} (Lu Ll Lt Lm Lo),
 // UCLS_N = \p{N} (Nd Nl No), UCLS_WS = \s (Unicode White_Space), anything else UCLS_OTHER.
 // Sorted, disjoint ranges: hi_cls = hi | cls << 24.
-#ifndef CWAYN_UNICODE_TABLES_H
-#define CWAYN_UNICODE_TABLES_H
+#ifndef GWENEDEG_UNICODE_TABLES_H
+#define GWENEDEG_UNICODE_TABLES_H
 
 #include <stdint.h>
 

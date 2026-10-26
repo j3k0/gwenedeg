@@ -40,7 +40,7 @@ DIM, HEADS, KV_HEADS, HD, FFN = 768, 8, 2, 128, 1280
 LAYERS = [0, 3, 27]  # 0.6B layers: attn_v / ffn_down Q6_K, Q4_K, Q6_K
 THETA, CTX = 5e6, 262144
 OVERRIDE = {  # metadata of the synthetic model (the rest copied from the source)
-    "general.name": (G.GV_STR, "cwayn-synth (cut from Qwen3-0.6B-Q4_K_M)"),
+    "general.name": (G.GV_STR, "gwenedeg-synth (cut from Qwen3-0.6B-Q4_K_M)"),
     "qwen3.block_count": (G.GV_U32, len(LAYERS)),
     "qwen3.context_length": (G.GV_U32, CTX),
     "qwen3.embedding_length": (G.GV_U32, DIM),

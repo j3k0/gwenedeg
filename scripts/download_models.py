@@ -11,7 +11,7 @@ Usage:
     scripts/download_models.py family          # a group: the bigger Qwen3 models of Step 11 (~21 GB)
     scripts/download_models.py --list
 
-Files go to models/<set-dir>/ (override with --dest or $CWAYN_MODELS).
+Files go to models/<set-dir>/ (override with --dest or $GWENEDEG_MODELS).
 Set $HF_TOKEN if you need authenticated access (not needed for these repos).
 """
 
@@ -120,7 +120,7 @@ def fetch(url, part, size):
         have = 0
     if have == size:
         return
-    req = urllib.request.Request(url, headers={"User-Agent": "cwayn-download/1"})
+    req = urllib.request.Request(url, headers={"User-Agent": "gwenedeg-download/1"})
     if os.environ.get("HF_TOKEN"):
         req.add_header("Authorization", "Bearer " + os.environ["HF_TOKEN"])
     if have:
@@ -177,7 +177,7 @@ def get_file(repo, rev, dest, path, size, kind, want, retries=3):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("sets", nargs="*", help=f"sets to fetch (default: {' '.join(DEFAULT_SETS)})")
-    ap.add_argument("--dest", default=os.environ.get("CWAYN_MODELS", str(ROOT / "models")))
+    ap.add_argument("--dest", default=os.environ.get("GWENEDEG_MODELS", str(ROOT / "models")))
     ap.add_argument("--list", action="store_true", help="list available sets and exit")
     args = ap.parse_args()
 

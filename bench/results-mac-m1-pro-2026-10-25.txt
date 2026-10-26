@@ -1,4 +1,4 @@
-# cwayn on Apple M1 Pro (8P+2E, 32 GB), macOS 26.6.2, Apple clang 21, runq at bb69e5f (+ docs), model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf
+# Gwenedeg on Apple M1 Pro (8P+2E, 32 GB), macOS 26.6.2, Apple clang 21, runq at bb69e5f (+ docs), model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf
 # date 2026-10-25T14:56:31Z; load before: 3.05 2.97 3.55
 
 ## generic C kernels (runq-generic), prefill (bench_prefill.sh, -b 512, best of 3, ALL=1)

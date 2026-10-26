@@ -1,10 +1,12 @@
-# Benchmarks
+# Gwenedeg benchmarks
 
-Qwen3-0.6B on the CPU: cwayn `runq` (Q8_0, AVX-512 VNNI, batched prefill) vs upstream qwen3.c and
+Qwen3-0.6B on the CPU: Gwenedeg's `runq` (Q8_0, AVX-512 VNNI, batched prefill) vs upstream qwen3.c and
 mynah-slm, plus perplexity. All numbers in the Results, Comparison and Quality sections are from
 **one session, 2026-10-25 04:08-05:05 UTC, commit `d76e4cc`**, same machine and conditions. Raw
 output of every run: [bench/results-2026-10-25.txt](bench/results-2026-10-25.txt). Earlier
 measurements are only in [History](#history-earlier-measurements) and are labelled there.
+(The project was called cwayn when these sessions ran; the raw logs in `bench/` have the new name and
+generic paths, nothing measured was changed.)
 
 The [Apple M1 Pro section](#apple-m1-pro-macos-neon) is a different machine and different sessions
 (2026-10-25, 14:56-22:30 UTC, branch `mac-m1-pro`) and is not comparable with the tables above
@@ -321,7 +323,7 @@ Prefill, tok/s (the short prompt is ~25 tokens: left out):
 
 ### Both
 
-- The oMLX figures the user reported on this Mac (`mlx-community/Qwen3-0.6B-4bit`, ~1,500 tok/s
+- The oMLX figures reported for this Mac (`mlx-community/Qwen3-0.6B-4bit`, ~1,500 tok/s
   prefill / ~150 tok/s decode) were not measured here and their prompt length and settings are
   unknown, so no comparison is made; the same model needs `mlx_lm` on the same prompts for one.
 

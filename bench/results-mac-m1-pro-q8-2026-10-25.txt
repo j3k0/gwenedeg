@@ -1,4 +1,4 @@
-# cwayn on Apple M1 Pro (8P+2E, 32 GB), macOS 26.6.2, Apple clang 21, mac-m1-pro at a2ab409 + uncommitted Q8_0 NEON kernels (Q8N_RQ=4, Q8N_C=3)
+# Gwenedeg on Apple M1 Pro (8P+2E, 32 GB), macOS 26.6.2, Apple clang 21, mac-m1-pro at a2ab409 + uncommitted Q8_0 NEON kernels (Q8N_RQ=4, Q8N_C=3)
 # date 2026-10-25T16:11:39Z; load before: 6.43 4.02 3.53
 
 ## Q8_0 .bin, generic kernels (runq-generic), prefill

@@ -5,7 +5,7 @@
 # "all:" columns: every run, prefill/decode tok/s (decode in bench_prefill.sh = only 15 tokens).
 # Bandwidth: /tmp/bwtest/bw (AVX-512 streaming read of a 1 GB buffer, best of 10 passes).
 # Perplexity text: bench/ppl_beagle_ch1.txt (sha256 6ac0515c1da2cfff7b1bbf09876b2b821950103583b3cf1d74170eb46a44fb2a).
-# Scratch paths /tmp/cwayn-bench/... no longer exist; the prompts come from scripts/bench_prefill.sh -P <len>.
+# Scratch paths /tmp/gwenedeg-bench/... no longer exist; the prompts come from scripts/bench_prefill.sh -P <len>.
 
 === session start 2026-10-25T04:08:02+00:00, HEAD d76e4cc
 gcc (Debian 14.2.0-19) 14.2.0
@@ -149,27 +149,27 @@ Q4_K_M t8: [load 0.14s | prompt 1500 tok, prefill 21.5 tok/s | gen 16 tok, decod
 [load] 04:36:28 ppl-hf-runq: 9.46 10.52 8.04 2/2907 2994686 > 6, waiting
 [load] 04:36:58 ppl-hf-runq: 7.15 9.85 7.90 2/2878 2999397 > 6, waiting
 [load] 04:37:28 ppl-hf-runq: 5.30 9.14 7.72 3/2886 3004745 (waited 90s)
-text /tmp/cwayn-bench/ppl/beagle_ch1_4k.txt: 17077 bytes, 4142 tokens (HF); full: 4141 predictions; win512: 8 windows, 4088 predictions
+text /tmp/gwenedeg-bench/ppl/beagle_ch1_4k.txt: 17077 bytes, 4142 tokens (HF); full: 4141 predictions; win512: 8 windows, 4088 predictions
 engine                             protocol   pred      nll      ppl    time
 HF fp32                            full       4141  3.31677   27.571   44.0s
 HF fp32                            win512     4088  3.46524   31.984   10.3s
 Traceback (most recent call last):
-  File "/opt/projects/tools/cwayn/scripts/ppl.py", line 154, in <module>
+  File "/path/to/gwenedeg/scripts/ppl.py", line 154, in <module>
     main()
     ~~~~^^
-  File "/opt/projects/tools/cwayn/scripts/ppl.py", line 140, in main
+  File "/path/to/gwenedeg/scripts/ppl.py", line 140, in main
     r = score(s) if kind == "hf" else score(s, tok.decode(s))
                                       ~~~~~^^^^^^^^^^^^^^^^^^
-  File "/opt/projects/tools/cwayn/scripts/ppl.py", line 69, in score
+  File "/path/to/gwenedeg/scripts/ppl.py", line 69, in score
     logits = np.memmap(out, dtype=np.float32, mode="r", offset=8 + 4 * n, shape=(n, vocab))
-  File "/opt/projects/tools/cwayn/.venv/lib/python3.13/site-packages/numpy/_core/memmap.py", line 284, in __new__
+  File "/path/to/gwenedeg/.venv/lib/python3.13/site-packages/numpy/_core/memmap.py", line 284, in __new__
     bytes -= start
 OverflowError: Python integer 2517292224 out of bounds for int32
 7.63 8.99 7.76 4/2861 3016458
 
 --- (runq failed above on a script bug: int32 overflow in the memmap offset; fixed, runq only:) .venv/bin/python -I scripts/ppl.py TEXT --runq -t 8
 [load] 04:39:01 ppl-runq: 5.69 8.42 7.61 3/2892 3020840 (waited 0s)
-text /tmp/cwayn-bench/ppl/beagle_ch1_4k.txt: 17077 bytes, 4142 tokens (HF); full: 4141 predictions; win512: 8 windows, 4088 predictions
+text /tmp/gwenedeg-bench/ppl/beagle_ch1_4k.txt: 17077 bytes, 4142 tokens (HF); full: 4141 predictions; win512: 8 windows, 4088 predictions
 engine                             protocol   pred      nll      ppl    time
 runq Q8_0                          full       4141  3.32522   27.805    8.9s
 runq Q8_0                          win512     4088  3.47217   32.206    9.7s
@@ -179,7 +179,7 @@ runq Q8_0                          win512     4088  3.47217   32.206    9.7s
 [load] 04:39:39 ppl-mynah: 8.31 8.74 7.75 3/2867 3028144 > 6, waiting
 [load] 04:40:09 ppl-mynah: 7.29 8.44 7.68 7/2860 3033353 > 6, waiting
 [load] 04:40:39 ppl-mynah: 5.20 7.84 7.50 3/2858 3038373 (waited 60s)
-text /tmp/cwayn-bench/ppl/beagle_ch1_4k.txt: 17077 bytes, 4142 tokens (HF); full: 4141 predictions; win512: 8 windows, 4088 predictions
+text /tmp/gwenedeg-bench/ppl/beagle_ch1_4k.txt: 17077 bytes, 4142 tokens (HF); full: 4141 predictions; win512: 8 windows, 4088 predictions
 engine                             protocol   pred      nll      ppl    time
 mynah-slm Qwen3-0.6B-Q8_0.gguf     full       4141  3.31709   27.580  206.4s
 mynah-slm Qwen3-0.6B-Q8_0.gguf     win512     4088  3.46694   32.039  125.1s

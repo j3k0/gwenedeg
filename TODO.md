@@ -1,4 +1,10 @@
-# TODO
+# Gwenedeg: development log and TODO
+
+The project's history step by step (design decisions, measurements, test results), the open items and
+ideas. The project was called cwayn until 2026-10-26; the user-facing overview is [README.md](README.md),
+the developer notes moved out of it are in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Measurements are from
+the development machine (a shared 16-vCPU AMD EPYC Genoa VM, "the box") unless noted. IDEAS.md, mentioned
+in a few places, was a private notes file, not part of the repository.
 
 Goal: fast Qwen3-0.6B inference in C on CPU, based on qwen3.c (Q8_0).
 Baseline (16-vCPU EPYC Genoa, 8 threads): prefill ~85 tok/s, decode ~100 tok/s.
@@ -1126,7 +1132,7 @@ Goal: a local OpenAI-compatible endpoint, usable as LiteLLM's complexity-router 
   engine and connection threads instrumented): 48 / 48, clean after one fix (the shutdown flag written by the
   signal handler and read by the connection threads: now atomic). The fuzz check (150 mutated / random requests)
   runs in all of them
-- [x] End to end (`scripts/litellm_e2e.sh`): an own LiteLLM 1.105.0 proxy from `/opt/litellm/venv-1.105.0` (read
+- [x] End to end (`scripts/litellm_e2e.sh`): an own LiteLLM 1.105.0 proxy from a local LiteLLM install (read
   only; `env -i`, scratch HOME, random master key, no database, telemetry and remote cost map off, free localhost
   ports) with `auto_router/complexity_router`, `classifier_type: llm`, `classifier_context_window_size: 0`, the
   judge and the four tier models all on one runq serve (tier models by model name), 8 prompts through the openai
@@ -1773,8 +1779,8 @@ Found by the tests.
 Steps 4-7 are done. Next plan (2026-10-26), from IDEAS.md (multi-sequence decode, `runq serve` as the
 LiteLLM auto-router judge) and the user's request: clean up first, then both features, then other models.
 IDEAS.md facts outdated since it was written: the KV cache is f16 by default (115 KB per position, not
-229), Step 7 has landed and the Mac port is merged (NEON Q8_0 kernels exist too). The LiteLLM proxy on
-this box runs 1.105.0 (`/opt/litellm/venv-1.105.0`; never touch the running proxy or its config).
+229), Step 7 has landed and the Mac port is merged (NEON Q8_0 kernels exist too). The LiteLLM install on
+this box is 1.105.0 (used read-only, by scratch proxies only).
 - [x] Step 8: cleanup / architecture for batched decode and the server, no change in results:
   model (weights, read-only, shared) vs sequence state (KV cache, position, tokens, sampler) vs
   scratch; a request-level API (tokens in, logits / tokens out, callbacks instead of printing);

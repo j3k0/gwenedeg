@@ -1,8 +1,8 @@
-# Tests
+# Gwenedeg tests
 
 `make test` (or `tests/run_tests.sh`) builds `./runq`, `./runq-generic`, `build/api_test` and
-`build/api_test-generic` if needed (in parallel) and runs everything in about 29-30 s on the 16-vCPU dev box
-(475 checks; the box is shared, so the time varies: Step 11's 475 checks 28.6-29.8 s vs 26.6-28.0 s for the 430
+`build/api_test-generic` if needed (in parallel) and runs everything in about 29-30 s on the 16-vCPU dev box,
+a shared AMD EPYC Genoa VM (475 checks; the box is shared, so the time varies: Step 11's 475 checks 28.6-29.8 s vs 26.6-28.0 s for the 430
 of Step 10b, interleaved, load 8-34; 28.3-28.9 s at load 18-31 in Step 10b, where the same checks in the
 previous order took 32.5-33.0 s; Step 10a's 427 checks took 31.5-34 s at load 8-22).
 The suite is bound by CPU time (~360 core-seconds, ~310 processes, each runq start ~0.5-0.9 core-s of loading

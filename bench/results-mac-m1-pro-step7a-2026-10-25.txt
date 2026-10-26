@@ -1,6 +1,6 @@
-# cwayn on Apple M1 Pro (8P+2E, 32 GB), macOS 26.6.2, Apple clang 21
+# Gwenedeg on Apple M1 Pro (8P+2E, 32 GB), macOS 26.6.2, Apple clang 21
 # NEW = ./runq at 33069be (mac-m1-pro rebased onto origin/main 10211a3, Step 7a)
-# OLD = the pre-rebase build (/tmp/cwayn-bin/runq-f4b8a68: mac-m1-pro at f4b8a68 = 14169f4's code on base 92fe41f; local tag mac-m1-pro-pre-step7a)
+# OLD = the pre-rebase build (/tmp/gwenedeg-bin/runq-f4b8a68: mac-m1-pro at f4b8a68 = 14169f4's code on base 92fe41f; local tag mac-m1-pro-pre-step7a)
 # date 2026-10-25T20:59:17Z; load before: 4.27 4.20 4.05
 
 ## round 1, OLD, Qwen3-0.6B-Q4_K_M.gguf, prefill (bench_prefill.sh -b 512, best of 3)

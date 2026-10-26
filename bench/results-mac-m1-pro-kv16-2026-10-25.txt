@@ -1,7 +1,7 @@
-# cwayn on Apple M1 Pro (8P+2E, 32 GB), macOS 26.6.2, Apple clang 21, 8 threads, -c 4096, greedy
+# Gwenedeg on Apple M1 Pro (8P+2E, 32 GB), macOS 26.6.2, Apple clang 21, 8 threads, -c 4096, greedy
 # new = ./runq at 59d1e34 (NEON attention for all three KV cache types)
-# old = /tmp/cwayn-bin/runq-4426981 (mac-m1-pro rebased onto origin/main 989f712, before that: bf16 / f16 on the generic attention)
-# pre = /tmp/cwayn-bin/runq-2b152b6 (mac-m1-pro on 10211a3, before Step 7b's cache layout; local tag mac-m1-pro-on-10211a3)
+# old = /tmp/gwenedeg-bin/runq-4426981 (mac-m1-pro rebased onto origin/main 989f712, before that: bf16 / f16 on the generic attention)
+# pre = /tmp/gwenedeg-bin/runq-2b152b6 (mac-m1-pro on 10211a3, before Step 7b's cache layout; local tag mac-m1-pro-on-10211a3)
 # prompts: short = bench_qwen3c.sh's (then 256 new tokens); 451 / 1500 / 3000 = bench_prefill.sh -P (chat mode, then 128)
 # date 2026-10-25T22:17:29Z; load before: 10.63 11.42 10.09
 round build model  kv    prompt   prefill    decode

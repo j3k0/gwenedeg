@@ -78,7 +78,10 @@ import tempfile
 import time
 import unicodedata
 
-import numpy as np
+# numpy's BLAS threads (OpenBLAS: OMP_NUM_THREADS otherwise, 8): its few matrix products here (the synth group's
+# reference forward pass) are small, and idle BLAS threads spin next to the runq processes (~20 core-s per run)
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+import numpy as np  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import check_models  # noqa: E402  (groups synth and models: tests/check_models.py)

@@ -37,18 +37,19 @@ struct HttpConn {
     void *app;
 };
 
-static volatile sig_atomic_t g_stop = 0;
+static int g_stop = 0; // (set by the signal handler, read by every thread: atomic loads / stores, lock-free)
 static int g_pipe[2] = { -1, -1 };
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static int g_conns = 0;
 
-int http_shutting_down(void) { return g_stop != 0; }
+static int stopping(void) { return __atomic_load_n(&g_stop, __ATOMIC_ACQUIRE); }
+int http_shutting_down(void) { return stopping(); }
 
 static void on_signal(int sig) {
     (void)sig;
-    if (g_stop) _exit(130); // (a second signal: no more grace)
-    g_stop = 1;
+    if (stopping()) _exit(130); // (a second signal: no more grace)
+    __atomic_store_n(&g_stop, 1, __ATOMIC_RELEASE);
     if (g_pipe[1] >= 0) {
         ssize_t r = write(g_pipe[1], "x", 1);
         (void)r;
@@ -131,7 +132,7 @@ static int fill(HttpConn *c, double deadline, size_t limit) {
         int r = poll(&p, 1, left > 0.2 ? 200 : (int)(left * 1000) + 1);
         if (r < 0 && errno != EINTR) return -1;
         if (r <= 0) {
-            if (g_stop) return -3;
+            if (stopping()) return -3;
             continue;
         }
         ssize_t k = recv(c->fd, c->buf + c->n, limit - c->n, 0);
@@ -345,10 +346,10 @@ static void *conn_main(void *arg) {
         HttpReq r;
         int k = read_request(c, &r);
         if (k <= 0) break;
-        if (g_stop) r.keep_alive = 0;
+        if (stopping()) r.keep_alive = 0;
         c->h(c->app, c, &r);
         free(r.body);
-        if (!r.keep_alive || c->dead || g_stop) break;
+        if (!r.keep_alive || c->dead || stopping()) break;
     }
     shutdown(c->fd, SHUT_WR);
     close(c->fd);
@@ -405,7 +406,7 @@ void http_run(int lfd, const HttpOpts *o, HttpHandler h, void *app) {
     pthread_attr_init(&at);
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     pthread_attr_setstacksize(&at, 256 * 1024);
-    while (!g_stop) {
+    while (!stopping()) {
         struct pollfd p[2] = { { lfd, POLLIN, 0 }, { g_pipe[0], POLLIN, 0 } };
         int r = poll(p, 2, 1000);
         if (r <= 0) continue;

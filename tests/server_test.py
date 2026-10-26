@@ -325,12 +325,13 @@ def run_all(a, t, port, ref, slow, logname):
     s, _, fin, usage, done, err = stream(port, dict(body, stream_options={"include_usage": True}))
     rep(s == text_of(aus) and fin == aus["choices"][0]["finish_reason"] and done and not err and usage
         and usage["completion_tokens"] == aus["usage"]["completion_tokens"], "stream/equals_non_stream", repr(s))
-    stop = {"messages": [{"role": "user", "content": AUS}], "temperature": 0, "max_tokens": 40, "stop": ["Canberra", "zzz"]}
+    word = text_of(aus).split()[-1][:-1] if len(text_of(aus).split()) > 3 else "zzzz"  # (the answer's last word)
+    stop = {"messages": [{"role": "user", "content": AUS}], "temperature": 0, "max_tokens": 40, "stop": ["zzz", word]}
     _, d, _ = chat(port, stop)
     s2, _, fin2, _, _, _ = stream(port, stop)
-    cut = text_of(aus).split("Canberra")[0]
-    rep(text_of(d) == cut == s2 and d["choices"][0]["finish_reason"] == fin2 == "stop" and "Canberra" in text_of(aus),
-        "stream/stop_strings", f"{text_of(d)!r} / {s2!r}")
+    cut = text_of(aus).split(word)[0]
+    rep(text_of(d) == cut == s2 and d["choices"][0]["finish_reason"] == fin2 == "stop" and word in text_of(aus) and cut,
+        "stream/stop_strings", f"stop {word!r}: {text_of(d)!r} / {s2!r}")
     s3, r3, fin3, _, _, _ = stream(port, {"messages": [{"role": "user", "content": MULT}], "temperature": 0, "max_tokens": 24,
                                           "chat_template_kwargs": {"enable_thinking": True}})
     rep(r3 == rs and s3 == "" and fin3 == "length", "stream/thinking", repr(r3[:50]))

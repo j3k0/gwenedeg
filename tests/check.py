@@ -147,9 +147,10 @@ THREADS_PROMPT = "en"
 # VNNI vs generic kernels: (prompt, -b). -b 1 on en: GEMV (decode path, incl. the classifier);
 # -b 7 on en (15 tokens): GEMM tiles of 6 + 1 rows, last chunk 1 row; -b 64 on all (86 tokens,
 # chunks 64 + 22): tiles of 6 + 4 rows, LOGITS_ALL classifier GEMM
-# long on -b 64: attention over 12 KV tiles, causal row blocks in later chunks (generic: C attention)
-KERNEL_CASES = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH), (BATCH_LONG2, BATCH),
-                (BATCH_LONG3, BATCH)]
+# long2 on -b 64 (297 tokens, 5 chunks): attention over 19 KV tiles and past one attention block, causal row
+# blocks in later chunks (generic: C attention). (long, 187 tokens, was a case too until Step 10b: long2 = long +
+# all + code takes the same paths, so it covers it; the generic build's run of long was ~6 core-seconds)
+KERNEL_CASES = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG, BATCH), (BATCH_LONG3, BATCH)]
 THREADS_LONG = 3         # long -b 64: OMP_NUM_THREADS=3 vs the default (other work partitions)
 # GGUF (group size 32): logits vs HF batched on all prompts and sequential on GGUF_SEQ; batched
 # (prompt, -b) vs -b 1 bitwise (2-chunk GEMM tiles and the all-rows classifier: GGUF_KERNELS all_b64);
@@ -749,11 +750,9 @@ def greedy_output(a, args, model=None):
     return p.stdout.decode("utf-8", errors="replace")
 
 
-def test_greedy(a, res):
-    d = os.path.join(GOLDEN, "greedy")
-    os.makedirs(d, exist_ok=True)
-    # all runs at once, 3 at a time (outputs do not depend on the thread count or timing)
-    ex = cf.ThreadPoolExecutor(max_workers=3)
+def greedy_start(a, ex):
+    """the greedy / seeded runs, on ex (from the beginning of the suite; outputs do not depend on the thread
+    count or timing): futures for test_greedy"""
     outs = {}
     for name, args in GREEDY_CASES:
         if (a.update_greedy and "@" in name) or (name.startswith("gguf_") and not a.gguf) or (name.startswith("q4_") and not a.q4):
@@ -762,7 +761,13 @@ def test_greedy(a, res):
     seeded = {c: ex.submit(run, [a.runq, a.model, "-b", str(c)] + SEEDED_ARGS)
               for c in (SEEDED_CHUNKS[:1] if a.update_greedy else SEEDED_CHUNKS)}
     seeded_gen = ex.submit(run, [a.runq, a.model] + SEEDED_GEN_ARGS)
-    ex.shutdown(wait=False)
+    return outs, seeded, seeded_gen
+
+
+def test_greedy(a, res, futs):
+    d = os.path.join(GOLDEN, "greedy")
+    os.makedirs(d, exist_ok=True)
+    outs, seeded, seeded_gen = futs
     for name, args in GREEDY_CASES:
         path = os.path.join(d, name.split("@")[0] + ".txt")  # name@variant: same golden
         if a.update_greedy and "@" in name:
@@ -983,14 +988,17 @@ def chat_case_check(a, tmp, vocab, d, name, args, users, chk, tname, prefix, cha
     return reports
 
 
-def test_chat(a, res, tmp):
+def chat_start(a, tmp, ex):
+    """start the CHAT_CASES on ex (from the beginning of the suite: their runs only need the model)"""
     vocab = load_vocab(a.vocab_model)
     d = os.path.join(GOLDEN, "greedy")
-    with cf.ThreadPoolExecutor(max_workers=3) as ex:
-        futs = [ex.submit(chat_case, a, tmp, vocab, d, *case) for case in CHAT_CASES]
-        for f in futs:
-            for ok, n, detail in f.result():
-                res.report(ok, n, detail)
+    return [ex.submit(chat_case, a, tmp, vocab, d, *case) for case in CHAT_CASES]
+
+
+def test_chat(a, res, futs):
+    for f in futs:
+        for ok, n, detail in f.result():
+            res.report(ok, n, detail)
 
 
 # ----------------------------------------------------------------------------- GGUF
@@ -1007,7 +1015,22 @@ def same_files(pa, pb):
     return False, f"DIFFER (max abs diff {d.max():.3g} at pos {int(d.max(axis=1).argmax())})"
 
 
-def test_gguf(a, res, tmp):
+def templates_start(a, tmp, ex):
+    """chat templates: built into runq for GGUF, read from the .template* side files for the .bin. A 1-turn chat
+    (-n 1) on both: the KV cache ids up to the reply (the rendered prompt) must be equal (same vocab, so the
+    same bytes), and decode to the side file rendering (test_gguf). The runs, started on ex: futures by tag"""
+    def chat_ids(model, tag, args):
+        prefix = os.path.join(tmp, f"tmpl_{tag}")
+        env = dict(os.environ, RUNQ_CHAT_DUMP=prefix, OMP_NUM_THREADS="2")
+        p = subprocess.run([a.runq, model, "-t", "0", "-c", CTX, "-n", "1", "-i", "Hi there"] + args, env=env, capture_output=True)
+        if p.returncode != 0:
+            raise RuntimeError(f"runq chat failed: {p.stderr.decode(errors='replace')[-300:]}")
+        return [int(x) for x in open(prefix + ".ids").read().split()][:-1]  # (minus the 1 reply token)
+    return {f"{name}_{k}": ex.submit(chat_ids, m, f"{name}_{k}", args)
+            for name, args, _ in GGUF_TEMPLATES for k, m in (("bin", a.model), ("gguf", a.gguf))}
+
+
+def test_gguf(a, res, tmp, tmpl):
     if not a.gguf:
         print("      skipped: no GGUF file (--gguf)")
         return
@@ -1038,20 +1061,9 @@ def test_gguf(a, res, tmp):
     else:
         print("      gguf_kernels skipped: no generic build (--generic / RUNQ_GENERIC)")
 
-    # chat templates: built into runq for GGUF, read from the .template* side files for the .bin. A
-    # 1-turn chat (-n 1) on both: the KV cache ids up to the reply (the rendered prompt) must be equal
-    # (same vocab, so the same bytes), and decode to the side file rendering
-    def chat_ids(model, tag, args):
-        prefix = os.path.join(tmp, f"tmpl_{tag}")
-        env = dict(os.environ, RUNQ_CHAT_DUMP=prefix, OMP_NUM_THREADS="2")
-        p = subprocess.run([a.runq, model, "-t", "0", "-c", CTX, "-n", "1", "-i", "Hi there"] + args, env=env, capture_output=True)
-        if p.returncode != 0:
-            raise RuntimeError(f"runq chat failed: {p.stderr.decode(errors='replace')[-300:]}")
-        return [int(x) for x in open(prefix + ".ids").read().split()][:-1]  # (minus the 1 reply token)
+    # chat templates (runs started early: templates_start)
     vocab = load_vocab(a.vocab_model)
-    jobs = [(m, f"{name}_{k}", args) for name, args, _ in GGUF_TEMPLATES for k, m in (("bin", a.model), ("gguf", a.gguf))]
-    with cf.ThreadPoolExecutor(max_workers=4) as ex:
-        ids = dict(zip([j[1] for j in jobs], ex.map(lambda j: chat_ids(*j), jobs)))
+    ids = {k: f.result() for k, f in tmpl.items()}
     for name, args, sfx in GGUF_TEMPLATES:
         with open(a.model + sfx, encoding="utf-8", newline="") as f:
             tmpl = f.read()
@@ -1065,17 +1077,11 @@ def test_gguf(a, res, tmp):
 
 # ----------------------------------------------------------------------------- Q4_K_M
 
-def test_q4(a, res, tmp):
-    if not a.q4:
-        print("      skipped: no Q4_K_M file (--q4)")
-        return
-    q4 = argparse.Namespace(**{**vars(a), "model": a.q4})
+def dequant_start(a, tmp, ex):
+    """dequantization vs gguf-py, bitwise: rows from the file's blocks (embedding lookup) and from the repacked
+    Q4P / Q6P layouts (what the matmul kernels read); the runq -m dequant runs, started on ex (test_q4 checks)"""
     qtmp = os.path.join(tmp, "q4")
     os.makedirs(qtmp, exist_ok=True)
-    texts = dict(batched_prompts())
-    # (the generic build's runs for q4_kernels are prefetched in the background: prefetch_all)
-    # dequantization vs gguf-py, bitwise: rows from the file's blocks (embedding lookup) and from
-    # the repacked Q4P / Q6P layouts (what the matmul kernels read)
     g = np.load(os.path.join(GOLDEN, "dequant", "q4_k_m.npz"))
     def dequant(i):
         name, rows = str(g["names"][i]), g[f"rows{i}"]
@@ -1085,8 +1091,21 @@ def test_q4(a, res, tmp):
             return name, rows, None, p.stderr.decode(errors="replace")[-300:]
         h = np.fromfile(path, dtype=np.int32, count=3)
         return name, rows, np.fromfile(path, dtype=np.float32, offset=12).reshape(1 + int(h[2]), int(h[0]), int(h[1])), ""
-    with cf.ThreadPoolExecutor(max_workers=4) as ex:
-        outs = list(ex.map(dequant, range(len(g["names"]))))
+    return [ex.submit(dequant, i) for i in range(len(g["names"]))]
+
+
+def test_q4(a, res, tmp, deq):
+    if not a.q4:
+        print("      skipped: no Q4_K_M file (--q4)")
+        return
+    q4 = argparse.Namespace(**{**vars(a), "model": a.q4})
+    qtmp = os.path.join(tmp, "q4")
+    os.makedirs(qtmp, exist_ok=True)
+    texts = dict(batched_prompts())
+    # (the generic build's runs for q4_kernels are prefetched in the background: prefetch_all; the dequant
+    # runs started early: dequant_start)
+    g = np.load(os.path.join(GOLDEN, "dequant", "q4_k_m.npz"))
+    outs = [f.result() for f in deq]
     for i, (name, rows, got, err) in enumerate(outs):
         what = f"{str(g[f'type{i}'])} rows {int(g['row0'][i])}..{int(g['row0'][i]) + rows.shape[0] - 1} x {rows.shape[1]}"
         if got is None:
@@ -1185,10 +1204,18 @@ def main():
         only = {"greedy", "chat"}
     with tempfile.TemporaryDirectory(prefix="cwayn-test-") as tmp, \
             cf.ThreadPoolExecutor(max_workers=PREFETCH_JOBS) as fg, cf.ThreadPoolExecutor(max_workers=2) as bg, \
-            cf.ThreadPoolExecutor(max_workers=1) as ax, cf.ThreadPoolExecutor(max_workers=1) as sx, \
-            cf.ThreadPoolExecutor(max_workers=1) as gx:
+            cf.ThreadPoolExecutor(max_workers=2) as ax, cf.ThreadPoolExecutor(max_workers=1) as sx, \
+            cf.ThreadPoolExecutor(max_workers=1) as gx, cf.ThreadPoolExecutor(max_workers=3) as cx, \
+            cf.ThreadPoolExecutor(max_workers=2) as tx:
+        # started first, checked at their group's turn: the server and API tests, the greedy runs, the chat cases,
+        # the GGUF template and Q4_K_M dequant runs (their processes then overlap the logits runs: the suite is
+        # bound by CPU time, and in group order they ran with the CPUs half idle at the end, Step 10b)
         server = server_run(a, sx) if "server" in only and not a.update_greedy else None
         api = api_runs(a, ax, gx) if "api" in only else ({}, {})
+        greedy = greedy_start(a, cx) if "greedy" in only else None
+        chats = chat_start(a, tmp, cx) if "chat" in only else []
+        tmpl = templates_start(a, tmp, tx) if "gguf" in only and a.gguf and not a.update_greedy else {}
+        deq = dequant_start(a, tmp, tx) if "q4" in only and a.q4 and not a.update_greedy else []
         if not a.update_greedy:
             prefetch_all(a, tmp, only, fg, bg)
         for name, fn in [("tokenizer", lambda: test_tokenizer(a, res)),
@@ -1198,10 +1225,10 @@ def main():
                          ("batched", lambda: test_batched(a, res, tmp)),
                          ("threads", lambda: test_threads(a, res, tmp)),
                          ("kernels", lambda: test_kernels(a, res, tmp)),
-                         ("greedy", lambda: test_greedy(a, res)),
-                         ("chat", lambda: test_chat(a, res, tmp)),
-                         ("gguf", lambda: test_gguf(a, res, tmp)),
-                         ("q4", lambda: test_q4(a, res, tmp)),
+                         ("greedy", lambda: test_greedy(a, res, greedy)),
+                         ("chat", lambda: test_chat(a, res, chats)),
+                         ("gguf", lambda: test_gguf(a, res, tmp, tmpl)),
+                         ("q4", lambda: test_q4(a, res, tmp, deq)),
                          ("kv", lambda: test_kv(a, res, tmp)),
                          ("api", lambda: test_api(a, res, api)),
                          ("server", lambda: test_server(a, res, server))]:

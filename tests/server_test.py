@@ -23,11 +23,10 @@ builds). Checks:
              every output parses and validates, the decision step's top_logprobs are the allowed tokens
              only, forced tokens have logprob 0; a nested schema (objects, boolean, integer range,
              optional property, anyOf null, const); the rubric prefix of a second classification cached
-  batch      continuous batching (the server runs --parallel 4 --chunk 16): 5 requests at once (greedy, a system
-             prompt, seeded, thinking, streamed) == runq -m chat; constrained (greedy with logprobs, sampled, nested),
-             free with logprobs, a stream with a stop string, 7 at once == each alone (text and logprobs); three
-             requests joining a running stream; a client leaving mid-stream (499) while three others run: theirs
-             unchanged; four requests sharing a new system prompt at once (the first prefills it, the others wait
+  batch      continuous batching (the server runs --parallel 4 --chunk 16): constrained (greedy with logprobs,
+             sampled, nested), free with logprobs, a stream with a stop string, seeded, 7 at once == each alone (text
+             and logprobs); three requests (greedy with a system prompt, seeded, thinking) joining a running stream ==
+             runq -m chat; a client leaving mid-stream (499) while three others (greedy, seeded) run == runq -m chat; four requests sharing a new system prompt at once (the first prefills it, the others wait
              and copy it from its slot: cached_tokens) == the same with cache_prompt: false
   errors     malformed JSON, invalid UTF-8, missing / empty messages, bad role, n = 2, bad schema,
              json_object, out-of-range parameters, context too long (code context_length_exceeded),
@@ -405,12 +404,6 @@ def run_all(a, t, port, ref, slow, logname):
         """[aus, pirate, cats, think] results (status, body) == the CLI's text (thinking: the reasoning seen alone)"""
         return ([x[0] for x in r] == [200] * 4 and [text_of(x[1]) + "\n" for x in r[:3]] == [want["aus"], want["pirate"], want["cats"]]
                 and r[3][1]["choices"][0]["message"].get("reasoning_content") == rs)
-    r = conc([lambda: chat(port, B_AUS), lambda: chat(port, B_PIRATE), lambda: chat(port, B_CATS), lambda: chat(port, B_THINK),
-              lambda: stream(port, B_AUS)])
-    rep(cli_ok(r[:4]) and r[4][0] == text_of(aus), "batch/concurrent_eq_cli",
-        "greedy, system prompt, seeded, thinking, streamed: 5 at once == runq -m chat" if cli_ok(r[:4]) else
-        f"{[text_of(x[1]) for x in r[:4]]!r}")
-
     # mixed: constrained (greedy with logprobs, sampled), free with logprobs, a stream with a stop string, at once
     def cls(prompt, rf, **kw):
         return lambda: classify(prompt, rf, **kw)

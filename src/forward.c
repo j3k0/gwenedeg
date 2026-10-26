@@ -1984,9 +1984,9 @@ static int batch_decode(RqCtx *c, int n, int nsel, float *out) {
 
 int rq_forward_batch(RqCtx *c, const RqSegment *sg, int nseg, float *out, float **logits) {
     // One batched pass over the rows of nseg segments: the same computation per row as rq_decode on
-    // its sequence, with every weight matrix applied to all rows at once (GEMM work items), and
-    // bit-identical results. Fills the KV caches. One parallel job (prefill_worker), in phases
-    // (threads.h)
+    // its sequence, with every weight matrix applied to all rows at once (GEMM / small-batch work
+    // items), and bit-identical results. Fills the KV caches. One parallel job in phases (threads.h):
+    // batch_decode_worker if every segment is one row (decode rows, up to bd_max), else prefill_worker
     const RqModel *m = c->m;
     const Config *p = &m->config;
     int ar = m->att_rows, n = 0, ntile = 0, nrb = 0, nsel = 0, any_all = 0;

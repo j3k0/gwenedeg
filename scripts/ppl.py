@@ -4,6 +4,8 @@
 Usage: .venv/bin/python scripts/ppl.py TEXT [--hf] [--runq] [--runq-model M ...] [--mynah GGUF ...] [-w 512] [-t 8]
   (no engine flag = all: --hf --runq and mynah-slm on the Q8_0 and Q4_K_M GGUFs if built)
   --runq-model: checkpoints for runq (.bin or GGUF; repeatable; default the Q8_0 .bin), implies --runq
+  --hf-dir: the HF model (tokenizer, --hf; default models/Qwen3-0.6B; Qwen3.5: models/Qwen3.5-0.8B with
+  .venv-hf5's transformers 5.x)
 
 Two protocols, both teacher-forced, raw text (no chat template, no BOS: Qwen3 has none):
   full   the whole text as one sequence, every token after the first scored (N-1 predictions).
@@ -37,11 +39,11 @@ def nll_from_logits(logits, ids):
     return total
 
 
-def hf_engine(threads):
+def hf_engine(threads, hf_dir):
     import torch
     from transformers import AutoModelForCausalLM
     torch.set_num_threads(threads)
-    model = AutoModelForCausalLM.from_pretrained(HF_DIR, torch_dtype=torch.float32,
+    model = AutoModelForCausalLM.from_pretrained(hf_dir, torch_dtype=torch.float32,
                                                  attn_implementation="eager", local_files_only=True)
     model.eval()
 
@@ -108,6 +110,7 @@ def main():
     ap.add_argument("-t", "--threads", type=int, default=8)
     ap.add_argument("--runq-bin", default=os.path.join(ROOT, "runq"))
     ap.add_argument("--no-full", action="store_true", help="only the windowed protocol")
+    ap.add_argument("--hf-dir", default=HF_DIR, help="HF model directory (tokenizer; --hf)")
     a = ap.parse_args()
     if a.runq_model:
         a.runq = True
@@ -118,7 +121,7 @@ def main():
         a.mynah = [os.path.join(GGUF_DIR, f) for f in ("Qwen3-0.6B-Q8_0.gguf", "Qwen3-0.6B-Q4_K_M.gguf")]
 
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(HF_DIR, local_files_only=True)
+    tok = AutoTokenizer.from_pretrained(a.hf_dir, local_files_only=True)
     text = open(a.text, encoding="utf-8").read()
     ids = tok.encode(text, add_special_tokens=False)
     W = a.window
@@ -129,7 +132,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix="gwenedeg-ppl-")
     engines = []
     if a.hf:
-        engines.append(("HF fp32", "hf", hf_engine(a.threads)))
+        engines.append(("HF fp32", "hf", hf_engine(a.threads, a.hf_dir)))
     for m in (a.runq_model or [Q8BIN]) if a.runq else []:
         engines.append((f"runq {os.path.basename(m)}", "runq", runq_engine(tmp, a.threads, a.runq_bin, m)))
     for g in a.mynah or []:

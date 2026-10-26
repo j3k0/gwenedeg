@@ -225,37 +225,81 @@ const uint8_t *gguf_weight(const Gguf *g, const char *name, uint32_t type, uint6
     return g->map + t->off;
 }
 
-void gguf_config(const Gguf *g, Config *c, float *rope_theta) {
-    // the hyperparameters from the metadata (llama.cpp's qwen3 keys), checked against what this
+void gguf_config(const Gguf *g, Config *c, float *rope_theta, int *rope_dim, Hybrid *hy) {
+    // the hyperparameters from the metadata (llama.cpp's qwen3 / qwen35 keys), checked against what this
     // engine implements: Qwen3 (any RoPE theta: 1e6, the 2507 models 5e6; no RoPE scaling) with RMSNorm
-    // eps 1e-6 (the constant in rmsnorm); Q8_0 / Q4_K / Q6_K weights (gguf_matrices)
+    // eps 1e-6 (the constant in rmsnorm); Q8_0 / Q4_K / Q6_K weights (gguf_matrices). Qwen3.5 (qwen35, the
+    // hybrid layers: docs/qwen35.md): also the linear-attention shapes (ssm.*), the attention layer interval
+    // and the partial RoPE (rope.dimension_count); key heads == value heads only (the 0.8B; the converter
+    // reorders the value heads of the bigger models, not checked yet)
     uint64_t n;
     const char *arch = gguf_get_str(g, "general.architecture", &n);
-    if (!arch || n != 5 || memcmp(arch, "qwen3", 5)) {
+    int q35 = arch && n == 6 && !memcmp(arch, "qwen35", 6);
+    if (!q35 && (!arch || n != 5 || memcmp(arch, "qwen3", 5))) {
         char a[40];
         snprintf(a, sizeof(a), "%.*s", arch ? (int)(n < 32 ? n : 32) : 6, arch ? arch : "(none)");
-        gguf_fail(g, "architecture '%s' is not supported (need qwen3)", a);
+        gguf_fail(g, "architecture '%s' is not supported (need qwen3 or qwen35)", a);
     }
-    const char *keys[] = { "qwen3.block_count", "qwen3.embedding_length", "qwen3.feed_forward_length",
-                           "qwen3.attention.head_count", "qwen3.attention.head_count_kv", "qwen3.context_length",
-                           "qwen3.attention.key_length", "qwen3.attention.value_length" };
+    const char *A = q35 ? "qwen35" : "qwen3";
+    char key[96];
+    const char *names[] = { "block_count", "embedding_length", "feed_forward_length", "attention.head_count",
+                            "attention.head_count_kv", "context_length", "attention.key_length", "attention.value_length" };
     int64_t v[8];
     for (int i = 0; i < 8; i++) {
-        if (!gguf_get_int(g, keys[i], &v[i])) {
-            if (i < 6) gguf_fail(g, "metadata %s missing", keys[i]);
+        snprintf(key, sizeof(key), "%s.%s", A, names[i]);
+        if (!gguf_get_int(g, key, &v[i])) {
+            if (i < 6) gguf_fail(g, "metadata %s missing", key);
             v[i] = i == 6 ? v[1] / (v[3] ? v[3] : 1) : v[6]; // llama.cpp's defaults: dim / heads
         }
-        if (v[i] < 1 || v[i] > (1 << 20)) gguf_fail(g, "metadata %s out of range", keys[i]);
+        if (v[i] < 1 || v[i] > (1 << 20)) gguf_fail(g, "metadata %s out of range", key);
     }
     float theta = 0, eps = 0;
-    if (!gguf_get_float(g, "qwen3.rope.freq_base", &theta) || !(theta >= 1e3f && theta <= 1e9f))
-        gguf_fail(g, "qwen3.rope.freq_base missing or out of range (1e3 .. 1e9)%s", NULL);
-    if (!gguf_get_float(g, "qwen3.attention.layer_norm_rms_epsilon", &eps) || eps != 1e-6f)
-        gguf_fail(g, "qwen3.attention.layer_norm_rms_epsilon must be 1e-6 (the engine's RMSNorm)%s", NULL);
-    const char *rs = gguf_get_str(g, "qwen3.rope.scaling.type", &n);
+    snprintf(key, sizeof(key), "%s.rope.freq_base", A);
+    if (!gguf_get_float(g, key, &theta) || !(theta >= 1e3f && theta <= 1e9f))
+        gguf_fail(g, "%s missing or out of range (1e3 .. 1e9)", key);
+    snprintf(key, sizeof(key), "%s.attention.layer_norm_rms_epsilon", A);
+    if (!gguf_get_float(g, key, &eps) || eps != 1e-6f) gguf_fail(g, "%s must be 1e-6 (the engine's RMSNorm)", key);
+    snprintf(key, sizeof(key), "%s.rope.scaling.type", A);
+    const char *rs = gguf_get_str(g, key, &n);
     if (rs && !(n == 4 && !memcmp(rs, "none", 4))) gguf_fail(g, "RoPE scaling is not supported%s", NULL);
     if (v[6] != v[7]) gguf_fail(g, "attention key_length != value_length is not supported%s", NULL);
     if (v[3] % v[4]) gguf_fail(g, "head_count is not a multiple of head_count_kv%s", NULL);
+    // the rotated dims per head (llama.cpp's n_rot; Qwen3: all of them, Qwen3.5: 64 of 256). (Qwen3.5's
+    // rope.dimension_sections, MRoPE: with text the three position ids are equal, which makes it this
+    // plain partial RoPE; images are not supported)
+    int64_t rd = v[6];
+    snprintf(key, sizeof(key), "%s.rope.dimension_count", A);
+    if (gguf_get_int(g, key, &rd) && (rd < 2 || rd > v[6] || rd % 2))
+        gguf_fail(g, "%s must be even and at most the head dimension", key);
+    memset(hy, 0, sizeof(*hy));
+    if (q35) {
+        const char *sk[] = { "ssm.conv_kernel", "ssm.state_size", "ssm.group_count", "ssm.time_step_rank", "ssm.inner_size",
+                             "full_attention_interval" };
+        int64_t sv[6];
+        for (int i = 0; i < 6; i++) {
+            snprintf(key, sizeof(key), "%s.%s", A, sk[i]);
+            if (!gguf_get_int(g, key, &sv[i])) gguf_fail(g, "metadata %s missing", key);
+            if (sv[i] < 1 || sv[i] > (1 << 16)) gguf_fail(g, "metadata %s out of range", key);
+        }
+        hy->on = 1;
+        hy->conv = (int)sv[0];
+        hy->dk = (int)sv[1];
+        hy->nk = (int)sv[2];
+        hy->nv = (int)sv[3];
+        hy->interval = (int)sv[5];
+        if (sv[4] % sv[3]) gguf_fail(g, "ssm.inner_size is not a multiple of ssm.time_step_rank%s", NULL);
+        hy->dv = (int)(sv[4] / sv[3]);
+        if (hy->nk != hy->nv)
+            gguf_fail(g, "linear attention with key heads != value heads is not supported yet (Qwen3.5 0.8B only)%s", NULL);
+        // (the kernels: head slices in whole activation groups of 32 and vector widths of 16)
+        if (hy->conv < 2 || hy->conv > 8 || hy->dk % 16 || hy->dv % 32 || hy->dk > 512 || hy->dv > 512)
+            gguf_fail(g, "unsupported linear attention shape (conv kernel 2..8, head dims multiples of 16 / 32, <= 512)%s", NULL);
+        hy->conv_dim = 2 * hy->nk * hy->dk + hy->nv * hy->dv;
+        hy->vdim = hy->nv * hy->dv;
+        for (int l = 0; l < v[0]; l++)
+            hy->n_lin += (l + 1) % hy->interval != 0;
+        if (hy->n_lin == v[0]) gguf_fail(g, "no attention layer (full_attention_interval > block_count)%s", NULL);
+    }
     const GgufTensor *emb = gguf_tensor(g, "token_embd.weight");
     if (!emb || emb->n_dims != 2 || emb->ne[0] != (uint64_t)v[1] || emb->ne[1] > (1 << 24))
         gguf_fail(g, "tensor token_embd.weight missing or not [embedding_length, vocab]%s", NULL);
@@ -273,6 +317,7 @@ void gguf_config(const Gguf *g, Config *c, float *rope_theta) {
     c->shared_classifier = gguf_tensor(g, "output.weight") == NULL; // absent: tied to token_embd
     c->group_size = 32; // activation groups: Q8_0 blocks, Q4_K sub-blocks, 2 Q6_K sub-blocks
     *rope_theta = theta;
+    *rope_dim = (int)rd;
 }
 
 static int has_text(const char *s, uint64_t n, const char *pat) {
@@ -290,8 +335,11 @@ int gguf_chat_variant(const Gguf *g) {
     //     when thinking is off
     //   thinking only (Qwen3-*-Thinking-2507): '<|im_start|>assistant\n<think>\n', no enable_thinking
     //   instruct (Qwen3-*-Instruct-2507): '<|im_start|>assistant\n', no think block at all
-    // Absent, or not a ChatML template: hybrid (the built-in templates, as before)
+    // Absent, or not a ChatML template: hybrid (the built-in templates, as before). A qwen35 file: Qwen3.5's
+    // (its template has enable_thinking too, but thinking off by default and Thinking-2507's "<think>\n" when on)
     uint64_t n = 0;
+    const char *arch = gguf_get_str(g, "general.architecture", &n);
+    if (arch && n == 6 && !memcmp(arch, "qwen35", 6)) return RQ_CHAT_QWEN35; // (by architecture: one template)
     const char *t = gguf_get_str(g, "tokenizer.chat_template", &n);
     if (!t || !has_text(t, n, "<|im_start|>") || has_text(t, n, "enable_thinking")) return RQ_CHAT_HYBRID;
     if (has_text(t, n, "<|im_start|>assistant\\n<think>\\n'") || has_text(t, n, "<|im_start|>assistant\n<think>\n'") ||

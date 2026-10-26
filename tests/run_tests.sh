@@ -32,6 +32,12 @@ if [[ -n "$Q4" && ! -f "$Q4" ]]; then
     Q4=""
 fi
 
+Q35="${Q35-models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf}"
+if [[ -n "$Q35" && ! -f "$Q35" ]]; then
+    echo "note: $Q35 not found, skipping the Qwen3.5 tests (scripts/download_models.py 3.5-0.8b-q8)" >&2
+    Q35=""
+fi
+
 API_TEST=""
 if [[ -z "${RUNQ:-}" ]]; then
     make -s -j8 runq runq-generic api-test
@@ -53,4 +59,4 @@ for x in "$@"; do
 done
 set -- "${ARGS[@]+"${ARGS[@]}"}"
 exec "${PY[@]}" tests/check.py --runq "$RUNQ" --generic "${RUNQ_GENERIC:-}" --model "$MODEL" --gguf "$GGUF" --q4 "$Q4" \
-    --api-test "$API_TEST" "$@"
+    --api-test "$API_TEST" --q35 "$Q35" "$@"

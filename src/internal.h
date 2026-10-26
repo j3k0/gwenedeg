@@ -4,7 +4,7 @@
  *   forward.c    RqSeq, RqCtx and every numeric part of the forward passes (decode, batched
  *                prefill, attention and matmul dispatch, quantization, norms); one translation unit
  *                so that the -Ofast code generation of the exact arithmetic stays as measured
- *   tokenizer.c  the BPE tokenizer (HF-compatible: added tokens, NFC, Qwen2 pre-tokenizer), detok
+ *   tokenizer.c  the BPE tokenizer (HF-compatible: added tokens, NFC, Qwen2 / Qwen3.5 pre-tokenizer), detok
  *   sampler.c    greedy / top-p sampling
  *   chat.c       chat template rendering, the generation loop (rq_generate)
  *   threads.c    the thread pool (threads.h: phase synchronization)
@@ -49,6 +49,9 @@ extern int GS;
 // within noise of 512. The chunk buffers take ~58 KB per row (~30 MB at 512)
 #define B_MAX RQ_BATCH_MAX
 
+// Qwen3.5: recurrent-state checkpoints per sequence (rq_seq_checkpoint_at)
+#define RQ_SEQ_CK 2
+
 // KV cache element type: fp32, bf16 or f16 (16-bit: half the bytes; layouts in kernels_avx512.h)
 enum { KV_F32 = RQ_KV_F32, KV_BF16 = RQ_KV_BF16, KV_F16 = RQ_KV_F16 };
 
@@ -71,6 +74,19 @@ typedef struct {
 } Config;
 #define BIN_MAGIC 0x616a6331
 
+// Qwen3.5 (GGUF qwen35, docs/qwen35.md): the shapes of the hybrid layers (all 0 for Qwen3). Layer l is a
+// gated full-attention layer if (l + 1) % interval == 0, else a linear-attention (Gated DeltaNet) layer
+typedef struct {
+    int on;        // a hybrid model: linear-attention layers, gated attention ([q | gate] per head in attn_q)
+    int interval;  // full_attention_interval
+    int conv;      // causal conv kernel (ssm.conv_kernel: 4); the state keeps the last conv - 1 inputs
+    int dk, nk;    // key head dim (ssm.state_size: 128), key heads (ssm.group_count: 16)
+    int dv, nv;    // value head dim (ssm.inner_size / nv: 128), value heads (ssm.time_step_rank: 16; == nk)
+    int conv_dim;  // 2 nk dk + nv dv: the qkv projection rows = the conv channels [q | k | v] (6144)
+    int vdim;      // nv dv: the output gate z and the input of the output projection (2048)
+    int n_lin;     // linear-attention layers (18 of 24)
+} Hybrid;
+
 typedef struct {
     int8_t *q;    // quantized values
     float *s; // scaling factors
@@ -84,18 +100,19 @@ typedef struct {
 } QuantizedTensor;
 
 typedef struct {
+    // (attention weights are per attention layer, RqModel.kv_layer: every layer for Qwen3, 6 of 24 for Qwen3.5)
     // token embedding table
     QuantizedTensor *q_tokens; // (vocab_size, dim); rows dequantized at lookup (embed_row)
     // weights for rmsnorms
     float *rms_att_weight; // (layer, dim) rmsnorm weights
     float *rms_ffn_weight; // (layer, dim)
     // weights for matmuls. note dim == n_heads * head_size
-    QuantizedTensor *wq; // (layer, dim, n_heads * head_size)
+    QuantizedTensor *wq; // (layer, dim, n_heads * head_size); Qwen3.5: (layer, dim, n_heads * 2 head_size), [q | gate] per head
     QuantizedTensor *wk; // (layer, dim, n_kv_heads * head_size)
     QuantizedTensor *wv; // (layer, dim, n_kv_heads * head_size)
     QuantizedTensor *wo; // (layer, n_heads * head_size, dim)
     // QK-RMSNorm for Qwen3
-    float *q_norm_weights;
+    float *q_norm_weights; // (layer, head_dim)
     float *k_norm_weights;
     // weights for ffn
     QuantizedTensor *w1; // (layer, hidden_dim, dim)
@@ -105,6 +122,16 @@ typedef struct {
     float *rms_final_weight; // (dim,)
     // (optional) classifier weights for the logits, on the last layer
     QuantizedTensor *wcls;
+    // Qwen3.5's linear-attention layers (per linear layer, RqModel.lin_layer; NULL for Qwen3); Hybrid shapes
+    QuantizedTensor *wqkv; // (conv_dim, dim): the q / k / v projection, the conv's input
+    QuantizedTensor *wz;   // (vdim, dim): the output gate z
+    QuantizedTensor *wa;   // (nv, dim): alpha, the decay's input
+    QuantizedTensor *wb;   // (nv, dim): beta
+    QuantizedTensor *wso;  // (dim, vdim): the output projection
+    float *ssm_conv;       // (conv, conv_dim): the conv kernel, tap-major (the GGUF's (conv_dim, conv) transposed)
+    float *ssm_a;          // (nv): -exp(A_log)
+    float *ssm_dt;         // (nv): the dt bias
+    float *ssm_norm;       // (dv): the gated RMSNorm's weight (shared by the heads)
     // one allocation holding the matmul weights converted at load (prepare_weights): VNNI build:
     // repacked (QuantizedTensor.p); generic kernels on a GGUF file: q / s arrays; else NULL
     uint8_t *packed;
@@ -156,6 +183,7 @@ typedef struct {
     int *added;             // added tokens (special or not), longest first
     int n_added;
     unsigned char added_first[256]; // 1 if some added token starts with this byte
+    int marks35;            // pre-tokenizer: Qwen3.5's regex (tokenizer.ggml.pre qwen35: \p{M} joins letters), else Qwen2's
 } Tokenizer;
 
 #define TMPL_MAX 1024 // bytes of a chat template (the .bin's .template* files are read up to this)
@@ -179,6 +207,13 @@ struct RqModel {
     float att_scale;            // 1 / sqrt(head_dim)
     float rope_theta;           // RoPE base (GGUF qwen3.rope.freq_base: Qwen3 1e6, the 2507 models 5e6; .bin 1e6)
     float rope_log_theta;       // (float)ln(rope_theta), the form rope_row uses
+    int rope_dim;               // rotated dims per head (Qwen3: head_dim; Qwen3.5: 64 of 256, the rest passes through)
+    Hybrid hy;                  // Qwen3.5's hybrid layers (hy.on), else all 0
+    int n_attn;                 // attention layers: the KV cache's layers (Qwen3: n_layers)
+    int *kv_layer;              // [n_layers]: the layer's attention layer index (KV cache, attention weights), or -1
+    int *lin_layer;             // [n_layers]: the layer's linear-attention layer index (state, weights), or -1
+    int qh;                     // rows of wq per head: head_dim, Qwen3.5 2 x head_dim ([q | gate])
+    size_t ssm_layer;           // floats of one linear layer's state in a sequence (conv inputs + S per head)
     int ctx_max;                // the model's context length (metadata) before the ctx_len cap
     int chat;                   // chat template variant (RQ_CHAT_*): from the GGUF's tokenizer.chat_template
     // chat templates per thinking mode (0 off, 1 on): the user turn + assistant header with one %s
@@ -197,7 +232,7 @@ const char *gguf_get_str(const Gguf *g, const char *key, uint64_t *len);
 const GgufKV *gguf_get_array(const Gguf *g, const char *key, uint32_t type);
 const GgufTensor *gguf_tensor(const Gguf *g, const char *name);
 const uint8_t *gguf_weight(const Gguf *g, const char *name, uint32_t type, uint64_t ne0, uint64_t ne1);
-void gguf_config(const Gguf *g, Config *c, float *rope_theta);
+void gguf_config(const Gguf *g, Config *c, float *rope_theta, int *rope_dim, Hybrid *hy);
 int gguf_chat_variant(const Gguf *g); // RQ_CHAT_* from tokenizer.chat_template (hybrid if absent / unknown)
 // model.c
 const char *chat_gen_suffix(const RqModel *m, int thinking); // after the assistant header (the variant's)
@@ -236,6 +271,15 @@ struct RqSeq {
     void *value_cache;  // (layer, kv_len, kv_dim)
     int len;            // positions in the cache
     int *tokens;        // [cap]: the token at each position
+    // Qwen3.5: the recurrent state of the linear-attention layers after position len - 1 (it cannot be rewound),
+    // per linear layer RqModel.ssm_layer floats: the last conv - 1 inputs of the conv (conv - 1, conv_dim), then
+    // per value head S (dk, dv); and a few checkpoints of it (position + copy), for truncate / copy to an
+    // earlier length (forward.c, rq_seq_checkpoint_at)
+    float *ssm;
+    size_t ssm_bytes;
+    struct { int pos; float *st; } ck[RQ_SEQ_CK];
+    int ck_at;          // a checkpoint to take when the sequence reaches this length (0: none)
+    int ck_slot;        // the checkpoint slot being written by the pass in progress (-1: none)
     unsigned long long rng; // sampling (xorshift)
 };
 

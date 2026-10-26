@@ -491,8 +491,8 @@ def first_diff(a, b):
 
 # ----------------------------------------------------------------------------- tokenizer
 
-def test_tokenizer(a, res, prefix="tokenizer"):
-    with open(os.path.join(GOLDEN, "tokenizer.json"), encoding="utf-8") as f:
+def test_tokenizer(a, res, prefix="tokenizer", golden="tokenizer.json"):
+    with open(os.path.join(GOLDEN, golden), encoding="utf-8") as f:
         cases = json.load(f)["cases"]
     with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
         outs = list(ex.map(lambda c: runq_tokenize(a, c["text"]), cases))
@@ -847,9 +847,26 @@ def test_greedy(a, res, futs):
 
 # ----------------------------------------------------------------------------- chat (multi-turn)
 
+def gguf_vocab(path):
+    """token bytes from a GGUF's tokenizer metadata: normal tokens through GPT-2's byte-to-unicode map, control /
+    user-defined (added) tokens as their UTF-8 text, unused ones empty"""
+    bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+    cs = bs[:] + [256 + i for i in range(256 - len(bs))]
+    bs += [b for b in range(256) if b not in bs]
+    dec = {chr(c): b for b, c in zip(bs, cs)}
+    f = check_models.G.GgufFile(path)
+    out = []
+    for t, ty in zip(f.kv["tokenizer.ggml.tokens"], f.kv["tokenizer.ggml.token_type"]):
+        s = t.decode("utf-8")
+        out.append(bytes(dec[ch] for ch in s) if ty == 1 else s.encode() if ty in (3, 4) else b"")
+    return out
+
+
 def load_vocab(model):
     """token bytes from the .tokenizer file (header: 3 x u32; per token: f32 score, i32 len, bytes) of
-    the .bin model (also for GGUF runs: its tokens decode to the same bytes)"""
+    the .bin model (also for GGUF runs: its tokens decode to the same bytes); a .gguf path: its metadata"""
+    if model.endswith(".gguf"):
+        return gguf_vocab(model)
     with open(model + ".tokenizer", "rb") as f:
         data = f.read()
     vocab, off = [], 12
@@ -1200,7 +1217,8 @@ def main():
     ap.add_argument("--gguf", default="", help="GGUF Q8_0 file for the gguf tests and greedy goldens (empty: skip)")
     ap.add_argument("--q4", default="", help="GGUF Q4_K_M file for the q4 tests and greedy goldens (empty: skip)")
     ap.add_argument("--api-test", default="", help="tests/api_test binary for the api group (empty: skip)")
-    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv,api,server,synth",
+    ap.add_argument("--q35", default="", help="Qwen3.5-0.8B Q8_0 GGUF for the q35 group (empty: skip)")
+    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv,api,server,synth,q35",
                     help="comma-separated subset of tests to run (models: the bigger Qwen3 models, opt-in)")
     ap.add_argument("--update-models", action="store_true", help="write the models group's greedy goldens")
     ap.add_argument("--update-greedy", action="store_true", help="regenerate the greedy goldens")
@@ -1219,7 +1237,8 @@ def main():
             cf.ThreadPoolExecutor(max_workers=PREFETCH_JOBS) as fg, cf.ThreadPoolExecutor(max_workers=2) as bg, \
             cf.ThreadPoolExecutor(max_workers=2) as ax, cf.ThreadPoolExecutor(max_workers=1) as sx, \
             cf.ThreadPoolExecutor(max_workers=1) as gx, cf.ThreadPoolExecutor(max_workers=3) as cx, \
-            cf.ThreadPoolExecutor(max_workers=2) as tx, cf.ThreadPoolExecutor(max_workers=2) as yx:
+            cf.ThreadPoolExecutor(max_workers=2) as tx, cf.ThreadPoolExecutor(max_workers=2) as yx, \
+            cf.ThreadPoolExecutor(max_workers=1) as qx:
         # started first, checked at their group's turn: the server and API tests, the greedy runs, the chat cases,
         # the GGUF template and Q4_K_M dequant runs (their processes then overlap the logits runs: the suite is
         # bound by CPU time, and in group order they ran with the CPUs half idle at the end, Step 10b)
@@ -1231,6 +1250,8 @@ def main():
         deq = dequant_start(a, tmp, tx) if "q4" in only and a.q4 and not a.update_greedy else []
         texts = dict(batched_prompts())
         synth = check_models.synth_start(a, tmp, yx, bg, texts) if "synth" in only and not a.update_greedy else None
+        q35 = check_models.q35_start(a, tmp, cx, qx, dict(batched_prompts()), test_tokenizer, chat_case, load_vocab) \
+            if "q35" in only and not a.update_greedy else None
         if not a.update_greedy:
             prefetch_all(a, tmp, only, fg, bg)
         for name, fn in [("tokenizer", lambda: test_tokenizer(a, res)),
@@ -1248,6 +1269,7 @@ def main():
                          ("api", lambda: test_api(a, res, api)),
                          ("server", lambda: test_server(a, res, server)),
                          ("synth", lambda: check_models.test_synth(a, res, synth, texts)),
+                         ("q35", lambda: check_models.test_q35(a, res, tmp, texts, q35)),
                          ("models", lambda: check_models.test_models(a, res, tmp, texts, a.update_models))]:
             if name in only:
                 t = time.time()

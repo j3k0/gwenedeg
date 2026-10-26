@@ -2,10 +2,14 @@
  "meta": {
   "transformers": "4.53.0",
   "tokenizer": "models/Qwen3-0.6B",
+  "tokenizers": {
+   "qwen3.5": "models/Qwen3.5-0.8B"
+  },
   "templates": {
    "qwen3": "tests/golden/templates/qwen3.jinja",
    "instruct-2507": "tests/golden/templates/instruct-2507.jinja",
-   "thinking-2507": "tests/golden/templates/thinking-2507.jinja"
+   "thinking-2507": "tests/golden/templates/thinking-2507.jinja",
+   "qwen3.5": "tests/golden/templates/qwen3.5.jinja"
   }
  },
  "cases": [
@@ -283,6 +287,80 @@
   },
   {
    "variant": "qwen3",
+   "thinking": 0,
+   "name": "spaces",
+   "messages": [
+    {
+     "role": "system",
+     "content": "  Be brief.\n"
+    },
+    {
+     "role": "user",
+     "content": "　Hi! \n"
+    },
+    {
+     "role": "assistant",
+     "content": " Hello.\n"
+    },
+    {
+     "role": "user",
+     "content": "\tAnd now? "
+    }
+   ],
+   "text": "<|im_start|>system\n  Be brief.\n<|im_end|>\n<|im_start|>user\n　Hi! \n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n Hello.\n<|im_end|>\n<|im_start|>user\n\tAnd now? <|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "ids": [
+    151644,
+    8948,
+    198,
+    220,
+    2823,
+    9814,
+    624,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    22441,
+    13048,
+    0,
+    715,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    151667,
+    271,
+    151668,
+    271,
+    21927,
+    624,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    197,
+    3036,
+    1431,
+    30,
+    220,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    151667,
+    271,
+    151668,
+    271
+   ],
+   "hf": false,
+   "hf_text": "<|im_start|>system\n  Be brief.\n<|im_end|>\n<|im_start|>user\n　Hi! \n<|im_end|>\n<|im_start|>assistant\n Hello.\n<|im_end|>\n<|im_start|>user\n\tAnd now? <|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "variant": "qwen3",
    "thinking": 1,
    "name": "one_turn",
    "messages": [
@@ -514,6 +592,71 @@
    "hf": true
   },
   {
+   "variant": "qwen3",
+   "thinking": 1,
+   "name": "spaces",
+   "messages": [
+    {
+     "role": "system",
+     "content": "  Be brief.\n"
+    },
+    {
+     "role": "user",
+     "content": "　Hi! \n"
+    },
+    {
+     "role": "assistant",
+     "content": " Hello.\n"
+    },
+    {
+     "role": "user",
+     "content": "\tAnd now? "
+    }
+   ],
+   "text": "<|im_start|>system\n  Be brief.\n<|im_end|>\n<|im_start|>user\n　Hi! \n<|im_end|>\n<|im_start|>assistant\n Hello.\n<|im_end|>\n<|im_start|>user\n\tAnd now? <|im_end|>\n<|im_start|>assistant\n",
+   "ids": [
+    151644,
+    8948,
+    198,
+    220,
+    2823,
+    9814,
+    624,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    22441,
+    13048,
+    0,
+    715,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    21927,
+    624,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    197,
+    3036,
+    1431,
+    30,
+    220,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+   ],
+   "hf": true
+  },
+  {
    "variant": "instruct-2507",
    "thinking": 0,
    "name": "one_turn",
@@ -757,6 +900,71 @@
   },
   {
    "variant": "instruct-2507",
+   "thinking": 0,
+   "name": "spaces",
+   "messages": [
+    {
+     "role": "system",
+     "content": "  Be brief.\n"
+    },
+    {
+     "role": "user",
+     "content": "　Hi! \n"
+    },
+    {
+     "role": "assistant",
+     "content": " Hello.\n"
+    },
+    {
+     "role": "user",
+     "content": "\tAnd now? "
+    }
+   ],
+   "text": "<|im_start|>system\n  Be brief.\n<|im_end|>\n<|im_start|>user\n　Hi! \n<|im_end|>\n<|im_start|>assistant\n Hello.\n<|im_end|>\n<|im_start|>user\n\tAnd now? <|im_end|>\n<|im_start|>assistant\n",
+   "ids": [
+    151644,
+    8948,
+    198,
+    220,
+    2823,
+    9814,
+    624,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    22441,
+    13048,
+    0,
+    715,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    21927,
+    624,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    197,
+    3036,
+    1431,
+    30,
+    220,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+   ],
+   "hf": true
+  },
+  {
+   "variant": "instruct-2507",
    "thinking": 1,
    "name": "one_turn",
    "messages": [
@@ -989,6 +1197,71 @@
     39752,
     76322,
     13,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+   ],
+   "hf": true
+  },
+  {
+   "variant": "instruct-2507",
+   "thinking": 1,
+   "name": "spaces",
+   "messages": [
+    {
+     "role": "system",
+     "content": "  Be brief.\n"
+    },
+    {
+     "role": "user",
+     "content": "　Hi! \n"
+    },
+    {
+     "role": "assistant",
+     "content": " Hello.\n"
+    },
+    {
+     "role": "user",
+     "content": "\tAnd now? "
+    }
+   ],
+   "text": "<|im_start|>system\n  Be brief.\n<|im_end|>\n<|im_start|>user\n　Hi! \n<|im_end|>\n<|im_start|>assistant\n Hello.\n<|im_end|>\n<|im_start|>user\n\tAnd now? <|im_end|>\n<|im_start|>assistant\n",
+   "ids": [
+    151644,
+    8948,
+    198,
+    220,
+    2823,
+    9814,
+    624,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    22441,
+    13048,
+    0,
+    715,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    21927,
+    624,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    197,
+    3036,
+    1431,
+    30,
+    220,
     151645,
     198,
     151644,
@@ -1274,6 +1547,80 @@
   },
   {
    "variant": "thinking-2507",
+   "thinking": 0,
+   "name": "spaces",
+   "messages": [
+    {
+     "role": "system",
+     "content": "  Be brief.\n"
+    },
+    {
+     "role": "user",
+     "content": "　Hi! \n"
+    },
+    {
+     "role": "assistant",
+     "content": " Hello.\n"
+    },
+    {
+     "role": "user",
+     "content": "\tAnd now? "
+    }
+   ],
+   "text": "<|im_start|>system\n  Be brief.\n<|im_end|>\n<|im_start|>user\n　Hi! \n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n Hello.\n<|im_end|>\n<|im_start|>user\n\tAnd now? <|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "ids": [
+    151644,
+    8948,
+    198,
+    220,
+    2823,
+    9814,
+    624,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    22441,
+    13048,
+    0,
+    715,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    151667,
+    271,
+    151668,
+    271,
+    21927,
+    624,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    197,
+    3036,
+    1431,
+    30,
+    220,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    151667,
+    271,
+    151668,
+    271
+   ],
+   "hf": false,
+   "hf_text": "<|im_start|>system\n  Be brief.\n<|im_end|>\n<|im_start|>user\n　Hi! \n<|im_end|>\n<|im_start|>assistant\n Hello.\n<|im_end|>\n<|im_start|>user\n\tAnd now? <|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "variant": "thinking-2507",
    "thinking": 1,
    "name": "one_turn",
    "messages": [
@@ -1510,6 +1857,717 @@
     77091,
     198,
     151667,
+    198
+   ],
+   "hf": true
+  },
+  {
+   "variant": "thinking-2507",
+   "thinking": 1,
+   "name": "spaces",
+   "messages": [
+    {
+     "role": "system",
+     "content": "  Be brief.\n"
+    },
+    {
+     "role": "user",
+     "content": "　Hi! \n"
+    },
+    {
+     "role": "assistant",
+     "content": " Hello.\n"
+    },
+    {
+     "role": "user",
+     "content": "\tAnd now? "
+    }
+   ],
+   "text": "<|im_start|>system\n  Be brief.\n<|im_end|>\n<|im_start|>user\n　Hi! \n<|im_end|>\n<|im_start|>assistant\n Hello.\n<|im_end|>\n<|im_start|>user\n\tAnd now? <|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "ids": [
+    151644,
+    8948,
+    198,
+    220,
+    2823,
+    9814,
+    624,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    22441,
+    13048,
+    0,
+    715,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    21927,
+    624,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    197,
+    3036,
+    1431,
+    30,
+    220,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    151667,
+    198
+   ],
+   "hf": true
+  },
+  {
+   "variant": "qwen3.5",
+   "thinking": 0,
+   "name": "one_turn",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi there"
+    }
+   ],
+   "text": "<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "ids": [
+    248045,
+    846,
+    198,
+    12675,
+    1017,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ],
+   "hf": true
+  },
+  {
+   "variant": "qwen3.5",
+   "thinking": 0,
+   "name": "system",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What is 2+2?"
+    }
+   ],
+   "text": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "ids": [
+    248045,
+    8678,
+    198,
+    2523,
+    513,
+    48834,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    3710,
+    369,
+    220,
+    17,
+    10,
+    17,
+    30,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ],
+   "hf": true
+  },
+  {
+   "variant": "qwen3.5",
+   "thinking": 0,
+   "name": "multi_turn",
+   "messages": [
+    {
+     "role": "user",
+     "content": "My name is Ada."
+    },
+    {
+     "role": "assistant",
+     "content": "Hello Ada!"
+    },
+    {
+     "role": "user",
+     "content": "What is my name?"
+    }
+   ],
+   "text": "<|im_start|>user\nMy name is Ada.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nHello Ada!<|im_end|>\n<|im_start|>user\nWhat is my name?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "ids": [
+    248045,
+    846,
+    198,
+    4888,
+    803,
+    369,
+    49428,
+    13,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271,
+    9419,
+    49428,
+    0,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    3710,
+    369,
+    821,
+    803,
+    30,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ],
+   "hf": false,
+   "hf_text": "<|im_start|>user\nMy name is Ada.<|im_end|>\n<|im_start|>assistant\nHello Ada!<|im_end|>\n<|im_start|>user\nWhat is my name?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "variant": "qwen3.5",
+   "thinking": 0,
+   "name": "reasoning_history",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "Hi!"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nThe user greets me.\n</think>\n\nHello! How can I help?"
+    },
+    {
+     "role": "user",
+     "content": "And in French?"
+    }
+   ],
+   "text": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi!<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<think>\nThe user greets me.\n</think>\n\nHello! How can I help?<|im_end|>\n<|im_start|>user\nAnd in French?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "ids": [
+    248045,
+    8678,
+    198,
+    3320,
+    9522,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    12675,
+    0,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271,
+    248068,
+    198,
+    760,
+    1156,
+    2726,
+    1367,
+    728,
+    13,
+    198,
+    248069,
+    271,
+    9419,
+    0,
+    2500,
+    628,
+    353,
+    1438,
+    30,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    2939,
+    303,
+    8323,
+    30,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ],
+   "hf": false,
+   "hf_text": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi!<|im_end|>\n<|im_start|>assistant\nHello! How can I help?<|im_end|>\n<|im_start|>user\nAnd in French?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "variant": "qwen3.5",
+   "thinking": 0,
+   "name": "unicode",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Écris un haïku\nsur la mer 🌊, s'il te plaît."
+    }
+   ],
+   "text": "<|im_start|>user\nÉcris un haïku\nsur la mer 🌊, s'il te plaît.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "ids": [
+    248045,
+    846,
+    198,
+    25933,
+    4920,
+    284,
+    632,
+    6185,
+    36328,
+    11788,
+    198,
+    19181,
+    1147,
+    4552,
+    10838,
+    234,
+    232,
+    11,
+    274,
+    33096,
+    979,
+    243030,
+    13,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ],
+   "hf": true
+  },
+  {
+   "variant": "qwen3.5",
+   "thinking": 0,
+   "name": "spaces",
+   "messages": [
+    {
+     "role": "system",
+     "content": "  Be brief.\n"
+    },
+    {
+     "role": "user",
+     "content": "　Hi! \n"
+    },
+    {
+     "role": "assistant",
+     "content": " Hello.\n"
+    },
+    {
+     "role": "user",
+     "content": "\tAnd now? "
+    }
+   ],
+   "text": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi!<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nHello.<|im_end|>\n<|im_start|>user\nAnd now?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "ids": [
+    248045,
+    8678,
+    198,
+    3320,
+    9522,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    12675,
+    0,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271,
+    9419,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    2939,
+    1381,
+    30,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ],
+   "hf": false,
+   "hf_text": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi!<|im_end|>\n<|im_start|>assistant\nHello.<|im_end|>\n<|im_start|>user\nAnd now?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "variant": "qwen3.5",
+   "thinking": 1,
+   "name": "one_turn",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi there"
+    }
+   ],
+   "text": "<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "ids": [
+    248045,
+    846,
+    198,
+    12675,
+    1017,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    198
+   ],
+   "hf": true
+  },
+  {
+   "variant": "qwen3.5",
+   "thinking": 1,
+   "name": "system",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What is 2+2?"
+    }
+   ],
+   "text": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "ids": [
+    248045,
+    8678,
+    198,
+    2523,
+    513,
+    48834,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    3710,
+    369,
+    220,
+    17,
+    10,
+    17,
+    30,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    198
+   ],
+   "hf": true
+  },
+  {
+   "variant": "qwen3.5",
+   "thinking": 1,
+   "name": "multi_turn",
+   "messages": [
+    {
+     "role": "user",
+     "content": "My name is Ada."
+    },
+    {
+     "role": "assistant",
+     "content": "Hello Ada!"
+    },
+    {
+     "role": "user",
+     "content": "What is my name?"
+    }
+   ],
+   "text": "<|im_start|>user\nMy name is Ada.<|im_end|>\n<|im_start|>assistant\nHello Ada!<|im_end|>\n<|im_start|>user\nWhat is my name?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "ids": [
+    248045,
+    846,
+    198,
+    4888,
+    803,
+    369,
+    49428,
+    13,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    9419,
+    49428,
+    0,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    3710,
+    369,
+    821,
+    803,
+    30,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    198
+   ],
+   "hf": true
+  },
+  {
+   "variant": "qwen3.5",
+   "thinking": 1,
+   "name": "reasoning_history",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "Hi!"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nThe user greets me.\n</think>\n\nHello! How can I help?"
+    },
+    {
+     "role": "user",
+     "content": "And in French?"
+    }
+   ],
+   "text": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi!<|im_end|>\n<|im_start|>assistant\nHello! How can I help?<|im_end|>\n<|im_start|>user\nAnd in French?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "ids": [
+    248045,
+    8678,
+    198,
+    3320,
+    9522,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    12675,
+    0,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    9419,
+    0,
+    2500,
+    628,
+    353,
+    1438,
+    30,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    2939,
+    303,
+    8323,
+    30,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    198
+   ],
+   "hf": true
+  },
+  {
+   "variant": "qwen3.5",
+   "thinking": 1,
+   "name": "unicode",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Écris un haïku\nsur la mer 🌊, s'il te plaît."
+    }
+   ],
+   "text": "<|im_start|>user\nÉcris un haïku\nsur la mer 🌊, s'il te plaît.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "ids": [
+    248045,
+    846,
+    198,
+    25933,
+    4920,
+    284,
+    632,
+    6185,
+    36328,
+    11788,
+    198,
+    19181,
+    1147,
+    4552,
+    10838,
+    234,
+    232,
+    11,
+    274,
+    33096,
+    979,
+    243030,
+    13,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    198
+   ],
+   "hf": true
+  },
+  {
+   "variant": "qwen3.5",
+   "thinking": 1,
+   "name": "spaces",
+   "messages": [
+    {
+     "role": "system",
+     "content": "  Be brief.\n"
+    },
+    {
+     "role": "user",
+     "content": "　Hi! \n"
+    },
+    {
+     "role": "assistant",
+     "content": " Hello.\n"
+    },
+    {
+     "role": "user",
+     "content": "\tAnd now? "
+    }
+   ],
+   "text": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi!<|im_end|>\n<|im_start|>assistant\nHello.<|im_end|>\n<|im_start|>user\nAnd now?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "ids": [
+    248045,
+    8678,
+    198,
+    3320,
+    9522,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    12675,
+    0,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    9419,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    2939,
+    1381,
+    30,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
     198
    ],
    "hf": true

@@ -5,8 +5,11 @@ Usage: .venv/bin/python tests/fuzz_tokenizer.py [-n 5000] [--seed 1] [--jobs 8] 
        .venv/bin/python tests/fuzz_tokenizer.py --nfc-all     (exhaustive NFC check, see below)
        .venv/bin/python tests/fuzz_tokenizer.py --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf
                                                      (the tokenizer runq builds from GGUF metadata)
+       .venv/bin/python tests/fuzz_tokenizer.py --model models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf \
+                                                --hf-dir models/Qwen3.5-0.8B   (Qwen3.5's tokenizer: \\p{M})
 Needs transformers (.venv) and models/Qwen3-0.6B (local files only) plus models/Qwen3-0.6B-q8.bin
-(its .tokenizer file gives the token bytes, --vocab; a GGUF file's tokens decode to the same bytes).
+(its .tokenizer file gives the token bytes, --vocab; a GGUF file's tokens decode to the same bytes; with a
+--model GGUF and no --vocab, that file's tokens).
 
 Cases:
   random  -n strings built from a mix of character classes (ASCII words, digits, punctuation,
@@ -208,9 +211,14 @@ class Runner:
         from tokenizers.normalizers import NFC
         from transformers import AutoTokenizer
         self.a = a
-        self.tok = AutoTokenizer.from_pretrained(MODEL_DIR, local_files_only=True)
+        self.tok = AutoTokenizer.from_pretrained(a.hf_dir, local_files_only=True)
         self.hf_nfc = NFC().normalize_str
-        self.vocab = load_vocab(a.vocab)
+        if a.vocab:
+            self.vocab = load_vocab(a.vocab)
+        else:  # the GGUF's own tokens (check.py's gguf_vocab)
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import check
+            self.vocab = check.gguf_vocab(a.model)
 
     def hf(self, s):
         return self.tok.encode(s, add_special_tokens=False)
@@ -326,9 +334,13 @@ def main():
     ap.add_argument("--no-files", action="store_true", help="skip the real-text cases")
     ap.add_argument("--runq", default=os.path.join(ROOT, "runq"))
     ap.add_argument("--model", default=os.path.join(ROOT, "models", "Qwen3-0.6B-q8.bin"), help=".bin or GGUF checkpoint")
-    ap.add_argument("--vocab", default=os.path.join(ROOT, "models", "Qwen3-0.6B-q8.bin"),
-                    help=".bin checkpoint whose .tokenizer file gives the token bytes")
+    ap.add_argument("--vocab", default=None,
+                    help=".bin checkpoint whose .tokenizer file gives the token bytes (default: models/Qwen3-0.6B-q8.bin; "
+                         "with a GGUF --model, its own tokens)")
+    ap.add_argument("--hf-dir", default=MODEL_DIR, help="the HF tokenizer to compare with (default models/Qwen3-0.6B)")
     a = ap.parse_args()
+    if a.vocab is None and not a.model.endswith(".gguf"):
+        a.vocab = os.path.join(ROOT, "models", "Qwen3-0.6B-q8.bin")
 
     t0 = time.time()
     r = Runner(a)

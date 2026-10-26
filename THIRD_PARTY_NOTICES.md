@@ -56,13 +56,13 @@ SOFTWARE.
   `PropList.txt`): general categories, canonical combining classes, decompositions and compositions.
 - License: Unicode License v3, full text in [licenses/Unicode-3.0.txt](licenses/Unicode-3.0.txt).
 
-## Qwen3 (models, tokenizer, chat templates)
+## Qwen3 and Qwen3.5 (models, tokenizers, chat templates)
 
-- Source: the Qwen team's models on Hugging Face (`Qwen/Qwen3-*`; the GGUF files are unsloth's conversions
-  of them). `scripts/download_models.py` downloads them; none are included.
-- Used for: `tests/golden/templates/*.jinja` (Qwen3's chat templates, verbatim); the chat templates built
-  into `src/model.c`; and the test references in `tests/golden/` (token ids, logits and texts computed
-  with the Qwen3 models and tokenizer, and chat renderings).
+- Source: the Qwen team's models on Hugging Face (`Qwen/Qwen3-*`, `Qwen/Qwen3.5-0.8B`; the GGUF files are
+  unsloth's conversions of them). `scripts/download_models.py` downloads them; none are included.
+- Used for: `tests/golden/templates/*.jinja` (Qwen3's and Qwen3.5's chat templates, verbatim); the chat templates
+  built into `src/model.c`; and the test references in `tests/golden/` (token ids, logits and texts computed
+  with the Qwen3 / Qwen3.5 models and tokenizers, and chat renderings).
 - License: Apache License 2.0, full text in [licenses/Apache-2.0.txt](licenses/Apache-2.0.txt).
 
 ## Hugging Face transformers / tokenizers

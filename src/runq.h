@@ -1,4 +1,4 @@
-/* runq: Qwen3 inference on the CPU, as a library (the engine of the runq CLI, src/cli.c).
+/* runq: Qwen3 (and Qwen3.5-0.8B) inference on the CPU, as a library (the engine of the runq CLI, src/cli.c).
  *
  * Three kinds of objects (README.md, Architecture):
  *   RqModel  the model: hyperparameters, weights (repacked for the kernels at load), tokenizer, chat
@@ -77,6 +77,8 @@ typedef struct {
     const char *warning;   // a load-time warning to show (e.g. weights not packable), or NULL
     int chat;              // chat template variant, RQ_CHAT_* (below)
     float rope_theta;      // RoPE base
+    int linear_layers;     // Qwen3.5: linear-attention layers, whose recurrent state cannot be rewound (rq_seq_truncate,
+                           // rq_seq_checkpoint_at); 0 for Qwen3
 } RqModelInfo;
 void rq_model_info(const RqModel *m, RqModelInfo *info);
 
@@ -91,14 +93,25 @@ int rq_kv_parse(const char *name);     // the type, or RQ_ERR_ARG
 RqSeq *rq_seq_new(const RqModel *m, int capacity, int kv_type, int *err);
 void rq_seq_free(RqSeq *s);
 void rq_seq_reset(RqSeq *s);                   // empty (position 0)
-int rq_seq_truncate(RqSeq *s, int n);          // keep positions 0..n-1 (n <= the current length)
+// keep positions 0..n-1 (n <= the current length). A model with linear-attention layers (Qwen3.5,
+// RqModelInfo.linear_layers) cannot rewind their state: unless n is the current length, the sequence goes back
+// to its longest checkpoint at or below n (rq_seq_checkpoint_at), else to 0. Callers read rq_seq_len afterwards
+// and prefill the rest again (the results are then those of an uninterrupted run)
+int rq_seq_truncate(RqSeq *s, int n);
+int rq_seq_keep(const RqSeq *s, int n);        // the length rq_seq_truncate(s, n) would keep (n for Qwen3)
+// Qwen3.5: keep the recurrent state at length pos (>= the current length) as a checkpoint, taken by the forward
+// pass that reaches it (or now, if the sequence is there); the sequence keeps the last few (RQ_SEQ_CK = 2,
+// ~19 MB each for the 0.8B), dropped when truncated below them. E.g. the start of the assistant turn, where the
+// next request of a chat diverges. A no-op for Qwen3. RQ_ERR_ARG (pos below the length), RQ_ERR_NOMEM
+int rq_seq_checkpoint_at(RqSeq *s, int pos);
 int rq_seq_len(const RqSeq *s);                // positions in the cache = the next token's position
 int rq_seq_capacity(const RqSeq *s);
 const int *rq_seq_tokens(const RqSeq *s);      // the tokens at positions 0..len-1
 int rq_seq_common_prefix(const RqSeq *s, const int *tokens, int n); // longest common prefix length
 // dst := the first n positions of src (KV entries and tokens; n <= rq_seq_len(src), n <= dst's capacity, the
 // same model and KV type; dst's RNG unchanged): e.g. a cached prompt prefix shared by several sequences.
-// The copied entries are the same bits, so dst continues exactly as src would
+// The copied entries are the same bits, so dst continues exactly as src would. Qwen3.5: unless n is src's
+// length, as rq_seq_truncate: src's longest checkpoint <= n, else 0 (rq_seq_len(dst) tells)
 int rq_seq_copy(RqSeq *dst, const RqSeq *src, int n);
 void rq_seq_seed(RqSeq *s, unsigned long long seed);
 unsigned long long *rq_seq_rng(RqSeq *s);      // the sampling RNG state (xorshift)
@@ -199,11 +212,18 @@ int rq_detok_flush(RqDetok *d, char *out, size_t cap);
 //                     history as the hybrid with thinking. thinking 0
 //                     gives the hybrid's empty think block instead, which is not in this model's template
 //                     (runq serve uses it only for a constrained reply)
-enum { RQ_CHAT_HYBRID = 0, RQ_CHAT_INSTRUCT = 1, RQ_CHAT_THINKING = 2 };
-const char *rq_chat_name(int variant); // "qwen3", "instruct-2507", "thinking-2507"
+//   RQ_CHAT_QWEN35    Qwen3.5: thinking on or off per call, off by default in the CLI (as its template);
+//                     on: rendered as Thinking-2507's ("<think>\n" opens the reply, answered turns lose it),
+//                     off: as the hybrid's. Message texts are trimmed of surrounding whitespace (its template's
+//                     |trim)
+enum { RQ_CHAT_HYBRID = 0, RQ_CHAT_INSTRUCT = 1, RQ_CHAT_THINKING = 2, RQ_CHAT_QWEN35 = 3 };
+const char *rq_chat_name(int variant); // "qwen3", "instruct-2507", "thinking-2507", "qwen3.5""
 enum { RQ_ROLE_SYSTEM = 0, RQ_ROLE_USER = 1, RQ_ROLE_ASSISTANT = 2 };
 typedef struct { int role; const char *content; } RqMessage;
 
+// a message text as the variant's template renders it (Qwen3.5: without surrounding whitespace, Python's
+// str.strip(); the others: as is): its start in text and *len bytes. rq_chat_system / user / render apply it
+const char *rq_chat_trim(const RqModel *m, const char *text, size_t *len);
 int rq_chat_system(const RqModel *m, const char *text, int thinking, RqTokens *out);
 int rq_chat_user(const RqModel *m, const char *text, int thinking, RqTokens *out);
 int rq_chat_end(const RqModel *m, RqTokens *out);
@@ -216,6 +236,10 @@ int rq_chat_user_history(const RqModel *m, const char *text, int thinking, RqTok
 int rq_chat_assistant(const RqModel *m, int thinking, RqTokens *out);
 // the history form of a reply generated as tokens (thinking: without its reasoning block)
 int rq_chat_reply_history(const RqModel *m, const int *reply, int n, int thinking, RqTokens *out);
+// where a chat prompt's recurrent state is worth a checkpoint (rq_seq_checkpoint_at; Qwen3.5): the position of its
+// last <|im_start|> (the assistant header: the next request of the conversation diverges after it when the
+// reply is rendered from its text, without its reasoning or cut at a stop string), or -1
+int rq_chat_checkpoint_pos(const RqModel *m, const int *tokens, int n);
 // a whole conversation: an optional system message, then user / assistant alternating, ending with
 // a user message (then the assistant header: the prompt to generate from) or an assistant one
 int rq_chat_render(const RqModel *m, const RqMessage *msgs, int n, int thinking, RqTokens *out);

@@ -7,6 +7,11 @@ synth   (default suite) synthetic GGUF models cut out of Qwen3-0.6B-Q4_K_M.gguf 
         weights, fp32), batched vs sequential, threads, AVX-512 vs generic (bitwise), the library API (batched
         decode rows == alone, digests), the chat template variants (`-m render` on tokenizer-only files with the
         three HF templates vs tests/golden/chat_render.json; the chat's KV cache ids)
+q35     (default suite, if models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf is there: --q35) Qwen3.5-0.8B, the hybrid
+        architecture (docs/qwen35.md): the Qwen3.5 tokenizer golden (golden/tokenizer_qwen35.json), CLI chats whose
+        history diverges (-r 1: the cache goes back to a checkpoint, the logits must equal a single-shot run's), and
+        the models group's checks on the file (Q35_TAG); no synthetic model: the 248k-token vocabulary keeps a
+        cut-out near the real file's size, and the real file is small
 models  (opt-in: tests/run_tests.sh --models, make test-models) every downloaded family model
         (scripts/download_models.py family; missing files are skipped): logits vs HF fp32 (Qwen3-1.7B) and vs
         the dequantized-weights reference (tests/golden/models, tests/make_model_ref.py), bitwise invariants
@@ -246,6 +251,22 @@ FAMILY = [
     ("4b-2507i-q4km", "Qwen3-4B-Instruct-2507-GGUF/Qwen3-4B-Instruct-2507-Q4_K_M.gguf", "instruct-2507", [("4b-2507i-q4km", "ref")]),
     ("4b-2507t-q4km", "Qwen3-4B-Thinking-2507-GGUF/Qwen3-4B-Thinking-2507-Q4_K_M.gguf", "thinking-2507", [("4b-2507t-q4km", "ref")]),
     ("8b-q4km", "Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf", "qwen3", [("8b-q4km", "ref")]),
+    # Qwen3.5 (hybrid: Gated DeltaNet + gated attention; goldens made with transformers 5.21, docs/qwen35.md)
+    ("3.5-0.8b-q8", "Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf", "qwen3.5", [("3.5-0.8b-hf", "q8_hf"), ("3.5-0.8b-q8", "ref")]),
+]
+Q35_TAG = "3.5-0.8b-q8"
+# chats on Qwen3.5 (check.py's chat_case): -r 1, the history drops turn 1's reasoning (and its "<think>\n"): the cache
+# goes back to the checkpoint at turn 1's assistant header; the generic build too; -r 0 with a system prompt (no
+# rollback); context full: the oldest turns dropped (back to a checkpoint or 0)
+Q35_CHAT_CASES = [
+    ("q35_thinking", ["-r", "1", "-n", "300"], ["What is 2+2? Answer with the number only.", "And times 3?"],
+     {"stripped": 1}),
+    ("q35_multiturn", ["-n", "24", "-y", "Be brief."],
+     ["My name is Ada and my favourite colour is green.", "What is my name and favourite colour?"],
+     {"mentions": (1, ["ada", "green"]), "generic": True}),
+    ("q35_context_full", ["-c", "160", "-n", "30", "-y", "You are a terse assistant."],
+     ["My name is Ada.", "Name three fruits.", "Name three animals.", "Name three colours.", "What is my name?"],
+     {"dropped": True}),
 ]
 # thresholds (per prompt: cos mean / every position >= 1 / position 0, top-1 fraction; pooled cos), measured in
 # Step 11 (docs/DEVELOPMENT.md, History): vs the dequantized-weights reference only runq's int8 activations differ (as Q8_0 vs HF
@@ -342,12 +363,14 @@ def greedy_text(stdout):
     return stdout.decode(errors="replace").rstrip("\n")
 
 
-def test_models(a, res, tmp, texts, update=False):
+def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", path=None):
+    """the checks of every downloaded FAMILY file (tags: only those; path: the file of the one tag)"""
     gdir = os.path.join(GOLDEN, "models")
-    present = [(tag, os.path.join(ROOT, "models", f), v, gs) for tag, f, v, gs in FAMILY
-               if os.path.exists(os.path.join(ROOT, "models", f))]
-    for tag, f, v, gs in FAMILY:
-        if not os.path.exists(os.path.join(ROOT, "models", f)):
+    fam = [x for x in FAMILY if tags is None or x[0] in tags]
+    where = lambda f: path or os.path.join(ROOT, "models", f)
+    present = [(tag, where(f), v, gs) for tag, f, v, gs in fam if os.path.exists(where(f))]
+    for tag, f, v, gs in fam:
+        if not os.path.exists(where(f)):
             print(f"      {tag}: skipped (models/{f} not downloaded: scripts/download_models.py)")
     nd = MODEL_THREADS
     for tag, model, variant, goldens in present:
@@ -361,7 +384,7 @@ def test_models(a, res, tmp, texts, update=False):
                 logits_run(runq, model, texts[name], path, chunk, threads)
             return path
         # template variant and renderings (tokenizer only)
-        render_cases(a.runq, model, variant, res, f"models/{tag}/render")
+        render_cases(a.runq, model, variant, res, f"{prefix}/{tag}/render")
         # greedy golden
         gpath = os.path.join(gdir, "greedy", f"{tag}.txt")
         p = run([a.runq, model] + GREEDY, nd)
@@ -371,14 +394,14 @@ def test_models(a, res, tmp, texts, update=False):
             with open(gpath, "w", encoding="utf-8") as fh:
                 fh.write(txt + "\n")
         want = open(gpath, encoding="utf-8").read().rstrip("\n") if os.path.exists(gpath) else None
-        res.report(p.returncode == 0 and txt == want, f"models/{tag}/greedy", repr(txt[-120:]) +
+        res.report(p.returncode == 0 and txt == want, f"{prefix}/{tag}/greedy", repr(txt[-120:]) +
                    ("" if txt == want else f"  <- golden {want!r}" if want is not None else "  <- no golden (--update-models)"))
         # logits vs the goldens
         for sub, kind in goldens:
             th = TH[kind]
             gd = os.path.join(gdir, sub)
             if not os.path.isdir(gd):
-                res.report(False, f"models/{tag}/logits_{kind}", f"no goldens in tests/golden/models/{sub}")
+                res.report(False, f"{prefix}/{tag}/logits_{kind}", f"no goldens in tests/golden/models/{sub}")
                 continue
             allc = []
             for fn in sorted(os.listdir(gd)):
@@ -387,11 +410,11 @@ def test_models(a, res, tmp, texts, update=False):
                 g = np.load(os.path.join(gd, fn))
                 name = fn[:-4]
                 if str(g["text"]) != texts.get(name):
-                    res.report(False, f"models/{tag}/logits_{kind}/{name}", "the golden's text is not check.py's prompt")
+                    res.report(False, f"{prefix}/{tag}/logits_{kind}/{name}", "the golden's text is not check.py's prompt")
                     continue
                 ids, lg = read_logits(lf(name, 64))
                 if ids.tolist() != g["ids"].tolist() or not np.isfinite(lg).all():
-                    res.report(False, f"models/{tag}/logits_{kind}/{name}", "token ids differ or non-finite logits")
+                    res.report(False, f"{prefix}/{tag}/logits_{kind}/{name}", "token ids differ or non-finite logits")
                     continue
                 pos, c, t1 = model_metrics(g, lg)
                 rest = c[pos >= 1]
@@ -401,33 +424,72 @@ def test_models(a, res, tmp, texts, update=False):
                 if not rest.min() >= th["cos_pos"]: why.append(f"cos min < {th['cos_pos']}")
                 if 0 in pos and not c[0] >= th["cos_pos0"]: why.append(f"cos pos0 < {th['cos_pos0']}")
                 if not t1.mean() >= th["top1"]: why.append(f"top1 < {th['top1']}")
-                res.report(not why, f"models/{tag}/logits_{kind}/{name}",
+                res.report(not why, f"{prefix}/{tag}/logits_{kind}/{name}",
                            f"{len(pos)} positions: cos" + (f" pos0 {c[0]:.4f}," if 0 in pos else "") + f" mean {rest.mean():.5f} "
                            f"min {rest.min():.5f}, top1 {int(t1.sum())}/{len(t1)}" + ("  <- " + "; ".join(why) if why else ""))
             if allc:
-                res.report(bool(np.mean(allc) >= th["cos_all"]), f"models/{tag}/logits_{kind}/cos_pooled",
+                res.report(bool(np.mean(allc) >= th["cos_all"]), f"{prefix}/{tag}/logits_{kind}/cos_pooled",
                            f"{np.mean(allc):.5f} over {len(allc)} positions (min {th['cos_all']})")
         # bitwise invariants: batched vs sequential (the decode path), chunkings, threads, generic kernels
         for n, c in (("en", 7), ("en", 64), ("all", 64)):
             ok, det = same(lf(n, 1), lf(n, c))
-            res.report(ok, f"models/{tag}/batched/{n}_b{c}", f"-b {c} vs -b 1: {det}")
+            res.report(ok, f"{prefix}/{tag}/batched/{n}_b{c}", f"-b {c} vs -b 1: {det}")
         ok, det = same(lf("long2", 64), lf("long2", 512))
-        res.report(ok, f"models/{tag}/batched/long2_b512", f"-b 512 vs -b 64 (297 tokens): {det}")
+        res.report(ok, f"{prefix}/{tag}/batched/long2_b512", f"-b 512 vs -b 64 (297 tokens): {det}")
         ok, det = same(lf("all", 64), lf("all", 64, 3))
-        res.report(ok, f"models/{tag}/threads/all_b64", f"{nd} vs 3 threads: {det}")
+        res.report(ok, f"{prefix}/{tag}/threads/all_b64", f"{nd} vs 3 threads: {det}")
         if a.generic:
             for n, c in (("en", 1), ("en", 7)):
                 ok, det = same(lf(n, c), lf(n, c, 4, a.generic, "_gen"))
-                res.report(ok, f"models/{tag}/kernels/{n}_b{c}", f"AVX-512 vs generic: {det}")
+                res.report(ok, f"{prefix}/{tag}/kernels/{n}_b{c}", f"AVX-512 vs generic: {det}")
         if a.api_test:
             p = run([a.api_test, model], nd)
             lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
             bad = [l[5:].split("  ")[0] for l in lines if l.startswith("FAIL ")]
-            res.report(p.returncode == 0 and lines and not bad, f"models/{tag}/api",
+            res.report(p.returncode == 0 and lines and not bad, f"{prefix}/{tag}/api",
                        f"api_test (batched decode rows == alone, mixed passes, ...): {len(lines) - len(bad)}/{len(lines)} passed"
                        + (f"; failed: {', '.join(bad)}" if bad else ""))
         for ok, name, det in server_smoke(a.runq, model, variant, want, None):
-            res.report(ok, f"models/{tag}/server/{name}", det)
+            res.report(ok, f"{prefix}/{tag}/server/{name}", det)
         for fn in os.listdir(d):
             os.remove(os.path.join(d, fn))
         print(f"      ({tag}: {time.time() - t0:.1f} s)")
+
+
+# ------------------------------------------------------------------------------------------ q35
+
+class Recorded:
+    """a Results stand-in that keeps the reports, for a group run in the background (replayed at its turn)"""
+    def __init__(self):
+        self.reports = []
+
+    def report(self, ok, name, detail="", xfail=None):
+        self.reports.append((ok, name, detail, xfail))
+
+
+def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
+    """start the q35 group in the background: its chat cases (check.py's chat_case) on ex, the models group's
+    checks of the file on mx (reports recorded); None if there is no Qwen3.5 file"""
+    if not a.q35:
+        return None
+    a2 = argparse.Namespace(**{**vars(a), "model": a.q35, "vocab_model": a.q35})
+    vocab = load_vocab(a.q35)
+    d = os.path.join(GOLDEN, "greedy")
+    rec = Recorded()
+    t = os.path.join(tmp, "q35")
+    os.makedirs(t, exist_ok=True)
+    return {"a": a2, "tok_test": tok_test, "chats": [ex.submit(chat_case, a2, tmp, vocab, d, *c) for c in Q35_CHAT_CASES],
+            "rec": rec, "models": mx.submit(test_models, a, rec, t, texts, False, {Q35_TAG}, "q35", a.q35)}
+
+
+def test_q35(a, res, tmp, texts, S):
+    if S is None:
+        print("      skipped: no Qwen3.5-0.8B Q8_0 GGUF (--q35; scripts/download_models.py 3.5-0.8b-q8)")
+        return
+    S["tok_test"](S["a"], res, "q35/tokenizer", "tokenizer_qwen35.json")
+    for f in S["chats"]:
+        for ok, n, detail in f.result():
+            res.report(ok, n.replace("chat/", "q35/chat/"), detail)
+    S["models"].result()
+    for ok, n, detail, xfail in S["rec"].reports:
+        res.report(ok, n, detail, xfail)

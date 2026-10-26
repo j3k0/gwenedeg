@@ -293,13 +293,19 @@ static void chat(RqModel *m, RqCtx *c, RqSeq *s, const RqSampling *cfg, char *cl
         // prefill what is not in the cache yet (the longest common prefix stays), then the reply:
         // sample, print, feed back; ends at <|im_end|> (sampled, not fed yet: the next turn's prefill
         // starts with it), at -n tokens, or at the end of the context
+        // (Qwen3.5: the recurrent state cannot be rewound: the cache goes back to a checkpoint <= L, e.g. this
+        // conversation's last assistant header, where a reasoning reply's history form diverges, and the rest is
+        // prefilled again; the next turn's checkpoint: this prompt's assistant header)
         int L = rq_seq_common_prefix(s, want.v, want.n);
-        cdump_truncate(L);
         check(rq_seq_truncate(s, L), c);
+        L = rq_seq_len(s);
+        cdump_truncate(L);
+        int ckp = rq_chat_checkpoint_pos(m, want.v, want.n);
+        if (ckp >= L) check(rq_seq_checkpoint_at(s, ckp), c);
         ReplyOut ro = { m, &tn->reply };
         RqCallbacks cb = { on_reply_token, on_reply_logits, &ro };
-        if (info.chat == RQ_CHAT_THINKING && enable_thinking)
-            printf("<think>\n"); // (Thinking-2507: the prompt opened the block, the reply starts inside it)
+        if ((info.chat == RQ_CHAT_THINKING || info.chat == RQ_CHAT_QWEN35) && enable_thinking)
+            printf("<think>\n"); // (Thinking-2507, Qwen3.5: the prompt opened the block, the reply starts inside it)
         RqGenStats st;
         check(rq_generate(c, s, want.v + L, want.n - L, cfg, max_new_tokens, &cb, &st), c);
         if (st.stop == RQ_STOP_CONTEXT)

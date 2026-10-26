@@ -290,6 +290,10 @@ static int parse_chat(App *a, const Js *root, Chat *ch, Job *j, ReqErr *e) {
         const Js *c = json_get(m, "content");
         if (r != 2 && (!c || c->t == JS_NULL)) return bad(e, "messages", "a %s message needs 'content'", role->s);
         if (!(ch->msgs[i].text = content_text(c, e))) return -1;
+        size_t tl; // (Qwen3.5's template trims every message: rq_chat_trim, in place)
+        const char *t0 = rq_chat_trim(a->m, ch->msgs[i].text, &tl);
+        memmove(ch->msgs[i].text, t0, tl);
+        ch->msgs[i].text[tl] = 0;
         ch->msgs[i].role = r;
         ch->n_msgs = i + 1;
     }

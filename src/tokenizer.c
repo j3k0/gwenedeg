@@ -5,7 +5,8 @@
  *   2. normalizer (NFC), on the text between added tokens (nfc_check / nfc_normalize, tables in
  *      unicode_nfc.h: Unicode 15.1 data with the overrides that match HF tokenizers' older data)
  *   3. pre-tokenizer: Qwen2's split regex, hand-written in pretok_next(), with the Unicode
- *      classes \p{L}, \p{N}, \s from unicode_tables.h (tools/gen_unicode_tables.py)
+ *      classes \p{L}, \p{N}, \s from unicode_tables.h (tools/gen_unicode_tables.py); Qwen3.5's
+ *      variant (tokenizer.ggml.pre qwen35) differs only in \p{M}, see pretok_next
  *   4. byte-level BPE inside each chunk, starting from the single-byte tokens
  * Merge order: the .tokenizer file (third_party/qwen3.c/export.py) has one score per token,
  * -log(rank + 1) of the merge producing it, and no merge pairs. bpe_chunk() merges any adjacent
@@ -216,7 +217,10 @@ void build_tokenizer_gguf(Tokenizer *t, const Gguf *g, int vocab_size) {
     const char *model = gguf_get_str(g, "tokenizer.ggml.model", &n);
     if (!model || n != 4 || memcmp(model, "gpt2", 4)) gguf_fail(g, "tokenizer.ggml.model must be gpt2 (byte-level BPE)%s", NULL);
     const char *pre = gguf_get_str(g, "tokenizer.ggml.pre", &n);
-    if (!pre || n != 5 || memcmp(pre, "qwen2", 5)) gguf_fail(g, "tokenizer.ggml.pre must be qwen2 (the pre-tokenizer runq implements)%s", NULL);
+    int m35 = pre && n == 6 && !memcmp(pre, "qwen35", 6);
+    if (!m35 && (!pre || n != 5 || memcmp(pre, "qwen2", 5)))
+        gguf_fail(g, "tokenizer.ggml.pre must be qwen2 or qwen35 (the pre-tokenizers runq implements)%s", NULL);
+    t->marks35 = m35;
     const GgufKV *tk = gguf_get_array(g, "tokenizer.ggml.tokens", GV_STR);
     const GgufKV *ty = gguf_get_array(g, "tokenizer.ggml.token_type", GV_I32);
     const GgufKV *mg = gguf_get_array(g, "tokenizer.ggml.merges", GV_STR);
@@ -329,6 +333,10 @@ void free_tokenizer(Tokenizer *t) {
 
 // --- pre-tokenizer: Qwen2's Split regex (tokenizer.json, behavior Isolated)
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+// Qwen3.5's (tokenizer.ggml.pre qwen35) has [\p{L}\p{M}]+ for the letter run and [^\s\p{L}\p{M}\p{N}] for the
+// punctuation run; its optional prefix [^\r\n\p{L}\p{N}] admits a mark, but a mark there is followed by the
+// letter run anyway, which takes it too. So that regex is this one with every mark read as a letter, and
+// Qwen2's with every mark read as "other": uchar_at maps UCLS_M by the tokenizer's variant (marks35)
 
 typedef struct { uint32_t cp; int len; int cls; } UChar;
 
@@ -367,17 +375,19 @@ static inline uint32_t utf8_cp(const unsigned char *p, const unsigned char *end,
     return cp;
 }
 
-static inline UChar uchar_at(const unsigned char *p, const unsigned char *end) {
-    // decode one UTF-8 code point; an invalid byte counts as one "other" character (U+FFFD is one)
+static inline UChar uchar_at(const unsigned char *p, const unsigned char *end, int m35) {
+    // decode one UTF-8 code point; an invalid byte counts as one "other" character (U+FFFD is one).
+    // m35: Qwen3.5's regex, marks are letters (else other)
     UChar c;
     c.cp = utf8_cp(p, end, &c.len);
     c.cls = ucls(c.cp);
+    if (c.cls == UCLS_M) c.cls = m35 ? UCLS_L : UCLS_OTHER;
     return c;
 }
 
-static inline const unsigned char *skip_class(const unsigned char *p, const unsigned char *end, int cls) {
+static inline const unsigned char *skip_class(const unsigned char *p, const unsigned char *end, int cls, int m35) {
     while (p < end) {
-        UChar c = uchar_at(p, end);
+        UChar c = uchar_at(p, end, m35);
         if (c.cls != cls) break;
         p += c.len;
     }
@@ -397,9 +407,10 @@ static int contraction_len(const unsigned char *p, const unsigned char *end) {
     return 0;
 }
 
-static const unsigned char *pretok_next(const unsigned char *p, const unsigned char *end) {
-    // end of the regex match starting at p (p < end); every character matches some alternative
-    UChar c = uchar_at(p, end);
+static const unsigned char *pretok_next(const unsigned char *p, const unsigned char *end, int m35) {
+    // end of the regex match starting at p (p < end); every character matches some alternative.
+    // m35: Qwen3.5's variant of the regex
+    UChar c = uchar_at(p, end, m35);
     const unsigned char *q = p + c.len;
     int crlf = c.cp == '\r' || c.cp == '\n';
     // (?i:'s|'t|'re|'ve|'m|'ll|'d)
@@ -408,14 +419,14 @@ static const unsigned char *pretok_next(const unsigned char *p, const unsigned c
         if (n) return q + n;
     }
     // [^\r\n\p{L}\p{N}]?\p{L}+
-    if (c.cls == UCLS_L) return skip_class(q, end, UCLS_L);
-    if (c.cls != UCLS_N && !crlf && q < end && uchar_at(q, end).cls == UCLS_L) return skip_class(q, end, UCLS_L);
+    if (c.cls == UCLS_L) return skip_class(q, end, UCLS_L, m35);
+    if (c.cls != UCLS_N && !crlf && q < end && uchar_at(q, end, m35).cls == UCLS_L) return skip_class(q, end, UCLS_L, m35);
     // \p{N}: one digit at a time
     if (c.cls == UCLS_N) return q;
     // ' ?[^\s\p{L}\p{N}]+[\r\n]*' (only ASCII space as the optional prefix)
     const unsigned char *r = c.cp == ' ' ? q : p;
-    if (r < end && uchar_at(r, end).cls == UCLS_OTHER) {
-        r = skip_class(r, end, UCLS_OTHER);
+    if (r < end && uchar_at(r, end, m35).cls == UCLS_OTHER) {
+        r = skip_class(r, end, UCLS_OTHER, m35);
         while (r < end && (*r == '\r' || *r == '\n')) r++;
         return r;
     }
@@ -425,7 +436,7 @@ static const unsigned char *pretok_next(const unsigned char *p, const unsigned c
     const unsigned char *last_nl = NULL, *last_start = p;
     r = p;
     while (r < end) {
-        UChar w = uchar_at(r, end);
+        UChar w = uchar_at(r, end, m35);
         if (w.cls != UCLS_WS) break;
         if (w.cp == '\r' || w.cp == '\n') last_nl = r + w.len;
         last_start = r;
@@ -713,7 +724,7 @@ static int encode_segment(const Tokenizer *t, const unsigned char *p, const unsi
         end = norm + n;
     }
     while (p < end) {
-        q = pretok_next(p, end);
+        q = pretok_next(p, end, t->marks35);
         bpe_chunk(t, p, (int)(q - p), s, tokens, n_tokens);
         p = q;
     }

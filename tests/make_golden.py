@@ -2,10 +2,13 @@
 """Generate the HF golden references for the Gwenedeg test suite (run once, commit the output).
 
 Usage: .venv/bin/python tests/make_golden.py [--tokenizer-only]
+       .venv/bin/python tests/make_golden.py --tokenizer-qwen35
        .venv/bin/python tests/make_golden.py --q4ref [--gguf-py DIR]
        .venv/bin/python tests/make_golden.py --long
 Needs torch + transformers (.venv); reads models/Qwen3-0.6B only (local_files_only, no network).
 --tokenizer-only rewrites tests/golden/tokenizer.json only (no model load, ~2 s).
+--tokenizer-qwen35 writes tests/golden/tokenizer_qwen35.json only: the same cases plus combining-mark ones
+(Qwen3.5's pre-tokenizer joins \\p{M} to letter runs), ids from the Qwen3.5 tokenizer (models/Qwen3.5-0.8B).
 --q4ref writes only tests/golden/logits_q4/*.npz (~20 s): the same prompts and format, from the
 same HF model with every weight replaced by the Q4_K_M GGUF's tensors dequantized by gguf-py
 (gguf.quants.dequantize; norms F32 as stored), i.e. Q4_K_M weights with fp32 activations. runq on
@@ -163,6 +166,20 @@ TOKENIZER_CASES = [
     ("nfc_hf_compat", "a\u1df6\u0301 a\u0301\u1df6 \U00011935\U00011930 x\u0d3b\u0323"),  # HF's Unicode 9.0 data
 ]
 
+# Qwen3.5's regex: [\p{L}\p{M}]+ letter runs, \p{M} excluded from the punctuation runs (marks of every kind: Mn, Mc,
+# Me; after letters, digits, punctuation, spaces, at the start; scripts whose vowels are marks)
+TOKENIZER_CASES_QWEN35 = [
+    ("marks_devanagari", "नमस्ते दुनिया, यह एक परीक्षण है। क्षत्रिय ज्ञान"),
+    ("marks_thai", "สวัสดีครับ ภาษาไทย น้ำ ที่นี่"),
+    ("marks_hebrew_arabic", "שָׁלוֹם עוֹלָם مَرْحَبًا بِالْعَالَمِ"),
+    ("marks_vietnamese_nfd", "Tie\u0302\u0301ng Vie\u0323\u0302t co\u0301 da\u0302\u0301u"),
+    ("marks_after_nonletters", "1\u0301 2\u0332x !\u0301a ?\u20dd \u0301b \u0332 c\u0332\u0332d"),
+    ("marks_start_and_runs", "\u0301\u0302abc \u0300\u0300 xy\u0308z\u0308 \u20dd\u20de"),
+    ("marks_keycap_emoji", "#\ufe0f\u20e3 1\ufe0f\u20e3 \u2764\ufe0f ok\ufe0f"),
+    ("marks_mc_spacing", "\u0915\u093e\u0915\u093f\u0915\u0940 \u0d15\u0d3e x\u093e"),
+    ("marks_mixed", "Ⓐ\u0301 ñ ñ ü\u0332 ß\u0301 Ω\u0301 ДА\u0301 中\u0301文"),
+]
+
 # Known runq tokenizer limitations: reported as XFAIL, do not fail the suite.
 # (none since Step 5: the two NFC cases above pass)
 TOKENIZER_XFAIL = {}
@@ -181,6 +198,7 @@ LOGITS_PROMPTS = [
 def main():
     ap = argparse.ArgumentParser(description="Generate the HF goldens for the Gwenedeg tests.")
     ap.add_argument("--tokenizer-only", action="store_true", help="only rewrite golden/tokenizer.json")
+    ap.add_argument("--tokenizer-qwen35", action="store_true", help="only write golden/tokenizer_qwen35.json")
     ap.add_argument("--q4ref", action="store_true", help="only write golden/logits_q4 (HF with the Q4_K_M weights)")
     ap.add_argument("--gguf-py", default="", help="directory containing the gguf package (--q4ref)")
     ap.add_argument("--long", action="store_true", help="only write golden/logits_long (positions past 256)")
@@ -190,6 +208,17 @@ def main():
     a = ap.parse_args()
     if a.model_dir:
         return write_model(a.model_dir, a.out_dir, a.subset)
+    if a.tokenizer_qwen35:
+        tok = AutoTokenizer.from_pretrained(os.path.join(ROOT, "models", "Qwen3.5-0.8B"), local_files_only=True)
+        meta = {"model": "Qwen/Qwen3.5-0.8B", "transformers": transformers.__version__}
+        cases = [{"name": n, "text": t, "ids": tok.encode(t, add_special_tokens=False)}
+                 for n, t in TOKENIZER_CASES + TOKENIZER_CASES_QWEN35]
+        path = os.path.join(OUT_DIR, "tokenizer_qwen35.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"meta": meta, "cases": cases}, f, ensure_ascii=False, indent=1)
+            f.write("\n")
+        print(f"wrote {path} ({len(cases)} cases)")
+        return 0
     torch.manual_seed(0)
     tok = AutoTokenizer.from_pretrained(MODEL_DIR, local_files_only=True)
     meta = {"model": "Qwen/Qwen3-0.6B", "torch": torch.__version__,

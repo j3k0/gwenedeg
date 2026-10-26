@@ -63,6 +63,7 @@ struct Engine {
     size_t kv_pos;        // KV bytes per position
     ConVocab *vocab;
     int V, eos, think_start, think_end, chat; // chat: the template variant (RQ_CHAT_*)
+    int hybrid;                               // Qwen3.5's linear layers: a copy keeps only a checkpointed length
     Run **run;            // running jobs, in admission order
     int nrun;
     // per pass
@@ -498,8 +499,8 @@ static void start_run(Engine *e, Job *j, int si, int src, int L) {
     r->row = -1;
     r->o.e = e;
     r->o.j = j;
-    if (j->thinking && e->chat == RQ_CHAT_THINKING)
-        r->o.mode = 1; // (Thinking-2507: the prompt opened the <think> block, the reply starts in the reasoning)
+    if (j->thinking && (e->chat == RQ_CHAT_THINKING || e->chat == RQ_CHAT_QWEN35))
+        r->o.mode = 1; // (Thinking-2507, Qwen3.5: the prompt opened the <think> block, the reply starts in the reasoning)
     for (int i = 0; i < j->nstop; i++)
         if ((int)strlen(j->stop[i]) > r->o.maxstop) r->o.maxstop = (int)strlen(j->stop[i]);
     sl->run = r;
@@ -509,6 +510,11 @@ static void start_run(Engine *e, Job *j, int si, int src, int L) {
         if (src >= 0) L = 0;
         rq_seq_truncate(s, L);
     }
+    // (Qwen3.5: copy / truncate keep a checkpointed length <= L; the next request of this conversation diverges
+    // after its assistant header, so the state there is kept, rq_chat_checkpoint_pos)
+    L = rq_seq_len(s);
+    int ckp = rq_chat_checkpoint_pos(m, j->prompt.v, n);
+    if (ckp >= L) rq_seq_checkpoint_at(s, ckp);
     if (e->o.verbose) {
         char from[48] = "";
         if (src >= 0) snprintf(from, sizeof(from), " (copied from slot %d)", src);
@@ -563,7 +569,7 @@ static int admit(Engine *e, Job *j) {
     int n = j->prompt.n, ib = -1, li = -1, lru = -1, bb = -1, lb = 0;
     for (int i = 0; i < e->nslot; i++) {
         Slot *s = &e->slot[i];
-        int L = j->no_cache ? 0 : rq_seq_common_prefix(s->seq, P, n);
+        int L = j->no_cache ? 0 : rq_seq_keep(s->seq, rq_seq_common_prefix(s->seq, P, n)); // (Qwen3.5: a checkpoint)
         if (!s->run) {
             if (L > li || (L == li && s->used > e->slot[ib].used)) { ib = i; li = L; }
             if (lru < 0 || s->used < e->slot[lru].used) lru = i;
@@ -585,14 +591,15 @@ static int admit(Engine *e, Job *j) {
             int sh = lcp(r->j->prompt.v, r->j->prompt.n, P, n);
             if (sh > rq_seq_len(e->slot[r->si].seq) && sh > pend) pend = sh;
         }
-        if (pend >= have + e->o.copy_min && real_reuse(pend, n)) return 0;
+        // (Qwen3.5: no waiting for a prefix being prefilled: its state is gone once the prefill moves past it)
+        if (!e->hybrid && pend >= have + e->o.copy_min && real_reuse(pend, n)) return 0;
         if (bb >= 0 && lb >= li + e->o.copy_min && real_reuse(lb, n)) {
             start_run(e, j, lru, bb, lb);
             return 1;
         }
     }
     if (real_reuse(li, n)) start_run(e, j, ib, -1, li);
-    else start_run(e, j, lru, -1, rq_seq_common_prefix(e->slot[lru].seq, P, n));
+    else start_run(e, j, lru, -1, rq_seq_keep(e->slot[lru].seq, rq_seq_common_prefix(e->slot[lru].seq, P, n)));
     return 1;
 }
 
@@ -834,6 +841,7 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
     e->V = info.vocab_size;
     e->eos = info.eos;
     e->chat = info.chat;
+    e->hybrid = info.linear_layers > 0;
     e->think_start = single_token(m, "<think>");
     e->think_end = single_token(m, "</think>");
     // the pool: --slots sequences of -c positions (default --parallel + 4), within --kv-mem (default: half the RAM)

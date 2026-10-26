@@ -21,7 +21,10 @@
  * Thinking-2507's P_i ends with "<think>\n" with thinking on (G = "<think>\n\n</think>\n\n" with it off,
  * not in its template), history as the hybrid's, except that an answered turn's P_i loses the "<think>\n"
  * (rq_chat_user_history: HF renders earlier assistant turns without it; the reply is re-prefilled from its
- * answer anyway, as with the hybrid's thinking). */
+ * answer anyway, as with the hybrid's thinking). Qwen3.5 (models/Qwen3.5-0.8B/chat_template.jinja): with thinking
+ * on, Thinking-2507's form ("<think>\n" opens the reply, answered turns lose it); off, the hybrid's (the empty
+ * think block G); its template trims every message text (|trim: Python's str.strip()), so do rq_chat_system /
+ * user / render here (rq_chat_trim). */
 #include "internal.h"
 
 static int chat_mode(const RqModel *m, int thinking) {
@@ -47,12 +50,62 @@ double rq_now(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-static int render_tokens(const RqModel *m, const char *tmpl, const char *arg, RqTokens *out) {
-    // the tokens of tmpl with its one %s replaced by arg, appended to out
+static int is_py_space(uint32_t c) {
+    // Python's str.isspace() (what Jinja's trim strips): \t \n \v \f \r, U+001C..U+001F, space, U+0085, U+00A0,
+    // U+1680, U+2000..U+200A, U+2028, U+2029, U+202F, U+205F, U+3000
+    return (c >= 9 && c <= 13) || (c >= 0x1c && c <= 0x20) || c == 0x85 || c == 0xa0 || c == 0x1680 ||
+           (c >= 0x2000 && c <= 0x200a) || c == 0x2028 || c == 0x2029 || c == 0x202f || c == 0x205f || c == 0x3000;
+}
+
+static int utf8_at(const unsigned char *p, const unsigned char *end, uint32_t *c) {
+    // the code point at p (its byte length), or 0 if p does not start a valid sequence of at most 3 bytes
+    // (the spaces above are all below U+10000)
+    if (p >= end) return 0;
+    if (p[0] < 0x80) { *c = p[0]; return 1; }
+    if ((p[0] & 0xe0) == 0xc0 && end - p >= 2 && (p[1] & 0xc0) == 0x80) { *c = (p[0] & 0x1fu) << 6 | (p[1] & 0x3f); return 2; }
+    if ((p[0] & 0xf0) == 0xe0 && end - p >= 3 && (p[1] & 0xc0) == 0x80 && (p[2] & 0xc0) == 0x80) {
+        *c = (p[0] & 0x0fu) << 12 | (p[1] & 0x3fu) << 6 | (p[2] & 0x3f);
+        return 3;
+    }
+    return 0;
+}
+
+const char *rq_chat_trim(const RqModel *m, const char *text, size_t *len) {
+    const unsigned char *p = (const unsigned char *)text, *end = p + strlen(text);
+    uint32_t c;
+    int k;
+    if (m->chat == RQ_CHAT_QWEN35) {
+        while ((k = utf8_at(p, end, &c)) && is_py_space(c)) p += k;
+        for (const unsigned char *q = end; q > p;) { // the last code point: back over continuation bytes
+            const unsigned char *r = q - 1;
+            while (r > p && (*r & 0xc0) == 0x80 && q - r < 3) r--;
+            if (!((k = utf8_at(r, q, &c)) && r + k == q && is_py_space(c))) break;
+            end = q = r;
+        }
+    }
+    *len = (size_t)(end - p);
+    return (const char *)p;
+}
+
+static int render_tokens(const RqModel *m, const char *tmpl, const char *arg0, RqTokens *out) {
+    // the tokens of tmpl with its one %s replaced by arg (rq_chat_trim'd), appended to out
+    size_t al;
+    const char *arg = rq_chat_trim(m, arg0, &al);
+    char *cp = NULL;
+    if (al != strlen(arg0)) { // (trimmed: a copy)
+        if (!(cp = malloc(al + 1))) return RQ_ERR_NOMEM;
+        memcpy(cp, arg, al);
+        cp[al] = 0;
+        arg = cp;
+    }
     int n = snprintf(NULL, 0, tmpl, arg);
     char *s = n < 0 ? NULL : malloc((size_t)n + 1);
-    if (!s) return RQ_ERR_NOMEM;
+    if (!s) {
+        free(cp);
+        return RQ_ERR_NOMEM;
+    }
     snprintf(s, (size_t)n + 1, tmpl, arg);
+    free(cp);
     int e = rq_tokenize(m, s, n, out);
     free(s);
     return e;
@@ -78,7 +131,7 @@ int rq_chat_end(const RqModel *m, RqTokens *out) { return rq_tokenize(m, "<|im_e
 
 int rq_chat_user_history(const RqModel *m, const char *text, int thinking, RqTokens *out) {
     thinking = chat_mode(m, thinking);
-    if (m->chat != RQ_CHAT_THINKING || !thinking) return rq_chat_user(m, text, thinking, out);
+    if ((m->chat != RQ_CHAT_THINKING && m->chat != RQ_CHAT_QWEN35) || !thinking) return rq_chat_user(m, text, thinking, out);
     int e = tmpl_ok(m, thinking);
     return e != RQ_OK ? e : render_tokens(m, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", text, out);
 }
@@ -118,6 +171,15 @@ int rq_chat_reply_history(const RqModel *m, const int *r, int n, int thinking, R
     return rq_tokens_push(out, r + i, n - i);
 }
 
+int rq_chat_checkpoint_pos(const RqModel *m, const int *tokens, int n) {
+    RqTokens t = { 0 };
+    int e = rq_tokenize(m, "<|im_start|>", -1, &t), id = e == RQ_OK && t.n == 1 ? t.v[0] : -1;
+    rq_tokens_free(&t);
+    for (int i = n - 1; i >= 0 && id >= 0; i--)
+        if (tokens[i] == id) return i;
+    return -1;
+}
+
 int rq_chat_render(const RqModel *m, const RqMessage *msgs, int n, int thinking, RqTokens *out) {
     // [system] + per user message P_i, per assistant message H_i (from its text) + E
     int i = 0, e = RQ_OK, expect = RQ_ROLE_USER, users = 0;
@@ -132,11 +194,12 @@ int rq_chat_render(const RqModel *m, const RqMessage *msgs, int n, int thinking,
             users++;
             continue;
         }
-        const char *c = msgs[i].content, *p;
+        size_t cl;
+        const char *c = rq_chat_trim(m, msgs[i].content, &cl), *p, *ce = c + cl;
         if (thinking) // the text after the last </think>, leading newlines stripped
-            for (const char *q = c; (p = strstr(q, "</think>")); q = p + 8)
+            for (const char *q = c; (p = strstr(q, "</think>")) && p + 8 <= ce; q = p + 8)
                 c = p + 8 + strspn(p + 8, "\n");
-        e = rq_tokenize(m, c, -1, out);
+        e = rq_tokenize(m, c, c < ce ? (long)(ce - c) : 0, out);
         if (e == RQ_OK)
             e = rq_chat_end(m, out);
         expect = RQ_ROLE_USER;

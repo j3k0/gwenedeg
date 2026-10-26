@@ -48,6 +48,14 @@ static RqSeq *seq_new(int cap) {
 
 static int same(const float *a, const float *b, size_t n) { return !memcmp(a, b, n * sizeof(float)); }
 
+static int seq_from(RqCtx *c, RqSeq *dst, const RqSeq *base, int n) {
+    // dst := base's first n positions: rq_seq_copy; a model with linear-attention layers (Qwen3.5) keeps only a
+    // checkpointed length there, so its prefix is prefilled again (the same bits as a copy would give)
+    if (!I.linear_layers) return rq_seq_copy(dst, base, n);
+    rq_seq_reset(dst);
+    return n > 0 ? rq_prefill(c, dst, rq_seq_tokens(base), n, RQ_LOGITS_NONE, NULL, NULL) : RQ_OK;
+}
+
 static float *logits_alone(RqCtx *c, const int *t, int n, const int *dec, int ndec) {
     // reference: a fresh sequence, all-rows prefill of t, then ndec decode steps; rows n + ndec
     float *out = malloc((size_t)(n + ndec) * V * sizeof(float)), *lg;
@@ -71,7 +79,7 @@ static uint64_t hash_f(const float *x, size_t n) {
     return h;
 }
 
-// Batched decode rows. Sequence i of a set: the first plen(i) positions of a base sequence (rq_seq_copy:
+// Batched decode rows. Sequence i of a set: the first plen(i) positions of a base sequence (seq_from:
 // prefixes of different lengths, so the rows sit at different positions), then the tokens tk(i, 0),
 // tk(i, 1) (sequences i >= BD_TWO: tk(i, 0) only), decoded together with the set's other sequences (one
 // row each per rq_forward_batch pass)
@@ -87,7 +95,7 @@ static void bd_refs(RqCtx *c, RqSeq *base, int lo, int span, int n, int kvt, uin
     RqSeq *s = rq_seq_new(M, 0, kvt, &e);
     if (!s) die("rq_seq_new", e);
     for (int i = 0; i < n; i++) {
-        if ((e = rq_seq_copy(s, base, plen(i, lo, span))) != RQ_OK) die("rq_seq_copy", e);
+        if ((e = seq_from(c, s, base, plen(i, lo, span))) != RQ_OK) die("rq_seq_copy", e);
         for (int t = 0; t < (i < BD_TWO ? BD_STEPS : 1); t++) {
             float *lg;
             if ((e = rq_decode(c, s, tk(i, t), &lg)) != RQ_OK) die("rq_decode", e);
@@ -107,7 +115,7 @@ static int bd_batch(RqCtx *c, RqSeq **sq, RqSeq *base, int lo, int span, int n, 
     RqSegment sg[BD_SEQS];
     uint64_t dg = 0;
     for (int i = 0; i < n; i++)
-        ok &= rq_seq_copy(sq[i], base, plen(i, lo, span)) == RQ_OK;
+        ok &= seq_from(c, sq[i], base, plen(i, lo, span)) == RQ_OK;
     for (int t = 0; t < (n <= BD_TWO ? BD_STEPS : 1) && ok; t++) {
         for (int i = 0; i < n; i++) {
             tok[i] = tk(i, t);
@@ -219,14 +227,15 @@ int main(int argc, char **argv) {
         RqSegment s1[2] = { { sa, A.v, A.n, RQ_LOGITS_ALL }, { sb, B.v, nb0, RQ_LOGITS_ALL } };
         ok &= rq_forward_batch(c, s1, 2, out, &lg) == RQ_OK && lg == out;
         ok &= same(out, refA, (size_t)A.n * V) && same(out + (size_t)A.n * V, refB, (size_t)nb0 * V);
-        RqSegment s2[2] = { { sb, B.v + nb0, B.n - nb0, RQ_LOGITS_LAST }, { sc, C.v, 20, RQ_LOGITS_NONE } };
+        int c0 = 64 - (B.n - nb0) < 20 ? 64 - (B.n - nb0) : 20; // (C's first rows next to B's last ones: the tokenizer's counts)
+        RqSegment s2[2] = { { sb, B.v + nb0, B.n - nb0, RQ_LOGITS_LAST }, { sc, C.v, c0, RQ_LOGITS_NONE } };
         ok &= rq_forward_batch(c, s2, 2, NULL, &lg) == RQ_OK && lg && same(lg, refB + (size_t)(B.n - 1) * V, V);
-        for (int i = 20; i < C.n && ok; i += 64) { // the rest of C in 64-row chunks
+        for (int i = c0; i < C.n && ok; i += 64) { // the rest of C in 64-row chunks
             int k = C.n - i < 64 ? C.n - i : 64;
             RqSegment s = { sc, C.v + i, k, RQ_LOGITS_LAST };
             ok &= rq_forward_batch(c, &s, 1, NULL, &lg) == RQ_OK;
         }
-        ok &= same(lg, refC + (size_t)(C.n - 1) * V, V);
+        ok = ok && lg && same(lg, refC + (size_t)(C.n - 1) * V, V);
         report(ok, "batch_prefill_bitwise", "chunks of 2 sequences in one pass (all rows / last row / none)");
         ok = 1;
         for (int i = 0; i < 3 && ok; i++) { // 3 decode rows of 3 sequences per pass
@@ -248,11 +257,12 @@ int main(int argc, char **argv) {
         rq_seq_free(sc);
     }
 
-    // 3. truncate + re-prefill == fresh prefill (positions overwritten in the cache)
+    // 3. truncate + re-prefill == fresh prefill (positions overwritten in the cache; Qwen3.5: to a checkpoint)
     {
         RqSeq *s = seq_new(0);
         float *lg;
-        int ok = rq_prefill(c, s, B.v, B.n, RQ_LOGITS_NONE, NULL, NULL) == RQ_OK;
+        int ok = rq_seq_checkpoint_at(s, 20) == RQ_OK; // (a no-op for Qwen3)
+        ok &= rq_prefill(c, s, B.v, B.n, RQ_LOGITS_NONE, NULL, NULL) == RQ_OK;
         for (int i = 0; i < 3; i++) ok &= rq_decode(c, s, dB[i], NULL) == RQ_OK;
         ok &= rq_seq_truncate(s, 20) == RQ_OK && rq_seq_len(s) == 20;
         ok &= rq_prefill(c, s, A.v, A.n, RQ_LOGITS_LAST, NULL, &lg) == RQ_OK;
@@ -266,6 +276,64 @@ int main(int argc, char **argv) {
         free(ref);
         rq_tokens_free(&t);
         rq_seq_free(s);
+    }
+
+    // 3b. Qwen3.5: recurrent-state checkpoints (rq_seq_checkpoint_at) taken by a prefill chunk (mid-chunk), at once,
+    // by a decode step and by a batched decode pass; truncate / copy / rq_seq_keep to, above and below them; each
+    // continuation == a fresh run of the same tokens, bitwise
+    if (I.linear_layers) {
+        RqSeq *s = seq_new(0), *t = seq_new(0);
+        float *lg;
+        int ok = 1, d2[2] = { 279, 13 };
+        RqTokens u = { 0 };
+        rq_tokens_push(&u, B.v, B.n);
+        rq_tokens_push(&u, dB, 3);
+        float *ref = logits_alone(c, u.v, u.n, NULL, 0); // B + dB, every row
+        ok &= rq_seq_checkpoint_at(s, 40) == RQ_OK && rq_prefill(c, s, B.v, B.n, RQ_LOGITS_NONE, NULL, NULL) == RQ_OK;
+        ok &= rq_seq_checkpoint_at(s, B.n) == RQ_OK && rq_seq_checkpoint_at(s, B.n - 1) == RQ_ERR_ARG;
+        ok &= rq_seq_checkpoint_at(s, B.n + 2) == RQ_OK;
+        for (int i = 0; i < 3; i++)
+            ok &= rq_decode(c, s, dB[i], NULL) == RQ_OK; // (takes the one at B.n + 2, replacing the one at 40)
+        ok &= rq_seq_keep(s, B.n + 3) == B.n + 3 && rq_seq_keep(s, B.n + 1) == B.n && rq_seq_keep(s, B.n + 2) == B.n + 2;
+        ok &= rq_seq_keep(s, 50) == 0 && rq_seq_keep(s, B.n + 4) == RQ_ERR_ARG;
+        // back to B.n + 2 (exact), then the last token again
+        ok &= rq_seq_truncate(s, B.n + 2) == RQ_OK && rq_seq_len(s) == B.n + 2;
+        ok &= rq_decode(c, s, dB[2], &lg) == RQ_OK && same(lg, ref + (size_t)(u.n - 1) * V, V);
+        // above B.n (the checkpoint at B.n + 2 is gone with the truncation below it): to B.n, re-prefill 2
+        ok &= rq_seq_truncate(s, B.n + 1) == RQ_OK && rq_seq_len(s) == B.n && rq_seq_keep(s, B.n) == B.n;
+        ok &= rq_prefill(c, s, dB, 2, RQ_LOGITS_LAST, NULL, &lg) == RQ_OK && same(lg, ref + (size_t)(B.n + 1) * V, V);
+        // copy: src's length (its state), below it (the checkpoint at B.n), below every checkpoint (0)
+        ok &= rq_seq_copy(t, s, rq_seq_len(s)) == RQ_OK && rq_seq_len(t) == B.n + 2;
+        ok &= rq_decode(c, t, dB[2], &lg) == RQ_OK && same(lg, ref + (size_t)(u.n - 1) * V, V);
+        ok &= rq_seq_copy(t, s, B.n + 1) == RQ_OK && rq_seq_len(t) == B.n;
+        ok &= rq_prefill(c, t, dB, 3, RQ_LOGITS_ALL, NULL, NULL) == RQ_ERR_ARG; // (all rows need an output buffer)
+        ok &= rq_prefill(c, t, dB, 3, RQ_LOGITS_LAST, NULL, &lg) == RQ_OK && same(lg, ref + (size_t)(u.n - 1) * V, V);
+        ok &= rq_seq_copy(t, s, 30) == RQ_OK && rq_seq_len(t) == 0;
+        // below every checkpoint: to 0, re-prefill all
+        ok &= rq_seq_truncate(s, 30) == RQ_OK && rq_seq_len(s) == 0;
+        ok &= rq_prefill(c, s, u.v, u.n, RQ_LOGITS_LAST, NULL, &lg) == RQ_OK && same(lg, ref + (size_t)(u.n - 1) * V, V);
+        // a checkpoint taken by a batched decode pass (2 sequences, one row each; s's next position)
+        rq_seq_reset(t);
+        ok &= rq_prefill(c, t, A.v, A.n, RQ_LOGITS_NONE, NULL, NULL) == RQ_OK && rq_seq_checkpoint_at(s, u.n + 1) == RQ_OK;
+        RqSegment two[2] = { { s, d2, 1, RQ_LOGITS_LAST }, { t, d2 + 1, 1, RQ_LOGITS_LAST } };
+        ok &= rq_forward_batch(c, two, 2, NULL, NULL) == RQ_ERR_ARG; // (2 rows of logits: an output buffer)
+        float *o2 = malloc((size_t)2 * V * sizeof(float));
+        ok &= o2 && rq_forward_batch(c, two, 2, o2, NULL) == RQ_OK && rq_seq_keep(s, u.n + 1) == u.n + 1;
+        free(o2);
+        ok &= rq_decode(c, s, d2[1], NULL) == RQ_OK && rq_seq_truncate(s, u.n + 1) == RQ_OK && rq_seq_len(s) == u.n + 1;
+        RqTokens w = { 0 };
+        rq_tokens_push(&w, u.v, u.n);
+        rq_tokens_push(&w, d2, 2);
+        float *ref2 = logits_alone(c, w.v, w.n, NULL, 0);
+        ok &= rq_decode(c, s, d2[1], &lg) == RQ_OK && same(lg, ref2 + (size_t)(w.n - 1) * V, V);
+        report(ok, "checkpoints_bitwise", "taken by a prefill chunk / at once / a decode step / a batched decode pass; "
+               "truncate, copy, keep to / above / below them == fresh runs");
+        free(ref);
+        free(ref2);
+        rq_tokens_free(&u);
+        rq_tokens_free(&w);
+        rq_seq_free(s);
+        rq_seq_free(t);
     }
 
     // 4. rq_generate (greedy) == a hand-written sample / decode loop; stats; the reply limit
@@ -353,6 +421,7 @@ int main(int argc, char **argv) {
         rq_tokens_free(&r);
         report(ok, "chat_render", I.chat == RQ_CHAT_HYBRID ? "system, user, assistant, user; thinking off / on"
                                   : I.chat == RQ_CHAT_INSTRUCT ? "system, user, assistant, user (instruct-2507: no thinking)"
+                                  : I.chat == RQ_CHAT_QWEN35 ? "system, user, assistant, user (qwen3.5); thinking off / on"
                                   : "system, user, assistant, user (thinking-2507)");
     }
 
@@ -480,7 +549,7 @@ static void batch_tests(RqCtx *c, RqTokens A, RqTokens B, RqTokens C, const floa
         RqSegment sg[8];
         uint64_t dg = 0;
         for (int i = 0; i < 5; i++) {
-            okm &= rq_seq_copy(sq[i], i < nlr ? bl : bs, i < nlr ? plen(i, 248, 12) : plen(i, 8, 25)) == RQ_OK;
+            okm &= seq_from(c, sq[i], i < nlr ? bl : bs, i < nlr ? plen(i, 248, 12) : plen(i, 8, 25)) == RQ_OK;
             tok[i] = tk(i, 0);
         }
         sg[0] = (RqSegment) { sq[0], &tok[0], 1, RQ_LOGITS_LAST };

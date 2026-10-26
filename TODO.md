@@ -1533,6 +1533,13 @@ unchanged. Before (Step 9): one engine thread ran one Job at a time from a FIFO 
   pass (p50 up, p95 down); the decision step of a classification still computes the full classifier row (Step 9's
   subset classifier); `json_object` / free strings in schemas; logprobs with streaming; per-request priorities;
   the HTTP layer is one thread per connection (fine up to `--max-conns` 128)
+- [x] macOS server build (`32826f8`, made on the Mac; review follow-up after it): one socket code path on both systems
+  (`socket()` / `accept()` + `fcntl(FD_CLOEXEC)`: runq never forks or execs, so losing accept4's atomicity is
+  harmless; SIGPIPE: the process-wide `SIG_IGN` is the guarantee, `MSG_NOSIGNAL` where defined and `SO_NOSIGPIPE` per
+  accepted socket on top); `job_wait` stays per platform (macOS has no `pthread_condattr_setclock`: a relative wait,
+  monotonic there too). No new minimum macOS version (`clock_gettime` already needs 10.12). Linux: `make test` 475 / 475,
+  the server tests 52 / 52 also with the Apple `job_wait` path emulated, listener / connections / self-pipe close-on-exec
+  checked in /proc. Open: the server tests on the Mac (`tests/server_test.py`)
 
 ## Step 11: other models (the Qwen3 dense family)
 Goal: the bigger Qwen3 models that share the engine's architecture (QK-norm, GQA, NeoX RoPE, SwiGLU) run, correctly

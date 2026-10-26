@@ -636,10 +636,14 @@ static void usage(void) {
             "  --port <int>        port, default 8080 (0: any free port)\n"
             "  --api-key <key>     require 'Authorization: Bearer <key>' (not on /health)\n"
             "  --name <id>         model id in /v1/models and responses, default: the file name\n"
-            "  -c, --ctx <int>     context (positions) per cached sequence, default 8192\n"
+            "  -c, --ctx <int>     context (positions) per sequence, default 8192\n"
             "  -k <type>           KV cache type f16|bf16|f32, default f16\n"
-            "  -b <int>            prefill chunk, default 512\n"
-            "  --slots <int>       cached sequences for prefix reuse, default 4\n"
+            "  --parallel <int>    requests running at once (batched in each forward pass), default 16\n"
+            "  --slots <int>       sequences in the pool: running requests + prefix caches, default parallel + 4\n"
+            "  --kv-mem <GiB>      KV cache of the pool at most (slots x ctx), default half the RAM\n"
+            "  -b <int>            prompt tokens per pass when no request is decoding, default 512\n"
+            "  --chunk <int>       prompt tokens per pass while others decode, default 64\n"
+            "  --prefix-copy <int> copy a running request's prompt prefix if that saves this many tokens, default 32 (0: never)\n"
             "  --queue <int>       requests waiting at most (more: 503), default 64\n"
             "  --max-conns <int>   connections at most (more: 503), default 128\n"
             "  --max-body <bytes>  request body limit (more: 413), default 4194304\n"
@@ -656,9 +660,10 @@ int serve_main(int argc, char **argv) {
     // argv[0] = "serve"
     if (argc < 2 || argv[1][0] == '-') usage();
     const char *path = argv[1], *name = NULL, *host = "127.0.0.1", *key = NULL;
-    int port = 8080, ctx = 8192, kv = RQ_KV_DEFAULT, batch = RQ_BATCH_MAX, slots = 4, queue = 64, conns = 128, threads = 0, verbose = 0, maxtok = 0;
+    int port = 8080, ctx = 8192, kv = RQ_KV_DEFAULT, batch = RQ_BATCH_MAX, slots = 0, queue = 64, conns = 128, threads = 0, verbose = 0, maxtok = 0;
+    int parallel = 16, chunk = 64, copy_min = 32;
     long long maxbody = 4 << 20;
-    double timeout = 600, temp = 1.0, topp = 1.0;
+    double timeout = 600, temp = 1.0, topp = 1.0, kv_mem = 0;
     for (int i = 2; i < argc; i++) {
         const char *f = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         if (!strcmp(f, "-v") || !strcmp(f, "--verbose")) { verbose = 1; continue; }
@@ -672,6 +677,10 @@ int serve_main(int argc, char **argv) {
         else if (!strcmp(f, "-k")) { if ((kv = rq_kv_parse(v)) < 0) usage(); }
         else if (!strcmp(f, "-b")) batch = atoi(v);
         else if (!strcmp(f, "--slots")) slots = atoi(v);
+        else if (!strcmp(f, "--parallel")) parallel = atoi(v);
+        else if (!strcmp(f, "--kv-mem")) kv_mem = atof(v);
+        else if (!strcmp(f, "--chunk")) chunk = atoi(v);
+        else if (!strcmp(f, "--prefix-copy")) copy_min = atoi(v);
         else if (!strcmp(f, "--queue")) queue = atoi(v);
         else if (!strcmp(f, "--max-conns")) conns = atoi(v);
         else if (!strcmp(f, "--max-body")) maxbody = atoll(v);
@@ -682,8 +691,8 @@ int serve_main(int argc, char **argv) {
         else if (!strcmp(f, "--threads")) threads = atoi(v);
         else usage();
     }
-    if (port < 0 || port > 65535 || ctx < 16 || slots < 1 || slots > 64 || queue < 1 || conns < 1 || maxbody < 1024 ||
-        temp < 0 || temp > 2 || topp <= 0 || topp > 1 || maxtok < 0 || batch < 0)
+    if (port < 0 || port > 65535 || ctx < 16 || slots < 0 || slots > 1024 || parallel < 1 || parallel > 256 || kv_mem < 0 || chunk < 1 ||
+        copy_min < 0 || queue < 1 || conns < 1 || maxbody < 1024 || temp < 0 || temp > 2 || topp <= 0 || topp > 1 || maxtok < 0 || batch < 1)
         usage();
     if (batch > RQ_BATCH_MAX) batch = RQ_BATCH_MAX;
 
@@ -723,7 +732,7 @@ int serve_main(int argc, char **argv) {
         else if (n > 4 && !strcmp(b + n - 4, ".bin")) n -= 4;
         snprintf(a.model_id, sizeof(a.model_id), "%.*s", (int)n, b);
     }
-    EngineOpts eo = { path, ctx, kv, batch, slots, queue, verbose };
+    EngineOpts eo = { path, ctx, kv, batch, chunk, parallel, slots, kv_mem, copy_min, queue, verbose };
     double t0 = rq_now();
     a.eng = engine_start(m, &eo, err, sizeof(err));
     if (!a.eng) { fprintf(stderr, "runq serve: %s\n", err); return 1; }
@@ -731,8 +740,10 @@ int serve_main(int argc, char **argv) {
     int bound = 0;
     int lfd = http_listen(&ho, &bound, err, sizeof(err));
     if (lfd < 0) { fprintf(stderr, "runq serve: %s\n", err); return 1; }
-    fprintf(stderr, "runq serve: %s as '%s' (context %d, KV %s, %d slot(s), %d threads, vocab index %.0f ms)\n", path, a.model_id, ctx,
-            rq_kv_name(kv), slots, rq_threads(), (rq_now() - t0) * 1e3);
+    char desc[512];
+    engine_describe(a.eng, desc, sizeof(desc));
+    fprintf(stderr, "runq serve: %s as '%s' (context %d, KV %s, %d threads, vocab index %.0f ms)\nrunq serve: %s\n", path, a.model_id, ctx,
+            rq_kv_name(kv), rq_threads(), (rq_now() - t0) * 1e3, desc);
     fprintf(stderr, "runq serve: listening on http://%s%s%s:%d\n", strchr(host, ':') ? "[" : "", host, strchr(host, ':') ? "]" : "", bound);
     fflush(stderr);
     http_run(lfd, &ho, handle, &a);

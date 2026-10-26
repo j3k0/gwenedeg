@@ -3,13 +3,15 @@
  *                (Content-Length bodies, limits), responses (fixed length or chunked), shutdown
  *   serve.c      the OpenAI layer: routes, request JSON -> a Job (chat template, sampling, stop strings,
  *                response_format), the Job's output -> JSON responses / SSE chunks, errors, logging
- *   engine.c     the engine: one thread running Jobs from a FIFO queue on one compute context, with
- *                prefix KV reuse over a few cached sequences (slots); the only code calling forward passes
+ *   engine.c     the engine: one thread running every Job on one compute context with continuous
+ *                batching (one batched pass per step over all running jobs: decode rows + prompt
+ *                chunks), a pool of sequences (slots) with prefix KV reuse; the only code calling
+ *                forward passes
  *   constrain.c  constrained decoding for json_schema with a finite set of outputs: schema -> canonical
  *                strings -> byte trie; per step the forced tokens or the token mask
  *   json.c       JSON parser / writer
- * Step 10 (continuous batching) replaces engine.c's loop with a scheduler behind the same Job interface;
- * serve.c and http.c do not depend on how Jobs are run.
+ * serve.c and http.c do not depend on how Jobs are run (Step 10b replaced Step 9's one-job-at-a-time loop
+ * with the scheduler behind the same Job interface).
  */
 #ifndef RUNQ_SERVE_H
 #define RUNQ_SERVE_H
@@ -82,15 +84,19 @@ struct Job {
     double t_submit, t_start, t_first, t_end; // rq_now()
     int cancel;                 // set by the connection (client gone): the engine stops at the next step
     int refs;                   // the submitter and the engine
-    int slot;                   // the cached sequence used
+    int slot;                   // the sequence (slot) used
 };
 
 typedef struct {
     const char *model_path;
-    int ctx;                    // positions per cached sequence
+    int ctx;                    // positions per sequence (slot)
     int kv_type;
-    int batch;                  // prefill chunk (-b)
-    int slots;                  // cached sequences (prefix reuse), >= 1
+    int batch;                  // prompt tokens per pass when no job is decoding (-b)
+    int chunk;                  // prompt tokens per pass while other jobs decode (--chunk)
+    int parallel;               // running jobs at most (--parallel; 0: 16)
+    int slots;                  // sequences in the pool (running jobs + prefix caches; 0: parallel + 4)
+    double kv_mem;              // GiB of KV cache for the pool at most (slots x ctx; 0: half the RAM)
+    int copy_min;               // copy a running job's prefix if that saves >= this many tokens (0: never)
     int queue;                  // queued jobs at most (waiting, not running)
     int verbose;
 } EngineOpts;
@@ -99,9 +105,10 @@ typedef struct Engine Engine;
 Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen);
 // queue the job (refs: the engine takes one); 0 = queued, -1 = queue full, -2 = shutting down
 int engine_submit(Engine *e, Job *j);
-void engine_stop(Engine *e, double grace); // reject the queue, let the running job finish (grace s), join
+void engine_stop(Engine *e, double grace); // reject the queue, let the running jobs finish (grace s), join
 void engine_free(Engine *e);                // (after engine_stop, once no connection uses it)
-int engine_queued(Engine *e, int *running);
+int engine_queued(Engine *e, int *running); // waiting jobs; *running: jobs running
+void engine_describe(Engine *e, char *buf, size_t n); // the effective pool / batching settings (one line)
 const ConVocab *engine_vocab(Engine *e);
 
 Job *job_new(void);

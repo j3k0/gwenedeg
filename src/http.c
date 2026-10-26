@@ -21,12 +21,19 @@
 #include "runq.h"
 #include "http.h"
 
-// Portability: macOS lacks SOCK_CLOEXEC, accept4 and MSG_NOSIGNAL.
+// Portability: one code path on Linux and macOS (macOS has no SOCK_CLOEXEC / accept4; older SDKs no
+// MSG_NOSIGNAL). FD_CLOEXEC is set with fcntl right after socket() / accept() / pipe(): runq never forks
+// or execs, so the window between the two calls is harmless and the flag is hygiene only. SIGPIPE: the
+// guarantee is http_signals' process-wide SIG_IGN (installed before the listener exists), so a write to
+// a connection the client closed fails with EPIPE / ECONNRESET on both systems and only that connection
+// ends; MSG_NOSIGNAL per send (where defined) and SO_NOSIGPIPE per accepted socket (macOS: set on each
+// one, accept() does not reliably inherit it from the listener) are a second line of defence.
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
 
 static void set_cloexec(int fd) {
+    // (best effort: F_GETFD / F_SETFD on a valid descriptor do not fail)
     int f = fcntl(fd, F_GETFD);
     if (f >= 0) fcntl(fd, F_SETFD, f | FD_CLOEXEC);
 }
@@ -68,6 +75,8 @@ static void on_signal(int sig) {
 
 int http_signals(void) {
     if (pipe(g_pipe)) return -1;
+    set_cloexec(g_pipe[0]);
+    set_cloexec(g_pipe[1]);
     fcntl(g_pipe[0], F_SETFL, O_NONBLOCK);
     fcntl(g_pipe[1], F_SETFL, O_NONBLOCK);
     struct sigaction sa;

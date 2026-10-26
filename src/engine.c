@@ -119,9 +119,15 @@ void job_lock(Job *j) { pthread_mutex_lock(&((JobSync *)j->mu)->mu); }
 void job_unlock(Job *j) { pthread_mutex_unlock(&((JobSync *)j->mu)->mu); }
 
 int job_wait(Job *j, double seconds) {
+    // one wait of at most `seconds` for news: a tick, not a deadline (serve.c's wait_job waits 0.1 s at a
+    // time and re-checks the job's state, so spurious wakeups are harmless and nothing accumulates; the
+    // request's deadline is checked by the engine against rq_now()). Monotonic on both systems, so a
+    // wall-clock change cannot stretch a tick: Linux waits until an absolute CLOCK_MONOTONIC time (the
+    // condition's clock, job_new); macOS has no pthread_condattr_setclock (its conditions time out on
+    // the wall clock), so it waits a relative time, which the kernel measures on the monotonic mach clock
     JobSync *s = j->mu;
-#ifdef __APPLE__
     if (seconds < 0) seconds = 0;
+#ifdef __APPLE__
     long long rel = (long long)(seconds * 1e9);
     struct timespec rt = { (time_t)(rel / 1000000000LL), (long)(rel % 1000000000LL) };
     return pthread_cond_timedwait_relative_np(&s->cv, &s->mu, &rt) == 0;

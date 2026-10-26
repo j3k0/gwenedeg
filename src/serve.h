@@ -115,6 +115,8 @@ Job *job_new(void);
 void job_release(Job *j);                    // drop a reference (freed at 0)
 void job_lock(Job *j);
 void job_unlock(Job *j);
-int job_wait(Job *j, double seconds);        // under the lock: wait for news (or timeout); 0 on timeout
+// under the lock: one wait for news of at most `seconds` (monotonic; may wake early: re-check the job's
+// state); 0 on timeout
+int job_wait(Job *j, double seconds);
 
 #endif

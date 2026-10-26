@@ -315,5 +315,6 @@ lists open work only; the full log is in git: `git show b3e48a3:TODO.md`. The st
 | 9 | `runq serve` (OpenAI API, prefix reuse, constrained decoding) | `69078ea` |
 | 10a, 10b | batched decode of several sequences; continuous batching in `runq serve` | `302e0b2`, `38b71d9` |
 | 11 | the other Qwen3 dense models (1.7B-8B, 2507), fixes and tests | `fb2b9fb`, `6e1f251` |
+| 12 | Qwen3.5-0.8B: Gated DeltaNet + gated attention, recurrent-state checkpoints ([qwen35.md](qwen35.md)) | `99dfa79`, `8d3be20` |
 
 The macOS / NEON port (`67d7296` onwards) was developed on a separate branch and merged after Step 7b.

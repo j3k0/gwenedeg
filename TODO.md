@@ -75,56 +75,30 @@ and generic kernels, a request batched or alone), and a change of numerics must 
   computing). No test reaches this path. It needs a fault-injection hook (e.g. an environment variable that fails
   one segment) and a test showing that the other jobs' outputs are unchanged, bitwise.
 
-## Qwen3.5-0.8B (hybrid: Gated DeltaNet + gated attention)
+## Qwen3.5 (hybrid: Gated DeltaNet + gated attention)
 
-Design, verified GGUF layout and reasoning: [docs/qwen35.md](docs/qwen35.md). Prepared so far: the numpy
-reference `tests/ref_qwen35.py` (= HF fp32 to 6e-5), goldens `tests/golden/models/3.5-0.8b-hf` / `3.5-0.8b-q8`
-(not wired into `check_models.py` yet), `scripts/download_models.py qwen35`, `.venv-hf5` (transformers 5.x).
-Rules for every step: `make test` stays green, Qwen3 logits stay bit-identical (`tests/compare_bins.sh` for the
--Ofast code generation of `src/forward.c`), and the new paths obey the bitwise invariants (batched == sequential,
-any thread count, AVX-512 == generic, a request batched or alone). Target file: the Unsloth Q8_0 (Q8_0 + F32 only).
+Qwen3.5-0.8B Q8_0 runs and is tested (`make test`'s `q35` group); design, results and measurements in
+[docs/qwen35.md](docs/qwen35.md). The rules stay: `make test` green, Qwen3's outputs byte-identical
+(`tests/compare_bins.sh`), the bitwise invariants on the new paths.
 
-- [ ] **Q35-1. Loader, tokenizer, chat template.** `qwen35` in `gguf_config` / `gguf.c` (accept the architecture;
-  new `Config` fields: per-layer type from `full_attention_interval` or `attention.recurrent_layers`, `rope_dim`,
-  the ssm shapes; check every tensor's name, type and shape; ignore `mtp.*` / vision tensors if present). The
-  `qwen35` pre-tokenizer: `[\p{L}\p{M}]+` letters and `\p{M}` excluded from the punctuation class
-  (`tools/gen_unicode_tables.py` + `src/unicode_tables.h` get a `UCLS_M`; `pretok_next` picks the variant from
-  `tokenizer.ggml.pre`; vocab 248,320). `RQ_CHAT_QWEN35` (detect by architecture; thinking off by default,
-  `<think>\n` opened when on). Until Q35-2 the forward pass is refused with a clear message.
-  Done when: `-m tokenize` matches HF on a Qwen3.5 tokenizer golden (second file next to `golden/tokenizer.json`,
-  incl. combining-mark cases) and `fuzz_tokenizer.py` vs HF; `-m render` matches `golden/chat_render.json` cases
-  made with `.venv-hf5` (`make_chat_golden.py`); Qwen3 tokenizer goldens unchanged.
-- [ ] **Q35-2. Forward pass, sequential (`-b 1`), Q8_0.** DeltaNet decode layer (conv ring state, l2norm, beta / g,
-  the 128 x 128 recurrence vectorized along v with k-sequential sums, gated rmsnorm, `ssm_out`); gated attention
-  (`attn_q` = [q | gate] per head, sigmoid gate, QK-norm); partial RoPE (`rope_dim` 64 of 256, rest passes through;
-  with `rope_dim` = `head_dim` Qwen3 stays bit-identical); KV cache for the 6 attention layers only (indexed by
-  attention layer); per-sequence conv + S state in `RqSeq` (fp32, ~18.9 MiB); the generic kernels first.
-  Done when: `-m logits` on `en` / `code` / `chat` / `long2` passes vs `3.5-0.8b-q8` (thresholds as Q8_0 vs its
-  reference) and vs `3.5-0.8b-hf`, and a greedy chat answer is sane ("capital of Australia").
-- [ ] **Q35-3. Batched prefill, threads, AVX-512.** The recurrence as (sequence, head) work items over a chunk's
-  tokens in order (state stays in L2); the per-head scalars (`exp(g)`, beta, l2norm sums) from one shared
-  function; SIMD paths with the same per-lane k order as the generic one (`ATT_EXACT` / `ATT_FMA` rules).
-  Done when: `-b 7 / 64 / 512` bitwise == `-b 1`, 8 threads == 3, AVX-512 == generic (`kernels/*`), and the
-  batched-decode rows == alone (`api_test`).
-- [ ] **Q35-4. Sequences: state checkpoints.** `rq_seq_checkpoint`, an automatic checkpoint at the end of each
-  prefill, a small LRU per sequence (config field). `rq_seq_truncate` on a hybrid model rolls back to the
-  largest checkpoint <= n and returns the length kept; `rq_seq_copy` copies the KV prefix plus the checkpoint;
-  audit every caller (`cli.c` chat reuse, `engine.c` prefix cache and slot copy, `rq_seq_common_prefix` users).
-  Models without linear layers keep today's exact behaviour.
-  Done when: `api_test` cases (truncate to / below a checkpoint, copy, re-prefill gives bitwise the same logits as
-  an uninterrupted run), CLI multi-turn chat goldens, `runq serve` prefix reuse across requests (`server_test.py`).
-- [ ] **Q35-5. Tests in the suite.** Wire `3.5-0.8b-hf` / `3.5-0.8b-q8` into the `models` group of
-  `check_models.py` (logits, bitwise groups, greedy golden, render, server); a synth model for the default
-  `make test` (2 linear + 1 attention layer cut from the 0.8B Q8_0, `make_synth.py`, numpy reference
-  `ref_qwen35.py`); README "Other models" table and limitations; BENCHMARKS numbers for 0.8B.
-- [ ] **Q35-6. Q5_K, for the Unsloth Q4_K_M** (`attn_qkv` and `ssm_out` of the 18 linear layers are Q5_K): the
-  "More GGUF types" item below, Q5_K first. Done when `Qwen3.5-0.8B-Q4_K_M.gguf` passes vs a
-  `make_model_ref.py` golden (`3.5-0.8b-q4km`) and the bitwise groups.
-- [ ] **Q35-7. Performance.** Measure decode / prefill vs the estimates in docs/qwen35.md (classifier = a third of
-  the Q8_0 weights; recurrence ~2.5% of prefill); fixed head-to-thread assignment so the state stays in L2; NEON
-  port of the recurrence; the subset-classifier item (Server) matters more here.
-- [ ] **Later, separate:** Qwen3.5-2B / 4B / 9B (`num_v_heads != num_k_heads`: the converter reorders v heads,
-  check against HF), MoE models (Qwen3.6-35B-A3B: these layers plus expert routing), images (3-D MRoPE positions).
+- [ ] **The recurrence's speed.** It takes ~45% of a Qwen3.5-0.8B prefill (0.28 of 0.61 s for 712 tokens at 8
+  threads, `-DRUNQ_PROFILE`'s "attention+quant" bucket), against ~2.5% of the flops: `dn_head` streams each head's
+  64 KB state twice per token (~4 of ~5 us per token and head, one thread), and a segment has 16 work items (one
+  per value head), so 12-16 threads barely help (0.20 s at 16). Plan: split each head's v columns into blocks of 32
+  (each v lane's recurrence is independent, so the bits stay the same; a 128 x 32 block of S, 16 KB, stays in L1;
+  64 items per segment), with the conv + l2norm + gates and the gated norm as phases of their own (per row and
+  head), and the decay folded into one pass over the state. Decode the same way (16 -> 64 items). Done when prefill
+  is >= 0.8x Qwen3-0.6B's tok/s (now ~0.6x) with the q35 group unchanged; then the NEON check of the recurrence
+  (vectorized along v: it should be bit-identical to the generic build there too, untested).
+- [ ] **Q5_K, for the Unsloth Q4_K_M** (`Qwen3.5-0.8B-Q4_K_M.gguf`: `attn_qkv` and `ssm_out` of the 18 linear layers
+  are Q5_K, rejected today): the "More GGUF types" item below, Q5_K first. Done when the file passes vs a
+  `make_model_ref.py` golden (`3.5-0.8b-q4km`) and the bitwise groups (a `FAMILY` entry in `tests/check_models.py`).
+- [ ] **The other sizes**: Qwen3.5-2B / 4B / 9B have `num_v_heads != num_k_heads` (rejected at load): the converter
+  reorders the value heads, check against HF (`tests/ref_qwen35.py` asserts equal counts too); MoE models
+  (Qwen3.6-35B-A3B: these layers plus expert routing); images (MRoPE's 3-D positions, the vision tower).
+- [ ] **Checkpoints, measured**: `RQ_SEQ_CK` = 2 per sequence (18.9 MB each) at the prompt's assistant header
+  (docs/qwen35.md). Not measured on real traffic: how often `runq serve`'s requests roll back further (a
+  re-prefill of the whole conversation), and whether a checkpoint at the end of each reply would pay off.
 
 ## Models and formats
 

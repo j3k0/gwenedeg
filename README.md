@@ -1,13 +1,14 @@
 # Gwenedeg
 
-Gwenedeg runs Qwen3 dense language models on the CPU, in plain C with no external dependencies. It is a small
+Gwenedeg runs Qwen3 dense language models, and Qwen3.5-0.8B, on the CPU, in plain C with no external dependencies. It is a small
 inference library (`src/runq.h`), a command line, and an OpenAI-compatible HTTP server. **The binary is
 called `runq`**, as in qwen3.c, the project it grew from. The library keeps the name too (`runq.h`,
 `rq_` prefix).
 
-- **Models**: Qwen3-0.6B, 1.7B, 4B and 8B, plus Qwen3-4B-Instruct-2507 / Thinking-2507. It loads GGUF
-  **Q8_0** and **Q4_K_M** files directly (weights, tokenizer and hyperparameters come from the file; chat
-  templates are built in), and also qwen3.c's Q8_0 `.bin` export.
+- **Models**: Qwen3-0.6B, 1.7B, 4B and 8B, plus Qwen3-4B-Instruct-2507 / Thinking-2507, and Qwen3.5-0.8B (the
+  hybrid architecture: Gated DeltaNet linear attention + gated attention; Q8_0). It loads GGUF **Q8_0** and
+  **Q4_K_M** files directly (weights, tokenizer and hyperparameters come from the file; chat templates are built
+  in), and also qwen3.c's Q8_0 `.bin` export.
 - **Kernels**: AVX-512 VNNI on x86-64, NEON (dot product) on AArch64 / Apple Silicon, and generic C
   everywhere else. The SIMD kernels give bit-identical results to the generic ones.
 - **Deterministic**: logits are bit-identical whatever the thread count, the prefill chunk size or the
@@ -80,7 +81,8 @@ prefill and decode speed. Details: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 | `4b-2507i-q4km` | `Qwen3-4B-Instruct-2507-Q4_K_M.gguf` | 2,497 MB | the best 4B for chat (never thinks) |
 | `4b-2507t-q4km` | `Qwen3-4B-Thinking-2507-Q4_K_M.gguf` | 2,497 MB | always thinks |
 | `8b-q4km` | `Qwen3-8B-Q4_K_M.gguf` | 5,028 MB | quality over speed |
-| `hf`, `1.7b-hf` | `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-1.7B` (bf16 safetensors) | 1.5 / 4.1 GB | for the `.bin` export and the test goldens |
+| `3.5-0.8b-q8` | `Qwen3.5-0.8B-Q8_0.gguf` (unsloth) | 812 MB | Qwen3.5: hybrid layers, 248k vocabulary, thinking off by default ([docs/qwen35.md](docs/qwen35.md)) |
+| `hf`, `1.7b-hf`, `3.5-0.8b-hf` | `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-1.7B`, `Qwen/Qwen3.5-0.8B` (bf16 safetensors) | 1.5 / 4.1 / 1.8 GB | for the `.bin` export and the test goldens |
 
 Measured on the 16-vCPU AMD EPYC Genoa VM (shared, noisy: best of 2, interleaved, 2026-10-26; prefill of
 451 tokens, decode of 128 tokens after a short prompt, perplexity on the 4,142-token
@@ -97,6 +99,12 @@ Measured on the 16-vCPU AMD EPYC Genoa VM (shared, noisy: best of 2, interleaved
 | Qwen3-4B-Instruct-2507 Q4_K_M | 2.8 GB | 284 / 401 | 56 / 56 | 173 / 237 | 11.86 |
 | Qwen3-4B-Thinking-2507 Q4_K_M | 2.8 GB | 280 / 375 | 51 / 58 | 179 / 233 | 13.61 |
 | Qwen3-8B Q4_K_M | 4.9 GB | 158 / 219 | 30 / 30 | 91 / 119 | 11.53 |
+| Qwen3.5-0.8B Q8_0 (\*) | 0.96 GB | 1,117 / 1,580 | 141 / 182 | | 18.86 (512-token windows: 22.729, HF 22.728) |
+
+(\*) Another session (2026-10-26, `scripts/bench_models.py`, 448 tokens; Qwen3-0.6B Q8_0 alongside: 1,817 / 2,494 and
+209 / 230). Its decode barely slows down with the context (160 / 174 tok/s after 1,500 tokens): only 6 of its 24
+layers have a KV cache, at 12 KB per token. Prefill is ~0.6x the 0.6B's: the linear attention's recurrence is not
+tuned yet (docs/qwen35.md, Performance).
 
 Decode is memory-bound and moves with the machine's load (8B ranged 12-30 tok/s); startup takes 0.1-0.2 s
 up to 1.7B, ~0.5 s for 4B and ~1 s for 8B. Q4_K_M is the better trade at 4B / 8B (decode ~1.6x Q8_0 at
@@ -104,9 +112,14 @@ up to 1.7B, ~0.5 s for 4B and ~1 s for 8B. Q4_K_M is the better trade at 4B / 8B
 "Sydney" for the capital of Australia.
 
 **Chat templates** are detected from the file's `tokenizer.chat_template`, which is not interpreted
-(Qwen3's three variants are built in). The hybrid Qwen3 template (0.6B to 8B) follows `-r 0` / `-r 1`.
-Instruct-2507 never thinks, and Thinking-2507 always does; `-r` is ignored for those, with a note. The
-renderings equal HF's `apply_chat_template` (tested).
+(Qwen3's three variants and Qwen3.5's are built in). The hybrid Qwen3 template (0.6B to 8B) follows `-r 0` / `-r 1`.
+Instruct-2507 never thinks, and Thinking-2507 always does; `-r` is ignored for those, with a note. Qwen3.5 follows
+`-r` too, off by default as in its template. The renderings equal HF's `apply_chat_template` (tested).
+
+**Qwen3.5** keeps a fixed-size recurrent state per sequence (19 MB for 0.8B) besides its small KV cache. That state
+cannot be rewound, so a chat that edits its history (a thinking reply's reasoning, dropped from the next turn) goes
+back to a checkpoint the CLI and the server keep at each prompt's assistant header and prefills the rest again, with
+the same results as a fresh run.
 
 **qwen3.c's `.bin`** (Q8_0, group 64) works too, exported from the HF weights with qwen3.c's exporter.
 The tests use it, and it is the format for comparing with upstream: `scripts/download_models.py hf &&
@@ -114,7 +127,8 @@ scripts/setup_venv.sh && scripts/export_q8.sh` (a `.venv` with CPU torch) gives 
 `make models` does the same.
 
 Not supported: other GGUF types (Q5_K_M, Q4_0, IQ*, F16, the Unsloth "UD" files: rejected with a clean
-error), Qwen3-14B and larger (untested), the MoE models (`qwen3moe`), Qwen3-Embedding / Reranker, and RoPE
+error; so is Unsloth's Qwen3.5-0.8B Q4_K_M, which has Q5_K tensors), Qwen3-14B and larger (untested), Qwen3.5 sizes
+other than 0.8B (rejected), the MoE models (`qwen3moe`, Qwen3.6), images, Qwen3-Embedding / Reranker, and RoPE
 scaling (YaRN).
 
 ## Performance
@@ -261,12 +275,14 @@ make test                                 # the regression suite
 make test-models                          # optional: every downloaded bigger model (minutes)
 ```
 
-`make test` runs 475 checks in ~30-36 s on the 16-vCPU VM. It needs numpy (from `.venv` or the system
-`python3`) and the 0.6B `.bin`; the GGUF groups are skipped if their files are missing. It covers:
+`make test` runs 481 checks in ~28-36 s on the 16-vCPU VM, 613 in ~45 s with the Qwen3.5-0.8B Q8_0 file
+(`scripts/download_models.py 3.5-0.8b-q8`). It needs numpy (from `.venv` or the system `python3`) and the 0.6B
+`.bin`; the GGUF groups are skipped if their files are missing. It covers:
 tokenizer ids against HF; logits against HF fp32 (cosine, top-1 / top-5); batched against sequential,
 thread-count and generic-against-SIMD bit-identity; Q4_K_M dequantization against gguf-py; the KV cache
 types; greedy-output goldens; chat-template rendering against HF's `apply_chat_template`; the library
-API; the server over HTTP; and synthetic GGUF models with the bigger models' shapes. Golden references
+API; the server over HTTP; synthetic GGUF models with the bigger models' shapes; and Qwen3.5-0.8B (its tokenizer,
+logits against HF fp32, the same invariants, chats that roll back to a state checkpoint). Golden references
 come from HF transformers and are committed under `tests/golden/`. See [tests/README.md](tests/README.md).
 
 Benchmarks: `make bench` (decode, thread sweep), `make bench-prefill`, `scripts/bench_all.sh` (the runq
@@ -276,9 +292,9 @@ mynah-slm, an optional reference engine for comparison (not part of this reposit
 
 ## Limitations
 
-- Qwen3 dense models only (`general.architecture` qwen3, gpt2 / qwen2 tokenizer). GGUF Q8_0 / Q4_K_M
-  (any mix of Q8_0, Q4_K and Q6_K tensors) and qwen3.c's `.bin`. No other quantization types, no MoE, no
-  RoPE scaling, no Jinja interpreter (Qwen3's templates are built in).
+- Qwen3 dense models and Qwen3.5-0.8B (`general.architecture` qwen3 / qwen35, gpt2 tokenizer with the qwen2 /
+  qwen35 pre-tokenizer). GGUF Q8_0 / Q4_K_M (any mix of Q8_0, Q4_K and Q6_K tensors) and qwen3.c's `.bin`. No other
+  quantization types, no MoE, no RoPE scaling, no images, no Jinja interpreter (the templates are built in).
 - Fast paths: x86-64 with AVX-512 VNNI (selected at compile time with `-march=native`) and AArch64 with
   the dot-product extension. Other CPUs, including x86 without AVX-512 VNNI, use the generic C kernels:
   the same results, but for Q4_K_M ~10x slower prefill and ~3-4x slower decode.

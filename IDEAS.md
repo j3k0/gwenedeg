@@ -22,6 +22,9 @@ k + 1 rows, with logits for every row. Accept drafts while they equal the token 
   rejection sampling.
 - Gain depends on how repetitive the output is (code edits, quoting, extraction, JSON echoing the prompt). In
   `runq serve` the draft rows would simply enlarge the job's segment in the batched pass.
+- Qwen3.5 ships its own draft model: a multi-token-prediction head (`mtp.*` in the HF checkpoint, 15 tensors; not in
+  the Unsloth GGUFs, docs/qwen35.md). On a hybrid model a rejected draft also needs the recurrent state from before
+  it: a checkpoint per verification pass (18.9 MB for 0.8B), or verification rows that keep the state per position.
 
 ## A classification endpoint that returns label probabilities
 

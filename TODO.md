@@ -19,6 +19,8 @@ tok/s). Default threads nproc - nproc/8 (14 here).
 KV cache (Step 7b): f16 by default (`-k f16|bf16|f32`): half the memory, as accurate as fp32 (KL from HF
 +0.2%); with the new cache layout decode after 3,000 tokens 90 -> 128 tok/s (Q8_0 GGUF, 8 threads; Q4_K_M
 103 -> 158), prefill unchanged within -0..+7%.
+Architecture (Step 8): a library (`src/runq.h`: model / sequence / compute context, multi-sequence batched
+passes, errors returned, no printing) in modules, the CLI on top; outputs byte-identical, same speed.
 
 Status: `[ ]` todo · `[~]` in progress · `[x]` done
 
@@ -907,6 +909,108 @@ prompt ~86 tok/s at 8 threads (Q8_0 GGUF) vs ~190 at short contexts; prefill at 
   tok/s, f32 1.36 GB at 132), above the 72-130 GB/s of Step 3a's read test: the bandwidth limit of this VM
   needs re-measuring before deciding what bounds long-context decode
 
+## Step 8: cleanup / architecture (library API, modules)
+Goal: make Steps 9 (`runq serve`) and 10 (multi-sequence decode) natural without changing any result.
+Before: one file `src/runq.c` (3,916 lines): `Transformer` = config + weights + one `RunState` (activations,
+batched buffers, the KV cache) + the GGUF mapping; globals for the group size, K-quant flag, `-b`, `-k`, `-n`;
+`forward(tok, pos)` / `forward_batch(tokens, n, pos0)` for consecutive positions of the one sequence; chat /
+generate print and sample inside the loops; 66 `exit()` calls (62 in runq.c, 4 in threads.h).
+- [x] Modules, one translation unit each (`dfed67f`, then reworked): `model.c` (loading .bin / GGUF, weight
+  conversion / repacking, chat templates), `gguf.c` (reader), `forward.c` (sequences, contexts and every
+  numeric part: decode step, batched pass, attention / matmul dispatch, quantization, norms, RoPE, KV cache),
+  `tokenizer.c` (+ detokenization), `sampler.c`, `chat.c` (template rendering, generation loop), `threads.c`
+  (the pool; `threads.h` keeps the inline phase synchronization, its globals are single instances now),
+  `cli.c`, `internal.h`, the public `runq.h`. Separate TUs rather than a unity build: all numeric code of the
+  forward passes stays together in `forward.c` (the exact arithmetic depends on gcc -Ofast's code
+  generation in its context, e.g. `quantize()`, Step 7b), and the mechanical split alone was checked first:
+  byte-identical outputs (compare_bins.sh, 360 jobs), speed within noise. The one place the context mattered
+  elsewhere: `sample()` keeps its own function (noinline, the configuration through a pointer): inlined into
+  a caller with a local configuration, -Ofast may turn the per-value temperature division into a
+  multiplication by the reciprocal (other bits). Makefile: objects per flavour (`build/native`, `generic`,
+  `debug`, rebuilt when the flags change); a clean native build still takes ~20 s (`forward.c` with the
+  kernels, ~22 s for the single file before), a change outside `forward.c` rebuilds in ~1-3 s
+- [x] The three objects (`src/runq.h`): **RqModel** (config, weights, tokenizer, the templates of both thinking
+  modes; read-only once loaded, shared), **RqSeq** (its own KV cache: capacity and KV type per sequence; length;
+  the tokens at its positions; RNG), **RqCtx** (activation / scratch buffers for `max_batch` rows, attention
+  scratch sized for a context length and grown for a longer sequence, synchronization, logits, profiling, the
+  per-thread conversion buffer the generic attention used to malloc per call). The forward passes take the
+  sequence(s): `rq_decode`, `rq_prefill` (chunks, or token by token without batch buffers), and
+  **`rq_forward_batch`**: rows of several sequences in one pass, in segments (consecutive positions of one
+  sequence); per-row position (RoPE, causal length), per-segment KV cache in the QK-norm + RoPE + store items
+  (a cache tile of one segment) and in the attention items (row blocks never straddle a segment; sorted
+  longest first, for one segment the old order), logits of selected rows (none / last / all per segment: the
+  decode GEMV for a single last row, as before, else the classifier GEMM over the compacted rows). So Step 10's
+  multi-sequence decode is already possible (B segments of one row) and bit-identical to separate runs
+  (tests below); what it lacks is speed (below)
+- [x] API around it: `rq_model_load` (opts: context cap, tokenizer only, weights only), `rq_seq_*` (new /
+  free / reset / truncate / common prefix / seed), `rq_sample` (per-call temperature / top-p, the sequence's
+  RNG, an optional token mask for constrained decoding: disallowed logits set to a large finite negative
+  value, no infinities under -Ofast), `rq_generate` (the chat loop as a function: prefill, RNG draws per
+  prefilled token, sample, end tokens, max tokens, context full; callbacks per token (may stop) and per logits
+  vector; stats and timing in a struct), `rq_tokenize` (with length: NUL bytes allowed), `rq_detok_push` /
+  `_flush` (incremental, never splits a UTF-8 character), `rq_chat_system / user / end / reply_history /
+  render` (messages -> tokens in the CLI chat's canonical form, thinking on / off), `rq_dequant_rows` (hook).
+  No printing in the library: the load warning and the RUNQ_SYNC note are returned; the CLI prints the same
+  `[timing]` / `[tokenize]` / `[profile]` lines from the stats
+- [x] Errors: request paths return `RQ_ERR_*` (prompt past the capacity: `RQ_ERR_CONTEXT`, nothing prefilled;
+  bad token / segment / mode: `RQ_ERR_ARG`; allocation: `RQ_ERR_NOMEM`, incl. inside encode / NFC / BPE) with
+  a message (`rq_ctx_error`); load errors (every GGUF check, .bin header / size (new: a truncated .bin was a
+  crash), tokenizer, allocation in the parallel workers) come back from `rq_model_load` as the message the CLI
+  printed before, after freeing what was allocated (load_fail / gguf_fail longjmp to the loader; checked
+  with ASan on truncated / corrupt files incl. a failure after the weights were loaded); `rq_begin` /
+  `rq_sync_init` return errors; the pool keeps the threads it got if `pthread_create` fails. **exit(): 66 ->
+  16, all in cli.c** (library: 0). CLI unchanged (same flags, modes, outputs, defaults); the only visible
+  difference: `-c < 0` says so instead of "malloc failed!"
+- [x] Cleanup: comments name the modules; the per-call malloc in the generic attention, globals for
+  `-b` / `-k` / `-n` / the K-quant flag, `decode()`, the `Sampler` construction, `DecodeJob.token`, the
+  duplicated template strings removed; `rq_model_free` / `rq_ctx_free` free everything (ASan leak check clean)
+- [x] Verification (2026-10-26): `tests/compare_bins.sh` (new, reusable: two builds' outputs byte for byte,
+  360 jobs: 3 models x both builds x f16 / bf16 / f32 x `-b 1 / 7 / 64 / 512` x a 5-token and a 280-token prompt
+  for `-m logits`; greedy and seeded generate / chat, multi-turn on stdin with `-r 0 / 1`, a system prompt,
+  context full, a cut reply, `-b 1 / 7`, the chat dumps, tokenize, dequant, error cases) against copies of the
+  pre-refactor binaries (`e6ca1ec` = /tmp/cw11/runq-base): all identical after each commit. `make test` 300 ->
+  333 checks (new group `api`, below), ~29 s at load 8-12. ASan + UBSan (scratch, both builds): generate at
+  -b 7 / 512, logits -b 1 / 64 (-k bf16), chat with context full (-c 96) and -r 1 -k f32 -t 0.8, 16-thread
+  decode past 256 positions, on the 3 models; tokenize, dequant, the API test on the 3 models (both builds);
+  8 loads of truncated / corrupt files: ~65 runs, no reports. Builds: -DRUNQ_PROFILE (profile lines as
+  before), no -fopenmp, -DRUNQ_NO_POOL, -march=x86-64-v3, -O0 compile and give the same text; -march=x86-64
+  compiles; the NEON / macOS (clang) and Windows paths could not be compiled here (no toolchain): same
+  guards and macros, to be checked on the Mac
+- [x] Tests (`tests/api_test.c`, group `api`, 11 checks per model, .bin / Q8_0 GGUF / Q4_K_M, ~1.3 s each in the
+  background from the start, so +0 s): sequences interleaved == alone, chunks of 2 sequences in one pass (all
+  rows / last / none), decode rows of 3 sequences per pass (one at positions 250+), a chunk at 256..276,
+  truncate + re-prefill == fresh, all bitwise; `rq_generate` == a hand-written loop; error codes; chat
+  rendering == the CLI's pieces; detokenization; the token mask. Breakage (scratch): one sequence's cache for
+  every attention row block, or position 0 for later segments: the batch checks fail
+- [x] Speed (2026-10-26, interleaved with the pre-refactor binary, best of 6 (decode: best / median), chat,
+  `-c 4096 -n 128`, load 9-12; prefill numbers in tok/s):
+
+  | | prefill 451 tok, 8 / 12 thr | prefill 1,500 tok, 8 / 12 | decode after 451, 8 thr | 12 thr |
+  |---|---|---|---|---|
+  | Q8_0 GGUF, before | 1,875 / 2,356 | 1,391 / 1,933 | 201 / 153 | 190 / 165 |
+  | Q8_0 GGUF, Step 8 | 1,856 / 2,526 | 1,428 / 1,982 | 185 / 162 | 220 / 194 |
+  | Q4_K_M, before | 1,700 / 2,308 | 1,318 / 1,840 | 280 / 228 | 294 / 241 |
+  | Q4_K_M, Step 8 | 1,681 / 2,354 | 1,317 / 1,816 | 297 / 249 | 294 / 245 |
+
+  Within the noise everywhere (decode +-10% run to run on the shared box). Startup (`-n 1 -i hi`, 12 threads,
+  median of 9): 0.095 / 0.072 / 0.077 s (Q8_0 GGUF / Q4_K_M / .bin) for both binaries
+- Ready for Step 9: per request, `rq_chat_render` (thinking off) -> tokens; prefix reuse across requests with
+  `rq_seq_common_prefix` + `rq_seq_truncate` on a cached sequence (several sequences = several prefix
+  slots); `rq_generate` with the request's sampling, max tokens, `on_token` for stop strings / streaming
+  (`rq_detok_push`), usage from the stats; constrained decoding through `RqSampling.allow` (the caller may
+  change the mask from `on_token` between steps; forced runs of tokens can go through `rq_prefill`); errors
+  as codes for HTTP statuses. Not there: HTTP / JSON, the schema -> token trie, a queue. One forward pass at
+  a time per process (the pool is process-wide and not reentrant): the server serializes model calls
+- Ready for Step 10: `rq_forward_batch` over rows of different sequences, each with its own cache and
+  position, bit-identical to separate runs; sequences can join / leave per pass. Not there: small-B kernels
+  (decode rows run through the prefill GEMM, whose per-call tile unpacking makes B = 2-8 slow, IDEAS.md), the
+  per-256-position attention split for decode rows in a batch (one item per (row block, kv head): long
+  contexts at small B use few threads), per-sequence sampling in parallel, a scheduler
+- Open: the group size is process-wide (one model, or models of the same group size, per process:
+  `rq_model_load` refuses another); `rq_chat_render` with thinking on drops the reasoning of every
+  assistant message (HF keeps it for messages after the last user message; only matters when continuing an
+  assistant message); `rq_detok_push` passes invalid UTF-8 through (a JSON writer must replace it)
+
 ## Known bugs
 Found by the tests.
 - [x] Tokenizer: no NFC normalizer (HF's tokenizer.json normalizer is NFC); the input was assumed
@@ -943,10 +1047,11 @@ LiteLLM auto-router judge) and the user's request: clean up first, then both fea
 IDEAS.md facts outdated since it was written: the KV cache is f16 by default (115 KB per position, not
 229), Step 7 has landed and the Mac port is merged (NEON Q8_0 kernels exist too). The LiteLLM proxy on
 this box runs 1.105.0 (`/opt/litellm/venv-1.105.0`; never touch the running proxy or its config).
-- [ ] Step 8: cleanup / architecture for batched decode and the server, no change in results:
+- [x] Step 8: cleanup / architecture for batched decode and the server, no change in results:
   model (weights, read-only, shared) vs sequence state (KV cache, position, tokens, sampler) vs
   scratch; a request-level API (tokens in, logits / tokens out, callbacks instead of printing);
-  errors returned instead of `exit()` in request paths; runq.c split into modules; docs updated
+  errors returned instead of `exit()` in request paths; runq.c split into modules; docs updated: done,
+  see above
 - [ ] Step 9: `runq serve`: OpenAI-compatible HTTP server (non-streaming chat completions, models,
   prefix KV reuse across requests, `response_format` json_schema with finite outputs by constrained
   decoding, FIFO), tests, end-to-end with a scratch LiteLLM instance, judge-quality evaluation

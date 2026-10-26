@@ -1,8 +1,8 @@
 # Tests
 
-`make test` (or `tests/run_tests.sh`) builds `./runq` and `./runq-generic` if needed (in parallel)
-and runs everything in about 25 s on the 16-vCPU dev box (300 checks; the box is shared, so the time
-varies: ~25 s at load 9-14). Every `-m logits` run the selected groups need starts up front, 3 at a time, the generic
+`make test` (or `tests/run_tests.sh`) builds `./runq`, `./runq-generic` and `build/api_test` if needed
+(in parallel) and runs everything in about 30 s on the 16-vCPU dev box (333 checks; the box is shared,
+so the time varies: ~29 s at load 8-12). Every `-m logits` run the selected groups need starts up front, 3 at a time, the generic
 build's at 4 threads in the background (`prefetch_all` in `check.py`); the tests then read the
 files in their usual order. Greedy and chat cases run 3 at a time (their outputs do not depend on
 the thread count or the timing). It needs `models/Qwen3-0.6B-q8.bin`, plus numpy
@@ -16,10 +16,10 @@ scratch venv) only for the Q4_K_M goldens.
 ```sh
 tests/run_tests.sh                    # all tests, OMP_NUM_THREADS=8 unless set
 tests/run_tests.sh -v                 # + per-position logits metrics and a summary table
-tests/run_tests.sh --only logits      # subset: tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv
+tests/run_tests.sh --only logits      # subset: tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv,api
 GGUF=other.gguf tests/run_tests.sh    # the gguf group on another Q8_0 GGUF file (GGUF= skips it)
 Q4= tests/run_tests.sh                # without the Q4_K_M group
-RUNQ=/path/to/other-binary tests/run_tests.sh   # test another build (no make; kernels test skipped)
+RUNQ=/path/to/other-binary tests/run_tests.sh   # test another build (no make; kernels and api tests skipped)
 RUNQ=./runq RUNQ_GENERIC=./runq-generic tests/run_tests.sh   # ... with the kernels test
 tests/run_tests.sh --update-greedy    # regenerate the greedy goldens (incl. the chat transcript)
 .venv/bin/python tests/make_golden.py # regenerate the HF goldens (tokenizer + logits, ~15 s)
@@ -31,12 +31,14 @@ python3 tests/make_dequant_golden.py  # golden/dequant/q4_k_m.npz (needs numpy +
 .venv/bin/python tests/fuzz_tokenizer.py --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf   # GGUF tokenizer (~20 s)
 .venv/bin/python tests/fuzz_tokenizer.py --nfc-all       # exhaustive NFC normalizer check vs HF (~8 s)
 .venv/bin/python tools/gen_unicode_tables.py --check-hf  # HF's NFC data vs Unicode 15.1 (~1 s)
+tests/compare_bins.sh REF_DIR NEW_DIR # two builds' outputs byte for byte (below; ~3-6 min)
+build/api_test MODEL                  # the library API tests alone (make api-test; ~1.3 s per model)
 ```
 
 Exit status is non-zero if any test fails. XFAIL = known engine bug, reported but not failing;
 XPASS = an XFAIL case now passes (remove its mark in `make_golden.py`).
 
-## Engine hooks (`src/runq.c`)
+## Engine hooks (`src/cli.c`)
 
 All hooks work the same on a GGUF file (tokenizer and templates from the file and built in).
 
@@ -46,9 +48,9 @@ All hooks work the same on a GGUF file (tokenizer and templates from the file an
   time only).
 - `-m logits -i TEXT -o FILE [-b N]`: writes `int32 n, int32 vocab, int32 ids[n],
   float32 logits[n][vocab]` (row i = logits after token i). `-b 1` feeds the tokens one at a
-  time through `forward()` (`forward_sequential`); `-b N > 1` (default 512) uses the batched
-  prefill, `forward_batch()` in chunks of N tokens with the logits of every row
-  (`forward_chunked`). The tests always pass `-b` explicitly.
+  time through the decode path (`rq_prefill` on a context without batch buffers: `rq_decode` per
+  token); `-b N > 1` (default 512) uses the batched prefill, `rq_forward_batch` in chunks of N tokens
+  with the logits of every row. The tests always pass `-b` explicitly.
 - `RUNQ_CHAT_DUMP=PREFIX` (chat mode): at exit, writes `PREFIX.ids` (the token ids in the KV
   cache, i.e. the conversation as the model saw it, space-separated) and `PREFIX.logits`
   (`int32 n, int32 vocab, int32 pos[n], float32 logits[n][vocab]`: every logits vector chat
@@ -96,6 +98,7 @@ All hooks work the same on a GGUF file (tokenizer and templates from the file an
 | `kv_f32_*`, `kv_bf16_*` | the KV cache types other than the default f16 (Step 7b), on the .bin with `-k f32` / `-k bf16`: `kv_*_logits/{en,code}` + pooled vs HF fp32 (`-b 64`, the Q8_0 thresholds), `kv_*_logits_long/long2` (positions 248..296, past one attention block), `kv_*_batched/en_b7`, `long2_b64` vs `-b 1`, `kv_*_threads/bitwise_long2_b64` (8 vs 3 threads), `kv_*_kernels/en_b1`, `long2_b64` (AVX-512 vs generic), all bitwise | `golden/logits*`, other runs |
 | `greedy/f32_generate`, `greedy/bf16_generate` | exact stdout of `generate` (the `generate` prompt) with `-k f32` (the text the default gave before Step 7b) and `-k bf16` | `golden/greedy/{f32,bf16}_generate.txt` |
 | `chat/long_context`, `chat/long_context_generic` | the same checks on a 411-token conversation (a 374-token system prompt, `-n 12`) decoded at OMP_NUM_THREADS=16: the reply's positions are past one attention block, so decode splits each kv head's attention over threads per block and combines (Step 7a); its sampled logits equal the batched prefill's (`-m logits`, 8 threads) bit for bit, and the generic build's run (4 threads: C attention, generic kernels) gives the same cache ids and logits file | `-m logits`, `./runq-generic` |
+| `api_bin/*`, `api_gguf/*`, `api_q4/*` | the library API (`src/runq.h`) per model, `tests/api_test.c`, 11 checks each: `interleaved_bitwise` (2 sequences prefilled and decoded alternately on one context == each alone), `batch_prefill_bitwise` (chunks of 2 sequences in one `rq_forward_batch`: all rows / last row / no logits), `batch_decode_bitwise` (decode rows of 3 sequences per pass, one at positions 250+: classifier GEMM over the selected rows), `batch_past_block_bitwise` (a chunk at positions 256..276), `truncate_reprefill_bitwise` (truncate + re-prefill == fresh prefill), `generate_loop` (`rq_generate` == a hand-written sample / decode loop, stats, the reply limit), `errors` (prompt past the capacity: `RQ_ERR_CONTEXT` with nothing prefilled, bad token, a sequence twice in a pass, logits rows without a buffer, a batch larger than the context's), `chat_render` (a message list == the CLI's pieces, thinking off / on), `detok_utf8` (incremental detokenization: whole UTF-8 characters, the text back), `sample_mask` (token mask: greedy and sampled), `load_error`. Runs in the background from the start (4 threads per model). Breakage (scratch builds): one sequence's KV cache for every attention row block, or the first position for later segments: the batch checks fail | other runs of the same binary |
 
 Logits metrics, per position, over the union of a fixed 4096-id vocab subset and HF's top-64 ids:
 cosine similarity, top-1 agreement (runq argmax vs HF top-1), top-5 overlap. Position 0 has its
@@ -177,7 +180,8 @@ threads claim items from shared counters or steal them, src/threads.h), and each
 result does not depend on the other vectors in its item. So results are bit-identical for any thread
 count and any interleaving (tested 1 / 3 / 16 vs 8; also checked 5 and 13).
 
-Batched vs sequential: `forward_batch()` gives bit-identical logits to `forward()` because both
+Batched vs sequential: the batched pass (`rq_forward_batch`) gives bit-identical logits to the decode
+step (`rq_decode`; `forward_batch()` / `forward()` before Step 8) because both
 call the same numeric kernels (`dot_q8`, `qk_norm_rope`, `attention_kv`, `swiglu`, `rmsnorm`,
 `quantize`) per row, and the 4-row GEMM kernel `dot_q8_x4` is compiled without FP contraction
 (`NO_FP_CONTRACT`, gcc only) so it rounds like `dot_q8`. With contraction (an FMA in the scale
@@ -185,7 +189,7 @@ accumulation) the logits differ slightly and `greedy/chat_system` flips a token.
 that sums in another order may legitimately need the 1e-3 tolerance (or a looser one, justified);
 real bugs are far off. Deliberate breakage (scratch builds, all caught):
 
-| breakage in forward_batch | max abs diff | min cos | caught by |
+| breakage in the batched pass | max abs diff | min cos | caught by |
 |---|---|---|---|
 | causal mask leaks one position (row b sees b+1) | 22.4 .. 32.1 | <= 0.41 | every `batched/*` |
 | K RoPE at the chunk-local position (b, not pos0+b) | 17.3 / 32.1 | 0.47 / -0.42 | `_b7`, `all_b64` |
@@ -244,8 +248,8 @@ thread pool runs everything: loading, prefill, decode; libgomp is not instrument
 Attention (Step 3b): the attention is defined once (arithmetic and tile layout in the
 `src/kernels_avx512.h` header comment): scores as fma chains over chunks of 32 dims, a clamped
 Cephes-style `exp`, 16 partial sums with a fixed reduction tree, one division, V accumulated by
-an fma chain in position order. Decode (`forward`, 2 query vectors per kv head) and prefill
-(`forward_batch`, 2 x 6 vectors per work item, causal per row) run the same per-vector
+an fma chain in position order. Decode (`rq_decode`, 2 query vectors per kv head) and prefill
+(`rq_forward_batch`, 2 x 6 vectors per work item, causal per row) run the same per-vector
 operations, so `batched/*` stay bit-identical, and the generic C version (`attention_vec`,
 compiled with FP contraction and reassociation off) does the same, so `kernels/*` stay
 bit-identical (a scratch build with the C reduction tree replaced by a linear sum: max |diff| 1.3-1.5,
@@ -305,3 +309,20 @@ opposite (0 differences from `unicodedata`, the same counts from HF).
 Invalid UTF-8 has no HF reference (a Python str cannot hold it). runq keeps every invalid byte
 (byte-level fallback, as before) and its normalizer does not reorder or compose across one (each
 acts like U+FFFD, a starter composing with nothing); `tokenizer/nfc_invalid_utf8` tests that.
+
+## Comparing two builds (`tests/compare_bins.sh`, on demand)
+
+`tests/compare_bins.sh [-j JOBS] [-t THREADS] [--quick] REF_DIR NEW_DIR` runs the same command lines
+with `REF_DIR/runq`, `REF_DIR/runq-generic` and the two of `NEW_DIR` and compares the outputs byte for
+byte: the check for refactorings, where nothing may change. 360 jobs: `-m logits` files for the 3
+models x both builds x KV f16 / bf16 / f32 x `-b 1 / 7 / 64 / 512` x a 5-token and a 280-token prompt
+(past one attention block); greedy generate (short / long prompt, `-b 1 / 7`, default `-c`, a prompt
+longer than `-c`, `-n 1`); seeded sampling (`-t 0.8 -s 7` generate and chat, `-t 1.5 -p 0.95`, `-b 1`,
+multi-turn); multi-turn chat on stdin (a system prompt, `-r 1`, context full at `-c 160`, a reply cut
+at `-c 48`, `-b 1 / 7`, a message too long), with the `RUNQ_CHAT_DUMP` files; `-m tokenize`;
+`-m dequant`; error cases (prompt too long for `-m logits`, empty prompt, bad `-k`, unknown mode,
+missing file, usage). It compares stdout, stderr (the numbers of `[timing]` / `[tokenize]` lines
+masked) and the exit status; logits files are hashed and deleted at once. `CMP_CACHE=DIR` keeps the
+reference results (keyed by the binaries and the job list), so later comparisons against the same
+reference only run the new binaries: ~3 min with the cache, ~6 without (`-j 3`, 4 threads per job).
+Step 8 used it against copies of the binaries before the refactoring (all identical).

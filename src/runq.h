@@ -158,7 +158,7 @@ int rq_is_end_token(const RqModel *m, int token);                   // eos or bo
 // Incremental detokenization for streaming: rq_detok_push appends a token's bytes and writes the
 // part that ends at a UTF-8 character boundary (a character split over tokens comes out whole once
 // complete; invalid bytes pass through); rq_detok_flush writes what is left. Return the bytes
-// written (cap >= 16 always suffices), or RQ_ERR_ARG
+// written, or RQ_ERR_ARG if cap is too small (the token's byte length + 8 always suffices)
 typedef struct { unsigned char b[8]; int n; } RqDetok;
 int rq_detok_push(const RqModel *m, RqDetok *d, int token, char *out, size_t cap);
 int rq_detok_flush(RqDetok *d, char *out, size_t cap);

@@ -1,7 +1,8 @@
 # cwayn
 
 Personal experiment: running Qwen3-0.6B from plain C on the CPU.
-The engine is `src/runq.c`, derived from qwen3.c. Roadmap and status: [TODO.md](TODO.md).
+The engine is a small C library (`src/runq.h`, see Architecture below) with the `runq` command line on
+top, derived from qwen3.c. Roadmap and status: [TODO.md](TODO.md).
 
 ## Quick start
 
@@ -50,7 +51,7 @@ scripts/export_q8.sh                  # -> models/Qwen3-0.6B-q8.bin (Q8_0, ~630 
 # (or: make models, which runs download + export if the .bin is missing)
 ./runq models/Qwen3-0.6B-q8.bin -c 4096
 
-make test                             # regression suite, ~25 s (tests/README.md)
+make test                             # regression suite, ~30 s (tests/README.md)
 make bench                            # thread sweep, prefill/decode tok/s (scripts/bench_qwen3c.sh)
 make bench-prefill                    # prefill tok/s vs prompt length and -b (scripts/bench_prefill.sh)
 scripts/bench_all.sh                  # all runq speed tables of BENCHMARKS.md (~8 min)
@@ -105,6 +106,68 @@ splits each kv head's attention over threads per 256 positions (3,000 tokens at 
 without it the KV cache is sized for the full 40,960-token context, 4.7 GB of address space (9.4 GB with
 `-k f32`), touched only as far as the conversation goes.
 
+## Architecture
+
+Since Step 8 (TODO.md) the engine is a library, `src/runq.h`, and the CLI (`src/cli.c`) only uses that
+API. Three kinds of objects:
+
+- **RqModel** (`rq_model_load`): hyperparameters, weights (repacked for the kernels at load),
+  tokenizer, the chat templates of both thinking modes. Loaded once, read-only afterwards, shared by
+  any number of sequences and contexts. Load errors (missing / corrupt / unsupported file, no memory)
+  come back as a message, nothing exits.
+- **RqSeq** (`rq_seq_new`): one sequence: its own KV cache (capacity and type `RQ_KV_F16 / BF16 / F32`
+  per sequence), its length and the tokens at its positions, an RNG for sampling;
+  `rq_seq_truncate` / `rq_seq_common_prefix` for prefix reuse.
+- **RqCtx** (`rq_ctx_new`): a compute context: activation and scratch buffers for up to `max_batch`
+  rows, the threads' synchronization state, the logits buffer, profiling. The threads are one
+  process-wide pool (`rq_threads_init`), so one forward pass runs at a time per process.
+
+The forward passes take the sequence(s) explicitly: `rq_decode` (one token: the GEMV path, attention
+split over threads per 256 positions), `rq_prefill` (a sequence's tokens in chunks of `max_batch`),
+`rq_forward_batch` (one pass over rows of several sequences, each at its own next position: a prefill
+chunk next to decode rows of other sequences, logits of the selected rows). Results are bit-identical
+whatever the thread count, chunk size or batch composition (`tests/api_test.c` checks sequences
+interleaved and batched together against each alone). On top: `rq_sample` (per-call temperature /
+top-p, the sequence's RNG, an optional token mask for constrained decoding), `rq_generate` (the chat
+loop: prefill, sample, decode; callbacks per token and per logits vector; timing in a struct),
+`rq_tokenize`, `rq_detok_push` (incremental, never splits a UTF-8 character: streaming),
+`rq_chat_render` (system / user / assistant messages in Qwen3's template, thinking on or off, as the
+CLI's chat keeps the conversation). Errors are `RQ_ERR_*` codes (e.g. `RQ_ERR_CONTEXT` for a prompt
+longer than the sequence's capacity); the library never prints or exits.
+
+```c
+rq_threads_init(0);
+RqModel *m = rq_model_load("Qwen3-0.6B-Q8_0.gguf", NULL, err, sizeof(err));
+RqCtx *c = rq_ctx_new(m, 512, 0, &e);
+RqSeq *s = rq_seq_new(m, 4096, RQ_KV_DEFAULT, &e);
+RqMessage msg[] = { { RQ_ROLE_USER, "Why is the sky blue?" } };
+RqTokens t = { 0 };
+rq_chat_render(m, msg, 1, 0, &t);
+RqSampling cfg = { 0.7f, 0.9f, NULL };
+RqCallbacks cb = { on_token, NULL, user };   // on_token: e.g. rq_detok_push + write
+rq_generate(c, s, t.v, t.n, &cfg, 256, &cb, &stats);
+```
+
+| file | contents |
+|---|---|
+| `src/runq.h` | the public API |
+| `src/model.c` | RqModel: .bin / GGUF loading, weight conversion and repacking (`prepare_weights`), chat templates |
+| `src/gguf.c` | the GGUF reader (untrusted input: every count, length and offset checked) |
+| `src/forward.c` | RqSeq, RqCtx and all numeric code of the forward passes: decode step, batched pass, attention and matmul dispatch, quantization, norms, RoPE, KV cache |
+| `src/tokenizer.c` | BPE tokenizer matching HF (added tokens, NFC, Qwen2 pre-tokenizer), detokenization |
+| `src/sampler.c`, `src/chat.c` | sampling; chat template rendering and the generation loop |
+| `src/threads.c`, `src/threads.h` | the thread pool and the phase synchronization |
+| `src/kernels_avx512.h`, `src/kernels_neon.h`, `src/kquants.h` | SIMD kernels, K-quant formats and arithmetic definitions |
+| `src/internal.h` | the structures shared by the modules |
+| `src/cli.c` | the `runq` command line and its test hooks |
+
+Each module is its own translation unit (objects in `build/native`, `build/generic`, `build/debug`).
+All numeric code of the forward passes stays in `forward.c`, so the `-Ofast` code generation of the
+exactly defined arithmetic is the one measured and tested before; the split was checked byte for byte
+against the single-file binary (`tests/compare_bins.sh`) and is as fast. The activation group size
+(64 for the .bin, 32 for GGUF) is a process-wide setting of the kernels: one model, or models of the
+same group size, per process.
+
 ## Models (`scripts/download_models.py --list`)
 
 | set | source | file(s) |
@@ -123,7 +186,8 @@ float folds in the GEMM), decode ~5% (the packed weights are ~6% larger: fp32 sc
 
 ## Layout and third-party code
 
-- `src/runq.c`: our engine, from qwen3.c's `runq.c` (MIT, see `LICENSE`). Changes so far:
+- `src/*.c`: our engine (library + CLI, see Architecture), from qwen3.c's `runq.c` (MIT, see `LICENSE`).
+  Changes so far:
   `-n <int>` max new tokens, plus a `[timing]` line on stderr (prefill and decode tok/s);
   no classifier matmul for prompt tokens whose logits are unused;
   batched prefill (`-b <int>` tokens per chunk, default 512, `-b 1` = token by token):
@@ -167,7 +231,9 @@ float folds in the GEMM), decode ~5% (the packed weights are ~6% larger: fp32 sc
   Q8_0), activations int8 per 32, AVX-512 VNNI GEMV (at the memory-bandwidth limit: decode ~1.5x
   the Q8_0 GGUF) and GEMM (weight tile unpacked once per thread into u8, ~1.17x the Q8_0 GEMM time),
   bit-identical to the generic C kernels, embedding rows dequantized with ggml's expressions
-  (bit-identical to gguf-py), test hook `-m dequant`.
+  (bit-identical to gguf-py), test hook `-m dequant`;
+  the library API (Step 8: model / sequence / compute context, multi-sequence batched passes, errors
+  returned instead of `exit()`, no printing in the library), split into modules.
 - `src/kquants.h`: the Q4_K / Q6_K block formats, their dequantization, the repacked layouts (Q4P,
   Q6P) and the generic kernels; the arithmetic of a K-quant matmul output is defined there.
 - `src/kernels_avx512.h`: the AVX-512 VNNI Q8_0 GEMM / GEMV (group size 64 or 32) and the weight
@@ -181,7 +247,8 @@ float folds in the GEMM), decode ~5% (the packed weights are ~6% larger: fp32 sc
   `tools/gen_unicode_tables.py --nfc`: Unicode 15.1 with the overrides that reproduce HF
   tokenizers' older (9.0) normalization data (108 newer marks ccc 0, U+11938); see TODO.md Step 5.
 - `third_party/qwen3.c/`: pristine https://github.com/adriancable/qwen3.c @ `55643ff`
-  (2025-07-05), kept for diffs (`diff -u third_party/qwen3.c/runq.c src/runq.c`). Only its
+  (2025-07-05), kept for diffs (upstream's `runq.c`; ours is `src/*.c` since Step 8, the single file
+  before it in git history). Only its
   `export.py`/`model.py` are used, by `scripts/export_q8.sh` (the .bin path; GGUF needs neither).
   qwen3.c itself started from Andrej Karpathy's llama2.c.
 - `third_party/mynah-slm/`: not committed. `scripts/fetch_mynah.sh` clones

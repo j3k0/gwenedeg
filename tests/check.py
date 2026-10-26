@@ -28,6 +28,9 @@ Tests (see tests/README.md):
              dequantized Q4_K_M weights; tight), batched vs sequential, threads and the AVX-512
              K-quant kernels (GEMV, GEMM over several chunks) vs the generic ones bitwise; its greedy
              goldens (q4_*) run in the greedy group
+  server     runq serve over HTTP (tests/server_test.py, in the background from the start): endpoints,
+             completions == runq -m chat, prefix reuse bitwise, streaming, json_schema constrained
+             decoding, errors, queue / cancellation, fuzzing, shutdown
   kv         the KV cache types other than the default f16 (-k f32, -k bf16): logits vs HF (en, code,
              long2), batched vs sequential, threads and AVX-512 vs generic bitwise; their greedy goldens
              (f32_generate, bf16_generate) run in the greedy group
@@ -383,6 +386,30 @@ def test_api(a, res, futs):
             res.report(ok, f"api_{tag}/{name.strip()}", detail.strip())
         if p.returncode not in (0, 1) or not lines:
             res.report(False, f"api_{tag}/run", f"exit status {p.returncode}: {p.stderr.decode(errors='replace')[-300:]}")
+
+
+SERVER_THREADS = 2  # runq serve and its CLI reference runs (in the background from the start)
+
+
+def server_run(a, ex):
+    """Start tests/server_test.py (runq serve over HTTP) on the GGUF Q8_0 file (else the .bin)."""
+    model = a.gguf or a.model
+    return ex.submit(run, [sys.executable, "-I", os.path.join(ROOT, "tests", "server_test.py"), "--runq", a.runq,
+                           "--model", model, "--threads", str(SERVER_THREADS)])
+
+
+def test_server(a, res, fut):
+    """tests/server_test.py: runq serve's endpoints, greedy / seeded completions == runq -m chat, prefix
+    reuse == fresh prefill (bitwise logprobs), streaming, constrained json_schema outputs, errors, queue,
+    cancellation, fuzzing, shutdown"""
+    p = fut.result()
+    lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
+    for l in lines:
+        ok, rest = l.startswith("PASS "), l[5:]
+        name, _, detail = rest.partition("  ")
+        res.report(ok, f"server/{name.strip()}", detail.strip())
+    if p.returncode not in (0, 1) or not lines:
+        res.report(False, "server/run", f"exit status {p.returncode}: {(p.stdout + p.stderr).decode(errors='replace')[-500:]}")
 
 
 def read_logits(path):
@@ -1092,7 +1119,7 @@ def main():
     ap.add_argument("--gguf", default="", help="GGUF Q8_0 file for the gguf tests and greedy goldens (empty: skip)")
     ap.add_argument("--q4", default="", help="GGUF Q4_K_M file for the q4 tests and greedy goldens (empty: skip)")
     ap.add_argument("--api-test", default="", help="tests/api_test binary for the api group (empty: skip)")
-    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv,api",
+    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv,api,server",
                     help="comma-separated subset of tests to run")
     ap.add_argument("--update-greedy", action="store_true", help="regenerate the greedy goldens")
     ap.add_argument("--jobs", type=int, default=8, help="parallel runq processes for the tokenizer test")
@@ -1108,7 +1135,8 @@ def main():
         only = {"greedy", "chat"}
     with tempfile.TemporaryDirectory(prefix="cwayn-test-") as tmp, \
             cf.ThreadPoolExecutor(max_workers=PREFETCH_JOBS) as fg, cf.ThreadPoolExecutor(max_workers=2) as bg, \
-            cf.ThreadPoolExecutor(max_workers=1) as ax:
+            cf.ThreadPoolExecutor(max_workers=1) as ax, cf.ThreadPoolExecutor(max_workers=1) as sx:
+        server = server_run(a, sx) if "server" in only and not a.update_greedy else None
         api = api_runs(a, ax) if "api" in only else {}
         if not a.update_greedy:
             prefetch_all(a, tmp, only, fg, bg)
@@ -1124,7 +1152,8 @@ def main():
                          ("gguf", lambda: test_gguf(a, res, tmp)),
                          ("q4", lambda: test_q4(a, res, tmp)),
                          ("kv", lambda: test_kv(a, res, tmp)),
-                         ("api", lambda: test_api(a, res, api))]:
+                         ("api", lambda: test_api(a, res, api)),
+                         ("server", lambda: test_server(a, res, server))]:
             if name in only:
                 t = time.time()
                 print(f"== {name}")

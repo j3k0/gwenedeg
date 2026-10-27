@@ -125,7 +125,7 @@ static void get_health(App *a, HttpConn *c, HttpReq *r) {
 
 // ------------------------------------------------------------------------------ chat: the request
 
-typedef struct { int role; char *text; } Msg; // role: 0 system, 1 user, 2 assistant
+typedef struct { int role; char *text, *reasoning; } Msg; // role: 0 system, 1 user, 2 assistant; reasoning: Qwen3.8 (or NULL)
 
 typedef struct {
     int status;
@@ -187,6 +187,51 @@ static const char *after_think(const char *s) {
     return s + strspn(s, "\n");
 }
 
+static int render38(const RqModel *m, const Msg *msg, int n, int thinking, RqTokens *out) {
+    // Qwen3.8's template (runq.h): the leading system / developer messages merged with "\n" (empty ones skipped) after
+    // the effort instruction (parse_chat refused later ones, as its template does); every assistant message in its think
+    // form (rq_chat_reply; its reasoning_content, if given, as the reasoning: "<think>" R "</think>" C), after the
+    // assistant header of the user turn before it (rq_chat_user_history) or its own; other sequences as render's
+    size_t tot = 1;
+    int i = 0, e = RQ_OK, open = 0;
+    for (; i < n && msg[i].role == 0; i++) tot += strlen(msg[i].text) + 1;
+    char *sys = malloc(tot);
+    if (!sys) return RQ_ERR_NOMEM;
+    sys[0] = 0;
+    for (int j = 0; j < i; j++)
+        if (msg[j].text[0]) {
+            if (sys[0]) strcat(sys, "\n");
+            strcat(sys, msg[j].text); // (trimmed by parse_chat)
+        }
+    e = rq_chat_system(m, sys[0] ? sys : NULL, thinking, out);
+    free(sys);
+    for (; i < n && e == RQ_OK; i++) {
+        const Msg *x = &msg[i];
+        if (x->role == 1) {
+            if (i == n - 1 || msg[i + 1].role == 2) {
+                e = i == n - 1 ? rq_chat_user(m, x->text, thinking, out) : rq_chat_user_history(m, x->text, thinking, out);
+                open = 1;
+                continue;
+            }
+            e = tok_text(m, "<|im_start|>user\n", x->text, "<|im_end|>\n", out);
+        } else {
+            char *t = x->text;
+            if (x->reasoning) { // (reasoning_content: the text rq_chat_reply splits back into it and the content)
+                size_t l = strlen(x->reasoning) + strlen(x->text) + 16;
+                if (!(t = malloc(l))) return RQ_ERR_NOMEM;
+                snprintf(t, l, "<think>%s</think>%s", x->reasoning, x->text);
+            }
+            if (!open) e = tok_text(m, "<|im_start|>assistant\n", "", "", out);
+            if (e == RQ_OK) e = rq_chat_reply(m, t, thinking, out);
+            if (e == RQ_OK) e = rq_chat_end(m, out);
+            if (t != x->text) free(t);
+        }
+        open = 0;
+    }
+    if (e == RQ_OK && !open) e = rq_chat_assistant(m, thinking, out);
+    return e;
+}
+
 static int render(const RqModel *m, int chat, const Msg *msg, int n, int thinking, RqTokens *out) {
     // Qwen3's template in the CLI chat's canonical form (rq_chat_render: [system] then user / assistant
     // turns, the empty think block with thinking off kept in every user turn); other sequences as HF's
@@ -196,6 +241,7 @@ static int render(const RqModel *m, int chat, const Msg *msg, int n, int thinkin
     // Instruct-2507 keeps assistant messages verbatim (its template does), no think block anywhere;
     // Thinking-2507's generation prompt opens the think block
     int i = 0, e = RQ_OK, open = 0; // open: the last piece ends with the assistant header
+    if (chat == RQ_CHAT_QWEN38) return render38(m, msg, n, thinking, out);
     if (n > 0 && msg[0].role == 0) {
         e = rq_chat_system(m, msg[0].text, thinking, out);
         i = 1;
@@ -230,7 +276,10 @@ typedef struct {
 } Chat;
 
 static void chat_free(Chat *ch) {
-    for (int i = 0; i < ch->n_msgs; i++) free(ch->msgs[i].text);
+    for (int i = 0; i < ch->n_msgs; i++) {
+        free(ch->msgs[i].text);
+        free(ch->msgs[i].reasoning);
+    }
     free(ch->msgs);
     con_free(ch->con);
 }
@@ -296,6 +345,16 @@ static int parse_chat(App *a, const Js *root, Chat *ch, Job *j, ReqErr *e) {
         ch->msgs[i].text[tl] = 0;
         ch->msgs[i].role = r;
         ch->n_msgs = i + 1;
+        if (a->info.chat == RQ_CHAT_QWEN38) { // (its template: system / developer messages first; earlier reasoning kept)
+            if (r == 0 && i > 0 && ch->msgs[i - 1].role != 0)
+                return bad(e, "messages", "system / developer messages must be at the beginning (Qwen3.8's chat template)%s", NULL);
+            const Js *rc = json_get(m, "reasoning_content");
+            if (r == 2 && rc && rc->t == JS_STR) {
+                if (!(ch->msgs[i].reasoning = content_text(rc, e))) return -1;
+                if (strstr(ch->msgs[i].reasoning, "</think>") || strstr(ch->msgs[i].text, "</think>"))
+                    return bad(e, "messages", "an assistant message with reasoning_content must not contain </think>%s", NULL);
+            }
+        }
     }
     long long n = 1;
     if (get_int(root, "n", 1, 1000000, &n, e)) return -1;
@@ -355,16 +414,22 @@ static int parse_chat(App *a, const Js *root, Chat *ch, Job *j, ReqErr *e) {
     if (get_bool(root, "cache_prompt", &cache, e)) return -1;
     j->no_cache = !cache;
 
-    // thinking: off unless reasoning_effort low / medium / high or chat_template_kwargs.enable_thinking
-    int thinking = 0;
-    const Js *re = json_get(root, "reasoning_effort");
-    if (re && re->t != JS_NULL) {
-        if (json_str_eq(re, "none") || json_str_eq(re, "minimal")) thinking = 0;
-        else if (json_str_eq(re, "low") || json_str_eq(re, "medium") || json_str_eq(re, "high")) thinking = 1;
-        else return bad(e, "reasoning_effort", "'reasoning_effort' must be none, minimal, low, medium or high%s", NULL);
-    }
+    // thinking: off unless reasoning_effort low / medium / high / xhigh or chat_template_kwargs.enable_thinking; Qwen3.8
+    // (its template): on by default, the effort xhigh (= high), medium or low (RQ_THINK_*), also as
+    // chat_template_kwargs.reasoning_effort (the template's variable: over the request's field)
+    int q38 = a->info.chat == RQ_CHAT_QWEN38, thinking = q38, effort = RQ_THINK_ON;
     const Js *ck = json_get(root, "chat_template_kwargs");
+    for (int k = 0; k < 2; k++) {
+        const Js *re = k == 0 ? json_get(root, "reasoning_effort") : ck && ck->t == JS_OBJ ? json_get(ck, "reasoning_effort") : NULL;
+        if (!re || re->t == JS_NULL) continue;
+        if (json_str_eq(re, "none") || json_str_eq(re, "minimal")) thinking = 0;
+        else if (re->t == JS_STR && rq_chat_effort(re->s) > 0) {
+            thinking = 1;
+            effort = rq_chat_effort(re->s);
+        } else return bad(e, "reasoning_effort", "'reasoning_effort' must be none, minimal, low, medium, high or xhigh%s", NULL);
+    }
     if (ck && ck->t == JS_OBJ && get_bool(ck, "enable_thinking", &thinking, e)) return -1;
+    if (thinking && q38) thinking = effort;
 
     // response_format
     const Js *rf = json_get(root, "response_format");

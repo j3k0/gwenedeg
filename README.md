@@ -60,7 +60,8 @@ CLI options (`./runq` without arguments prints them all):
 | `-K N` | top-k: sample among the N most likely tokens, then top-p among them (default 0 = off). `-t` / `-p` / `-K` not given: the model's recommended values if its GGUF has them (`general.sampling.*`, e.g. Qwen3.8-27B 1.0 / 0.95 / 20; none of the Qwen3 / Qwen3.5 files here do) |
 | `-n N` | max new tokens per answer (default unlimited) |
 | `-i TEXT`, `-y TEXT` | a single prompt (one turn, then exit); the system prompt |
-| `-r 0\|1` | thinking off (default) / on |
+| `-r 0\|1` | thinking off (default; Qwen3.8: on) / on |
+| `-e xhigh\|high\|medium\|low` | reasoning effort with thinking (Qwen3.8's template; default xhigh, high = xhigh) |
 | `-m MODE` | `chat` (default), `generate` (raw completion), `tokenize`; test hooks `logits`, `dequant`, `render` |
 | `-k f16\|bf16\|f32` | KV cache type, default f16 (half the memory of f32, as accurate) |
 | `-b N` | prefill chunk size, default 512 (`-b 1`: token by token) |
@@ -132,9 +133,13 @@ up to 1.7B, ~0.5 s for 4B and ~1 s for 8B. Q4_K_M is the better trade at 4B / 8B
 "Sydney" for the capital of Australia.
 
 **Chat templates** are detected from the file's `tokenizer.chat_template`, which is not interpreted
-(Qwen3's three variants and Qwen3.5's are built in). The hybrid Qwen3 template (0.6B to 8B) follows `-r 0` / `-r 1`.
+(Qwen3's three variants, Qwen3.5's and Qwen3.8's are built in). The hybrid Qwen3 template (0.6B to 8B) follows `-r 0` / `-r 1`.
 Instruct-2507 never thinks, and Thinking-2507 always does; `-r` is ignored for those, with a note. Qwen3.5 follows
-`-r` too, off by default as in its template. The renderings equal HF's `apply_chat_template` (tested).
+`-r` too, off by default as in its template. Qwen3.8 (a qwen35 file whose template has `reasoning_effort`) thinks by
+default (`-r 0` turns it off); with thinking on, the system block starts with the reasoning-effort instruction of
+`-e` (xhigh by default, medium has none, low a short one), merged with `-y`; earlier replies keep their reasoning,
+as its template renders them by default. The renderings equal HF's `apply_chat_template` (tested; the documented
+differences: [tests/README.md](tests/README.md)).
 
 **Qwen3.5** keeps a fixed-size recurrent state per sequence (19 MB for 0.8B) besides its small KV cache. That state
 cannot be rewound, so a chat that edits its history (a thinking reply's reasoning, dropped from the next turn) goes
@@ -151,9 +156,11 @@ them: rejected with a clean error; a "UD" file made only of Q4_K / Q5_K / Q6_K /
 the MoE models (`qwen3moe`, `qwen35moe`: Qwen3.5-35B-A3B and up, Qwen3.6-35B-A3B), images, Qwen3-Embedding / Reranker,
 RoPE scaling (YaRN), and Hadamard-folded GGUFs (`prism.hadamard.*` metadata: rejected). The other dense Qwen3.5 / 3.6
 sizes should load but are untested: 2B (as many value heads as key heads, like 0.8B), 9B, 27B and Qwen3.6-27B (2x / 3x
-as many value heads, like 4B; the 27B shape is covered by synthetic test models). Files with an MTP block
-(`nextn_predict_layers`, `nextn` tensors: e.g. bartowski's, and Unsloth's Qwen3.8-27B) are refused with a clear
-message, and F32 `ssm_alpha` / `ssm_beta` (Qwen3.8-27B's) do not load yet: use Unsloth's or LM Studio's Qwen3.5 files.
+as many value heads, like 4B; the 27B shape is covered by synthetic test models). **Qwen3.8-27B** (Unsloth's Q4_K_M,
+docs/qwen38-speculative.md) loads its main model: the MTP block after its 64 layers (`nextn_predict_layers` 1,
+`blk.64`: an attention layer + `nextn.*`) is checked (names, shapes, types) but not read nor used yet, and its F32
+`ssm_alpha` / `ssm_beta` matrices are applied in fp32; the bring-up on the real file (accuracy, speed) is open
+(TODO). Other MTP layouts (several blocks, `qwen3` files) are refused with a clear message.
 
 ## Performance
 
@@ -188,7 +195,7 @@ trusted network.
 - Endpoints: `POST /v1/chat/completions`, `GET /v1/models`, `GET /health`. Supported: system / user /
   assistant messages, `max_tokens`, `temperature`, `top_p`, `seed`, `stop`, `stream` (SSE),
   `logprobs`, thinking (`reasoning_effort` or `chat_template_kwargs.enable_thinking`, returned as
-  `reasoning_content`), `response_format` `json_schema`, and `usage` with cached prompt tokens. Errors
+  `reasoning_content`; Qwen3.8: on by default, `reasoning_effort` picks its effort instruction, docs/server.md), `response_format` `json_schema`, and `usage` with cached prompt tokens. Errors
   come back as OpenAI error objects.
 - **Continuous batching**: every running request (up to `--parallel` 16) contributes its next token or a
   prompt chunk to one batched forward pass per step. Streams keep flowing while long prompts prefill,
@@ -324,8 +331,10 @@ and builds mynah-slm, an optional reference engine for comparison (not part of t
 ## Limitations
 
 - Qwen3 dense models and dense Qwen3.5 (0.8B and 4B tested; `general.architecture` qwen3 / qwen35, gpt2 tokenizer with the qwen2 /
-  qwen35 pre-tokenizer). GGUF Q8_0 / Q4_K_M / Q5_K_M (any mix of Q8_0, Q4_K, Q5_K and Q6_K tensors) and qwen3.c's `.bin`. No other
-  quantization types, no MoE, no RoPE scaling, no images, no Jinja interpreter (the templates are built in).
+  qwen35 pre-tokenizer). GGUF Q8_0 / Q4_K_M / Q5_K_M (any mix of Q8_0, Q4_K, Q5_K and Q6_K tensors; F32 only for Qwen3.5's
+  `ssm_alpha` / `ssm_beta`, as in Qwen3.8-27B) and qwen3.c's `.bin`. No other quantization types, no MoE, no RoPE scaling,
+  no images, no Jinja interpreter (the templates are built in: Qwen3's, Qwen3.5's, Qwen3.8's). Qwen3.8-27B: its MTP block
+  is not used (not a draft yet), and the real file is not validated yet (TODO).
 - Fast paths: x86-64 with AVX-512 VNNI (selected at compile time with `-march=native`) and AArch64 with
   the dot-product extension. Other CPUs, including x86 without AVX-512 VNNI, use the generic C kernels:
   the same results, but for Q4_K_M / Q5_K_M ~10x slower prefill and ~3-4x slower decode.

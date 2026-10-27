@@ -56,14 +56,18 @@ SOFTWARE.
   `PropList.txt`): general categories, canonical combining classes, decompositions and compositions.
 - License: Unicode License v3, full text in [licenses/Unicode-3.0.txt](licenses/Unicode-3.0.txt).
 
-## Qwen3 and Qwen3.5 (models, tokenizers, chat templates)
+## Qwen3, Qwen3.5 and Qwen3.8 (models, tokenizers, chat templates)
 
-- Source: the Qwen team's models on Hugging Face (`Qwen/Qwen3-*`, `Qwen/Qwen3.5-0.8B`; the GGUF files are
-  unsloth's conversions of them). `scripts/download_models.py` downloads them; none are included.
-- Used for: `tests/golden/templates/*.jinja` (Qwen3's and Qwen3.5's chat templates, verbatim); the chat templates
-  built into `src/model.c`; and the test references in `tests/golden/` (token ids, logits and texts computed
-  with the Qwen3 / Qwen3.5 models and tokenizers, and chat renderings).
-- License: Apache License 2.0, full text in [licenses/Apache-2.0.txt](licenses/Apache-2.0.txt).
+- Source: the Qwen team's models on Hugging Face (`Qwen/Qwen3-*`, `Qwen/Qwen3.5-0.8B`, `Qwen/Qwen3.8-27B`; the GGUF
+  files are unsloth's conversions of them). `scripts/download_models.py` downloads them; none are included.
+- Used for: `tests/golden/templates/*.jinja` (Qwen3's and Qwen3.5's chat templates, verbatim; Qwen3.8's twice:
+  `qwen3.8-hf.jinja` from `Qwen/Qwen3.8-27B` @ 1d4bf0f, and `qwen3.8.jinja`, the `tokenizer.chat_template` of
+  unsloth's `Qwen3.8-27B-Q4_K_M.gguf` @ 4a03c64, Unsloth's modification of it, as distributed in that file); the
+  chat templates built into `src/model.c` / `src/chat.c` (incl. Qwen3.8's reasoning-effort instructions); and the
+  test references in `tests/golden/` (token ids, logits and texts computed with the Qwen3 / Qwen3.5 models and
+  tokenizers, and chat renderings).
+- License: Apache License 2.0 (Qwen3.8-27B: the model card's `license: apache-2.0`, also the GGUF's `general.license`),
+  full text in [licenses/Apache-2.0.txt](licenses/Apache-2.0.txt).
 
 ## Hugging Face transformers / tokenizers
 

@@ -15,7 +15,9 @@ q35     (default suite, if models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf is th
         layers, ~87 MB each with the 248k-token embedding; from the Q4_K_M file next to it, Qwen3.8-27B's layout and
         types at a small scale, 330 MB): logits vs tests/ref_qwen35.py, bitwise invariants, api_test; the 0.8B file and
         the r = 3 model in one process (api_test --two: interleaved == each alone); files that must be refused (bad
-        metadata; the 27B-shaped model with its MTP block)
+        metadata); the 27B-shaped model with its MTP block (logits == without it, bitwise), with F32 alpha / beta and
+        Qwen3.8's template (the checks above, a CLI chat, runq serve's prompts), Qwen3.8's renderings (tokenizer-only
+        files with its two templates vs tests/golden/chat_render.json)
 models  (opt-in: tests/run_tests.sh --models, make test-models) every downloaded family model
         (scripts/download_models.py family; missing files are skipped): logits vs HF fp32 (Qwen3-1.7B) and vs
         the dequantized-weights reference (tests/golden/models, tests/make_model_ref.py), bitwise invariants
@@ -29,6 +31,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 import numpy as np
@@ -94,7 +97,8 @@ def render_cases(runq, model, variant, res, prefix, jobs=None):
     """runq -m render on model (tokenizer only, one process for all cases) for the golden cases of its variant"""
     with open(os.path.join(GOLDEN, "chat_render.json"), encoding="utf-8") as f:
         cases = [c for c in json.load(f)["cases"] if c["variant"] == variant]
-    conv = [{"messages": c["messages"], "thinking": c["thinking"]} for c in cases]
+    conv = [dict({"messages": c["messages"], "thinking": c["thinking"]},
+                 **({"reasoning_effort": c["reasoning_effort"]} if "reasoning_effort" in c else {})) for c in cases]
     p = run([runq, model, "-m", "render", "-i", json.dumps(conv)], 1)
     lines = p.stdout.decode().splitlines() if p.returncode == 0 else []
     errs = p.stderr.decode(errors="replace").splitlines()
@@ -103,12 +107,20 @@ def render_cases(runq, model, variant, res, prefix, jobs=None):
         return
     for c, line, err in zip(cases, lines, [e for e in errs if e.startswith("[render]")]):
         ids = [int(x) for x in line.split()]
-        det = f"[{variant}] -r {c['thinking']}: {len(c['ids'])} tokens" + (", = HF's apply_chat_template" if c["hf"] else
-              " (runq's documented form, not HF's)")
+        det = f"[{variant}] -r {c['thinking']}" + (f" -e {c['reasoning_effort']}" if "reasoning_effort" in c else "") + \
+            f": {len(c['ids'])} tokens" + (", = HF's apply_chat_template" if c["hf"] else ", = HF's with reasoning_content"
+                                          if c.get("hf_reasoning_content") else " (runq's documented form, not HF's)")
         ok = ids == c["ids"] and f"chat template {variant}," in err
         if not ok:
             det += f"  <- got {len(ids)} tokens, {err!r}"
         res.report(ok, f"{prefix}/r{c['thinking']}_{c['name']}", det)
+
+
+def render_run(runq, model, variant, prefix):
+    """render_cases in the background: [(ok, name, detail)]"""
+    rec = Recorded()
+    render_cases(runq, model, variant, rec, prefix)
+    return [(ok, n, d) for ok, n, d, _ in rec.reports]
 
 
 # ------------------------------------------------------------------------------------------ synth
@@ -527,10 +539,14 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
 # Q4_K embedding + Q6_K classifier, Q4_K / Q5_K / Q6_K matrices as in its Q4_K_M file): measured cos mean 0.9984 / 0.9979 /
 # 0.9966 (en, code, long2), min 0.9803, top-1 281/338 (runq's int8 activations on cut-out K-quant weights, as the synth
 # group's 0.9993-0.9958); with the q heads on kv head h % 2 instead of h // 6 0.31-0.40, value heads grouped 0.25-0.38
-Q35_SYNTH = {"synth-q35-r2.gguf": True, "synth-q35-r3.gguf": False, "synth-q35-27b.gguf": True}  # file: full api_test (else digests)
+# synth-q35-27b-f32.gguf: the same with F32 alpha / beta (fp32 activations there, f32_rows), the MTP block, Qwen3.8's
+# template: measured cos mean 0.9984 / 0.9976 / 0.9966, min 0.9791, top-1 290/338
+Q35_SYNTH = {"synth-q35-r2.gguf": True, "synth-q35-r3.gguf": False, "synth-q35-27b.gguf": True,
+             "synth-q35-27b-f32.gguf": True}  # file: full api_test (else digests)
 Q35_SYNTH_REF = ["en", "code", "long2"]
 TH_Q35_SYNTH = dict(cos_mean=0.999, cos_pos=0.99, top1=0.8)
-TH_Q35_SYNTH_KQ = {"synth-q35-27b": dict(cos_mean=0.993, cos_pos=0.95, top1=0.7)}  # (per model, else TH_Q35_SYNTH)
+TH_Q35_SYNTH_KQ = {"synth-q35-27b": dict(cos_mean=0.993, cos_pos=0.95, top1=0.7),
+                   "synth-q35-27b-f32": dict(cos_mean=0.993, cos_pos=0.95, top1=0.7)}  # (per model, else TH_Q35_SYNTH)
 Q35_SYNTH_SAME = [(("en", 1), ("en", 7)), (("en", 1), ("en", 64)), (("all", 1), ("all", 64)), (("long2", 1), ("long2", 64)),
                   (("long2", 64), ("long2", 512)), (("long2", 64), ("long2", 64, 3)),
                   (("en", 1), ("en", 1, "gen")), (("en", 7), ("en", 7, "gen")), (("long2", 64), ("long2", 64, "gen"))]
@@ -545,13 +561,10 @@ def q35_synth_build(a):
     return p.stdout.decode().strip()
 
 
-# the rejected files (check name, message); synth-q35-27b-mtp.gguf: the 27B's MTP block (blk.n + nextn.*, block_count
-# n + 1, nextn_predict_layers 1) is refused before any weight is read (TODO S6), its tokenizer loads (-m tokenize)
+# the rejected files (check name, message)
 Q35_BAD = [("bad-q35-nv.gguf", "nv", "is not a multiple of ssm.group_count"),
            ("bad-q35-hadamard.gguf", "hadamard", "Hadamard-folded weights (prism.hadamard.* metadata) are not supported"),
-           ("bad-q35-nextn.gguf", "nextn", "metadata qwen35.nextn_predict_layers out of range"),
-           ("synth-q35-27b-mtp.gguf", "mtp", "MTP (multi-token prediction) layers are not supported yet: "
-            "qwen35.nextn_predict_layers = 1, block_count 9 includes the nextn block")]
+           ("bad-q35-nextn.gguf", "nextn", "metadata qwen35.nextn_predict_layers out of range")]
 
 
 def q35_bad_run(a, d):
@@ -563,11 +576,130 @@ def q35_bad_run(a, d):
         p = run([a.runq, os.path.join(d, fn), "-n", "1", "-i", "hi"], 1)
         err = p.stderr.decode(errors="replace").strip()
         out.append((p.returncode == 1 and msg in err, f"q35/synth/reject_{name}", f"exit status {p.returncode}: {err[-200:]!r}"))
-        if name == "mtp":
-            p = run([a.runq, os.path.join(d, fn), "-m", "tokenize", "-i", "hello world"], 1)
-            ids = p.stdout.decode(errors="replace").split()
-            out.append((p.returncode == 0 and ids == ["14556", "1814"], "q35/synth/mtp_tokenizer_only",
-                        f"-m tokenize (no weights): exit status {p.returncode}, ids {ids}"))
+    return out
+
+
+def q35_mtp_run(a, d, tmp, texts):
+    """synth-q35-27b-mtp.gguf (the 27B's MTP block: blk.8 + nextn.*, block_count 9, nextn_predict_layers 1): the main
+    model loads (the block validated, not used): its logits == synth-q35-27b.gguf's, bitwise (-b 64 and decode, both
+    builds), its tokenizer alone too; and synth-q35-27b-f32.gguf (Qwen3.8's template, thinking on by default): the CLI
+    chat's first prompt == -m render (the effort line merged with -y), and a second turn prefills only <|im_end|>\n +
+    its user turn (Qwen3.8's history keeps the reply as generated): [(ok, name, detail)]"""
+    import hashlib
+    import re
+    out = []
+    mtp, base, f32 = (os.path.join(d, f) for f in ("synth-q35-27b-mtp.gguf", "synth-q35-27b.gguf", "synth-q35-27b-f32.gguf"))
+    if not (os.path.exists(mtp) and os.path.exists(base)):
+        return out
+    for exe, b, th in [(a.runq, 64, SYNTH_THREADS), (a.runq, 1, SYNTH_THREADS)] + ([(a.generic, 7, 3)] if a.generic else []):
+        hs = []
+        for m in (base, mtp):
+            path = os.path.join(tmp, f"mtp_{os.path.basename(m)}_{b}_{th}.bin")
+            logits_run(exe, m, texts["en"], path, b, th)
+            with open(path, "rb") as fh:
+                hs.append(hashlib.sha256(fh.read()).hexdigest())
+            os.remove(path)
+        out.append((hs[0] == hs[1], f"q35/synth/mtp_logits/b{b}{'_gen' if exe == a.generic else ''}",
+                    f"synth-q35-27b-mtp.gguf (MTP block) vs synth-q35-27b.gguf, -b {b}"
+                    f"{' (generic build)' if exe == a.generic else ''}: " + ("bit-identical" if hs[0] == hs[1] else "DIFFER")))
+    p = run([a.runq, mtp, "-m", "tokenize", "-i", "hello world"], 1)
+    ids = p.stdout.decode(errors="replace").split()
+    out.append((p.returncode == 0 and ids == ["14556", "1814"], "q35/synth/mtp_tokenizer_only",
+                f"-m tokenize (no weights): exit status {p.returncode}, ids {ids}"))
+    if not os.path.exists(f32):
+        return out
+    prefix = os.path.join(tmp, "chat38")
+    p = run([a.runq, f32, "-t", "0", "-c", "1024", "-n", "6", "-e", "low", "-y", "Be brief."], 2, env={"RUNQ_CHAT_DUMP": prefix},
+            input=b"Hi there\nAnd now?\n")
+    msgs = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi there"}]
+    r = run([a.runq, f32, "-m", "render", "-e", "low", "-i", json.dumps(msgs)], 1)
+    t = run([a.runq, f32, "-m", "tokenize", "-i", "<|im_end|>\n<|im_start|>user\nAnd now?<|im_end|>\n<|im_start|>assistant\n<think>\n"], 1)
+    ids = open(prefix + ".ids").read().split() if p.returncode == 0 else []
+    want, turn2 = r.stdout.decode().split(), t.stdout.decode().split()
+    err = p.stderr.decode(errors="replace")
+    np_ = [int(x) for x in re.findall(r"\[timing\] prompt: (\d+) tok", err)]
+    so = p.stdout.decode(errors="replace")
+    ok = p.returncode == 0 and len(want) > 40 and ids[:len(want)] == want and np_ == [len(want), len(turn2)] and \
+        ids[-len(turn2) - 6:-6] == turn2 and so.count("<think>\n") == 2 and "chat template qwen3.8, thinking 1 (low)" in r.stderr.decode()
+    out.append((ok, "q35/synth-q35-27b-f32/chat_qwen38", f"-e low -y: the first prompt ({len(want)} tokens) == -m render, the "
+                f"second turn prefills {len(turn2)} tokens (<|im_end|>\\n + its user turn), the reply opens in <think>"
+                + ("" if ok else f"  <- rc {p.returncode}, prompts {np_}, {len(ids)} cached, {err[-200:]!r}")))
+    return out
+
+
+def q35_server38(a, d):
+    """runq serve on synth-q35-27b-f32.gguf (Qwen3.8's template): the prompt of each request == `-m render` of its
+    messages with the request's thinking / effort (usage.prompt_tokens; and a greedy reply == the CLI's): thinking
+    on by default (xhigh), reasoning_effort low / medium / none and chat_template_kwargs.reasoning_effort, system +
+    developer messages merged, an assistant message's reasoning_content kept in the history; a system message after
+    the first user one: 400 (the template raises). [(ok, name, detail)]"""
+    model = os.path.join(d, "synth-q35-27b-f32.gguf")
+    if not os.path.exists(model):
+        return []
+    S = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi there"}]
+    hist = [{"role": "user", "content": "Hi!"}, {"role": "assistant", "content": "Hello! How can I help?",
+                                                  "reasoning_content": "The user greets me."}, {"role": "user", "content": "And in French?"}]
+    hist_r = [dict(m) for m in hist]
+    hist_r[1] = {"role": "assistant", "content": "<think>\nThe user greets me.\n</think>\n\nHello! How can I help?"}
+    two = [{"role": "system", "content": "You are terse."}, {"role": "developer", "content": "Answer in French."},
+           {"role": "user", "content": "Hi!"}]
+    # (request extras, the messages to render, -r, -e)
+    cases = [("default", {}, S, 1, None), ("low", {"reasoning_effort": "low"}, S, 1, "low"),
+             ("medium", {"reasoning_effort": "medium"}, S, 1, "medium"), ("none", {"reasoning_effort": "none"}, S, 0, None),
+             ("kwargs_low", {"chat_template_kwargs": {"reasoning_effort": "low"}}, S, 1, "low"),
+             ("enable_thinking_false", {"chat_template_kwargs": {"enable_thinking": False}}, S, 0, None),
+             ("system_developer", {}, two, 1, None), ("reasoning_content", {}, hist, 1, None)]
+    conv = [dict({"messages": r, "thinking": t}, **({"reasoning_effort": e} if e else {})) for _, _, m, t, e in cases
+            for r in [hist_r if m is hist else m]]
+    p = run([a.runq, model, "-m", "render", "-i", json.dumps(conv)], 1)
+    want = [len(l.split()) for l in p.stdout.decode().splitlines()]
+    cli = run([a.runq, model, "-t", "0", "-c", "2048", "-n", "6", "-y", "Be brief.", "-i", "Hi there"], 4)
+    cli_text = cli.stdout.decode(errors="replace").split("<think>\n", 1)[-1].strip()
+    proc = subprocess.Popen([a.runq, "serve", model, "--port", "0", "-c", "2048", "--parallel", "2", "--slots", "2",
+                             "--threads", "4"], stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
+    out = []
+    try:
+        port, log, t0 = None, "", time.time()
+        while time.time() - t0 < 120:
+            line = proc.stderr.readline()
+            if not line:
+                break
+            log += line
+            if "listening on http://" in line:
+                port = int(line.rsplit(":", 1)[1])
+                break
+        if port is None or len(want) != len(cases):
+            return [(False, "q35/synth-q35-27b-f32/server38/start", f"{log[-300:]!r} {p.stderr.decode()[-200:]!r}")]
+
+        def post(body):
+            rq = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", json.dumps(body).encode(),
+                                        {"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(rq, timeout=300) as r:
+                    return r.status, json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read() or b"{}")
+        for (name, extra, msgs, think, eff), n in zip(cases, want):
+            st, r = post(dict({"messages": msgs, "temperature": 0, "max_tokens": 6}, **extra))
+            got = r.get("usage", {}).get("prompt_tokens") if st == 200 else None
+            m = r["choices"][0]["message"] if st == 200 else {}
+            ok = st == 200 and got == n and (("reasoning_content" in m) == bool(think))
+            det = f"prompt {got} tokens == -m render -r {think}{' -e ' + eff if eff else ''} ({n})"
+            if name == "default":
+                ok &= m.get("reasoning_content", "").strip() == cli_text
+                det += f", the greedy reply (reasoning) == the CLI's: {m.get('reasoning_content', '')!r}"
+            out.append((ok, f"q35/synth-q35-27b-f32/server38/{name}", det + ("" if ok else f"  <- status {st}: {json.dumps(r)[:200]}")))
+        st, r = post({"messages": [{"role": "user", "content": "Hi"}, {"role": "system", "content": "late"}], "max_tokens": 1})
+        ok = st == 400 and "at the beginning" in r.get("error", {}).get("message", "")
+        out.append((ok, "q35/synth-q35-27b-f32/server38/late_system", f"status {st}: {r.get('error', {}).get('message', '')!r}"))
+    except Exception as e:  # noqa: BLE001
+        out.append((False, "q35/synth-q35-27b-f32/server38/error", f"{type(e).__name__}: {e}"))
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
     return out
 
 
@@ -742,6 +874,9 @@ def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
     os.makedirs(os.path.join(t, "synth"), exist_ok=True)
     synth = [ex.submit(q35_synth_run, a, os.path.join(t, "synth"), os.path.join(sd, fn), texts, full)
              for fn, full in Q35_SYNTH.items() if os.path.exists(os.path.join(sd, fn))] + [ex.submit(q35_bad_run, a, sd)] + \
+        [ex.submit(q35_mtp_run, a, sd, os.path.join(t, "synth"), texts), ex.submit(q35_server38, a, sd)] + \
+        [ex.submit(render_run, a.runq, os.path.join(sd, fn), "qwen3.8", f"q35/synth/render_{fn[10:-5]}")
+         for fn in ("synth-tok-qwen3.8.gguf", "synth-tok-qwen3.8-hf.gguf")] + \
         ([ex.submit(q35_two_run, a, sd)] if a.api_test else []) if sd else []
     synth.append(ex.submit(q35_serve_slots, a))
     return {"a": a2, "tok_test": tok_test, "synth": synth, "synth_err": serr,

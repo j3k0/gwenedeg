@@ -501,8 +501,8 @@ static void start_run(Engine *e, Job *j, int si, int src, int L) {
     r->row = -1;
     r->o.e = e;
     r->o.j = j;
-    if (j->thinking && (e->chat == RQ_CHAT_THINKING || e->chat == RQ_CHAT_QWEN35))
-        r->o.mode = 1; // (Thinking-2507, Qwen3.5: the prompt opened the <think> block, the reply starts in the reasoning)
+    if (j->thinking && (e->chat == RQ_CHAT_THINKING || e->chat == RQ_CHAT_QWEN35 || e->chat == RQ_CHAT_QWEN38))
+        r->o.mode = 1; // (Thinking-2507, Qwen3.5 / 3.8: the prompt opened the <think> block, the reply starts in the reasoning)
     for (int i = 0; i < j->nstop; i++)
         if ((int)strlen(j->stop[i]) > r->o.maxstop) r->o.maxstop = (int)strlen(j->stop[i]);
     sl->run = r;

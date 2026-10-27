@@ -24,12 +24,40 @@
  * answer anyway, as with the hybrid's thinking). Qwen3.5 (models/Qwen3.5-0.8B/chat_template.jinja): with thinking
  * on, Thinking-2507's form ("<think>\n" opens the reply, answered turns lose it); off, the hybrid's (the empty
  * think block G); its template trims every message text (|trim: Python's str.strip()), so do rq_chat_system /
- * user / render here (rq_chat_trim). */
+ * user / render here (rq_chat_trim). Qwen3.8 (tests/golden/templates/qwen3.8.jinja, the 27B GGUF's, Unsloth's; Qwen's
+ * own, qwen3.8-hf.jinja, renders the same but has no developer role / merging / 'high'): Qwen3.5's user turns and trimming; with thinking on, the reasoning-
+ * effort instruction (chat_effort) opens the system block (alone without a system message: rq_chat_system(NULL));
+ * leading system / developer messages are merged ("\n"); earlier replies keep their reasoning (the template's
+ * preserve_thinking, on by default): H_i = G_i + R_i as generated (G_i: the generation suffix of P_i, which the
+ * history form of the user turn leaves out: the template renders the think block with the reply, in both modes,
+ * "<think>\n" REASONING "\n</think>\n\n" ANSWER), so the cache never diverges from the history. */
 #include "internal.h"
 
 static int chat_mode(const RqModel *m, int thinking) {
     // the thinking mode a call renders: Instruct-2507 has none
     return m->chat == RQ_CHAT_INSTRUCT ? 0 : thinking != 0;
+}
+
+// Qwen3.8's reasoning-effort instructions (its template's strings; medium: none)
+#define QWEN38_XHIGH "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, " \
+    "consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer."
+#define QWEN38_LOW "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion " \
+    "without unnecessary elaboration."
+
+static const char *chat_effort(const RqModel *m, int thinking) {
+    // the instruction a Qwen3.8 system block starts with, or NULL
+    if (m->chat != RQ_CHAT_QWEN38 || !thinking || thinking == RQ_THINK_MEDIUM) return NULL;
+    return thinking == RQ_THINK_LOW ? QWEN38_LOW : QWEN38_XHIGH;
+}
+
+int rq_chat_effort(const char *name) {
+    if (!name) return -1;
+    return !strcmp(name, "xhigh") || !strcmp(name, "high") ? RQ_THINK_ON : !strcmp(name, "medium") ? RQ_THINK_MEDIUM
+         : !strcmp(name, "low") ? RQ_THINK_LOW : -1;
+}
+
+const char *rq_chat_effort_name(int thinking) {
+    return !thinking ? "off" : thinking == RQ_THINK_MEDIUM ? "medium" : thinking == RQ_THINK_LOW ? "low" : "xhigh";
 }
 
 const char *rq_strerror(int err) {
@@ -74,7 +102,7 @@ const char *rq_chat_trim(const RqModel *m, const char *text, size_t *len) {
     const unsigned char *p = (const unsigned char *)text, *end = p + strlen(text);
     uint32_t c;
     int k;
-    if (m->chat == RQ_CHAT_QWEN35) {
+    if (m->chat == RQ_CHAT_QWEN35 || m->chat == RQ_CHAT_QWEN38) {
         while ((k = utf8_at(p, end, &c)) && is_py_space(c)) p += k;
         for (const unsigned char *q = end; q > p;) { // the last code point: back over continuation bytes
             const unsigned char *r = q - 1;
@@ -115,10 +143,38 @@ static int tmpl_ok(const RqModel *m, int thinking) {
     return !m->has_tok ? RQ_ERR_STATE : m->tmpl_missing[thinking][0] ? RQ_ERR_LOAD : RQ_OK;
 }
 
+static int tok_parts(const RqModel *m, const char *const *part, const size_t *len, int n, RqTokens *out) {
+    // the tokens of the concatenated parts (one piece)
+    size_t t = 0;
+    for (int i = 0; i < n; i++) t += len[i];
+    char *s = malloc(t + 1);
+    if (!s) return RQ_ERR_NOMEM;
+    for (size_t i = 0, o = 0; i < (size_t)n; o += len[i], i++) memcpy(s + o, part[i], len[i]);
+    s[t] = 0;
+    int e = rq_tokenize(m, s, (long)t, out);
+    free(s);
+    return e;
+}
+
+static int qwen38_system(const RqModel *m, const char *text, size_t tl, int thinking, RqTokens *out) {
+    // Qwen3.8's system block of the (trimmed) text, tl bytes (0: no system message): the effort instruction first
+    const char *ins = chat_effort(m, thinking);
+    if (!tl && !ins) return RQ_OK;
+    const char *part[5] = { "<|im_start|>system\n", ins ? ins : "", ins && tl ? "\n\n" : "", text ? text : "", "<|im_end|>\n" };
+    size_t len[5] = { strlen(part[0]), strlen(part[1]), strlen(part[2]), tl, strlen(part[4]) };
+    return tok_parts(m, part, len, 5, out);
+}
+
 int rq_chat_system(const RqModel *m, const char *text, int thinking, RqTokens *out) {
-    thinking = chat_mode(m, thinking);
-    int e = tmpl_ok(m, thinking);
-    return e != RQ_OK ? e : render_tokens(m, m->sys_tmpl[thinking], text, out);
+    int mode = chat_mode(m, thinking);
+    int e = tmpl_ok(m, mode);
+    if (e != RQ_OK) return e;
+    if (m->chat == RQ_CHAT_QWEN38) {
+        size_t tl = 0;
+        const char *t = text ? rq_chat_trim(m, text, &tl) : NULL;
+        return qwen38_system(m, t, tl, thinking, out);
+    }
+    return text ? render_tokens(m, m->sys_tmpl[mode], text, out) : RQ_OK;
 }
 
 int rq_chat_user(const RqModel *m, const char *text, int thinking, RqTokens *out) {
@@ -131,7 +187,9 @@ int rq_chat_end(const RqModel *m, RqTokens *out) { return rq_tokenize(m, "<|im_e
 
 int rq_chat_user_history(const RqModel *m, const char *text, int thinking, RqTokens *out) {
     thinking = chat_mode(m, thinking);
-    if ((m->chat != RQ_CHAT_THINKING && m->chat != RQ_CHAT_QWEN35) || !thinking) return rq_chat_user(m, text, thinking, out);
+    if (m->chat == RQ_CHAT_QWEN38) thinking = 1; // (the assistant header alone in both modes: the reply's piece has the rest)
+    if ((m->chat != RQ_CHAT_THINKING && m->chat != RQ_CHAT_QWEN35 && m->chat != RQ_CHAT_QWEN38) || !thinking)
+        return rq_chat_user(m, text, thinking, out);
     int e = tmpl_ok(m, thinking);
     return e != RQ_OK ? e : render_tokens(m, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", text, out);
 }
@@ -146,7 +204,11 @@ int rq_chat_assistant(const RqModel *m, int thinking, RqTokens *out) {
 int rq_chat_reply_history(const RqModel *m, const int *r, int n, int thinking, RqTokens *out) {
     // thinking: the reply as the template renders an earlier assistant turn: the text after the last
     // </think> (if any), leading "\n" stripped (content.split('</think>')[-1].lstrip('\n')); a token
-    // of newlines + text is re-encoded without the newlines
+    // of newlines + text is re-encoded without the newlines. Qwen3.8: the generation suffix + the reply as generated
+    if (m->chat == RQ_CHAT_QWEN38) {
+        int e = rq_tokenize(m, chat_gen_suffix(m, chat_mode(m, thinking)), -1, out);
+        return e != RQ_OK ? e : rq_tokens_push(out, r, n);
+    }
     if (!chat_mode(m, thinking)) return rq_tokens_push(out, r, n);
     RqTokens te = { 0 };
     int e = rq_tokenize(m, "</think>", -1, &te);
@@ -180,11 +242,75 @@ int rq_chat_checkpoint_pos(const RqModel *m, const int *tokens, int n) {
     return -1;
 }
 
+static int qwen38_reply(const RqModel *m, const char *text, RqTokens *out) {
+    // Qwen3.8: an earlier assistant message (without <|im_end|>) as its template renders reasoning_content R and content C:
+    // "<think>\n" trim(R) "\n</think>\n\n" trim(C), from a text whose reasoning ends at its last </think> (R: the part
+    // before it, after a <think> if any; no </think>: R empty, C the whole text)
+    size_t tl, rl = 0, cl;
+    const char *t = rq_chat_trim(m, text, &tl), *te = t + tl, *r = t, *re = t, *c = t, *p;
+    for (const char *q = t; (p = strstr(q, "</think>")) && p + 8 <= te; q = p + 8) {
+        re = p;
+        c = p + 8;
+    }
+    if (re > t) {
+        for (const char *q = t; (p = strstr(q, "<think>")) && p + 7 <= re; q = p + 7)
+            r = p + 7;
+        char *rc = malloc((size_t)(re - r) + 1);
+        if (!rc) return RQ_ERR_NOMEM;
+        memcpy(rc, r, (size_t)(re - r));
+        rc[re - r] = 0;
+        size_t off = (size_t)(rq_chat_trim(m, rc, &rl) - rc);
+        free(rc);
+        r += off;
+    }
+    char *cc = malloc((size_t)(te - c) + 1);
+    if (!cc) return RQ_ERR_NOMEM;
+    memcpy(cc, c, (size_t)(te - c));
+    cc[te - c] = 0;
+    size_t coff = (size_t)(rq_chat_trim(m, cc, &cl) - cc);
+    free(cc);
+    c += coff;
+    const char *part[4] = { "<think>\n", r, "\n</think>\n\n", c };
+    size_t len[4] = { 8, rl, 11, cl };
+    return tok_parts(m, part, len, 4, out);
+}
+
+int rq_chat_reply(const RqModel *m, const char *text, int thinking, RqTokens *out) {
+    if (!m->has_tok) return RQ_ERR_STATE;
+    if (m->chat == RQ_CHAT_QWEN38) return qwen38_reply(m, text, out);
+    size_t cl;
+    const char *c = rq_chat_trim(m, text, &cl), *p, *ce = c + cl;
+    if (chat_mode(m, thinking)) // the text after the last </think>, leading newlines stripped
+        for (const char *q = c; (p = strstr(q, "</think>")) && p + 8 <= ce; q = p + 8)
+            c = p + 8 + strspn(p + 8, "\n");
+    return rq_tokenize(m, c, c < ce ? (long)(ce - c) : 0, out);
+}
+
 int rq_chat_render(const RqModel *m, const RqMessage *msgs, int n, int thinking, RqTokens *out) {
     // [system] + per user message P_i, per assistant message H_i (from its text) + E
-    int i = 0, e = RQ_OK, expect = RQ_ROLE_USER, users = 0;
+    int i = 0, e = RQ_OK, expect = RQ_ROLE_USER, users = 0, effort = thinking;
     thinking = chat_mode(m, thinking);
-    if (n > 0 && msgs[0].role == RQ_ROLE_SYSTEM)
+    if (m->chat == RQ_CHAT_QWEN38) { // the leading system messages, merged; the effort instruction
+        size_t tot = 0, l;
+        for (; i < n && msgs[i].role == RQ_ROLE_SYSTEM; i++) {
+            if (!msgs[i].content) return RQ_ERR_ARG;
+            rq_chat_trim(m, msgs[i].content, &l);
+            tot += l + 1;
+        }
+        char *sys = malloc(tot + 1);
+        if (!sys) return RQ_ERR_NOMEM;
+        size_t sl = 0;
+        for (int j = 0; j < i; j++) {
+            const char *t = rq_chat_trim(m, msgs[j].content, &l);
+            if (!l) continue;
+            if (sl) sys[sl++] = '\n';
+            memcpy(sys + sl, t, l);
+            sl += l;
+        }
+        sys[sl] = 0;
+        e = qwen38_system(m, sys, sl, effort, out);
+        free(sys);
+    } else if (n > 0 && msgs[0].role == RQ_ROLE_SYSTEM)
         e = rq_chat_system(m, msgs[i++].content, thinking, out);
     for (; i < n && e == RQ_OK; i++) {
         if (msgs[i].role != expect || !msgs[i].content) return RQ_ERR_ARG;
@@ -194,12 +320,7 @@ int rq_chat_render(const RqModel *m, const RqMessage *msgs, int n, int thinking,
             users++;
             continue;
         }
-        size_t cl;
-        const char *c = rq_chat_trim(m, msgs[i].content, &cl), *p, *ce = c + cl;
-        if (thinking) // the text after the last </think>, leading newlines stripped
-            for (const char *q = c; (p = strstr(q, "</think>")) && p + 8 <= ce; q = p + 8)
-                c = p + 8 + strspn(p + 8, "\n");
-        e = rq_tokenize(m, c, c < ce ? (long)(ce - c) : 0, out);
+        e = rq_chat_reply(m, msgs[i].content, thinking, out);
         if (e == RQ_OK)
             e = rq_chat_end(m, out);
         expect = RQ_ROLE_USER;

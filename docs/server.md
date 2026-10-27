@@ -45,8 +45,8 @@ and llama.cpp's: an integer, 0 or -1 = off; top-p then applies among the k), `se
 up to 16), `n` (1 only), `stream` (SSE `data:` chunks, `data: [DONE]`, a final usage chunk with
 `stream_options.include_usage`), `logprobs` / `top_logprobs` (up to 20; not with `stream`), `response_format`
 (`text`; `json_schema`, below; `json_object` is rejected with a message), thinking with `reasoning_effort`
-low / medium / high or `chat_template_kwargs.enable_thinking` (off by default; the reasoning comes back as
-`reasoning_content`), and `cache_prompt: false` (llama.cpp's flag: prefill from scratch). `usage` counts
+low / medium / high / xhigh (`none` / `minimal`: off) or `chat_template_kwargs.enable_thinking` (off by default,
+except Qwen3.8: below; the reasoning comes back as `reasoning_content`), and `cache_prompt: false` (llama.cpp's flag: prefill from scratch). `usage` counts
 prompt, completion and cached prompt tokens (`prompt_tokens_details.cached_tokens`); `finish_reason` is
 `stop` or `length`. Errors are OpenAI error objects: 400 (invalid request; a prompt longer than the context
 has `code: context_length_exceeded`), 401, 404, 405, 411 (chunked uploads), 413, 503 (queue full / shutting
@@ -55,6 +55,16 @@ down), 504. Not supported: tools / function calls, images, `n > 1`, `json_object
 - **Conversation**: rendered with Qwen3's template (the model's variant: README, Chat templates) in the CLI chat's form (`runq -m chat`), so a greedy
   request gives the same text as the CLI for the same messages (tested bitwise, also with a seed: the RNG
   draws as the CLI's chat does for a first turn). Earlier assistant messages lose their `<think>` block.
+- **Qwen3.8** (its template, detected by `reasoning_effort` in it): thinking is **on** by default with the effort
+  `xhigh`; `reasoning_effort` (or `chat_template_kwargs.reasoning_effort`, which wins) `low` / `medium` / `high`
+  (= `xhigh`) / `xhigh` picks the reasoning-effort instruction the system block starts with (medium: none; low: a
+  short one), `none` / `minimal` or `chat_template_kwargs.enable_thinking: false` turn thinking off. The system and
+  developer messages at the start are merged (`\n`); one after them is a 400 (the template raises). Earlier
+  assistant messages keep their reasoning, as the template renders them by default: `"<think>\n" reasoning
+  "\n</think>\n\n" content`, the reasoning from the message's `reasoning_content` (a string; then neither may
+  contain `</think>`), else from its content split at its last `</think>` (none: an empty think block). Tested
+  (`q35/synth-q35-27b-f32/server38/*`): each request's prompt == `runq -m render` of its messages, the greedy reply
+  == the CLI's.
 - **Prefix reuse**: a new request takes the idle slot with the longest common token prefix, truncated
   to it, and prefills only the rest (if that saves at least 32 tokens or half the prompt; else the least
   recently used idle slot). If a running request's slot shares a longer prefix, it is copied

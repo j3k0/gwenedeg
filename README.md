@@ -298,8 +298,9 @@ come from HF transformers and are committed under `tests/golden/`. See [tests/RE
 
 Benchmarks: `make bench` (decode, thread sweep), `make bench-prefill`, `scripts/bench_all.sh` (the runq
 tables of BENCHMARKS.md, ~8 min), `scripts/bench_batch.sh`, `scripts/bench_serve.py`,
-`scripts/bench_models.py`, `scripts/ppl.py` (perplexity). `scripts/fetch_mynah.sh` fetches and builds
-mynah-slm, an optional reference engine for comparison (not part of this repository).
+`scripts/bench_models.py`, `scripts/ppl.py` (perplexity), `scripts/spec_accept.py` (draft acceptance for
+speculative decoding, [docs/qwen38-speculative.md](docs/qwen38-speculative.md)). `scripts/fetch_mynah.sh` fetches
+and builds mynah-slm, an optional reference engine for comparison (not part of this repository).
 
 ## Limitations
 

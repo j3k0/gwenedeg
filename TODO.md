@@ -62,16 +62,13 @@ Preparation (no output changes; `make test` and `tests/compare_bins.sh` byte-ide
 
 Steps:
 
-- [ ] **S0. Keep the measurement tooling.** Move `logs/specmeas-2026-10-27/{prompts,gen,measure}.py` into
-  `scripts/spec_accept.py` (endpoint, key file and models configurable; the 3.8 rendering with the reasoning-effort
-  line). Measure: the 0.8B Q4_K_M as the draft; adaptive draft length (stop when the draft's top-1 probability < tau:
-  changes the guesses, never the output); real prompts and longer reasoning. Done when it reproduces the table of
-  docs/qwen38-speculative.md from the saved JSON.
 - [ ] **S1. The speculative loop on Qwen3** (no recurrent state). Target Qwen3-1.7B, draft Qwen3-0.6B.
   `rq_generate_spec(ctx_t, seq_t, ctx_d, seq_d, tokens, n, cfg, max_new, k, cb, st)`: draft k tokens greedily on
   `seq_d`, verify `[last, d1..dk]` as one segment on `seq_t` (`RQ_LOGITS_ALL`), sample the rows in order with P5's
   step, accept while sample == draft (the first mismatch's sample is the next token), truncate both sequences.
-  Refuse a draft whose vocabulary or token bytes (hash) differ. CLI `-D draft.gguf -K k`; stats in `[timing]`. Done
+  Adaptive length as an option: stop drafting at the first guess whose draft top-1 probability < tau, at most k
+  (measured +5-6% est. tok/s at tau 0.4-0.5, k 6-8; docs/qwen38-speculative.md). Refuse a draft whose vocabulary or
+  token bytes (hash) differ. CLI `-D draft.gguf -K k` (and the tau); stats in `[timing]`. Done
   when, greedy and seeded, thinking on / off: tokens == `rq_generate`'s, each emitted token's logits hash == plain
   decoding's, `-K 0` is plain decoding; in `make test` on the 0.6B pair.
 - [ ] **S2. Verify-pass cost** (measure first). A segment of 2-8 rows of one sequence takes the prefill path
@@ -97,8 +94,8 @@ Steps:
   `apply_chat_template` for thinking off / on x each effort, with and without a system message.
 - [ ] **S7. 27B bring-up** (after P4; Q4_K_M). Download the pinned file with `hf` (into
   `models/`, sha256 checked); load: peak RSS, page cache dropped. Logits vs `tests/ref_qwen35.py` on the dequantized
-  weights (layer by layer, a few GB; a classifier subset); teacher-forced top-1 vs the API's model on S0's outputs
-  (a sanity check). Speed: plain decode (~120 ms per token), then with the 0.8B draft (thinking on: ~13-14 tok/s;
+  weights (layer by layer, a few GB; a classifier subset); teacher-forced top-1 vs the API's model on the saved outputs
+  (a sanity check). Speed: plain decode (~120 ms per token), then with the 0.8B Q4_K_M draft (thinking on: ~13-14 tok/s;
   off: ~17). Not in `make test` (an opt-in group, like `models`). Done when the
   numbers are in the README and docs, and the 27B's speculative output equals plain decoding bitwise.
 - [ ] **S8. Server.** `runq serve --draft FILE`: the draft rows join the job's segment in the batched pass, k per
@@ -111,8 +108,8 @@ Steps:
   more tok/s.
 - [ ] **S10. Seed-coupled drafting at temperature > 0.** The draft samples its guess with the target's next uniform
   draw u_j (known from a copy of the target's RNG) and the same settings, instead of its argmax: more accepted
-  guesses (up to sum min(p, q)), output unchanged. Measure first with the API's `top_logprobs` = 20 on S0's outputs.
-  Needs P5's top-k and the same candidate order in both models.
+  guesses (up to sum min(p, q)), output unchanged. Measure first with the API's `top_logprobs` = 20
+  (`scripts/spec_accept.py gen --top-logprobs 20`). Needs P5's top-k and the same candidate order in both models.
 
 RAM for the 27B runs (decided 2026-10-27): the parcolab, billing and triominos-server containers are stopped
 for the runs (`docker compose -p NAME stop`; `start` brings them back), which leaves ~24 GB available: the Q4_K_M

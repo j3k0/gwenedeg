@@ -26,7 +26,8 @@ a cross-check of the built-in rendering against the model's own template). Logit
 
 The cost model (report): tok/s = tokens per pass / pass time, pass time = step_ms x verify(n) + draft_ms x (n + 1)
 for n drafted tokens (verify(0) = 1: a plain step); verify(n) is the cost of a pass of n + 1 rows of one sequence
-relative to one decode step (--verify, k = 1..8; a guess until TODO S2 measures it). With --tau the teacher-forced
+relative to one decode step (--verify, k = 1..8; default: TODO S2's measurement on Qwen3-8B Q4_K_M, the 27B's
+proxy, docs/qwen38-speculative.md "Verify-pass cost"; the guess before it: 1.03,1.12,1.20,1.35,1.47,1.60,1.75,1.90). With --tau the teacher-forced
 probabilities are exact up to the first wrong guess; after it they only decide how many wasted guesses are paid for.
 """
 import argparse
@@ -401,9 +402,9 @@ def main():
     r.add_argument("meas", nargs="+")
     r.add_argument("--step-ms", type=float, default=120.0, help="one target decode step (27B Q4_K_M: ~120)")
     r.add_argument("--draft-ms", type=float, default=6.0, help="one draft decode step")
-    r.add_argument("--verify", default="1.03,1.12,1.20,1.35,1.47,1.60,1.75,1.90",
+    r.add_argument("--verify", default="1.14,1.16,1.25,1.41,1.62,1.83,2.15,2.52",
                    help="verify pass of k + 1 rows / one decode step, for k = 1.. (the table's k range; a larger "
-                        "--kmax extrapolates with the last slope)")
+                        "--kmax extrapolates with the last slope; default: measured, TODO S2)")
     r.add_argument("--by-kind", action="store_true")
     r.add_argument("--tau", help="comma-separated thresholds: adaptive draft length")
     r.add_argument("--kmax", default="4,8")

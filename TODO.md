@@ -33,22 +33,18 @@ Steps:
   `rq_gen_step` (`src/runq.h`; `api_test`'s `generate_step` runs this loop with an oracle draft), accept while
   sample == draft (the first mismatch's sample is the next token), truncate both sequences.
   Adaptive length as an option: stop drafting at the first guess whose draft top-1 probability < tau, at most k
-  (measured +5-6% est. tok/s at tau 0.4-0.5, k 6-8; docs/qwen38-speculative.md). Refuse a draft whose vocabulary or
+  (+3-5% est. tok/s at tau 0.3-0.4, k 4 with the measured verify cost; docs/qwen38-speculative.md). Refuse a draft whose vocabulary or
   token bytes (hash) differ. CLI `-D draft.gguf -G k` (`-K` is top-k; and the tau); stats in `[timing]`. Done
   when, greedy and seeded, thinking on / off: tokens == `rq_generate`'s, each emitted token's logits hash == plain
   decoding's, `-K 0` is plain decoding; in `make test` on the 0.6B pair.
-- [ ] **S2. Verify-pass cost** (measure first). A segment of 2-8 rows of one sequence takes the prefill path
-  (`rq_forward_batch`: `n == nseg` selects the decode rows). Time it against one decode step and against the same
-  number of decode rows of different sequences. If small segments are slow, route them through the small-batch
-  kernels, keeping causal attention inside the segment (`batch_mixed`-style bitwise tests). Done when f(rows) is
-  recorded and a 4-row segment costs <= ~1.3x one decode step (Qwen3-1.7B, Qwen3.5-4B).
 - [ ] **S3. Rollback for hybrid models: a checkpoint per verified row: its cost.** The API is in:
   `rq_seq_checkpoint_rows(s, pos, n)` takes a checkpoint after each of rows pos..pos+n-1 of the next pass (or of
   the next n decode steps, the draft's), replacing the previous call's; `rq_seq_set_checkpoints(s, k + 2)` keeps the
   prompt's checkpoint too; `rq_seq_truncate` lands exactly on any of them (`api_test`'s `checkpoint_sets`: the 0.8B
   and the synthetic models, both builds, and the 4B Q8_0). Left: measure the copies of a verify pass with k + 1
   checkpoints vs none (0.8B 18.9 MB per row, 4B; the 27B ~150 MiB per row: 0.6 GB at k = 3, estimated ~4-5 ms per
-  ~130 ms pass, measured at S7). Later, only if profiles show it: swap state buffers instead
+  ~130 ms pass, measured at S7). `build/bench_verify -c` times it (a first look, 500 positions: 0.8B ~0.3 ms per
+  row, 4B ~0.4-0.8 ms; docs/qwen38-speculative.md, "Verify-pass cost"). Later, only if profiles show it: swap state buffers instead
   of copying back, or keep each row's DeltaNet inputs (~2 MB per row for the 27B) and replay from the pre-pass
   checkpoint. Done when the cost per row is recorded (docs/qwen38-speculative.md).
 - [ ] **S5. The speculative loop on Qwen3.5.** Target Qwen3.5-4B Q8_0 + draft 0.8B (~6 GB), S3's rollback on both.

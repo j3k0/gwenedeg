@@ -81,20 +81,21 @@ struct RqCtx {
     // the plan of a batched pass: per row its token and position; the segments; the QK-norm + RoPE +
     // K/V store items (a cache tile of one segment); the attention row blocks (rows of one segment,
     // longest first); the rows whose logits are computed
-    int *row_tok, *row_pos;
+    int *row_tok, *row_pos, *row_seg; // (row_seg: the row's segment)
     PfSeg *seg;
     int *tile_seg, *tile_tb;
     int *rb_seg, *rb_b0, *rb_b1;
     int *rb_it0, *rb_sp; // attention items of row blocks 0..rb-1; split row block: its index (att_sp), else -1
     int *pop_seg;       // segments starting a new KV cache tile (pre-faulted in the first phase)
     int *sel_row;
-    // batched decode rows (rq_forward_batch with one row per segment, batch_decode_worker): at most bd_max
-    // rows; the norms as an epilogue up to bd_epi rows (else a phase); a row's attention split over its
-    // blocks of ATT_P positions when the pass has fewer than bd_split * threads (row, kv head) items; the
-    // small-batch kernels up to smb_max rows per weight type (gemm_plan). Tuning: RUNQ_SMB, RUNQ_BD
-    int smb_max[4], bd_max, bd_epi, bd_split;
+    // batched decode rows (rq_forward_batch with segments of at most bd_seg rows, e.g. one row per segment or a
+    // speculative verify segment: batch_decode_worker): at most bd_max rows; the norms as an epilogue up to bd_epi
+    // rows (else a phase); a row block's attention split over its blocks of ATT_P positions when the pass has fewer
+    // than bd_split * threads (row block, kv head) items; the small-batch kernels up to smb_max rows per weight
+    // type (gemm_plan). Tuning: RUNQ_SMB, RUNQ_BD
+    int smb_max[4], smb_pf, bd_max, bd_epi, bd_split, bd_seg;
     float *att_sp; size_t att_sp_n; // split attention: per (row, query head, block) partial results
-    int *row_it0;       // batch_decode_worker: attention items of rows 0..b-1 (per kv head)
+    int *row_it0;       // batch_decode_worker: attention items of row blocks 0..u-1 (per kv head)
     void *probindex;    // sampler scratch (sampler.c: vocab_size candidates)
     void *probindex_t;  // the same per thread (rq_sample_batch), allocated at its first use
     int probindex_nt;
@@ -529,6 +530,7 @@ RqCtx *rq_ctx_new(const RqModel *mc, int nb_max, int max_ctx, int *err) {
         c->rope_b = calloc(nb * hd, sizeof(float));
         c->row_tok = malloc(nb * sizeof(int));
         c->row_pos = malloc(nb * sizeof(int));
+        c->row_seg = malloc(nb * sizeof(int));
         c->seg = malloc(nb * sizeof(PfSeg));
         c->tile_seg = malloc(2 * nb * sizeof(int)); // (tiles of the segments: <= n / ATT_T + nseg)
         c->tile_tb = malloc(2 * nb * sizeof(int));
@@ -541,7 +543,7 @@ RqCtx *rq_ctx_new(const RqModel *mc, int nb_max, int max_ctx, int *err) {
         c->sel_row = malloc(nb * sizeof(int));
         c->row_it0 = malloc((nb + 1) * sizeof(int));
         if (!c->rope_b || !c->k_b || !c->v_b || !c->x_b || !c->xb_b || !c->q_b || !c->hb_b || !c->hb2_b || !c->xq_b.q ||
-            !c->xq_b.s || !c->hq_b.q || !c->hq_b.s || !c->row_tok || !c->row_pos || !c->seg || !c->tile_seg ||
+            !c->xq_b.s || !c->hq_b.q || !c->hq_b.s || !c->row_tok || !c->row_pos || !c->row_seg || !c->seg || !c->tile_seg ||
             !c->tile_tb || !c->rb_seg || !c->rb_b0 || !c->rb_b1 || !c->sel_row || !c->row_it0 ||
             !c->rb_it0 || !c->rb_sp || !c->pop_seg)
             goto fail;
@@ -604,7 +606,7 @@ void rq_ctx_free(RqCtx *c) {
                      c->v, c->logits, c->rope, c->att, c->att_part, c->att_b, c->att_pb, c->att_conv, c->x_b, c->xb_b,
                      c->q_b, c->k_b, c->v_b, c->hb_b, c->hb2_b, c->xq_b.q, c->xq_b.s, c->hq_b.q, c->hq_b.s, c->rope_b,
                      c->bq_corr, c->bq_xf, c->bq_c16, c->bh_corr, c->bh_xf, c->bh_c16, c->kq_scr, c->row_tok,
-                     c->row_pos, c->seg, c->tile_seg, c->tile_tb, c->rb_seg, c->rb_b0, c->rb_b1, c->sel_row, c->row_it0, c->att_sp, c->rb_it0, c->rb_sp, c->pop_seg, c->probindex, c->probindex_t };
+                     c->row_pos, c->row_seg, c->seg, c->tile_seg, c->tile_tb, c->rb_seg, c->rb_b0, c->rb_b1, c->sel_row, c->row_it0, c->att_sp, c->rb_it0, c->rb_sp, c->pop_seg, c->probindex, c->probindex_t };
     for (size_t i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++)
         free(bufs[i]);
     rq_sync_free(&c->sync);
@@ -849,6 +851,7 @@ typedef struct {
     int it0[5];          // items of job j: it0[j] .. it0[j + 1] - 1
     int tiled[4];        // job j in tiles x chunks (else blocks over all rows)
     int smb[4];          // job j by the small-batch kernel: one item per 16-row block, all rows (smb_rows)
+    int pf;              // small-batch kernels: their prefetch distance (smb_pf)
     int nbi, nchunk;     // tiled: activation rows per chunk, chunks
     int chunk, unit;     // items per claim; ranges of whole units (tiled: a tile's chunks)
     QuantizedTensor *x; int ldx, nb, k;
@@ -859,10 +862,20 @@ typedef struct {
 // over at most smb_max rows of its weight type (else the GEMM's tiles), and always in batch_decode_worker.
 // Crossover (one thread, measured in Step 10a): Q4_K / Q6_K faster than the GEMM up to ~24 rows (1.6-2.3x at
 // 1-4 rows: no tile unpacking), equal at 32, ~4% slower at 48-64; Q8_0 equal (the GEMM tile streams the
-// packed weights too). RUNQ_SMB=Q8,Q4,Q6,Q5 overrides them (tuning; 0 = never). Results never depend on it
+// packed weights too). RUNQ_SMB=Q8,Q4,Q6,Q5 overrides them (tuning; 0 = never). Results never depend on it.
+// The K-quant kernels prefetch their weights SMB_PF bytes ahead (TODO S2, 8 threads, Qwen3-8B Q4_K_M, 500
+// positions: a verify segment of 2 / 4 / 6 rows -10% / -12% / -5%, 1 and 9 rows unchanged; 1,024 / 2,048 / 8,192
+// bytes: about the same; Q8_0: none of it, within noise or up to +5% at 1-2 rows, so its kernel does not prefetch)
 enum { SMB_Q8, SMB_Q4, SMB_Q6, SMB_Q5 };
 #ifndef BD_MAX
 #define BD_MAX 64 // decode rows per batched pass in batch_decode_worker (if the small-batch kernels take them)
+#endif
+#ifndef SMB_PF
+#define SMB_PF 4096 // the K-quant small-batch kernels' software prefetch distance in bytes (0: none)
+#endif
+#ifndef BD_SEG
+#define BD_SEG 16 // rows of one sequence per segment in batch_decode_worker, at most (more: prefill_worker; TODO S2:
+                  // 2-16 rows mostly 0-7% faster there on Qwen3, 2-24% on Qwen3.5; 24-32 within noise / up to 3% slower)
 #endif
 
 static void env_ints(const char *name, int *v, int n) {
@@ -876,20 +889,21 @@ static void env_ints(const char *name, int *v, int n) {
 }
 
 static void smb_config(RqCtx *c) {
-    // the context's small-batch / batched-decode settings: defaults, RUNQ_SMB=Q8,Q4,Q6,Q5 (rows), RUNQ_BD=max,epi,split
-    c->smb_max[SMB_Q8] = 32;
-    c->smb_max[SMB_Q4] = 32;
-    c->smb_max[SMB_Q6] = 32;
-    c->smb_max[SMB_Q5] = 32;
-    env_ints("RUNQ_SMB", c->smb_max, 4);
-    int bd[3] = { BD_MAX, 2, 8 };
-    env_ints("RUNQ_BD", bd, 3);
+    // the context's small-batch / batched-decode settings: defaults, RUNQ_SMB=Q8,Q4,Q6,Q5,pf (rows per weight
+    // type; the kernels' prefetch distance in bytes), RUNQ_BD=max,epi,split,seg
+    int smb[5] = { 32, 32, 32, 32, SMB_PF };
+    env_ints("RUNQ_SMB", smb, 5);
+    memcpy(c->smb_max, smb, sizeof(c->smb_max));
+    c->smb_pf = smb[4];
+    int bd[4] = { BD_MAX, 2, 8, BD_SEG };
+    env_ints("RUNQ_BD", bd, 4);
 #ifdef RUNQ_NEON
     bd[0] = 0; // (NEON: its GEMM for batched rows, as before; no small-batch kernels there yet)
 #endif
     c->bd_max = bd[0] < c->nb_max ? bd[0] : c->nb_max;
     c->bd_epi = bd[1];
     c->bd_split = bd[2];
+    c->bd_seg = bd[3];
 }
 
 static inline int smb_slot(int type) {
@@ -911,7 +925,7 @@ static inline int smb_use(const RqCtx *c, const QuantizedTensor *w, int nb) {
 static void gemm_plan(const RqCtx *c, Gemm *g, int nj, const MatJob *job, QuantizedTensor *x, int ldx, int nb, int k,
                       const int32_t *corr, const float *xf, const int32_t *c16, int nt) {
     // (computed by every thread of the job: the same plan everywhere; results never depend on it)
-    g->nj = nj; g->x = x; g->ldx = ldx; g->nb = nb; g->k = k; g->corr = corr; g->xf = xf; g->c16 = c16;
+    g->nj = nj; g->x = x; g->ldx = ldx; g->nb = nb; g->k = k; g->corr = corr; g->xf = xf; g->c16 = c16; g->pf = c->smb_pf;
     int ntile = 0, all_tiled = 1;
     for (int j = 0; j < nj; j++) {
         g->job[j] = job[j];
@@ -959,7 +973,7 @@ NO_FP_CONTRACT static void gemm_item(const Gemm *g, int it, uint8_t *scr, const 
 #ifdef RUNQ_SMB
     if (g->smb[j]) { // 16-row block i, all rows
         smb_rows(w->kp ? w->type : 0, jb->out, jb->ldo, x->q, ldx, x->s, g->corr, g->xf, g->c16, nb, w->kp ? w->kp : w->p, k, GS,
-                 i, i + 1);
+                 i, i + 1, g->pf);
         return;
     }
 #endif
@@ -2443,16 +2457,19 @@ static int prefill_plan(RqCtx *c, int nseg, int nrb) {
 
 // ------------------------------------------------------------------------------ batched decode rows
 
-static void rows_mm(QuantizedTensor *w, float *out, int ldo, QuantizedTensor *x, int ldx, const int32_t *corr, const float *xf,
-                    const int32_t *c16, int nb, int k, int i0, int i1) {
+static void rows_mm(const RqCtx *c, QuantizedTensor *w, float *out, int ldo, QuantizedTensor *x, int ldx, const int32_t *corr,
+                    const float *xf, const int32_t *c16, int nb, int k, int i0, int i1) {
     // out[b * ldo + i] = W row i . x row b for i0 <= i < i1 (multiples of 16), b < nb (x row b at x->q +
-    // b * ldx; the activation prep of act_prep_row): the small-batch kernel, else the decode GEMV per row.
-    // Either way each output is the GEMV's (bit-identical)
+    // b * ldx; the activation prep of act_prep_row): the small-batch kernel (c: its prefetch distance), else the
+    // decode GEMV per row. Either way each output is the GEMV's (bit-identical)
 #ifdef RUNQ_SMB
     if (w->kp || w->p) {
-        smb_rows(w->kp ? w->type : 0, out, ldo, x->q, ldx, x->s, corr, xf, c16, nb, w->kp ? w->kp : w->p, k, GS, i0 / 16, i1 / 16);
+        smb_rows(w->kp ? w->type : 0, out, ldo, x->q, ldx, x->s, corr, xf, c16, nb, w->kp ? w->kp : w->p, k, GS, i0 / 16, i1 / 16,
+                 c->smb_pf);
         return;
     }
+#else
+    (void)c;
 #endif
     for (int b = 0; b < nb; b++) {
         QuantizedTensor xr = qrow(x, b, ldx);
@@ -2463,17 +2480,19 @@ static void rows_mm(QuantizedTensor *w, float *out, int ldo, QuantizedTensor *x,
 
 typedef struct {
     RqCtx *c;
-    int n;       // rows = segments, one row each (row b = segment b, at position row_pos[b] of seg[b].seq)
+    int n;       // rows (row b at position row_pos[b] of seg[row_seg[b]].seq)
+    int nseg;    // segments (consecutive rows of one sequence each, at most bd_seg)
+    int nrb;     // attention row blocks (rb_seg / rb_b0 / rb_b1: rows of one segment, at most att_rows)
     int nsel;    // rows with logits (sel_row), into out
     float *out;
     int epi;     // the norms as phase epilogues (else phases of their own)
-    int split;   // attention split over blocks of ATT_P positions (row_it0: items per row and kv head)
+    int split;   // attention split over blocks of ATT_P positions (row_it0: items of row blocks 0..rb-1 per kv head)
     int nbmax;   // blocks of the longest row (att_sp layout)
 } BatchDecJob;
 
 static int bd_phases(const RqModel *m, int epi) { return ((epi ? 4 : 6) + m->hy.on) * m->config.n_layers + 4; } // (+ Qwen3.5's quantization)
-// per layer: per kv head its q / k / v items done, its QK-norm + RoPE + stores done; per row its kv heads'
-// attention done; per (row, kv head) its blocks done (split attention)
+// per layer: per kv head its q / k / v items done, its QK-norm + RoPE + stores done; per row block its kv heads'
+// attention done; per (row block, kv head) its blocks done (split attention); (row blocks <= rows n)
 static int bd_counters(int nkv, int n, int nv) { // (nv: Qwen3.5's value heads: a linear layer needs 1 + 2 nv)
     int a = 2 * nkv + n * (1 + nkv), b = nv ? 1 + 2 * nv : 0;
     return a > b ? a : b;
@@ -2500,14 +2519,19 @@ static void bd_norm_row(RqCtx *c, const Config *p, const TransformerWeights *w, 
 }
 
 static void batch_decode_worker(void *arg, int tid, int nt) {
-    // rq_forward_batch over N decode rows of N sequences: decode_worker's structure for N rows at once,
-    // per layer 4 phases (6 with the norms as phases): [q, k, v per head over all rows (rows_mm) + QK-norm +
-    // RoPE + each row's K / V into its sequence's cache; attention per (row, kv head) or (row, kv head,
-    // block), once the 4 items of its kv head are done (dependency counters); the last kv head of a row
-    // quantizes its output] [wo; residual + rmsnorm + quantize per row] [w1 + w3 + SwiGLU + quantize per
-    // ff_rows hidden rows, all rows] [w2; residual + the next rmsnorm + quantize per row], then the
-    // classifier over the rows with logits. Every output is computed whole by the same functions as in
-    // decode_worker / prefill_worker: each row's results are those of its sequence decoded alone
+    // rq_forward_batch over N rows in short segments (decode rows of N sequences, a speculative verify segment
+    // of a few rows of one sequence, or both): decode_worker's structure for N rows at once, per layer 4
+    // phases (6 with the norms as phases): [q, k, v per head over all rows (rows_mm) + QK-norm + RoPE + each
+    // row's K / V into its sequence's cache; attention per (row block, kv head) or (row block, kv head, block),
+    // once the 4 items of its kv head are done (dependency counters): a row block is up to att_rows rows of
+    // one segment, as prefill_worker's, each row over its positions 0..pos (causal: the K / V of the
+    // segment's earlier rows are stored by then); the last kv head of a row block quantizes its rows' output]
+    // [wo; residual + rmsnorm + quantize per row] [w1 + w3 + SwiGLU + quantize per ff_rows hidden rows, all
+    // rows] [w2; residual + the next rmsnorm + quantize per row], then the classifier over the rows with
+    // logits. Qwen3.5's linear layers: dn_prep per value head over the rows in order, dn_rec per (value head,
+    // block) over each segment's rows in order (dn_rec_run, as prefill_worker). Every output is computed
+    // whole by the same functions as in decode_worker / prefill_worker: each row's results are those of its
+    // sequence decoded alone
     (void)nt;
     BatchDecJob *job = arg;
     RqCtx *c = job->c;
@@ -2524,7 +2548,7 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
     // q / k / v items per kv head, qr rows each (Qwen3.5: a query head's rows are [q | gate], 2 hd)
     int qr = hd % BD_QKV_ROWS ? hd : BD_QKV_ROWS, ng = (kv_mul * qh + 2 * hd) / qr;
     int ncl = bd_counters(nkv, n, hy->nv); // dependency counters per layer (bd_counters)
-    int nat = job->split ? c->row_it0[n] : n; // attention items per kv head
+    int nrb = job->nrb, nat = job->split ? c->row_it0[nrb] : nrb; // attention items per kv head
     size_t bs = (size_t)nkv * ATT_P * hd, pst = ATT_PSTRIDE(hd);
     float *att = c->att_b + (size_t)tid * m->att_rows * kv_mul * c->att_nb * ATT_P;
     float *part = c->att_pb + (size_t)tid * m->att_rows * kv_mul * c->att_nb * pst;
@@ -2541,7 +2565,7 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
             int q = (it - n) / (2 * NA), b = 0;
             for (;; b++)
                 if (c->row_pos[b] % ATT_T == 0 && q-- == 0) break;
-            kv_populate_one(seg[b].seq, p, c->row_pos[b], 1, (it - n) % (2 * NA));
+            kv_populate_one(seg[c->row_seg[b]].seq, p, c->row_pos[b], 1, (it - n) % (2 * NA));
             continue;
         }
         embed_row(c->x_b + (size_t)it * dim, w->q_tokens, c->row_tok[it], dim);
@@ -2567,8 +2591,8 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
             for (int it = lo; it < hi; it++) {
                 float *lb = c->lin_b;
                 if (it == 0) {
-                    rows_mm(w->wa + li, lb + hy->conv_dim + hy->vdim, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, 0, hy->nv);
-                    rows_mm(w->wb + li, lb + hy->conv_dim + hy->vdim + hy->nv, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, 0,
+                    rows_mm(c, w->wa + li, lb + hy->conv_dim + hy->vdim, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, 0, hy->nv);
+                    rows_mm(c, w->wb + li, lb + hy->conv_dim + hy->vdim + hy->nv, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, 0,
                             hy->nv);
                     rq_count(S, cb, 1);
                     continue;
@@ -2577,11 +2601,11 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
                     int h = it - 1, i0 = h * hy->dv;
                     int r0[3] = { h * hy->dk, hy->nk * hy->dk + h * hy->dk, 2 * hy->nk * hy->dk + h * hy->dv }, rn[3] = { hy->dk, hy->dk, hy->dv };
                     for (int t = h < hy->nk ? 0 : 2; t < 3; t++)
-                        rows_mm(w->wqkv + li, lb, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, r0[t], r0[t] + rn[t]);
-                    rows_mm(w->wz + li, lb + hy->conv_dim, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, i0, i0 + hy->dv);
+                        rows_mm(c, w->wqkv + li, lb, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, r0[t], r0[t] + rn[t]);
+                    rows_mm(c, w->wz + li, lb + hy->conv_dim, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, i0, i0 + hy->dv);
                     rq_wait_count(S, cb, 1);
-                    for (int b = 0; b < n; b++) {
-                        RqSeq *sq = seg[b].seq;
+                    for (int b = 0; b < n; b++) { // (a segment's rows in order: the conv state)
+                        RqSeq *sq = seg[c->row_seg[b]].seq;
                         int pos = c->row_pos[b];
                         dn_prep(m, li, h, sq->ssm + (size_t)li * m->ssm_layer, pos == 0, dn_ck(sq, li, pos), lb + (size_t)b * lw);
                     }
@@ -2592,11 +2616,11 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
                 rq_wait_count(S, cb + 1 + h, 1);
                 if (h >= hy->nk) // (its key head's q / k)
                     rq_wait_count(S, cb + 1 + h % hy->nk, 1);
-                for (int b = 0; b < n; b++) {
-                    RqSeq *sq = seg[b].seq;
-                    int pos = c->row_pos[b];
-                    dn_rec(m, h, jb, sq->ssm + (size_t)li * m->ssm_layer, pos == 0, &sq->ckw, (size_t)li * m->ssm_layer,
-                           lb + (size_t)b * lw, c->xb_b + (size_t)b * xs + i0);
+                for (int i = 0; i < job->nseg; i++) { // (a segment's rows in order: the recurrence)
+                    const PfSeg *sg = &seg[i];
+                    RqSeq *sq = sg->seq;
+                    dn_rec_run(m, h, jb, sq->ssm + (size_t)li * m->ssm_layer, sg->pos0 == 0, lb + (size_t)sg->b0 * lw, lw,
+                               c->xb_b + (size_t)sg->b0 * xs + i0, xs, sg->n, &sq->ckw, (size_t)li * m->ssm_layer);
                 }
                 if (rq_count(S, cb + 1 + hy->nv + h, 1) < nblk)
                     continue;
@@ -2617,17 +2641,17 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
             if (it < nkv * ng) {
                 int g = it / ng, r = (it % ng) * qr, nq = kv_mul * qh; // r: row offset in [q heads | k | v] of head g
                 if (r < nq)
-                    rows_mm(w->wq + al, c->q_b, qd, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, g * nq + r, g * nq + r + qr);
+                    rows_mm(c, w->wq + al, c->q_b, qd, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, g * nq + r, g * nq + r + qr);
                 else if (r < nq + hd)
-                    rows_mm(w->wk + al, c->k_b, kv_dim, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, g * hd + r - nq,
+                    rows_mm(c, w->wk + al, c->k_b, kv_dim, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, g * hd + r - nq,
                             g * hd + r - nq + qr);
                 else
-                    rows_mm(w->wv + al, c->v_b, kv_dim, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, g * hd + r - nq - hd,
+                    rows_mm(c, w->wv + al, c->v_b, kv_dim, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, g * hd + r - nq - hd,
                             g * hd + r - nq - hd + qr);
                 if (rq_count(S, cb + g, 1) < ng)
                     continue;
                 for (int b = 0; b < n; b++) {
-                    RqSeq *sq = seg[b].seq;
+                    RqSeq *sq = seg[c->row_seg[b]].seq;
                     const float *cs = c->rope_b + (size_t)b * hd;
                     float *kr = c->k_b + (size_t)b * kv_dim + g * hd;
                     qk_norm_rope(c->q_b + (size_t)b * qd + g * nq, kv_mul, qh, w->q_norm_weights + al * hd, hd, cs, rd);
@@ -2639,50 +2663,54 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
                 rq_count(S, cb + nkv + g, 1);
                 continue;
             }
-            // attention item: kv head g, row b (rows longest first), block j of the row if split
-            int a = it - nkv * ng, g = a / nat, i = a % nat, b = i, j = 0;
+            // attention item: kv head g, row block u (rows b0..b1-1 of one segment, each row's kv_mul query heads
+            // in one call: the K / V read once for them), block j of its longest row if split
+            int a = it - nkv * ng, g = a / nat, i = a % nat, u = i, j = 0;
             if (job->split) {
-                int lo_ = 0, hi_ = n; // the row whose items hold i: row_it0[b] <= i < row_it0[b + 1]
+                int lo_ = 0, hi_ = nrb; // the row block whose items hold i: row_it0[u] <= i < row_it0[u + 1]
                 while (hi_ - lo_ > 1) {
                     int mid = (lo_ + hi_) / 2;
                     if (c->row_it0[mid] <= i) lo_ = mid; else hi_ = mid;
                 }
-                b = lo_;
-                j = i - c->row_it0[b];
+                u = lo_;
+                j = i - c->row_it0[u];
             }
             rq_wait_count(S, cb + nkv + g, 1);
-            RqSeq *sq = seg[b].seq;
+            RqSeq *sq = seg[c->rb_seg[u]].seq;
             const char *kl = (const char *)sq->key_cache + loff * sq->kv_len * sq->kv_esz;
             const char *vl = (const char *)sq->value_cache + loff * sq->kv_len * sq->kv_esz;
             size_t o = kv_tile(0, g, nkv, hd) * sq->kv_esz;
-            int np = c->row_pos[b] + 1, nbk = (np + ATT_P - 1) / ATT_P;
+            int b0 = c->rb_b0[u], b1 = c->rb_b1[u], nv = 0, nbk = (c->row_pos[b1 - 1] + 1 + ATT_P - 1) / ATT_P;
             const float *qv[ATT_NV_MAX];
             float *ov[ATT_NV_MAX], *pv[ATT_NV_MAX];
             int npv[ATT_NV_MAX];
-            for (int r = 0; r < kv_mul; r++) {
-                qv[r] = c->q_b + (size_t)b * qd + (g * kv_mul + r) * qh;
-                ov[r] = c->xb_b + (size_t)b * xs + (g * kv_mul + r) * hd;
-                pv[r] = c->att_sp + ((size_t)b * nh + g * kv_mul + r) * job->nbmax * pst;
-                npv[r] = np;
-            }
-            if (job->split && nbk > 1) { // block j's partial results; the last block of (row, kv head) combines
-                attention_part(sq->kvt, kv_mul, qv, ov, pv, npv, j, j + 1, kl + o, vl + o, bs, hd, m->att_scale, att, conv);
-                if (rq_count(S, cb + 2 * nkv + n + b * nkv + g, 1) < nbk)
+            for (int b = b0; b < b1; b++)
+                for (int r = 0; r < kv_mul; r++, nv++) {
+                    qv[nv] = c->q_b + (size_t)b * qd + (g * kv_mul + r) * qh;
+                    ov[nv] = c->xb_b + (size_t)b * xs + (g * kv_mul + r) * hd;
+                    pv[nv] = c->att_sp + ((size_t)b * nh + g * kv_mul + r) * job->nbmax * pst;
+                    npv[nv] = c->row_pos[b] + 1;
+                }
+            if (job->split && nbk > 1) { // block j's partial results; the last block of (row block, kv head) combines
+                attention_part(sq->kvt, nv, qv, ov, pv, npv, j, j + 1, kl + o, vl + o, bs, hd, m->att_scale, att, conv);
+                if (rq_count(S, cb + 2 * nkv + n + u * nkv + g, 1) < nbk)
                     continue;
-                for (int r = 0; r < kv_mul; r++)
-                    att_combine(ov[r], nbk, pv[r], pst, hd);
+                for (int r = 0; r < nv; r++) // (each row over its own blocks)
+                    att_combine(ov[r], (npv[r] + ATT_P - 1) / ATT_P, pv[r], pst, hd);
             } else {
-                attention_kv(sq->kvt, kv_mul, qv, ov, npv, kl + o, vl + o, bs, hd, m->att_scale, att, part, conv);
+                attention_kv(sq->kvt, nv, qv, ov, npv, kl + o, vl + o, bs, hd, m->att_scale, att, part, conv);
             }
-            if (rq_count(S, cb + 2 * nkv + b, 1) < nkv)
+            if (rq_count(S, cb + 2 * nkv + u, 1) < nkv)
                 continue;
-            // the row's last kv head: its attention output quantized for wo (xq_b: every qkv item is done)
-            QuantizedTensor xq = qrow(&c->xq_b, b, xs);
-            if (hy->on)
-                for (int h = 0; h < nh; h++)
-                    attn_gate(c->xb_b + (size_t)b * xs + h * hd, c->q_b + (size_t)b * qd + h * qh + hd, hd);
-            quantize(&xq, c->xb_b + (size_t)b * xs, ahd);
-            act_prep_row(&xq, ahd, c->bq_corr, c->bq_xf, c->bq_c16, b);
+            // the row block's last kv head: its rows' attention output quantized for wo (xq_b: every qkv item is done)
+            for (int b = b0; b < b1; b++) {
+                QuantizedTensor xq = qrow(&c->xq_b, b, xs);
+                if (hy->on)
+                    for (int h = 0; h < nh; h++)
+                        attn_gate(c->xb_b + (size_t)b * xs + h * hd, c->q_b + (size_t)b * qd + h * qh + hd, hd);
+                quantize(&xq, c->xb_b + (size_t)b * xs, ahd);
+                act_prep_row(&xq, ahd, c->bq_corr, c->bq_xf, c->bq_c16, b);
+            }
         }
         PH_END_NOEPI
         PPROF(PF_BDQKV);
@@ -2703,7 +2731,7 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
         }
         if (job->epi) {
             PH_BEGIN(dim / 16, 1)
-                rows_mm(wout, c->xb_b, xs, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, kin, lo * 16, hi * 16);
+                rows_mm(c, wout, c->xb_b, xs, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, kin, lo * 16, hi * 16);
             PH_EPILOGUE
                 for (int b = 0; b < n; b++)
                     bd_norm_row(c, p, w, b, -1 - l, 1, b);
@@ -2711,7 +2739,7 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
             PPROF(PF_WO);
         } else {
             PH_BEGIN(dim / 16, 1)
-                rows_mm(wout, c->xb_b, xs, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, kin, lo * 16, hi * 16);
+                rows_mm(c, wout, c->xb_b, xs, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, kin, lo * 16, hi * 16);
             PH_END_NOEPI
             PPROF(PF_WO);
             PH_BEGIN(n, 1)
@@ -2724,8 +2752,8 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
         // w1 + w3 + SwiGLU + quantize per ff hidden rows, all rows
         PH_BEGIN(hidden / ff, 1)
         for (int i0 = lo * ff; i0 < hi * ff; i0 += ff) {
-            rows_mm(w->w1 + l, c->hb_b, hidden, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, i0, i0 + ff);
-            rows_mm(w->w3 + l, c->hb2_b, hidden, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, i0, i0 + ff);
+            rows_mm(c, w->w1 + l, c->hb_b, hidden, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, i0, i0 + ff);
+            rows_mm(c, w->w3 + l, c->hb2_b, hidden, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, i0, i0 + ff);
             for (int b = 0; b < n; b++) {
                 float *hb = c->hb_b + (size_t)b * hidden;
                 swiglu(hb + i0, c->hb2_b + (size_t)b * hidden + i0, ff);
@@ -2743,7 +2771,7 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
         int last = l + 1 == p->n_layers, nr = last ? job->nsel : n;
         if (job->epi) {
             PH_BEGIN(dim / 16, 1)
-                rows_mm(w->w2 + l, c->xb_b, xs, &c->hq_b, hidden, c->bh_corr, c->bh_xf, c->bh_c16, n, hidden, lo * 16, hi * 16);
+                rows_mm(c, w->w2 + l, c->xb_b, xs, &c->hq_b, hidden, c->bh_corr, c->bh_xf, c->bh_c16, n, hidden, lo * 16, hi * 16);
             PH_EPILOGUE
                 for (int j = 0; j < nr; j++)
                     bd_norm_row(c, p, w, last ? c->sel_row[j] : j, l + 1, 1, j);
@@ -2751,7 +2779,7 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
             PPROF(PF_FFN2);
         } else {
             PH_BEGIN(dim / 16, 1)
-                rows_mm(w->w2 + l, c->xb_b, xs, &c->hq_b, hidden, c->bh_corr, c->bh_xf, c->bh_c16, n, hidden, lo * 16, hi * 16);
+                rows_mm(c, w->w2 + l, c->xb_b, xs, &c->hq_b, hidden, c->bh_corr, c->bh_xf, c->bh_c16, n, hidden, lo * 16, hi * 16);
             PH_END_NOEPI
             PPROF(PF_FFN2);
             if (nr > 0) {
@@ -2768,23 +2796,24 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
         // (a vocabulary that is not a multiple of 16: the generic kernels' last block is partial, as in decode)
         int nblk = (p->vocab_size + 15) / 16, cc = nblk / (8 * nt) > 1 ? nblk / (8 * nt) : 1;
         PH_BEGIN(nblk, cc)
-            rows_mm(w->wcls, job->out, p->vocab_size, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, job->nsel, dim, lo * 16,
+            rows_mm(c, w->wcls, job->out, p->vocab_size, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, job->nsel, dim, lo * 16,
                     hi * 16 < p->vocab_size ? hi * 16 : p->vocab_size);
         PH_END_NOEPI
         PPROF(PF_CLS);
     }
 }
 
-static int batch_decode(RqCtx *c, int n, int nsel, float *out) {
-    // rq_forward_batch's plan (segments of one row each) -> batch_decode_worker; the rows' attention split
-    // over blocks if the (row, kv head) items alone are few for the threads
+static int batch_decode(RqCtx *c, int n, int nseg, int nrb, int nsel, float *out) {
+    // rq_forward_batch's plan (segments of at most bd_seg rows, row blocks) -> batch_decode_worker; the row
+    // blocks' attention split over blocks of ATT_P positions if the (row block, kv head) items alone are few
+    // for the threads
     const Config *p = &c->m->config;
     int nkv = p->n_kv_heads, nbmax = 1, nt = rq_nthreads();
     for (int b = 0; b < n; b++) {
         int nbk = (c->row_pos[b] + 1 + ATT_P - 1) / ATT_P;
         nbmax = nbk > nbmax ? nbk : nbmax;
     }
-    BatchDecJob job = { c, n, nsel, out, n <= c->bd_epi, nbmax > 1 && n * nkv < c->bd_split * nt, nbmax };
+    BatchDecJob job = { c, n, nseg, nrb, nsel, out, n <= c->bd_epi, nbmax > 1 && nrb * nkv < c->bd_split * nt, nbmax };
     if (job.split) {
         size_t need = (size_t)n * p->n_heads * nbmax * ATT_PSTRIDE(p->head_dim);
         if (need > c->att_sp_n) {
@@ -2794,9 +2823,9 @@ static int batch_decode(RqCtx *c, int n, int nsel, float *out) {
             c->att_sp = sp;
             c->att_sp_n = need;
         }
-        c->row_it0[0] = 0;
-        for (int b = 0; b < n; b++)
-            c->row_it0[b + 1] = c->row_it0[b] + (c->row_pos[b] + 1 + ATT_P - 1) / ATT_P;
+        c->row_it0[0] = 0; // (per row block: the blocks of its last row)
+        for (int u = 0; u < nrb; u++)
+            c->row_it0[u + 1] = c->row_it0[u] + (c->row_pos[c->rb_b1[u] - 1] + 1 + ATT_P - 1) / ATT_P;
     }
     PROF_START(c);
     if (rq_begin(&c->sync, bd_phases(c->m, job.epi), p->n_layers * bd_counters(nkv, n, c->m->hy.on ? c->m->hy.nv : 0), nt, rq_spin_dec) != 0)
@@ -2809,10 +2838,11 @@ int rq_forward_batch(RqCtx *c, const RqSegment *sg, int nseg, float *out, float 
     // One batched pass over the rows of nseg segments: the same computation per row as rq_decode on
     // its sequence, with every weight matrix applied to all rows at once (GEMM / small-batch work
     // items), and bit-identical results. Fills the KV caches. One parallel job in phases (threads.h):
-    // batch_decode_worker if every segment is one row (decode rows, up to bd_max), else prefill_worker
+    // batch_decode_worker if every segment is short (decode rows, a verify segment: at most bd_seg rows, up to
+    // bd_max rows in all), else prefill_worker
     const RqModel *m = c->m;
     const Config *p = &m->config;
-    int ar = m->att_rows, n = 0, ntile = 0, nrb = 0, nsel = 0, any_all = 0;
+    int ar = m->att_rows, n = 0, ntile = 0, nrb = 0, nsel = 0, any_all = 0, segmax = 0;
     c->err[0] = 0;
     if (logits) *logits = NULL;
     if (c->nb_max <= 1) return ctx_fail(c, RQ_ERR_STATE, "context without batch buffers (max_batch %d)", c->nb_max);
@@ -2833,6 +2863,7 @@ int rq_forward_batch(RqCtx *c, const RqSegment *sg, int nseg, float *out, float 
             if (sg[i].tokens[j] < 0 || sg[i].tokens[j] >= p->vocab_size)
                 return ctx_fail(c, RQ_ERR_ARG, "token %d out of range", sg[i].tokens[j]);
         n += sg[i].n;
+        segmax = sg[i].n > segmax ? sg[i].n : segmax;
         nsel += sg[i].logits == RQ_LOGITS_ALL ? sg[i].n : sg[i].logits == RQ_LOGITS_LAST;
         any_all |= sg[i].logits == RQ_LOGITS_ALL;
     }
@@ -2851,6 +2882,7 @@ int rq_forward_batch(RqCtx *c, const RqSegment *sg, int nseg, float *out, float 
         for (int j = 0; j < s->n; j++) {
             c->row_tok[n + j] = sg[i].tokens[j];
             c->row_pos[n + j] = s->pos0 + j;
+            c->row_seg[n + j] = i;
         }
         for (int tb = s->pos0 / ATT_T; tb <= (s->pos0 + s->n - 1) / ATT_T; tb++, ntile++) {
             c->tile_seg[ntile] = i;
@@ -2872,8 +2904,8 @@ int rq_forward_batch(RqCtx *c, const RqSegment *sg, int nseg, float *out, float 
 
     for (int i = 0; i < nseg; i++) // (Qwen3.5: a checkpoint this pass reaches)
         ck_plan(c->seg[i].seq, c->seg[i].pos0, c->seg[i].n);
-    if (n == nseg && n <= c->bd_max) { // decode rows only (one per segment): batch_decode_worker
-        int e = batch_decode(c, n, nsel, out);
+    if (n <= c->bd_max && segmax <= c->bd_seg) { // short segments only: batch_decode_worker
+        int e = batch_decode(c, n, nseg, nrb, nsel, out);
         if (e != RQ_OK) return e;
     } else {
         int e = prefill_plan(c, nseg, nrb);

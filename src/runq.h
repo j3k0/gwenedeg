@@ -396,6 +396,51 @@ int rq_gen_step(RqGen *g, RqCtx *c, int pos, float *logits);
 // comparing generation paths through on_logits (e.g. speculative == plain decoding)
 unsigned long long rq_logits_hash(const float *logits, int n);
 
+// ---------------------------------------------------------------------------- speculative decoding
+// rq_generate with a draft model (src/spec.c, docs/qwen38-speculative.md): the draft guesses up to k tokens greedily,
+// the target verifies [last, d1..dk] in one pass (RQ_LOGITS_ALL) and steps through the rows with rq_gen_step while
+// the sampled token equals the guess; the first mismatch's sample (or the bonus token after k accepted guesses) is
+// the next token; both sequences are cut back to what was accepted. The output is rq_generate's exactly, for any
+// draft, k and tau: the same tokens, RNG draws (the target sequence's; the draft draws none), callbacks (on_logits:
+// the same positions and logits bits), stop and the target's cache afterwards. The draft only changes how many
+// tokens a target pass yields (the speed).
+// The draft model needs the target's vocabulary: the same size and token strings (rq_spec_check; e.g. Qwen3-0.6B
+// for Qwen3-1.7B, Qwen3.5-0.8B for Qwen3.5 / 3.8). Its sequence (ds, on its own context dc) follows the target's:
+// each call keeps its longest common prefix with the target's tokens and feeds the rest, so it can be reused across
+// calls (a chat) or start empty. Qwen3.5 (target or draft): during the loop both sequences have at least k + 2
+// checkpoint slots (rq_seq_set_checkpoints) and a checkpoint per guess row of each pass (rq_seq_checkpoint_rows), so
+// that the rollbacks land exactly (RqSpecStats.refed counts the positions fed again where one did not); afterwards
+// the target's are as rq_generate leaves them (the rows' dropped, its slot count back: a later rq_seq_truncate lands
+// where it would after plain decoding), the draft keeps its k + 2
+#define RQ_SPEC_K_MAX 30
+typedef struct {
+    int k;       // guesses per pass, at most (0..RQ_SPEC_K_MAX; 0 = plain decoding: rq_generate, the draft unused)
+    float tau;   // adaptive length: stop drafting at the first guess whose draft top-1 probability is < tau (0 = off: k
+                 // guesses per pass, fewer only before max_new or the end of the context)
+} RqSpecOpts;
+typedef struct {
+    RqGenStats gen;    // as rq_generate's (t_prefill: both models' prompt; t_gen: the loop)
+    int passes;        // target passes after the prompt (each [last, guesses]; without a guess, a decode step)
+    int drafted;       // guesses verified
+    int accepted;      // guesses accepted (tokens that cost no target pass of their own: n_gen ~ passes + accepted)
+    int draft_steps;   // draft forward passes (catching up on the accepted tokens included)
+    int refed;         // positions fed again because a rollback landed short (Qwen3.5 without that checkpoint): 0
+    double t_draft, t_verify; // seconds: the draft (passes, picking the guesses), the target's passes
+} RqSpecStats;
+// RQ_OK if draft can draft for target (vocabulary size and a hash of every token's bytes equal), else RQ_ERR_ARG with
+// the reason in err (RQ_ERR_STATE: a model without its tokenizer). rq_generate_spec / rq_spec_run check it too
+// (RQ_ERR_ARG, before any pass)
+int rq_spec_check(const RqModel *target, const RqModel *draft, char *err, size_t errlen);
+// rq_generate on (c, s) with the draft (dc, ds): prefills tokens on s (and brings ds up to s's tokens), then
+// rq_spec_run. o NULL or o->k 0: rq_generate itself (dc, ds unused, may be NULL). st (may be NULL) is filled
+int rq_generate_spec(RqCtx *c, RqSeq *s, RqCtx *dc, RqSeq *ds, const int *tokens, int n, const RqSampling *cfg,
+                     int max_new, const RqSpecOpts *o, const RqCallbacks *cb, RqSpecStats *st);
+// the loop alone, for a caller that prefills and starts the reply itself (rq_gen_start: e.g. the CLI's generate
+// mode, which draws nothing for the prompt): g started on the target sequence g->s, logits = those of its last
+// position; runs until g is done, as rq_generate's loop after rq_gen_start would. Adds to st's counters, sets
+// st->gen.n_gen / stop / t_gen
+int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const RqSpecOpts *o, RqSpecStats *st);
+
 // ----------------------------------------------------------------------------------------- test hooks
 // rows r0..r0+nr-1 of the matrix `name` (llama.cpp tensor name; GGUF only) dequantized from the file's
 // blocks into rows (nr x *ncols), and for Q4_K / Q6_K also from the repacked layout into packed (if

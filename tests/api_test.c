@@ -18,6 +18,16 @@
  * and B goes on (== alone). Also: a sequence of one model on the other's context is refused, and with --gs a
  * model of another group size (the .bin: 64) is refused cleanly while A or B is loaded (they go on unchanged),
  * and loads once both are freed. DIGEST lines (a hash of each model's work) to compare builds.
+ *   tests/api_test --spec TARGET DRAFT [--quick] [--other MODEL]
+ * Speculative decoding (rq_generate_spec, TODO S1) == rq_generate: for each case (prompts with thinking off / on and
+ * raw text; greedy and seeded sampling with top-p / top-k; stops at an end token, at max_new and at the end of the
+ * context inside a verify pass, the draft's context shorter than the target's or than the prompt; a second call after
+ * both were cut
+ * back, as a chat's next turn) and each draft setting (k = 1 / 3 / 8, adaptive tau 0.5 with k 8; --quick: k 3 and
+ * adaptive, fewer cases): the tokens, the RNG state after each, every sampled logits vector's position and hash, the
+ * stop, the cache's tokens and one more decode step's logits. Also k 0 == rq_generate, the vocabulary check (the draft
+ * itself accepted; --other: a model of another vocabulary refused, loaded tokenizer-only) and, for Qwen3.5, that
+ * every rollback landed on its checkpoint (RqSpecStats.refed 0).
  *   tests/api_test MODEL --sample LOGITS_FILE < PLAN
  * rq_sample on the rows of a -m logits file, with the settings and RNG states of PLAN's lines ("T P K ROW
  * SEED..."): SAMPLE lines for tests/sampler_ref.py (the sampler's exact order replayed in numpy: top-k). */
@@ -190,7 +200,7 @@ static int on_tok(void *u, int t) {
 
 // rq_generate's callbacks recorded: each sampled logits vector (position, rq_logits_hash) and each reported
 // token with the RNG state right after its draw
-#define GR_MAX 64
+#define GR_MAX 512
 typedef struct {
     RqSeq *s;
     int n, nl, tok[GR_MAX], pos[GR_MAX];
@@ -266,6 +276,7 @@ static int gen_verify_loop(RqCtx *c, RqSeq *s, const int *p, int np, const RqSam
 
 static void batch_tests(RqCtx *c, RqTokens A, RqTokens B, RqTokens C, const float *refB, int only_digest);
 static int two_main(int argc, char **argv);
+static int spec_main(int argc, char **argv);
 
 static int sample_main(int argc, char **argv) {
     // api_test MODEL --sample LOGITS_FILE < PLAN: rq_sample on rows of a -m logits file (int32 n, vocab, ids[n],
@@ -317,6 +328,7 @@ static int sample_main(int argc, char **argv) {
 int main(int argc, char **argv) {
     int only_digest = 0;
     if (argc > 1 && !strcmp(argv[1], "--two")) return two_main(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "--spec")) return spec_main(argc, argv);
     if (argc > 3 && !strcmp(argv[2], "--sample")) return sample_main(argc, argv);
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--digest")) only_digest = 1;
@@ -329,6 +341,7 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv]\n"
                         "       api_test --two MODEL_A MODEL_B [--gs MODEL_OTHER_GROUP_SIZE]\n"
+                        "       api_test --spec TARGET DRAFT [--quick] [--other MODEL_OTHER_VOCABULARY]\n"
                         "       api_test MODEL --sample LOGITS_FILE < PLAN (lines: T P K ROW SEED...)\n");
         return 2;
     }
@@ -1455,5 +1468,197 @@ static int two_main(int argc, char **argv) {
                  g ? rq_strerror(e) : err);
         report(g && ok && gi.group_size != gs_a, "two_gs_after_free", head);
     }
+    return failed;
+}
+
+// ---------------------------------------------------------------------------------------- api_test --spec
+// rq_generate_spec == rq_generate (header). Each run on fresh sequences: the reference with rq_generate, then
+// rq_generate_spec per draft setting
+typedef struct {
+    const char *name;
+    int prompt;          // sp_prompt: 0 a chat turn, thinking off; 1 thinking on; 2 raw text (code)
+    RqSampling cfg;
+    unsigned long long seed;
+    int max_new;
+    int cap, dcap;       // the target's / draft's capacity past the prompt (0: the model's; < 0: shorter than it)
+    int turn2;           // a second call: both cut back 3 positions (at most to the prompt), then a user turn
+    int quick;           // in --quick
+} SpCase;
+
+typedef struct {
+    GenRec rec;
+    int stop[2], ngen[2], len;
+    unsigned long long rng, htok, hnext;
+    RqSpecStats st;      // summed over the calls (gen: the last call's)
+} SpOut;
+
+static RqModel *SD;
+static RqTokens sp_prompt[3], sp_turn2;
+
+static int sp_run(RqCtx *c, RqCtx *dc, const SpCase *k, const RqSpecOpts *o, SpOut *out) {
+    // o NULL: rq_generate
+    int e, np = sp_prompt[k->prompt].n;
+    RqSeq *s = rq_seq_new(M, k->cap ? np + k->cap : 0, RQ_KV_DEFAULT, &e);
+    if (!s) die("rq_seq_new", e);
+    RqSeq *ds = o ? rq_seq_new(SD, k->dcap ? np + k->dcap : 0, RQ_KV_DEFAULT, &e) : NULL;
+    if (o && !ds) die("rq_seq_new (draft)", e);
+    rq_seq_seed(s, k->seed);
+    memset(out, 0, sizeof(*out));
+    out->rec.s = s;
+    RqCallbacks cb = { gr_token, gr_logits, &out->rec };
+    RqTokens t = { 0 };
+    rq_tokens_push(&t, sp_prompt[k->prompt].v, np);
+    for (int call = 0; call <= k->turn2; call++) {
+        RqSpecStats st;
+        if (o) {
+            e = rq_generate_spec(c, s, dc, ds, t.v, t.n, &k->cfg, k->max_new, o, &cb, &st);
+            out->st.passes += st.passes, out->st.drafted += st.drafted, out->st.accepted += st.accepted;
+            out->st.refed += st.refed, out->st.draft_steps += st.draft_steps;
+        } else {
+            e = rq_generate(c, s, t.v, t.n, &k->cfg, k->max_new, &cb, &st.gen);
+        }
+        if (e != RQ_OK) break;
+        out->st.gen = st.gen;
+        out->stop[call] = st.gen.stop;
+        out->ngen[call] = st.gen.n_gen;
+        if (call < k->turn2) { // (Qwen3.5: the truncation goes back to a checkpoint: what it lost is fed again)
+            int L = rq_seq_len(s) - 3 < np ? np : rq_seq_len(s) - 3;
+            t.n = 0;
+            rq_tokens_push(&t, rq_seq_tokens(s), L);
+            if ((e = rq_seq_truncate(s, L)) != RQ_OK) break;
+            memmove(t.v, t.v + rq_seq_len(s), (size_t)(L - rq_seq_len(s)) * sizeof(int));
+            t.n = L - rq_seq_len(s);
+            rq_tokens_push(&t, sp_turn2.v, sp_turn2.n);
+        }
+    }
+    out->len = rq_seq_len(s);
+    out->htok = hash_f((const float *)rq_seq_tokens(s), (size_t)out->len);
+    out->rng = *rq_seq_rng(s);
+    float *lg;
+    if (e == RQ_OK && out->len < rq_seq_capacity(s) && (e = rq_decode(c, s, 1000, &lg)) == RQ_OK)
+        out->hnext = rq_logits_hash(lg, V);
+    rq_tokens_free(&t);
+    rq_seq_free(s);
+    rq_seq_free(ds);
+    return e;
+}
+
+static int sp_same(const SpOut *a, const SpOut *b) {
+    return gr_same(&a->rec, &b->rec) && !memcmp(a->stop, b->stop, sizeof(a->stop)) && !memcmp(a->ngen, b->ngen, sizeof(a->ngen)) &&
+           a->len == b->len && a->htok == b->htok && a->rng == b->rng && a->hnext == b->hnext;
+}
+
+static int spec_main(int argc, char **argv) {
+    const char *path[2] = { NULL, NULL }, *other = NULL;
+    int quick = 0, bad = 0;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--quick")) quick = 1;
+        else if (!strcmp(argv[i], "--other") && i + 1 < argc) other = argv[++i];
+        else if (argv[i][0] == '-') bad = 1;
+        else if (!path[0]) path[0] = argv[i];
+        else if (!path[1]) path[1] = argv[i];
+        else bad = 1;
+    }
+    if (bad || !path[1]) {
+        fprintf(stderr, "usage: api_test --spec TARGET DRAFT [--quick] [--other MODEL_OTHER_VOCABULARY]\n");
+        return 2;
+    }
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    rq_threads_init(0);
+    char err[512], d[2048];
+    if (!(M = rq_model_load(path[0], NULL, err, sizeof(err))) || !(SD = rq_model_load(path[1], NULL, err, sizeof(err)))) {
+        printf("FAIL setup  %s\n", err);
+        return 1;
+    }
+    rq_model_info(M, &I);
+    V = I.vocab_size;
+    int e;
+    RqCtx *c = rq_ctx_new(M, 64, 0, &e), *dc = c ? rq_ctx_new(SD, 64, 0, &e) : NULL;
+    if (!dc) die("rq_ctx_new", e);
+
+    // the vocabulary check: the draft and the target itself accepted; another vocabulary refused
+    {
+        double t0 = rq_now();
+        int ok = rq_spec_check(M, SD, err, sizeof(err)) == RQ_OK && rq_spec_check(M, M, NULL, 0) == RQ_OK;
+        double ms = (rq_now() - t0) * 1e3 / 2;
+        snprintf(d, sizeof(d), "the draft and the target itself accepted (%.1f ms per check)", ms);
+        if (other) {
+            RqModelOpts o = { 0, 1, 0 };
+            RqModel *x = rq_model_load(other, &o, err, sizeof(err));
+            int r = x ? rq_spec_check(M, x, err, sizeof(err)) : RQ_ERR_LOAD;
+            ok &= r == RQ_ERR_ARG && strstr(err, "not usable as a draft");
+            size_t dl = strlen(d);
+            snprintf(d + dl, sizeof(d) - dl, "; refused: %s", err);
+            rq_model_free(x);
+        }
+        report(ok, "spec_vocab", d);
+    }
+
+    // prompts (the chat ones as the CLI renders them; a model without thinking renders its own form)
+    rq_chat_user(M, "Name three colours.", 0, &sp_prompt[0]);
+    rq_chat_user(M, "Write a C function that reverses a string in place.", 1, &sp_prompt[1]);
+    sp_prompt[2] = toks("def is_prime(n):\n    \"\"\"Return True if n is a prime number.\"\"\"\n");
+    rq_chat_end(M, &sp_turn2);
+    rq_chat_user(M, "And three animals?", 0, &sp_turn2);
+    const SpCase cases[] = {
+        { "chat_greedy", 0, { 0, 0.9f, NULL, 0 }, 1, 96, 0, 0, 0, 1 },
+        { "chat_seeded_topk", 0, { 1.0f, 0.95f, NULL, 20 }, 7, 96, 0, 0, 0, 0 },
+        { "think_greedy_limit", 1, { 0, 0.9f, NULL, 0 }, 1, 45, 0, 0, 0, 0 },
+        { "think_seeded_limit", 1, { 0.8f, 0.9f, NULL, 0 }, 11, 37, 0, 0, 0, 1 },
+        { "text_greedy_context", 2, { 0, 0.9f, NULL, 0 }, 1, 0, 29, 0, 0, 0 },
+        { "text_seeded_context_draft_short", 2, { 1.0f, 0.95f, NULL, 20 }, 5, 0, 29, 12, 0, 1 },
+        { "text_draft_shorter_than_prompt", 2, { 0, 0.9f, NULL, 0 }, 1, 12, 0, -3, 0, 0 },
+        { "chat_turn2_seeded", 0, { 0.7f, 0.9f, NULL, 40 }, 3, 24, 0, 0, 1, 0 },
+        { "think_turn2_greedy", 1, { 0, 0.9f, NULL, 0 }, 1, 30, 0, 0, 1, 1 },
+    };
+    const RqSpecOpts opts[] = { { 1, 0 }, { 3, 0 }, { 8, 0 }, { 8, 0.5f } };
+    const char *stop_name[] = { "end", "limit", "context", "callback" };
+    int refed = 0;
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
+        const SpCase *k = &cases[ci];
+        if (quick && !k->quick) continue;
+        SpOut ref, got;
+        int ok = (e = sp_run(c, dc, k, NULL, &ref)) == RQ_OK;
+        snprintf(d, sizeof(d), "%d%s tok, stop %s%s%s:", ref.ngen[0] + ref.ngen[1], k->turn2 ? " (2 calls)" : "",
+                 stop_name[ref.stop[k->turn2] & 3], k->turn2 ? "/" : "", k->turn2 ? stop_name[ref.stop[1] & 3] : "");
+        for (size_t oi = 0; oi < sizeof(opts) / sizeof(opts[0]) && ok; oi++) {
+            if (quick && oi != 1 && oi != 3) continue;
+            int okk = (e = sp_run(c, dc, k, &opts[oi], &got)) == RQ_OK && sp_same(&ref, &got);
+            okk &= got.st.accepted <= got.st.drafted && (I.linear_layers || got.st.refed == 0);
+            refed += got.st.refed;
+            size_t dl = strlen(d);
+            snprintf(d + dl, sizeof(d) - dl, " k%d%s %d/%d in %d passes%s%s", opts[oi].k, opts[oi].tau > 0 ? " tau 0.5" : "",
+                     got.st.accepted, got.st.drafted, got.st.passes, got.st.refed ? " REFED" : "", okk ? "" : " DIFFER");
+            ok &= okk;
+        }
+        if (e != RQ_OK) {
+            size_t dl = strlen(d);
+            snprintf(d + dl, sizeof(d) - dl, " error %s (%s)", rq_strerror(e), rq_ctx_error(c));
+        }
+        char name[96];
+        snprintf(name, sizeof(name), "spec_%s", k->name);
+        report(ok, name, d);
+        if (ci == 0) { // k 0: rq_generate itself (no draft)
+            RqSpecOpts z = { 0, 0 };
+            RqSeq *s = seq_new(0);
+            rq_seq_seed(s, k->seed);
+            memset(&got, 0, sizeof(got));
+            got.rec.s = s;
+            RqCallbacks cb = { gr_token, gr_logits, &got.rec };
+            RqSpecStats st;
+            int ok0 = rq_generate_spec(c, s, NULL, NULL, sp_prompt[0].v, sp_prompt[0].n, &k->cfg, k->max_new, &z, &cb, &st) == RQ_OK;
+            ok0 &= gr_same(&ref.rec, &got.rec) && st.gen.stop == ref.stop[0] && st.gen.n_gen == ref.ngen[0] && st.passes == 0;
+            report(ok0, "spec_k0", "k 0 (no draft): rq_generate");
+            rq_seq_free(s);
+        }
+    }
+    // Qwen3.5: every rollback on a checkpoint (both sequences)
+    if (I.linear_layers) report(refed == 0, "spec_rollback_exact", refed ? "positions fed again after a rollback" : "no position fed again");
+    for (int i = 0; i < 3; i++) rq_tokens_free(&sp_prompt[i]);
+    rq_tokens_free(&sp_turn2);
+    rq_ctx_free(dc);
+    rq_ctx_free(c);
+    rq_model_free(SD);
+    rq_model_free(M);
     return failed;
 }

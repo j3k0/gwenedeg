@@ -1,9 +1,11 @@
 # Qwen3.8-27B with speculative decoding: facts and design
 
-Status (2026-10-27): **in progress.** The file's specifics are in (the MTP block, F32 `ssm_alpha` / `ssm_beta`, the
-3.8 chat template: TODO S6, checked on synthetic files); the speculative loop and the 27B bring-up are open. The steps
-are in [TODO.md](../TODO.md) (section "Qwen3.8-27B with
-speculative decoding"); this file holds what was verified and the design decisions, so that the two cannot drift.
+Status (2026-10-27): **in progress.** In: the speculative loop (S1: `rq_generate_spec` in `src/spec.c`, the CLI's
+`-D` / `-G` / `--tau`, exact on Qwen3 and Qwen3.5 targets and drafts, [below](#the-loop-s1)); the verify pass through
+the decode-rows worker (S2); the file's specifics (the MTP block, F32 `ssm_alpha` / `ssm_beta`, the 3.8 chat template:
+S6, checked on synthetic files). Open: the 27B bring-up, the MTP drafter and the server. The open steps are in
+[TODO.md](../TODO.md) (section "Qwen3.8-27B with speculative decoding"); this file holds what was verified and the
+design decisions, so that the two cannot drift.
 The architecture is Qwen3.5's (`qwen35`, [qwen35.md](qwen35.md)).
 
 **Goal:** decode Qwen3.8-27B on the CPU at ~13-18 tok/s on the 16-vCPU dev box (plain decode: ~8, estimated), with
@@ -334,6 +336,82 @@ checks, `on_logits`), which the speculative loop calls for each verified row wit
 `generate_step` runs that loop with an oracle draft (wrong guesses included) and checks tokens, RNG states and
 logits hashes against `rq_generate`. `rq_seq_rng` + `rq_rng_f32` on a copy give the next uniform draw without
 consuming it (S10).
+
+## The loop (S1)
+
+`src/spec.c`, API in `src/runq.h` (speculative decoding): `rq_generate_spec(c, s, dc, ds, tokens, n, cfg, max_new,
+&opts, cb, &stats)` is `rq_generate` with a draft (`RqSpecOpts`: `k` guesses at most, `tau`; k 0 = `rq_generate`);
+`rq_spec_run` is its loop alone, after the caller's prefill and `rq_gen_start` (the CLI's generate mode, which draws
+nothing for its prompt); `rq_spec_check` compares the vocabularies (size, and an FNV hash of every token's length and
+bytes: ~4 ms for Qwen3's 151,936 tokens, 7 ms for Qwen3.5's 248,320; checked by every call too). One round, the target
+at length P with its sampled token t not fed:
+
+1. **Draft**: the draft sequence keeps its longest common prefix with the target's tokens and is fed the rest + t
+   (one prefill: after an all-accepted pass, the last guess it never fed; after a rejection, nothing but t, the cut
+   being a truncation), then guesses greedily (argmax; the token mask of `cfg.allow` respected), each fed for the
+   next, at most k, fewer before `max_new` (the pass's last row gives one more token) or the end of either context;
+   adaptive: the first guess whose top-1 probability is < tau stops it (the softmax sum stops once it shows p < tau).
+2. **Verify**: `[t, d1..dn]` in one `rq_prefill(RQ_LOGITS_ALL)` (no guess: one decode step).
+3. **Accept**: `rq_gen_step` on rows 0..n: on_logits, the sample (the target sequence's RNG, one draw per row), the
+   stop checks; while the sample equals the next row's token, that row is valid; the first mismatch's sample (or row
+   n's, the bonus) is the next t (`RQ_GEN_LAST`: fed alone without logits; an accepted last token is already in);
+   the target is truncated after the last row used.
+
+Qwen3.5: `rq_seq_checkpoint_rows` on the target's verify rows (P .. P + n - 1) and on the draft's (t and the guesses
+but the last), k + 2 slots each during the loop, so both truncations land exactly (`RqSpecStats.refed` counts
+positions fed again: 0 in every test). Afterwards the target's checkpoints are as `rq_generate` leaves them (the rows'
+dropped, the slot count back): a chat's next turn then truncates to the same checkpoint as after plain decoding, so it
+prefills the same tokens and draws the same RNG values (one per prefilled token but the last). The draft keeps its
+slots. The CLI's chat keeps the draft's sequence across turns (the same common prefix and assistant-header checkpoint
+as the target's); the draft sequence is only ever a source of guesses.
+
+Equivalence (all bitwise, `tests/check_spec.py`, `make test`'s `spec` group, 44 checks): `api_test --spec` compares
+`rq_generate_spec` with k = 1 / 3 / 8 and k 8 + tau 0.5 against `rq_generate` on 9 cases (chat turns with thinking off /
+on, raw code; greedy, seeded T 1 / top-p 0.95 / top-k 20 and T 0.8 / top-p 0.9; an end token, `max_new` and the end of
+the context inside verify passes, a draft context shorter than the target's or than the prompt, two calls with both sequences cut back in
+between): the tokens, the RNG state after each, every sampled logits vector's position and hash, the stops, the cache
+and one more decode step's logits; on the 0.6B Q8_0 + Q4_K_M pair (both builds), the Qwen3.5-0.8B Q8_0 + Q4_K_M pair
+and, by hand, Qwen3-1.7B Q8_0 + 0.6B Q8_0 / Q4_K_M (11/11 each). The CLI against itself without `-D`: stdout, stderr
+but the `[timing]` lines, and the chat's `RUNQ_CHAT_DUMP` (the cache's ids and every sampled logits vector) for 12
+generate / chat cases (thinking on / off, seeded, `-n` 1 / 2 / 13, `-c` 37 / 41 / 100 / 160: the context's end inside a
+pass, turns dropped, a reply cut; `-b 1`), on the 0.6B pair (and the generic build, the Qwen3.5 pair) and by hand on
+both 1.7B pairs; `-G 0 -D` is plain decoding byte for byte (stderr included). A scratch build that kept one rejected row
+fails 2 of the api cases. `tests/compare_bins.sh` against 848cf01 (full, 792 jobs): identical but for the 16 usage-text
+jobs (the 4 lines of `-D` / `-G` / `--tau`).
+
+**Speed** (2026-10-27, `runq -m chat -n 256`, 8 threads, under the bench lock, load 4.5-10 from other jobs; median of 3
+runs, [min-max]; acceptance = accepted / drafted guesses, then tokens per target pass). Target Qwen3-1.7B Q8_0, draft
+Qwen3-0.6B Q4_K_M unless noted; prompts: code ("Write a Python function that parses a CSV file ...", greedy), chat
+("What are the main differences between a cat and a dog as pets?"), think ("How many prime numbers are there between 1
+and 50?", `-r 1`), code at `-t 1 -p 0.95 -K 20 -s 1`:
+
+| tok/s | code | chat | think | code, T 1 | mean |
+|---|---|---|---|---|---|
+| plain | 78 [67-84] | 70 [64-86] | 78 [60-90] | 75 [70-78] | 75.5 |
+| `-G 1` | 95, 85%, 1.86 | 74, 65%, 1.65 | 96, 94%, 1.94 | 99, 83%, 1.84 | 90.9 |
+| `-G 2` | 102, 83%, 2.67 | 86, 56%, 2.13 | 108, 83%, 2.64 | 99, 71%, 2.42 | 99.0 |
+| **`-G 3`** (default) | 111, 77%, 3.32 | 88, 45%, 2.35 | 119, 80%, 3.37 | 87, 64%, 2.91 | **101.5** |
+| `-G 4` | 110, 74%, 3.94 | 80, 41%, 2.64 | 108, 76%, 3.94 | 90, 57%, 3.28 | 96.8 |
+| `-G 5` | 122, 70%, 4.49 | 67, 36%, 2.78 | 118, 72%, 4.49 | 105, 55%, 3.71 | 103.0 |
+| `-G 6` | 110, 64%, 4.83 | 67, 32%, 2.88 | 121, 69%, 5.02 | 96, 49%, 3.88 | 98.5 |
+| `-G 6 --tau 0.4` | 115, 67%, 4.65 | 72, 47%, 2.72 | 100, 72%, 4.65 | 99, 55%, 3.46 | 96.4 |
+| `-G 8 --tau 0.5` | 99, 69%, 5.02 | 80, 54%, 2.61 | 114, 76%, 4.49 | 92, 59%, 3.76 | 96.0 |
+| Q8_0 draft, `-G 4` | 91, 68%, 3.71 | 68, 41%, 2.61 | 105, 77%, 4.00 | 77, 59%, 3.32 | 85.0 |
+| Q8_0 draft, `-G 8 --tau 0.5` | 93, 67%, 5.12 | 70, 62%, 2.64 | 83, 75%, 4.74 | 78, 55%, 3.71 | 81.0 |
+
+- **1.15-1.5x** at `-G 3` (code 1.42x, chat 1.26x, thinking 1.53x, code at T 1 1.16x); k 2-5 within the noise of each
+  other on average (chat prefers 2-3, code and thinking 3-6). An earlier session (2 runs, load 8-10) gave the same order:
+  `-G 3` 112-115 / 65-72 / 120 on code / chat / think, `-G 4` 116-121 / 64-78 / 124, adaptive (k 8, tau 0.5) 97-124 /
+  78-84 / 122, plain 62-67 / 66-75 / 77.
+- **The draft is expensive here**: a 0.6B Q4_K_M step costs ~4.2 ms (Q8_0 5.6 ms) against ~13 ms for a 1.7B decode
+  step, a ratio of ~0.32 (the 27B with the 0.8B: ~0.04-0.06), so every rejected guess costs a third of a target token;
+  the Q8_0 draft accepts the same and is 15-20% slower overall: Q4_K_M as the draft, as for the 27B.
+- **Adaptive length** did not beat the best fixed k here (`-G 8 --tau 0.5` 96 vs 101.5): it helps where guesses are
+  cheap relative to the target (the 27B's cost model, above), not at a 0.32 draft / target cost ratio. The option is in
+  for the 27B (S7).
+- **The verify pass** (S2 measures it properly): from these runs' stats, a pass of 2 / 4 / 5 rows took ~15.1 / 17.5 /
+  18.9 ms, 1.16x / 1.35x / 1.45x a plain step (13.0 ms including sampling): the cost model's factors (1.03 / 1.20 /
+  1.35) are optimistic for 1.7B. Temperature 1 accepts less (64% vs 77% at k 3), as the acceptance table predicted.
 
 ## Not now
 

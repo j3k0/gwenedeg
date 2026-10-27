@@ -19,7 +19,10 @@ The preparation is done (2026-10-27: the regression net `tests/compare_bins.sh R
 family incl. Qwen3.5 and the synthetic r = 2 / 3 / 27B-shaped models; two models in one process; checkpoint sets and
 `rq_seq_checkpoint_rows`; the memory estimate, `--mem` and the page-cache drop; `rq_gen_start` / `rq_gen_step`, top-k
 and `general.sampling.*`; the file's specifics: the MTP block validated and skipped, F32 `ssm_alpha` / `ssm_beta` in
-fp32, the 3.8 chat template with its reasoning effort): each step below keeps `make test` green and compare_bins identical where it promises no
+fp32, the 3.8 chat template with its reasoning effort; the verify-pass cost: small segments through the decode-rows
+worker, a 4-row segment 1.20-1.29x a decode step), and so is S1, the loop (`rq_generate_spec` / `rq_spec_run`,
+`src/spec.c`; CLI `-D` / `-G` / `--tau`; exact on Qwen3 and Qwen3.5, tested in `make test`'s `spec` group; Qwen3-1.7B
++ 0.6B Q4_K_M: 1.15-1.5x at k 3, [docs](docs/qwen38-speculative.md#the-loop-s1)): each step below keeps `make test` green and compare_bins identical where it promises no
 output change. **Disk and RAM:** ~40 GB free with the 27B Q4_K_M downloaded (`models/Qwen3.8-27B-GGUF`, sha256
 checked), `models/` 45 GB; `/tmp` is a 16 GB tmpfs (RAM: no models or venvs there); check `df` / `MemAvailable`
 before every download or 27B run, keep >= 15 GB of disk free (the 4B / 1.7B HF checkpoints were removed: they only
@@ -28,16 +31,6 @@ regenerate committed goldens, re-download their pinned sets), and use `flock /tm
 
 Steps:
 
-- [ ] **S1. The speculative loop on Qwen3** (no recurrent state). Target Qwen3-1.7B, draft Qwen3-0.6B.
-  `rq_generate_spec(ctx_t, seq_t, ctx_d, seq_d, tokens, n, cfg, max_new, k, cb, st)`: draft k tokens greedily on
-  `seq_d`, verify `[last, d1..dk]` as one segment on `seq_t` (`RQ_LOGITS_ALL`), sample the rows in order with
-  `rq_gen_step` (`src/runq.h`; `api_test`'s `generate_step` runs this loop with an oracle draft), accept while
-  sample == draft (the first mismatch's sample is the next token), truncate both sequences.
-  Adaptive length as an option: stop drafting at the first guess whose draft top-1 probability < tau, at most k
-  (+3-5% est. tok/s at tau 0.3-0.4, k 4 with the measured verify cost; docs/qwen38-speculative.md). Refuse a draft whose vocabulary or
-  token bytes (hash) differ. CLI `-D draft.gguf -G k` (`-K` is top-k; and the tau); stats in `[timing]`. Done
-  when, greedy and seeded, thinking on / off: tokens == `rq_generate`'s, each emitted token's logits hash == plain
-  decoding's, `-K 0` is plain decoding; in `make test` on the 0.6B pair.
 - [ ] **S3. Rollback for hybrid models: a checkpoint per verified row: its cost.** The API is in:
   `rq_seq_checkpoint_rows(s, pos, n)` takes a checkpoint after each of rows pos..pos+n-1 of the next pass (or of
   the next n decode steps, the draft's), replacing the previous call's; `rq_seq_set_checkpoints(s, k + 2)` keeps the
@@ -49,8 +42,12 @@ Steps:
   of copying back, or keep each row's DeltaNet inputs (~2 MB per row for the 27B) and replay from the pre-pass
   checkpoint. Done when the cost per row is recorded (docs/qwen38-speculative.md).
 - [ ] **S5. The speculative loop on Qwen3.5.** Target Qwen3.5-4B Q8_0 + draft 0.8B (~6 GB), S3's rollback on both.
-  Expect ~1.3-1.6x (a 0.8B guess costs ~18% of a 4B token). Done when outputs equal plain decoding bitwise (greedy,
-  seeded, thinking on / off) and tok/s + acceptance are recorded.
+  Expect ~1.3-1.6x (a 0.8B guess costs ~18% of a 4B token). The loop already handles hybrid sequences (S1: a
+  checkpoint per verify row on the target and per draft step on the draft, k + 2 slots, the target's checkpoints
+  restored afterwards; `spec_api/qwen35/*` on the 0.8B Q8_0 + Q4_K_M pair, every rollback exact, and the CLI's
+  `spec_cli/q35_*`). Left: `api_test --spec` and the CLI cases on the 4B + 0.8B by hand (both builds), the
+  tok/s and acceptance there (with S3's copy cost per row), and the default k / tau for it. Done when outputs equal
+  plain decoding bitwise (greedy, seeded, thinking on / off) and tok/s + acceptance are recorded.
 - [ ] **S7. 27B bring-up** (Q4_K_M). Download the pinned file with `hf` (into
   `models/`, sha256 checked); load: peak RSS vs the load-time estimate (`build/mem_probe`; runq's on the file: 18.50 GiB
   at `-c` 40,960, the `--mem 0.1` refusal),
@@ -60,7 +57,9 @@ Steps:
   off: ~17). Not in `make test` (an opt-in group, like `models`). Done when the
   numbers are in the README and docs, and the 27B's speculative output equals plain decoding bitwise.
 - [ ] **S8. Server.** `runq serve --draft FILE`: the draft rows join the job's segment in the batched pass, k per
-  request; speculate less as the batch fills. Done when `server_test.py` shows equal outputs with and without the
+  request; speculate less as the batch fills. (`rq_spec_run` is one sequence's loop on its own passes: the engine
+  needs the same round split into steps of its scheduler: draft rows, then the verify segment in the shared pass,
+  then `rq_gen_step` per row and the truncations, as `src/spec.c` does them.) Done when `server_test.py` shows equal outputs with and without the
   draft, and `scripts/bench_serve.py` numbers at 1 / 4 clients.
 - [ ] **S9. The MTP drafter** (`blk.64`, same file; validated at load into `RqModel.mtp`, `MtpBlock`: pointers into
   the mapping, to convert / repack when the drafter is built). The target's last hidden state + the next token's embedding ->
@@ -72,7 +71,8 @@ Steps:
   draw u_j (known from a copy of the target's RNG: `rq_seq_rng` + `rq_rng_f32`) and the same settings, instead of its
   argmax: more accepted guesses (up to sum min(p, q)), output unchanged. Measure first with the API's `top_logprobs`
   = 20 (`scripts/spec_accept.py gen --top-logprobs 20`). Top-k is in the sampler (`rq_sample`'s exact order,
-  `src/runq.h`).
+  `src/runq.h`). The guess is `draft_pick` in `src/spec.c` (S1: argmax; at temperature 1, k 3, the 1.7B accepted 64%
+  of the 0.6B's guesses against 77% greedy).
 
 RAM for the 27B runs (decided 2026-10-27): the parcolab, billing and triominos-server containers are stopped
 for the runs (`docker compose -p NAME stop`; `start` brings them back), which leaves ~24 GB available: the Q4_K_M

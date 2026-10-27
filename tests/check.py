@@ -48,6 +48,9 @@ Tests (see tests/README.md):
              Q4_K_M files interleaved == each alone, one freed while the other goes on, the .bin's group
              size refused while they are loaded); the sampler's top-k (api_test --sample, both builds) == a numpy
              replay draw for draw (tests/sampler_ref.py)
+  spec       speculative decoding (-D / -G / --tau, rq_generate_spec) == plain decoding: api_test --spec (0.6B Q8_0 +
+             Q4_K_M draft, both builds; Qwen3.5-0.8B Q8_0 + Q4_K_M) and the CLI's outputs, chat dumps and refusals
+             (tests/check_spec.py; in the background from the start)
 
 Logits metrics, per position, over U = (fixed 4096-id vocab subset) + (HF top-64 ids):
   cos   cosine similarity of runq vs HF logits on U
@@ -88,6 +91,7 @@ import numpy as np  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import check_models  # noqa: E402  (groups synth and models: tests/check_models.py)
+import check_spec  # noqa: E402  (group spec: tests/check_spec.py)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GOLDEN = os.path.join(ROOT, "tests", "golden")
@@ -1247,7 +1251,7 @@ def main():
     ap.add_argument("--q4", default="", help="GGUF Q4_K_M file for the q4 tests and greedy goldens (empty: skip)")
     ap.add_argument("--api-test", default="", help="tests/api_test binary for the api group (empty: skip)")
     ap.add_argument("--q35", default="", help="Qwen3.5-0.8B Q8_0 GGUF for the q35 group (empty: skip)")
-    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv,api,server,synth,q35",
+    ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv,api,server,synth,q35,spec",
                     help="comma-separated subset of tests to run (models: the bigger Qwen3 models, opt-in)")
     ap.add_argument("--update-models", action="store_true", help="write the models group's greedy goldens")
     ap.add_argument("--model-tags", default="", help="models group: only these FAMILY tags (comma-separated; default all)")
@@ -1268,7 +1272,7 @@ def main():
             cf.ThreadPoolExecutor(max_workers=2) as ax, cf.ThreadPoolExecutor(max_workers=1) as sx, \
             cf.ThreadPoolExecutor(max_workers=1) as gx, cf.ThreadPoolExecutor(max_workers=3) as cx, \
             cf.ThreadPoolExecutor(max_workers=2) as tx, cf.ThreadPoolExecutor(max_workers=2) as yx, \
-            cf.ThreadPoolExecutor(max_workers=1) as qx:
+            cf.ThreadPoolExecutor(max_workers=1) as qx, cf.ThreadPoolExecutor(max_workers=3) as px:
         # started first, checked at their group's turn: the server and API tests, the greedy runs, the chat cases,
         # the GGUF template and Q4_K_M dequant runs (their processes then overlap the logits runs: the suite is
         # bound by CPU time, and in group order they ran with the CPUs half idle at the end, Step 10b)
@@ -1282,6 +1286,7 @@ def main():
         synth = check_models.synth_start(a, tmp, yx, bg, texts) if "synth" in only and not a.update_greedy else None
         q35 = check_models.q35_start(a, tmp, cx, qx, dict(batched_prompts()), test_tokenizer, chat_case, load_vocab) \
             if "q35" in only and not a.update_greedy else None
+        spec = check_spec.spec_start(a, tmp, px) if "spec" in only and not a.update_greedy else []
         if not a.update_greedy:
             prefetch_all(a, tmp, only, fg, bg)
         for name, fn in [("tokenizer", lambda: test_tokenizer(a, res)),
@@ -1300,6 +1305,7 @@ def main():
                          ("server", lambda: test_server(a, res, server)),
                          ("synth", lambda: check_models.test_synth(a, res, synth, texts)),
                          ("q35", lambda: check_models.test_q35(a, res, tmp, texts, q35)),
+                         ("spec", lambda: check_spec.test_spec(a, res, spec)),
                          ("models", lambda: check_models.test_models(a, res, tmp, texts, a.update_models,
                                                                      set(a.model_tags.split(",")) if a.model_tags else None))]:
             if name in only:

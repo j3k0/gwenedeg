@@ -53,7 +53,7 @@ python3 tests/make_synth.py [--force] # build/synth: the synthetic models of the
 .venv/bin/python tests/fuzz_tokenizer.py --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf   # GGUF tokenizer (~20 s)
 .venv/bin/python tests/fuzz_tokenizer.py --nfc-all       # exhaustive NFC normalizer check vs HF (~8 s)
 .venv/bin/python tools/gen_unicode_tables.py --check-hf  # HF's NFC data vs Unicode 15.1 (~1 s)
-tests/compare_bins.sh REF_DIR NEW_DIR # two builds' outputs byte for byte (below; ~3-6 min)
+tests/compare_bins.sh REF_DIR NEW_DIR # two builds' outputs byte for byte, every model family (below; ~25 min, --quick ~2)
 build/api_test MODEL [--n65] [--kv]   # the library API tests alone (make api-test; ~4 s per model at 4 threads)
 build/api_test MODEL --digest         # only its batched passes' digests (compare thread counts / builds)
 build/bench_batch MODEL [-N 1,8] [-L 50,2000] [-P 64] [-d]   # batched decode benchmark (make bench-batch; not a test)
@@ -393,17 +393,38 @@ TSan: 12 clients at `--parallel 8 --queue 8`, a cold burst of 8): no reports, no
 
 ## Comparing two builds (`tests/compare_bins.sh`, on demand)
 
-`tests/compare_bins.sh [-j JOBS] [-t THREADS] [--quick] REF_DIR NEW_DIR` runs the same command lines
-with `REF_DIR/runq`, `REF_DIR/runq-generic` and the two of `NEW_DIR` and compares the outputs byte for
-byte: the check for refactorings, where nothing may change. 360 jobs: `-m logits` files for the 3
-models x both builds x KV f16 / bf16 / f32 x `-b 1 / 7 / 64 / 512` x a 5-token and a 280-token prompt
-(past one attention block); greedy generate (short / long prompt, `-b 1 / 7`, default `-c`, a prompt
-longer than `-c`, `-n 1`); seeded sampling (`-t 0.8 -s 7` generate and chat, `-t 1.5 -p 0.95`, `-b 1`,
-multi-turn); multi-turn chat on stdin (a system prompt, `-r 1`, context full at `-c 160`, a reply cut
-at `-c 48`, `-b 1 / 7`, a message too long), with the `RUNQ_CHAT_DUMP` files; `-m tokenize`;
-`-m dequant`; error cases (prompt too long for `-m logits`, empty prompt, bad `-k`, unknown mode,
-missing file, usage). It compares stdout, stderr (the numbers of `[timing]` / `[tokenize]` lines
-masked) and the exit status; logits files are hashed and deleted at once. `CMP_CACHE=DIR` keeps the
-reference results (keyed by the binaries and the job list), so later comparisons against the same
-reference only run the new binaries: ~3 min with the cache, ~6 without (`-j 3`, 4 threads per job).
-Step 8 used it against copies of the binaries before the refactoring (all identical).
+`tests/compare_bins.sh [-j JOBS] [-t THREADS] [--quick] [--q35-4b] [--no-api] REF_DIR NEW_DIR` runs the same
+command lines with `REF_DIR/runq`, `REF_DIR/runq-generic` and the two of `NEW_DIR` and compares the outputs byte for
+byte: the check for refactorings, where nothing may change. 792 jobs, per model family (a family whose file is
+missing is skipped, with a note in the summary):
+- Qwen3 (`bin`, `q8`, `q4`: Qwen3-0.6B .bin, Q8_0, Q4_K_M; 118 jobs each): `-m logits` files for both builds x KV
+  f16 / bf16 / f32 x `-b 1 / 7 / 64 / 512` x a 5-token and a 280-token prompt (past one attention block); greedy
+  generate (short / long prompt, `-b 1 / 7`, default `-c`, a prompt longer than `-c`, `-n 1`); seeded sampling
+  (`-t 0.8 -s 7` generate and chat, `-t 1.5 -p 0.95`, `-b 1`, multi-turn); multi-turn chat on stdin (a system prompt,
+  `-r 1`, context full at `-c 160`, a reply cut at `-c 48`, `-b 1 / 7`, a message too long), with the
+  `RUNQ_CHAT_DUMP` files; `-m tokenize`; `-m dequant`; error cases (prompt too long for `-m logits`, empty prompt,
+  bad `-k`, unknown mode, missing file, usage).
+- Qwen3.5 (`q35-q8`, `q35-q4`: Qwen3.5-0.8B Q8_0, Q4_K_M; `synth-r2`, `synth-r3`: the synthetic models with 2 / 3
+  value heads per key head; 108 jobs each): the `-m logits` grid (both builds x KV f16 / bf16 x 3 / 8 threads x
+  `-b 1 / 7 / 64 / 512` x the two prompts); greedy and seeded generate; `-r 1` chats whose next turn rolls the
+  recurrent state back to the checkpoint at the previous assistant header (greedy, `-b 7`, bf16 KV, seeded with a
+  system prompt, context full at `-c 160`) and `-r 0` ones, with the `RUNQ_CHAT_DUMP` files; `api_test --digest`
+  and `api_test-generic --digest-small` (the batched passes' logits hashes, section 9 of `api_test.c`).
+  The synthetic models are data, not code: `tests/make_synth_q35.py` of the script's own tree builds them (cached in
+  `build/synth-q35`), the same files serve both sides, and their hashes are part of the `CMP_CACHE` key.
+- `--q35-4b`: 7 jobs on Qwen3.5-4B Q8_0 (4.5 GB: one at a time, 8 threads; AVX-512 build only).
+- The `api_test` jobs need `api_test` and `api_test-generic` in both directories, as `DIR/api_test` or
+  `DIR/build/api_test` (`make api-test`; for a copy of a commit's binaries, copy them next to its `runq`); else they
+  are skipped with a note. `--no-api` leaves them out.
+
+It compares stdout, stderr (the numbers of `[timing]` / `[tokenize]` lines masked), the exit status and the output
+files (logits files, dumps: hashed and deleted at once; a Qwen3.5 logits file of the long prompt is 277 MB, so up to
+`-j` of them sit in `$TMPDIR` at a time). It prints a summary per family (jobs, identical / how many differ), then
+the differing jobs' hashes. `CMP_CACHE=DIR` keeps the reference results (keyed by the binaries, the synthetic models
+and the job list), so later comparisons against the same reference only run the new binaries: ~25 min without the
+cache, ~7 with it (`-j 3`, 4 threads per job; the generic build's Qwen3.5 logits jobs are the bulk); `--quick` (the
+AVX-512 builds, `-b 1 / 64`, 6 jobs + one `--digest-small` per Qwen3.5 family: 172 jobs) ~1.5 min.
+Step 8 used it against copies of the binaries before the refactoring (all identical). Checked when the Qwen3.5
+families were added: main against itself identical (full and `--quick`); a build with one DeltaNet gate one ulp off
+(`dn_gates`' exp(g)) differs in 352 Qwen3.5 jobs (every logits file, dump and digest; greedy text unchanged) and no
+Qwen3 job, `--quick` too (25 of 28); one with rmsnorm's scale one ulp off differs in every family (614 jobs).

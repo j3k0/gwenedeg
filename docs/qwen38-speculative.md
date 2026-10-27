@@ -47,9 +47,9 @@ Q3 also decodes faster: ~13.4 GB read per token, ~96 ms, ~10.4 tok/s plain, agai
   40,960 positions, touched only as used); DeltaNet state 48 x (48 x 128 x 128 x 4 B + 3 x 10,240 x 4 B) =
   **~150 MiB**, the same per checkpoint. A checkpoint per verified row (S3): ~0.6 GB at k = 3.
 - Total with the 0.8B draft (0.66 GB as Q4_K_M) and a few checkpoints: ~19-20 GB at Q4_K_M.
-- The box (2026-10-27): 31.3 GB RAM, other services ~13-17 GB (e.g. a 6 GB uvicorn), so ~14-17 GB available: the Q4
-  files need 2-5 GB freed during the runs, or Q3_K (TODO S4b). Disk: ~44 GB free, `models/` 42 GB; `/tmp` is a
-  16 GB tmpfs (RAM): never put model files or venvs there.
+- The box (2026-10-27): 31.3 GB RAM. With the parcolab, billing and triominos-server containers stopped (decided
+  for the 27B runs; they used ~7.5 GB, 6.2 of it a uvicorn) ~24 GB is available: **Q4_K_M** it is, no Q3_K. Disk:
+  58 GB free, `models/` 29 GB; `/tmp` is a 16 GB tmpfs (RAM): never put model files or venvs there.
 - `runq serve`'s slot budget counts only the KV cache today (`src/engine.c`), not the recurrent state and its
   checkpoints: ~0.45 GB per 27B slot uncounted (TODO P4).
 

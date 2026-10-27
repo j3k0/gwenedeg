@@ -15,9 +15,10 @@ Decode Qwen3.8-27B (`qwen35`, 64 layers, r = 3, untied, an MTP block) at ~13-18 
 Qwen3.5-0.8B as the draft, the output **exactly** plain decoding's (tokens, greedy and seeded, and each emitted
 token's logits bits). Facts, measurements and decisions: [docs/qwen38-speculative.md](docs/qwen38-speculative.md).
 Added rule for this section: speculative output == plain output (tokens + a hash of each emitted token's logits).
-Order: the preparation items (P) first, each a no-behaviour-change step checked by the regression net of P1, then
+Order: the preparation items (P1-P6) first, each a no-behaviour-change step checked by the regression net of P1, then
 the steps (S). **Disk and RAM:** ~44 GB free, `models/` 42 GB, `/tmp` is a 16 GB tmpfs (RAM: no models or venvs
-there); check `df` / `MemAvailable` before every download or 27B run, keep >= 15 GB of disk free, and use
+there); check `df` / `MemAvailable` before every download or 27B run, keep >= 15 GB of disk free (58 GB free after
+removing the 4B / 1.7B HF checkpoints, which only regenerate committed goldens: re-download their pinned sets), and use
 `flock /tmp/cwayn-bench.lock` for timings (several agents share the box).
 
 Preparation (no output changes; `make test` and `tests/compare_bins.sh` byte-identical after each):
@@ -58,10 +59,6 @@ Preparation (no output changes; `make test` and `tests/compare_bins.sh` byte-ide
   two, Q5_K / Q4_K / Q6_K matrices as in the Q4_K_M file; and a variant with an extra MTP block (`block_count` n + 1,
   `nextn_predict_layers` 1, the `nextn.*` tensors) that today must be refused cleanly (S6 makes it load). Done when
   the synthetic models pass `logits_ref` and the bitwise groups in the default suite.
-- [ ] **P7. Disk budget before the 27B download** (13.8-17.1 GB). Candidates to remove, all re-downloadable from
-  pinned sets and needed only to regenerate committed goldens: `models/Qwen3.5-4B` (HF, 8.8 GB), `models/Qwen3-1.7B`
-  (HF, 3.8 GB), the HF cache's duplicate `ggml-org/Qwen3.5-0.8B-GGUF` (0.8 GB). Ask before deleting. Ties in with
-  "A model directory convention" (one copy per file, the HF cache searched too).
 
 Steps:
 
@@ -88,10 +85,6 @@ Steps:
   only if profiles show it: swap state buffers instead of copying back, or keep each row's DeltaNet inputs (~2 MB per
   row for the 27B) and replay from the pre-pass checkpoint. Done when truncating to any position inside the last
   segment continues bitwise like an uninterrupted run (`api_test`, 0.8B and 4B).
-- [ ] **S4b. Q3_K weights** (only if the Q3 files are chosen: see the RAM question below). As Q5_K was done:
-  block format, repacked layout, generic + AVX-512 (+ NEON) kernels on one definition in `src/kquants.h`; `-m
-  dequant` bitwise vs gguf-py, logits vs the file's reference, the bitwise groups; a small Q3_K_M test file
-  (< 0.5 GB). Part of "More GGUF types" below.
 - [ ] **S5. The speculative loop on Qwen3.5.** Target Qwen3.5-4B Q8_0 + draft 0.8B (~6 GB), S3's rollback on both.
   Expect ~1.3-1.6x (a 0.8B guess costs ~18% of a 4B token). Done when outputs equal plain decoding bitwise (greedy,
   seeded, thinking on / off) and tok/s + acceptance are recorded.
@@ -102,12 +95,11 @@ Steps:
   system line merged with the system / developer message, `-r` plus an effort option, the server's
   `reasoning_effort`; the template in `tests/golden/templates/` (license noted). Done when `-m render` equals HF's
   `apply_chat_template` for thinking off / on x each effort, with and without a system message.
-- [ ] **S7. 27B bring-up** (after P4, P7, and the RAM question). Download the pinned file with `hf` (into
+- [ ] **S7. 27B bring-up** (after P4; Q4_K_M). Download the pinned file with `hf` (into
   `models/`, sha256 checked); load: peak RSS, page cache dropped. Logits vs `tests/ref_qwen35.py` on the dequantized
   weights (layer by layer, a few GB; a classifier subset); teacher-forced top-1 vs the API's model on S0's outputs
-  (a sanity check). Speed: plain decode (~120 ms per token at Q4_K_M, ~96 at Q3_K_M), then with the 0.8B draft
-  (thinking on: ~13-14 tok/s at Q4_K_M, ~16-17 at Q3_K_M; off: ~17 / ~21). Q3 only: perplexity vs Q4_K_M and the
-  draft's acceptance against the 3-bit target. Not in `make test` (an opt-in group, like `models`). Done when the
+  (a sanity check). Speed: plain decode (~120 ms per token), then with the 0.8B draft (thinking on: ~13-14 tok/s;
+  off: ~17). Not in `make test` (an opt-in group, like `models`). Done when the
   numbers are in the README and docs, and the 27B's speculative output equals plain decoding bitwise.
 - [ ] **S8. Server.** `runq serve --draft FILE`: the draft rows join the job's segment in the batched pass, k per
   request; speculate less as the batch fills. Done when `server_test.py` shows equal outputs with and without the
@@ -122,9 +114,9 @@ Steps:
   guesses (up to sum min(p, q)), output unchanged. Measure first with the API's `top_logprobs` = 20 on S0's outputs.
   Needs P5's top-k and the same candidate order in both models.
 
-Open question: **RAM for the 27B runs.** ~14-17 GB is available; the Q4 files need ~18.5-19.5 GB. Either 2-5 GB is
-freed while testing (Q4_K_S / Q4_K_M, no new kernels), or S4b (Q3_K) and Q3_K_M with ~1.5 GB freed, or Q3_K_S as is
-(no margin).
+RAM for the 27B runs (decided 2026-10-27): the parcolab, billing and triominos-server containers are stopped
+for the runs (`docker compose -p NAME stop`; `start` brings them back), which leaves ~24 GB available: the Q4_K_M
+file (~19.5 GB RSS with the draft and checkpoints), no Q3_K needed. Keep other jobs small while a 27B run is going.
 
 ## Platforms
 

@@ -22,8 +22,12 @@ and `general.sampling.*`; the file's specifics: the MTP block validated and skip
 fp32, the 3.8 chat template with its reasoning effort; the verify-pass cost: small segments through the decode-rows
 worker, a 4-row segment 1.20-1.29x a decode step), and so is S1, the loop (`rq_generate_spec` / `rq_spec_run`,
 `src/spec.c`; CLI `-D` / `-G` / `--tau`; exact on Qwen3 and Qwen3.5, tested in `make test`'s `spec` group; Qwen3-1.7B
-+ 0.6B Q4_K_M: 1.15-1.5x at k 3, [docs](docs/qwen38-speculative.md#the-loop-s1)): each step below keeps `make test` green and compare_bins identical where it promises no
-output change. **Disk and RAM:** ~40 GB free with the 27B Q4_K_M downloaded (`models/Qwen3.8-27B-GGUF`, sha256
++ 0.6B Q4_K_M: 1.15-1.5x at k 3, [docs](docs/qwen38-speculative.md#the-loop-s1)), and so is S7, the 27B bring-up
+(Unsloth's Q4_K_M: 16.3 GiB of RSS, the load estimate within 0.3%; logits vs its numpy reference cos 0.9999, top-1
+62/62; plain 8.7 tok/s, with the 0.8B Q4_K_M draft 13.2-14.1 tok/s thinking on, 16.6-17.2 off, 8 threads, every output
+plain decoding's; a checkpoint per verify row 2.2 ms (S3's cost); the opt-in `3.8-27b-q4km` of the `models` group;
+[docs](docs/qwen38-speculative.md#the-27b-bring-up-s7)): each step below keeps `make test` green and compare_bins
+identical where it promises no output change. **Disk and RAM:** ~40 GB free with the 27B Q4_K_M downloaded (`models/Qwen3.8-27B-GGUF`, sha256
 checked), `models/` 45 GB; `/tmp` is a 16 GB tmpfs (RAM: no models or venvs there); check `df` / `MemAvailable`
 before every download or 27B run, keep >= 15 GB of disk free (the 4B / 1.7B HF checkpoints were removed: they only
 regenerate committed goldens, re-download their pinned sets), and use `flock /tmp/cwayn-bench.lock` for timings
@@ -31,31 +35,14 @@ regenerate committed goldens, re-download their pinned sets), and use `flock /tm
 
 Steps:
 
-- [ ] **S3. Rollback for hybrid models: a checkpoint per verified row: its cost.** The API is in:
-  `rq_seq_checkpoint_rows(s, pos, n)` takes a checkpoint after each of rows pos..pos+n-1 of the next pass (or of
-  the next n decode steps, the draft's), replacing the previous call's; `rq_seq_set_checkpoints(s, k + 2)` keeps the
-  prompt's checkpoint too; `rq_seq_truncate` lands exactly on any of them (`api_test`'s `checkpoint_sets`: the 0.8B
-  and the synthetic models, both builds, and the 4B Q8_0). Left: measure the copies of a verify pass with k + 1
-  checkpoints vs none (0.8B 18.9 MB per row, 4B; the 27B ~150 MiB per row: 0.6 GB at k = 3, estimated ~4-5 ms per
-  ~130 ms pass, measured at S7). `build/bench_verify -c` times it (a first look, 500 positions: 0.8B ~0.3 ms per
-  row, 4B ~0.4-0.8 ms; docs/qwen38-speculative.md, "Verify-pass cost"). Later, only if profiles show it: swap state buffers instead
-  of copying back, or keep each row's DeltaNet inputs (~2 MB per row for the 27B) and replay from the pre-pass
-  checkpoint. Done when the cost per row is recorded (docs/qwen38-speculative.md).
-- [ ] **S5. The speculative loop on Qwen3.5.** Target Qwen3.5-4B Q8_0 + draft 0.8B (~6 GB), S3's rollback on both.
+- [ ] **S5. The speculative loop on Qwen3.5.** Target Qwen3.5-4B Q8_0 + draft 0.8B (~6 GB), a checkpoint per row on both.
   Expect ~1.3-1.6x (a 0.8B guess costs ~18% of a 4B token). The loop already handles hybrid sequences (S1: a
   checkpoint per verify row on the target and per draft step on the draft, k + 2 slots, the target's checkpoints
   restored afterwards; `spec_api/qwen35/*` on the 0.8B Q8_0 + Q4_K_M pair, every rollback exact, and the CLI's
   `spec_cli/q35_*`). Left: `api_test --spec` and the CLI cases on the 4B + 0.8B by hand (both builds), the
-  tok/s and acceptance there (with S3's copy cost per row), and the default k / tau for it. Done when outputs equal
+  tok/s and acceptance there (with the copy cost per row, `bench_verify -c`), and the default k / tau for it (and for
+  the 27B: `-G 6 --tau 0.4` was +4-7% over the default `-G 3` there). Done when outputs equal
   plain decoding bitwise (greedy, seeded, thinking on / off) and tok/s + acceptance are recorded.
-- [ ] **S7. 27B bring-up** (Q4_K_M). Download the pinned file with `hf` (into
-  `models/`, sha256 checked); load: peak RSS vs the load-time estimate (`build/mem_probe`; runq's on the file: 18.50 GiB
-  at `-c` 40,960, the `--mem 0.1` refusal),
-  page cache dropped (`auto`: the file is > 1/4 of the RAM). Logits vs `tests/ref_qwen35.py` on the dequantized
-  weights (layer by layer, a few GB; a classifier subset); teacher-forced top-1 vs the API's model on the saved outputs
-  (a sanity check). Speed: plain decode (~120 ms per token), then with the 0.8B Q4_K_M draft (thinking on: ~13-14 tok/s;
-  off: ~17). Not in `make test` (an opt-in group, like `models`). Done when the
-  numbers are in the README and docs, and the 27B's speculative output equals plain decoding bitwise.
 - [ ] **S8. Server.** `runq serve --draft FILE`: the draft rows join the job's segment in the batched pass, k per
   request; speculate less as the batch fills. (`rq_spec_run` is one sequence's loop on its own passes: the engine
   needs the same round split into steps of its scheduler: draft rows, then the verify segment in the shared pass,
@@ -66,7 +53,7 @@ Steps:
   `eh_proj` -> one full-attention layer with its own KV cache -> the shared output (~9-10 ms per guess for the 1 GB
   classifier; a vocabulary subset is fine, exactness does not care which guesses). Needs the final hidden state per
   row from the verify pass (a new `rq_forward_batch` output). Measure acceptance first; keep whichever draft gives
-  more tok/s.
+  more tok/s (the 0.8B Q4_K_M at S7: ~6.5 ms per guess, 13.2-14.1 tok/s thinking on, 16.6-17.2 off).
 - [ ] **S10. Seed-coupled drafting at temperature > 0.** The draft samples its guess with the target's next uniform
   draw u_j (known from a copy of the target's RNG: `rq_seq_rng` + `rq_rng_f32`) and the same settings, instead of its
   argmax: more accepted guesses (up to sum min(p, q)), output unchanged. Measure first with the API's `top_logprobs`
@@ -76,7 +63,8 @@ Steps:
 
 RAM for the 27B runs (decided 2026-10-27): the parcolab, billing and triominos-server containers are stopped
 for the runs (`docker compose -p NAME stop`; `start` brings them back), which leaves ~24 GB available: the Q4_K_M
-file (~19.5 GB RSS with the draft and checkpoints), no Q3_K needed. Keep other jobs small while a 27B run is going.
+file (measured at S7: 16.3 GiB of RSS alone, 17.4 GiB with the draft and its checkpoints; `api_test` on it alone
+22.4 GiB), no Q3_K needed. Keep other jobs small while a 27B run is going.
 
 ## Platforms
 
@@ -149,7 +137,7 @@ file (~19.5 GB RSS with the draft and checkpoints), no Q3_K needed. Keep other j
 Qwen3.5-0.8B (Q8_0 and Unsloth's Q4_K_M) and Qwen3.5-4B (Q8_0: more value heads than key heads) run and are tested
 (`make test`'s `q35` group, the 4B in the `models` group); design, results and measurements in
 [docs/qwen35.md](docs/qwen35.md). Untested but expected to load: 2B, 9B, 27B / Qwen3.6-27B (Q8_0 or Unsloth's Q4_K_M /
-Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M. The rules stay: `make test` green, Qwen3's outputs byte-identical
+Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M (Qwen3.8-27B Q4_K_M, the same architecture: tested, S7). The rules stay: `make test` green, Qwen3's outputs byte-identical
 (`tests/compare_bins.sh`), the bitwise invariants on the new paths.
 
 - [ ] **NEON check of the recurrence.** The blocked recurrence (`dn_prep` / `dn_rec` / `dn_out`, docs/qwen35.md) is

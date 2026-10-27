@@ -6,7 +6,8 @@ Status (2026-10-27): **Qwen3.5-0.8B Q8_0 and Unsloth's Q4_K_M, and Qwen3.5-4B Q8
 batched decode rows) with the bitwise invariants, recurrent-state checkpoints for truncate / copy, the CLI chat and
 `runq serve`, and the tests (`tests/check_models.py` group `q35` in `make test`, the file in the `models` group).
 Open: the NEON check of the recurrence, the MoE models ([TODO.md](../TODO.md)); 2B (16 / 16 heads, as 0.8B), 9B and 27B
-(2x / 3x as many value heads as key heads, as 4B) should load but are untested.
+(2x / 3x as many value heads as key heads, as 4B) should load but are untested (Qwen3.8-27B, the same architecture
+at r = 3, is tested: [qwen38-speculative.md](qwen38-speculative.md#the-27b-bring-up-s7)).
 This file records what Qwen3.5 is, what was verified, and the design. Test model: **Qwen3.5-0.8B**: the same layer
 types as the larger Qwen3.5 / 3.6 models, with a dense FFN instead of MoE.
 

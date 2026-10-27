@@ -142,6 +142,11 @@ SETS = {
     "3.5-4b-q8": ("unsloth/Qwen3.5-4B-GGUF", "e87f176479d0855a907a41277aca2f8ee7a09523", "Qwen3.5-4B-GGUF", [
         ("Qwen3.5-4B-Q8_0.gguf", 4482403488, "sha256", "10cc391b403021dd11c614679d2fd92f611c3681d29e29651b717316965d61e1"),
     ]),
+    # Qwen3.8-27B (qwen35, 64 layers + an MTP block, r = 3, untied; docs/qwen38-speculative.md): Unsloth's Q4_K_M
+    # (Q4_K / Q5_K / Q6_K / Q8_0, F32 ssm_alpha / ssm_beta), ~19 GB of RAM in runq; not main's UD-Q4_K_M (IQ types)
+    "3.8-27b-q4km": ("unsloth/Qwen3.8-27B-GGUF", "4a03c640833598c0fb5ddd11e846135e906eb764", "Qwen3.8-27B-GGUF", [
+        ("Qwen3.8-27B-Q4_K_M.gguf", 17106775008, "sha256", "7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169"),
+    ]),
 }
 DEFAULT_SETS = ["hf", "q4km", "q8gguf"]
 # names that stand for several sets

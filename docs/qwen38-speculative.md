@@ -1,9 +1,11 @@
 # Qwen3.8-27B with speculative decoding: facts and design
 
-Status (2026-10-27): **in progress.** In: the speculative loop (S1: `rq_generate_spec` in `src/spec.c`, the CLI's
-`-D` / `-G` / `--tau`, exact on Qwen3 and Qwen3.5 targets and drafts, [below](#the-loop-s1)); the verify pass through
-the decode-rows worker (S2); the file's specifics (the MTP block, F32 `ssm_alpha` / `ssm_beta`, the 3.8 chat template:
-S6, checked on synthetic files). Open: the 27B bring-up, the MTP drafter and the server. The open steps are in
+Status (2026-10-27): **the 27B runs, with the 0.8B draft, exactly.** In: the speculative loop (S1: `rq_generate_spec`
+in `src/spec.c`, the CLI's `-D` / `-G` / `--tau`, exact on Qwen3 and Qwen3.5 targets and drafts,
+[below](#the-loop-s1)); the verify pass through the decode-rows worker (S2); the file's specifics (the MTP block, F32
+`ssm_alpha` / `ssm_beta`, the 3.8 chat template: S6); the bring-up on the real file (S7, [below](#the-27b-bring-up-s7)):
+16.3 GiB of RSS, logits within cos 0.9999 of the numpy reference, 8.7 tok/s plain, 13-14 tok/s with the draft and
+thinking on, 16.5-17.5 off (8 threads), every output equal to plain decoding's. Open: the MTP drafter and the server. The open steps are in
 [TODO.md](../TODO.md) (section "Qwen3.8-27B with speculative decoding"); this file holds what was verified and the
 design decisions, so that the two cannot drift.
 The architecture is Qwen3.5's (`qwen35`, [qwen35.md](qwen35.md)).
@@ -126,14 +128,16 @@ checkpoints))", the script's estimate below.
 - The load-time estimate (`--mem`; computed from the tensor directory before any weight is read, refused past
   MemAvailable; within 3% of the peak RSS with the context full for Qwen3-0.6B to 8B and Qwen3.5-0.8B / 4B,
   [tests/README.md](../tests/README.md#memory)), for the 27B from its tensor directory with the same rules
-  (2026-10-27, by script; runq's own on the file: TODO S7; the MTP block is not counted, it is not loaded): repacked weights
+  (2026-10-27, by script; the MTP block is not counted, it is not loaded): repacked weights
   **15.3 GiB** (the 64 main layers and `output`; K-quants +1-3% repacked; `ssm_alpha` / `ssm_beta` counted as F32),
   runtime ~0.3 GiB, one sequence at the default `-c` 40,960: KV 2.5 GiB + state 150 MiB x 3: **~18.6 GiB** (~20 GB);
-  at `-c 8192`: ~16.6 GiB.
+  at `-c 8192`: ~16.6 GiB. runq's own (S7): 18.65 GiB at 40,960 (runtime 0.39), 16.51 at 8,192, 16.25 at 4,096;
+  measured: within 0.3% of the peak RSS ([S7](#the-27b-bring-up-s7)).
 - Per sequence: KV cache 16 layers x 4 x 256 x 2 x 2 B = 64 KiB per position (f16; 2.5 GiB of address space at
   40,960 positions, touched only as used); DeltaNet state 48 x (48 x 128 x 128 x 4 B + 3 x 10,240 x 4 B) =
   **~150 MiB**, the same per checkpoint. A checkpoint per verified row (S3): ~0.6 GB at k = 3.
-- Total with the 0.8B draft (0.66 GB as Q4_K_M) and a few checkpoints: ~19-20 GB at Q4_K_M.
+- Total with the 0.8B draft (0.66 GB as Q4_K_M) and a few checkpoints: ~19-20 GB at Q4_K_M (measured at S7: 17.4 GiB
+  of RSS with k + 2 = 10 checkpoint slots on each model).
 - The box (2026-10-27): 31.3 GB RAM. With the parcolab, billing and triominos-server containers stopped (decided
   for the 27B runs; they used ~7.5 GB, 6.2 of it a uvicorn) ~24 GB is available: **Q4_K_M** it is, no Q3_K. Disk:
   58 GB free, `models/` 29 GB; `/tmp` is a 16 GB tmpfs (RAM): never put model files or venvs there.
@@ -310,7 +314,9 @@ step, are about the same (0.61 bytes per weight in both files); both scale with 
 is much smaller per weight byte (64 KiB per position for 16.8 GB of weights, the 8B 144 KiB for 4.7 GB: its 500
 positions are the 27B's ~4,000). The hybrid layers add little per row: the Qwen3.5-4B's f(r) is at or below the dense
 1.7B's at the same Q8_0 (the recurrence per extra row is ~150 M multiply-adds for the 27B, against ~27 G in its
-matmuls). Not included: the checkpoint copies per row (TODO S3: ~150 MiB each, estimated ~2-4 ms, 2-3% of a step).
+matmuls). Not included: the checkpoint copies per row (~150 MiB each: measured ~2.2 ms, 2% of a step, at S7).
+The 27B itself (S7, [below](#the-27b-bring-up-s7)): f(2..5) = 1.10, 1.15, 1.25, 1.34 at 500 positions, the 8B's within
+0.01-0.07.
 Against the guess (1.03-1.90) verify is +0-4% at k = 1-3 and +19-33% at k = 6-8: the best fixed k stays 3, the
 estimates drop by 3-4% (table above: ~13-17 tok/s with the Q4_K_M draft, ~13.5-17.7 adaptive).
 
@@ -407,11 +413,108 @@ and 50?", `-r 1`), code at `-t 1 -p 0.95 -K 20 -s 1`:
   step, a ratio of ~0.32 (the 27B with the 0.8B: ~0.04-0.06), so every rejected guess costs a third of a target token;
   the Q8_0 draft accepts the same and is 15-20% slower overall: Q4_K_M as the draft, as for the 27B.
 - **Adaptive length** did not beat the best fixed k here (`-G 8 --tau 0.5` 96 vs 101.5): it helps where guesses are
-  cheap relative to the target (the 27B's cost model, above), not at a 0.32 draft / target cost ratio. The option is in
-  for the 27B (S7).
+  cheap relative to the target (the 27B's cost model, above), not at a 0.32 draft / target cost ratio. On the 27B it
+  is the best setting (S7, below).
 - **The verify pass** (S2 measures it properly): from these runs' stats, a pass of 2 / 4 / 5 rows took ~15.1 / 17.5 /
   18.9 ms, 1.16x / 1.35x / 1.45x a plain step (13.0 ms including sampling): the cost model's factors (1.03 / 1.20 /
   1.35) are optimistic for 1.7B. Temperature 1 accepts less (64% vs 77% at k 3), as the acceptance table predicted.
+
+## The 27B bring-up (S7)
+
+The pinned file (`scripts/download_models.py 3.8-27b-q4km`, sha256 checked), measured 2026-10-27 with the parcolab,
+billing and triominos containers stopped (MemAvailable 24-25 GiB before each run; one 27B process at a time).
+
+**Memory and load.** `build/mem_probe FILE 4096` (8 threads, a cold file: 10 MiB of it in the page cache before):
+load 19.6 s; estimate 16,621.7 MiB (weights 15,686.7, runtime 230.2, a sequence of 4,096 positions 704.9: KV 256 +
+state 149.6 x 3); the load's peak RSS 15,735.6 MiB (weights + runtime 1.2% above it); the file's page cache after
+the load 32 MiB (`auto` dropped it); peak RSS with the context full 16,676.2 MiB: **the estimate within -0.3%**. The
+CLI's peak RSS (1,500 + 128 tokens, `-c 4096`) 16,325-16,336 MiB; the load takes 20 s at 8 threads, 15 s at 12, 12 s
+at 16 (cold every time: the cache is dropped, so each run reads the 17 GB again). With the draft (`api_test --spec`:
+both models, k + 2 = 10 checkpoint slots on each): 17.4 GiB. Avoid: `api_test` on the file alone peaks at 22.4 GiB
+(its batched-decode checks hold up to 17 sequences, each with its 150 MiB state and checkpoints), so the models group
+skips it there; it passes by hand (32/32, 374 s).
+
+**Accuracy.** `tests/make_model_ref.py 3.8-27b-q4km` (`tests/ref_qwen35.py` on the file's dequantized weights, layer
+by layer, the MTP block skipped: 214 s at 8 BLAS threads, ~2 GB of anonymous memory, the rest mapped file pages) vs
+runq (`-b 64`): cos mean 0.99994 / 0.99996 / 0.99997 (chat, code, en), min 0.99981; long2 (positions 248..296)
+0.99966, min 0.99886; pooled 0.99992 over 59 positions, top-1 62/62 (the models group's `ref` thresholds: 0.995 /
+0.97 / 0.98 / top-1 0.75 / pooled 0.997). Teacher-forced through runq's 27B (`scripts/spec_accept.py measure` with the
+27B as the "draft") on the API's answers of the measurement above (`logs/specmeas-2026-10-27`, one answer per kind):
+runq's top-1 = the API model's token at **716 / 720** positions (99.4%) with thinking off (6 answers), **579 / 588**
+(98.5%) with thinking on (4 answers); every answer re-tokenized to the API's ids. Sanity: "Canberra" in generate and
+chat, thinking off and on; a two-turn chat remembers the name and colour of turn 1.
+
+**Bitwise** (the models group, `tests/run_tests.sh --models --model-tags 3.8-27b-q4km`: 61 checks, 419 s): `-b 7` /
+`-b 64` vs `-b 1` (en, all), `-b 512` vs `-b 64` (long2, 297 tokens), 8 vs 3 threads, AVX-512 vs generic (en, `-b 1` /
+`-b 7`): bit-identical; `api_test` (batched decode rows == alone, verify segments with a checkpoint per row, ...)
+32/32 by hand.
+
+**Plain speed** (`scripts/bench_models.py`, under the bench lock, best of 2 at 8 / 12 threads, 1 at 16; load 9-17
+including the run's own threads, 6.6 before):
+
+| threads | prefill 488 / 1,532 tokens | decode short / after 1,500 tokens | peak RSS |
+|---|---|---|---|
+| 8 | 45 / 44 tok/s | 8.5 / 8.7 tok/s | 16,325 MiB |
+| 12 | 65 / 64 | 10.0 / 10.6 | 16,329 |
+| 16 | 76 / 75 | 10.3 / 9.5 | 16,336 |
+
+The decode step is ~118 ms at 8 threads, the cost model's ~120 ms. `bench_verify -L 500` (11 reps, two runs): a
+segment of 2 / 3 / 4 / 5 rows 1.10 / 1.15 / 1.25 / 1.34x a decode step (the 8B Q4_K_M's, the model's: 1.14 / 1.16 /
+1.25 / 1.41); 2-5 decode rows of different sequences 1.13-1.14 / 1.21-1.25 / 1.30-1.38 / 1.49-1.53x.
+
+**Speculative** (target the 27B Q4_K_M, draft Qwen3.5-0.8B Q4_K_M; `runq -c 4096 -n 256 -r 1|0 -i PROMPT [-D DRAFT -G k
+[--tau T]]`, 8 threads, under the bench lock, load 7-11; prompts of `spec_accept.py`'s kinds: chat "What are the main
+differences between TCP and UDP?", code "Write a C function that reverses a singly linked list in place.", math the
+train's average speed, summ the bike-lane article in three bullet points; greedy, best of 2 runs for plain, `-G 3` /
+`4`, tau 0.3 / 0.4, 1 run for the others; tok/s, then guesses accepted and tokens per pass):
+
+| thinking on | chat | code | math | summ | mean | vs plain |
+|---|---|---|---|---|---|---|
+| plain | 8.6 | 8.2 | 8.9 | 9.0 | 8.7 | |
+| `-G 2` | 12.1 (52%, 2.04) | 10.7 (44%, 1.88) | 15.4 (78%, 2.56) | 13.0 (60%, 2.20) | 12.8 | 1.47x |
+| `-G 3` | 12.3 (43%, 2.30) | 10.2 (33%, 1.98) | 16.2 (71%, 3.12) | 13.9 (57%, 2.70) | 13.2 | 1.51x |
+| `-G 4` | 11.1 (36%, 2.45) | 9.5 (28%, 2.12) | 16.7 (67%, 3.68) | 13.6 (48%, 2.90) | 12.7 | 1.46x |
+| `-G 5` | 10.0 (30%, 2.48) | 8.8 (25%, 2.23) | 16.1 (61%, 4.07) | 11.9 (41%, 3.05) | 11.7 | 1.34x |
+| `-G 6` | 9.3 (27%, 2.60) | 7.8 (21%, 2.25) | 16.2 (56%, 4.38) | 12.8 (42%, 3.50) | 11.5 | 1.32x |
+| `-G 4 --tau 0.3` | 12.4 (56%, 2.43) | 11.3 (47%, 2.02) | 17.3 (72%, 3.68) | 14.5 (59%, 2.90) | 13.9 | 1.59x |
+| **`-G 6 --tau 0.4`** | 12.6 (58%, 2.43) | 11.4 (51%, 2.03) | 17.8 (68%, 4.30) | 14.6 (56%, 3.22) | **14.1** | **1.62x** |
+| `-G 8 --tau 0.5` | 12.6 (66%, 2.30) | 10.4 (50%, 1.88) | 16.2 (68%, 4.47) | 12.7 (56%, 2.70) | 13.0 | 1.49x |
+
+| thinking off | chat | code | math | summ | mean | vs plain |
+|---|---|---|---|---|---|---|
+| plain | 8.2 | 8.3 | 9.1 | 9.1 | 8.7 | |
+| `-G 2` | 13.3 (62%, 2.23) | 13.6 (87%, 2.74) | 14.3 (89%, 2.78) | 12.8 (64%, 2.28) | 13.5 | 1.56x |
+| `-G 3` | 13.1 (54%, 2.59) | 19.3 (85%, 3.55) | 19.9 (89%, 3.66) | 13.9 (55%, 2.65) | 16.6 | 1.91x |
+| `-G 4` | 12.9 (46%, 2.81) | 19.1 (78%, 4.11) | 20.4 (85%, 4.41) | 13.2 (48%, 2.92) | 16.4 | 1.89x |
+| `-G 5` | 11.9 (41%, 3.01) | 17.0 (72%, 4.59) | 20.2 (79%, 4.92) | 13.5 (47%, 3.35) | 15.7 | 1.80x |
+| `-G 6` | 10.8 (36%, 3.08) | 17.8 (67%, 5.03) | 22.0 (82%, 5.82) | 13.1 (43%, 3.56) | 15.9 | 1.83x |
+| `-G 4 --tau 0.3` | 13.2 (51%, 2.72) | 18.0 (80%, 4.11) | 20.2 (85%, 4.41) | 13.8 (53%, 2.78) | 16.3 | 1.88x |
+| **`-G 6 --tau 0.4`** | 13.3 (54%, 2.75) | 18.7 (74%, 5.03) | 22.0 (86%, 5.82) | 14.7 (59%, 3.26) | **17.2** | **1.98x** |
+| `-G 8 --tau 0.5` | 13.5 (63%, 2.61) | 19.8 (82%, 5.57) | 21.4 (85%, 6.74) | 15.6 (70%, 3.26) | 17.6 | 2.02x |
+
+- **The target is met at 8 threads:** 13.2-14.1 tok/s with thinking on (1.5-1.6x), 16.6-17.6 off (1.9-2.0x); the
+  goal was ~13-18. Adaptive length (tau 0.4, k_max 6) is the best single setting, +4-7% over `-G 3` (the CLI's
+  default stays `-G 3`, no tau: the per-model defaults are TODO S5's).
+- **Sampled** (the GGUF's defaults T 1, top-p 0.95, top-k 20, `-s 42`; 1 run): thinking on plain 8.6, `-G 3` 12.8,
+  tau 0.3 / k 4 13.5, tau 0.4 / k 6 13.6 (1.59x); off 8.5, 15.7, 16.2, 17.1 (2.03x).
+- **12 threads** (chat and code, greedy, 1 run, load 11-15): thinking on plain 10.3, `-G 3` 13.8, tau 0.4 / k 6 15.3;
+  off 9.6, 18.5, 20.6 (code 24.8).
+- **Against the API-based estimate:** the tokens per pass are the teacher-forced simulation's. `spec_accept.py`'s
+  simulation at k = 3 on the API's answers to the same 4 prompts (their first 256 tokens): thinking off 2.56 / 3.29 /
+  3.71 / 2.65 per pass, measured 2.59 / 3.55 / 3.66 / 2.65; on 2.30 / 1.91 / 3.14 / 2.42, measured 2.30 / 1.98 / 3.12 /
+  2.70. Its tok/s for them (17.6 off, 13.8 on, k = 3) are 4-6% above the measured 16.6 / 13.2: in the loop a k = 3
+  verify pass takes 167-171 ms, ~1.4x the CLI's plain step (the model: 1.25x, without the checkpoint copies and the
+  per-row sampling); the draft's ~20 ms per pass is the model's (4 x 5.1 ms).
+- **Exactness:** every speculative run printed plain decoding's text: 128 speculative runs of the tables (greedy and
+  sampled, both thinking modes, 8 and 12 threads) against their plain runs, stdout byte for byte; `spec`'s CLI cases on
+  the pair (`check_spec.cli_case`, 8 threads): `chat_greedy` (3 turns, thinking on, `-G 1 / 3 / 8`, `-G 8 --tau 0.5`),
+  `chat_seeded_think` and `gen_seeded_topk` (`-G 3`, `-G 8 --tau 0.5`): stdout, stderr but the `[timing]` lines and
+  the chat dumps (the cache's ids and every sampled logits vector) bitwise; `api_test --spec` on the pair: 12/12 (every
+  case at k = 1 / 3 / 8 and tau 0.5: tokens, RNG states, logits hashes, the cache; no position fed again; 178 s).
+- **The checkpoint copies (S3):** `bench_verify -L 500 -R 1,2,3,4,5 -r 11`, two runs without and two with `-c`
+  alternated: the best pass of 3 / 4 / 5 rows +6.2 / +8.9 / +11.9 ms with a checkpoint per row (the medians are
+  noisier: +2.7 / +2.1 / +10.7), **~2.2 ms per row** (150 MiB at ~70 GB/s), 1.8% of a decode step: ~7 ms of a k = 3
+  verify pass (4%). Not worth swapping buffers or replaying the DeltaNet inputs for (the ideas S3 kept for later).
 
 ## Not now
 

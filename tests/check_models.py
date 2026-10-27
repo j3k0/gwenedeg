@@ -19,7 +19,8 @@ q35     (default suite, if models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf is th
         Qwen3.8's template (the checks above, a CLI chat, runq serve's prompts), Qwen3.8's renderings (tokenizer-only
         files with its two templates vs tests/golden/chat_render.json)
 models  (opt-in: tests/run_tests.sh --models, make test-models) every downloaded family model
-        (scripts/download_models.py family; missing files are skipped): logits vs HF fp32 (Qwen3-1.7B) and vs
+        (scripts/download_models.py family; missing files are skipped; Qwen3.8-27B (BIG) also when MemAvailable does
+        not cover it): logits vs HF fp32 (Qwen3-1.7B) and vs
         the dequantized-weights reference (tests/golden/models, tests/make_model_ref.py), bitwise invariants
         (batched vs sequential, threads, generic, api_test: batched decode rows), greedy goldens, the chat
         template variant and its renderings, runq serve (greedy == the CLI, a constrained reply)
@@ -300,7 +301,16 @@ FAMILY = [
     # HF golden is tests/ref_qwen35.py on the HF bf16 weights (make_model_ref.py --hf: transformers' fp32 forward needs
     # ~17 GB), which matches transformers on 0.8B and on tiny models with nv = 2 / 3 nk (docs/qwen35.md)
     ("3.5-4b-q8", "Qwen3.5-4B-GGUF/Qwen3.5-4B-Q8_0.gguf", "qwen3.5", [("3.5-4b-hf", "q8_hf"), ("3.5-4b-q8", "ref")]),
+    # Qwen3.8-27B Q4_K_M (docs/qwen38-speculative.md: 64 layers + an MTP block (validated, not loaded), r = 3, GQA 6,
+    # untied, F32 ssm_alpha / ssm_beta, Qwen3.8's template: thinking on by default). ~16.3 GiB of RSS: run only when
+    # MemAvailable allows it (BIG); its golden is tests/ref_qwen35.py on the file (make_model_ref.py: 214 s, ~2 GB)
+    ("3.8-27b-q4km", "Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf", "qwen3.8", [("3.8-27b-q4km", "ref")]),
 ]
+# files checked against MemAvailable first (runq's own estimate at the default context, api_test's, + BIG_MARGIN GiB
+# for the logits files in TMPDIR and the server's slots): skipped with a note if it does not fit. Their runs go one
+# at a time (the models group runs its files in turn); GWENEDEG_TEST_MEM (GiB) stands in for MemAvailable
+BIG = {"3.8-27b-q4km"}
+BIG_MARGIN = 1.5
 # dequantized rows vs gguf-py (tests/golden/dequant, tests/make_dequant_golden.py --q5), bitwise, per FAMILY tag:
 # from the file's blocks and from the repacked layouts (`runq -m dequant`)
 DEQUANT = {"3.5-0.8b-q4km": "q5_k.npz"}
@@ -392,8 +402,8 @@ def server_smoke(runq, model, variant, greedy_text, port_file):
                     f"{('chat template ' + variant) in log}"))
         r = post({"messages": [{"role": "user", "content": GREEDY[-1]}], "temperature": 0, "max_tokens": 24})
         msg = r["choices"][0]["message"]
-        text = msg["content"] if variant != "thinking-2507" else None
-        if variant == "thinking-2507":  # (the CLI prints <think>\n, the reasoning, </think> and the answer)
+        text = msg["content"] if variant not in ("thinking-2507", "qwen3.8") else None
+        if variant in ("thinking-2507", "qwen3.8"):  # (the CLI prints <think>\n, the reasoning, </think> and the answer)
             ok = "reasoning_content" in msg and msg["reasoning_content"] != ""
             out.append((ok, "greedy_thinking", f"reasoning {len(msg.get('reasoning_content', ''))} chars, content "
                         f"{len(msg['content'])} chars (24 tokens)"))
@@ -418,6 +428,22 @@ def server_smoke(runq, model, variant, greedy_text, port_file):
     return out
 
 
+def mem_skip(runq, model):
+    """None if the file fits in MemAvailable (runq's load estimate at the default context + BIG_MARGIN), else why not"""
+    p = run([runq, model, "--mem", "0.01", "-n", "1", "-i", "x"], 1, stdin=subprocess.DEVNULL)
+    err = p.stderr.decode(errors="replace")
+    if "needs ~" not in err:
+        return f"no memory estimate from runq: {err.strip()[-200:]!r}"
+    need = float(err.split("needs ~", 1)[1].split()[0]) + BIG_MARGIN
+    have = os.environ.get("GWENEDEG_TEST_MEM")
+    if have is None:
+        with open("/proc/meminfo") as f:
+            have = next((int(l.split()[1]) / 1048576 for l in f if l.startswith("MemAvailable:")), None)
+    if have is None or float(have) >= need:
+        return None
+    return f"needs ~{need:.1f} GiB (runq's estimate + {BIG_MARGIN}), MemAvailable {float(have):.1f} GiB"
+
+
 def greedy_text(stdout):
     """the reply of a -t 0 -i chat run (stdout without the trailing newline)"""
     return stdout.decode(errors="replace").rstrip("\n")
@@ -434,6 +460,10 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
             print(f"      {tag}: skipped (models/{f} not downloaded: scripts/download_models.py)")
     nd = MODEL_THREADS
     for tag, model, variant, goldens in present:
+        why = mem_skip(a.runq, model) if tag in BIG else None
+        if why:
+            print(f"      {tag}: skipped (not enough memory: {why})")
+            continue
         t0 = time.time()
         d = os.path.join(tmp, "models", tag)
         os.makedirs(d, exist_ok=True)
@@ -514,7 +544,11 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
                 diff = [k for k in dg[0] if dg[1].get(k) != dg[0][k]]
                 res.report(len(dg[0]) >= 1 and not diff and set(dg[0]) == set(dg[1]), f"{prefix}/{tag}/api_digest_generic",
                            f"{len(dg[0])} batched passes (batched decode rows, ...): AVX-512 == generic" + (f"; differ: {diff}" if diff else ""))
-        if a.api_test:
+        if a.api_test and tag in BIG:
+            # (its batched decode of up to 17 sequences, each with its recurrent state and checkpoints, would need
+            # ~22.4 GiB of RSS on the 27B: run by hand, docs/qwen38-speculative.md)
+            print(f"      {tag}: api_test skipped (memory)")
+        elif a.api_test:
             p = run([a.api_test, model], nd)
             lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
             bad = [l[5:].split("  ")[0] for l in lines if l.startswith("FAIL ")]

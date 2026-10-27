@@ -72,6 +72,7 @@ tests/run_tests.sh --long-context     # group long alone (opt-in): Qwen3.5 at up
 .venv/bin/python tests/check_long.py --retrieval FILE.gguf   # only the retrieval check (any qwen35 file, no golden; e.g. the 27B)
 .venv/bin/python tests/make_long_ref.py 3.5-0.8b-q8 FILE.gguf   # golden/long/TAG: the long-context reference (~30 min; -n 32768 for the 4B: ~21 min)
 build/long_ctx MODEL -I IDS -P p1,p2 -o OUT [-V] [-g N]   # logits at positions of a long token file, the verify / decode paths there, greedy generation (make long-ctx)
+build/bench_long MODEL [-L 16384,32768,65536,98304] [-R 2,4,8] [-P 2560]   # decode / verify / prefill-chunk times at long context on a synthetic cache (make bench-long; not a test)
 tests/server_test.py --runq ./runq --model MODEL [--threads 4] [--slow] [-v]   # runq serve alone (~6 s; 2 threads ~11 s)
 scripts/bench_serve.py --runq ./runq --model MODEL [--only gen,judge,mix]   # runq serve under concurrent clients (not a test)
 ```

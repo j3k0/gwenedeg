@@ -447,6 +447,12 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
 // not NULL; *npacked = 1). rows / packed: malloc'd by the call
 int rq_dequant_rows(const RqModel *m, const char *name, size_t name_len, long r0, long nr, float **rows,
                     float **packed, int *ncols, int *npacked, char *err, size_t errlen);
+// a long context without prefilling it, for timing (tests/bench_long.c): the sequence becomes n positions long
+// (1 <= n <= its capacity) with pseudo-random KV entries at positions 0..n-1 (from seed; |K| < 4, |V| < 1, in the
+// cache's type; the pages touched as a prefill would) and, Qwen3.5, a pseudo-random recurrent state (|x| < 0.05);
+// tokens arbitrary valid ids, checkpoints dropped. The forward passes' cost does not depend on the values (no
+// data-dependent work), their results are meaningless. On the thread pool (as rq_seq_copy). RQ_ERR_ARG
+int rq_seq_fill_synthetic(RqSeq *s, int n, unsigned long long seed);
 
 #ifdef __cplusplus
 }

@@ -105,6 +105,12 @@ more than its new tokens plus the last reply.
   the 27B. (c) Draft acceptance on the sessions' real replies (`scripts/spec_accept.py`, teacher-forced): the 0.8B
   draft, prompt lookup (G6), both. Done when docs/qwen38-speculative.md has a turn-latency model checked against the
   replay, and the goal above has real numbers.
+  Status (2026-10-27): (b)'s tool is there, `build/bench_long` on `rq_seq_fill_synthetic` (a library test hook), run
+  on the 0.8B, the 4B (to 32k) and the 27B-shaped synthetic model; docs/qwen38-speculative.md, "Long-context costs",
+  has the numbers and a turn-latency model extrapolated to the 27B (decode ~4.8 / 5.6 tok/s at 98k with 8 / 16
+  threads, a 2.5k-chunk prefill ~250 / ~145 s; a verify row at 98k adds ~80-90% of a step's attention, so k = 3
+  passes cost ~2.2x a step there). Left of (b): the 27B run itself, alone on the box (the command is in that section);
+  (a) and (c) not started.
 - [ ] **G1. Tool calls in `runq serve`.** Requests with `tools` (OpenAI format) rendered by the Qwen3.8 template
   (the tool list in the system prompt; `tool` messages and earlier `tool_calls` in the history, as
   `tests/golden/templates/qwen3.8-hf.jinja`), and replies parsed from Qwen3.8's XML format

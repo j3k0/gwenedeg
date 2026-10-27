@@ -516,6 +516,102 @@ train's average speed, summ the bike-lane article in three bullet points; greedy
   noisier: +2.7 / +2.1 / +10.7), **~2.2 ms per row** (150 MiB at ~70 GB/s), 1.8% of a decode step: ~7 ms of a k = 3
   verify pass (4%). Not worth swapping buffers or replaying the DeltaNet inputs for (the ideas S3 kept for later).
 
+## Long-context costs (TODO G0 (b), measured 2026-10-27)
+
+What a turn of an agentic session costs at a context of L positions, without prefilling L tokens first (the 27B at
+~45 tok/s plus its attention: hours for 96k). **Tool:** `build/bench_long` (`make bench-long`, `tests/bench_long.c`):
+the sequence is filled by `rq_seq_fill_synthetic` (a test hook of the library, `src/runq.h`: pseudo-random KV entries
+at positions 0..L-1 in the cache's type, the pages touched as a prefill touches them, a pseudo-random recurrent state;
+no pass does data-dependent work, so the values do not change the timing), then per L: `dec` (a decode step with its
+logits), `seg r` (a verify segment of r rows, every row's logits: speculation with r - 1 guesses) and `pre` (a
+2,560-token chunk prefilled in passes of 512 rows, the last row's logits: a turn's new tokens), each pass followed by
+a truncation back to L (Qwen3.5: through a checkpoint at L), reps rotated over the configurations. Checked against a
+real context: Qwen3.5-0.8B at 16,384 positions, `bench_verify -L 16384` (a real prefill of the lighthouse text) vs
+`bench_long -L 16384`, 8 threads: decode 30.9 vs 28.9 ms (median; best 21.2 vs 20.1), segments of 2 / 4 / 8 rows
+34.2 / 50.1 / 73.3 vs 35.0 / 48.0 / 62.4 ms: the same within that run's noise (load 26-30).
+
+Measured (under the bench lock, f16 KV, 9 reps for dec / seg, 2 for pre; loadavg 2-15 from other jobs; medians, ms;
+`pre` in s):
+
+| model, threads | L | dec | seg 2 | seg 4 | seg 8 | pre 2,560 |
+|---|---|---|---|---|---|---|
+| 0.8B Q8_0, 8 | 512 | 6.0 | 7.0 | 8.5 | 12.0 | 1.93 |
+| | 16,384 | 8.8 | 10.9 | 15.3 | 25.1 | 5.41 |
+| | 32,768 | 11.4 | 14.6 | 21.6 | 36.9 | 9.18 |
+| | 65,536 | 14.6 | 20.8 | 33.3 | 62.0 | 17.6 |
+| | 98,304 | 19.3 | 27.5 | 45.5 | 86.1 | 26.2 |
+| 0.8B Q8_0, 16 | 512 | 6.8 | 8.1 | 10.1 | 12.3 | 1.25 |
+| | 32,768 | 9.0 | 12.0 | 16.8 | 26.9 | 5.33 |
+| | 98,304 | 14.8 | 19.5 | 30.5 | 54.4 | 15.0 |
+| 4B Q8_0, 8 | 512 | 29.6 | 33.6 | 38.8 | 51.2 | 8.94 |
+| | 16,384 | 42.0 | 47.6 | 57.2 | 82.9 | 18.4 |
+| | 32,768 | 38.6 | 49.3 | 67.9 | 113.5 | 29.0 |
+| 4B Q8_0, 16 | 512 | 27.5 | 29.0 | 31.3 | 38.1 | 5.57 |
+| | 32,768 | 35.4 | 40.3 | 50.3 | 74.7 | 16.6 |
+| synth-27b, 8 | 512 | 1.62 | 1.87 | 2.43 | 4.33 | 0.55 |
+| | 16,384 | 2.55 | 3.44 | 5.40 | 9.87 | 2.23 |
+| | 32,768 | 3.37 | 5.20 | 8.48 | 15.96 | 4.21 |
+| | 65,536 | 5.34 | 8.80 | 14.80 | 28.62 | 8.35 |
+| | 98,304 | 7.20 | 12.02 | 21.12 | 40.76 | 12.69 |
+| synth-27b, 16 | 512 | 1.87 | 2.33 | 2.92 | 4.01 | 0.36 |
+| | 16,384 | 2.89 | 3.43 | 5.04 | 8.02 | 1.31 |
+| | 32,768 | 2.61 | 4.30 | 6.25 | 10.96 | 2.37 |
+| | 65,536 | 4.14 | 6.26 | 10.06 | 18.37 | 4.66 |
+| | 98,304 | 6.86 | 9.48 | 15.79 | 27.27 | 7.16 |
+
+(The 4B only to 32k: at 98k it needs ~7.7 GB, more than this run's share of the box. Its 16k row at 8 threads is
+noisy: best 31 ms.) `synth-27b` is `build/synth-q35/synth-q35-27b.gguf` (`tests/make_synth_q35.py`): 2 attention
+layers with the 27B's attention shape, 12 query / 2 kv heads of 256 (6 query heads per kv head, as 24 / 4), and tiny
+matmuls; so `X(L) - X(512)` is the attention of 4 (layer, kv head) units, the 27B has 16 x 4 = 64 of them.
+
+- **Decode at long context is attention-bound well before 96k.** The 0.8B's step triples (6.0 -> 19.3 ms); its
+  attention reads 12 KiB per position (1.2 GB at 98k, ~91 GB/s) at ~370 GFLOPS; the 27B-shaped one at 98k does
+  ~430 GFLOPS (24.6 kFLOP per position) while reading ~72 GB/s: at the box's practical limits on both counts.
+- **Verify rows do not share the attention:** at 98k each extra row of a segment adds ~80-90% of a decode step's
+  attention (synth-27b, 8 threads: rows 2 / 4 / 8 add 10.2 / 18.7 / 36.4 ms of attention against 5.6 for one); only
+  the weights' read is shared. So f(r) grows with L: synth-27b f(4) 1.50 at 512, 2.93 at 98k.
+- **Prefill attention** of a 2,560-token chunk runs at ~510 GFLOPS at 8 threads (synth-27b: 6.3 TFLOP in 12.1 s at
+  98k), ~1.8x that at 16 threads.
+
+**The 27B, extrapolated** (not measured: the 27B run is below). Per pass: the 27B's own short-context cost (S7: decode
+118 ms at 8 threads, 97 ms at 16; prefill 45 / 76 tok/s; verify f(2) / f(4) = 1.10 / 1.25, f(8) ~2.15 as the 8B
+Q4_K_M's) + 16 x synth-27b's attention, `X(L) - X(512)`. The attention part should be an upper bound: with 4 kv heads
+per layer instead of 2 the 27B's passes have twice the work items per phase (better balance), and its KV cache per
+position (64 KiB) is 16 x the synth's exactly.
+
+| L | decode ms (tok/s), 8 thr | 16 thr | verify pass 2 / 4 / 8 rows, 8 thr (x decode) | prefill 2,560 tokens, 8 thr | 16 thr |
+|---|---|---|---|---|---|
+| 512 | 118 (8.5) | 97 (10.3) | 130 / 148 / 254 (1.10 / 1.25 / 2.15) | 57 s | 34 s |
+| 16,384 | 133 (7.5) | 113 (8.8) | 155 / 195 / 342 (1.17 / 1.47 / 2.57) | 84 s | 49 s |
+| 32,768 | 146 (6.8) | 109 (9.2) | 183 / 244 / 440 (1.25 / 1.67 / 3.01) | 116 s | 66 s |
+| 65,536 | 178 (5.6) | 133 (7.5) | 241 / 345 / 642 (1.36 / 1.95 / 3.62) | 182 s | 103 s |
+| 98,304 | 207 (4.8) | 177 (5.6) | 292 / 447 / 837 (1.41 / 2.16 / 4.04) | 251 s | 143 s |
+
+(16 threads, decode: synth-27b's medians are noisy at 16k-32k, hence 32k below 16k.) **Turn-latency model**, a turn
+at position L with P new tokens and a reply of G tokens, plain decoding: T(L) = P / R_mm + 16 A_pre(P, L) + G x
+(t_w + 16 A_dec(L)), with R_mm the 27B's prefill matmul rate (45 / 76 tok/s), A_pre / A_dec the synth's attention
+times above (both about linear in L: at 8 threads A_dec ~0.057 us per position, A_pre ~0.048 us per (query, key)
+pair) and t_w = 118 / 97 ms. A turn of 2,500 tokens + a 500-token reply at ~90k: **~5.6 min at 8 threads (~235 s +
+~100 s), ~3.6 min at 16 (~133 s + ~83 s)**; at 32k: ~3.2 / ~2.0 min. With
+speculation at 98k (k = 3: a 4-row pass of ~447 ms + the 0.8B draft's 3 steps at 98k, ~60 ms; 2.0-3.7 tokens per
+pass as at S7): ~4-7 tok/s against 4.8 plain, k = 1 about the same: the goal's ">= 8 tok/s at 90k with
+speculation" needs cheaper attention per row first (G4's bf16 dot products for prefill and verify, an 8-bit KV for
+the decode read; G7's k by position). To be checked against the 27B itself and the replay (G0 (a)).
+
+**The 27B run (later, alone on the box: the other services stopped, MemAvailable >= ~23.5 GiB):**
+
+```
+make bench-long
+flock /tmp/cwayn-bench.lock sh -c 'for t in 8 16; do OMP_NUM_THREADS=$t build/bench_long \
+    models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf -L 512,16384,32768,65536,98304 -R 2,4,8 -P 2560 -r 5 -p 1; done' \
+    | tee logs/bench-long-27b.txt
+```
+
+Its memory: weights 15.3 GiB + KV of 100,865 positions (6.2 GiB, 64 KiB each) + the attention scratch (~0.8 GiB at 16
+threads) + 2 checkpoints (0.3): ~22.7 GiB; runq's load-time check refuses it if MemAvailable does not cover its
+estimate (`-m GiB` overrides; with less memory, `-L ...,90112`). ~15 min per thread count (one 2.5k chunk at 98k is
+~2.5-4 min).
+
 ## Not now
 
 DFlash 2 (a 2B block-diffusion drafter: a new architecture, a 4 GB BF16 download); multi-VM splits (~10-30% over

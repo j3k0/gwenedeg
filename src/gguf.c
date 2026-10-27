@@ -230,9 +230,14 @@ void gguf_config(const Gguf *g, Config *c, float *rope_theta, int *rope_dim, Hyb
     // engine implements: Qwen3 (any RoPE theta: 1e6, the 2507 models 5e6; no RoPE scaling) with RMSNorm
     // eps 1e-6 (the constant in rmsnorm); Q8_0 / Q4_K / Q5_K / Q6_K weights (gguf_matrices). Qwen3.5 (qwen35, the
     // hybrid layers: docs/qwen35.md): also the linear-attention shapes (ssm.*), the attention layer interval
-    // and the partial RoPE (rope.dimension_count); key heads == value heads only (the 0.8B; the converter
-    // reorders the value heads of the bigger models, not checked yet)
+    // and the partial RoPE (rope.dimension_count); value heads a multiple of the key heads (4B / 9B / 27B: twice
+    // or three times as many), in the order llama.cpp's converter writes them (tiled: value head h uses key head
+    // h % nk). Files with Hadamard-folded weights (prism.hadamard.* metadata: other weights, and ssm_out's value
+    // heads in HF's grouped order) are rejected
     uint64_t n;
+    for (uint64_t i = 0; i < g->n_kv; i++)
+        if (g->kv[i].key_len >= 15 && !memcmp(g->kv[i].key, "prism.hadamard.", 15))
+            gguf_fail(g, "Hadamard-folded weights (prism.hadamard.* metadata) are not supported%s", NULL);
     const char *arch = gguf_get_str(g, "general.architecture", &n);
     int q35 = arch && n == 6 && !memcmp(arch, "qwen35", 6);
     if (!q35 && (!arch || n != 5 || memcmp(arch, "qwen3", 5))) {
@@ -289,8 +294,8 @@ void gguf_config(const Gguf *g, Config *c, float *rope_theta, int *rope_dim, Hyb
         hy->interval = (int)sv[5];
         if (sv[4] % sv[3]) gguf_fail(g, "ssm.inner_size is not a multiple of ssm.time_step_rank%s", NULL);
         hy->dv = (int)(sv[4] / sv[3]);
-        if (hy->nk != hy->nv)
-            gguf_fail(g, "linear attention with key heads != value heads is not supported yet (Qwen3.5 0.8B only)%s", NULL);
+        if (hy->nv % hy->nk)
+            gguf_fail(g, "ssm.time_step_rank (value heads) is not a multiple of ssm.group_count (key heads)%s", NULL);
         // (the kernels: head slices in whole activation groups of 32 and vector widths of 16)
         if (hy->conv < 2 || hy->conv > 8 || hy->dk % 16 || hy->dv % 32 || hy->dk > 512 || hy->dv > 512)
             gguf_fail(g, "unsupported linear attention shape (conv kernel 2..8, head dims multiples of 16 / 32, <= 512)%s", NULL);

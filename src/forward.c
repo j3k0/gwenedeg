@@ -1255,8 +1255,10 @@ static void swiglu(float *hb, const float *hb2, int n) {
 }
 
 // ---------------------------------------------------------------- Qwen3.5: linear attention (Gated DeltaNet)
-// One token of one value head h of linear-attention layer li (docs/qwen35.md):
-//   q, k, v = silu(causal depthwise conv over the last `conv` inputs of the head's channels: q, k (dk each), v (dv))
+// One token of one value head h of linear-attention layer li (docs/qwen35.md), with key head kh = h % nk (nv is a
+// multiple of nk: llama.cpp's converter writes the value heads in a tiled order, value head h = i nk + kh is the
+// i-th one of key head kh; with nv == nk, kh = h):
+//   q, k, v = silu(causal depthwise conv over the last `conv` inputs of the channels: q, k (dk each) of kh, v (dv) of h)
 //   q, k = l2norm (x / sqrt(sum x^2 + 1e-6)); q *= 1 / sqrt(dk)
 //   beta = sigmoid(b), g = ssm_a * softplus(a + ssm_dt)
 //   S (dk x dv, k-major) *= exp(g); delta = beta (v - S^T k); S += k delta^T; o = S^T q
@@ -1357,8 +1359,11 @@ DN_EXACT static void dn_conv(float *out, const float *x, float *st, const float 
 
 // The recurrence is split in three steps (docs/qwen35.md), the same functions in every path, so a sequence's
 // results do not depend on the path or the batch:
-//   dn_prep (per row and head, rows in order: the conv state): conv + SiLU, l2norm of q / k, the gates; the
-//     results go back into the row (q, k, v in place of the conv inputs, exp(g) and beta in place of alpha / beta)
+//   dn_prep (per row and channel group, rows in order: the conv state): conv + SiLU, l2norm of q / k, the gates; the
+//     results go back into the row (q, k, v in place of the conv inputs, exp(g) and beta in place of alpha / beta).
+//     The groups: q and k of each key head, v (and the gates) of each value head: a key head's q / k are shared by
+//     its nv / nk value heads, so they are computed (and their conv state advanced) once, by the item of value
+//     head kh (dn_prep) or as groups of their own (prefill)
 //   dn_rec (per row, head and block of DN_BW v columns, rows in order: S): the delta rule on a 128 x DN_BW block
 //     of S, which stays in L1; each v lane is independent of the others, so the blocks give the bits of the whole
 //   dn_out (per row and head, once all the blocks of the row are done): the gated RMSNorm over the head's dv outputs
@@ -1374,7 +1379,7 @@ DN_EXACT static void dn_conv(float *out, const float *x, float *st, const float 
 static inline int dn_nblk(const Hybrid *hy) { return hy->dv / DN_BW; }
 
 static inline void dn_chan(const Hybrid *hy, int h, int t, size_t *c0, int *cn) {
-    // the channel group t (0 q, 1 k, 2 v) of value head h: first channel, channels
+    // the channel group t (0 q, 1 k: of key head h; 2 v: of value head h): first channel, channels
     *c0 = t == 0 ? (size_t)h * hy->dk : t == 1 ? (size_t)hy->nk * hy->dk + (size_t)h * hy->dk : (size_t)2 * hy->nk * hy->dk + (size_t)h * hy->dv;
     *cn = t < 2 ? hy->dk : hy->dv;
 }
@@ -1395,8 +1400,8 @@ static inline void dn_pf(const float *p, int n) {
 
 DN_EXACT static void dn_prep_part(const RqModel *m, int li, int h, int t, float *st, int first, float *ck, float *row,
                                   const float *next) { RQ_FP_EXACT
-    // step 1 for one token, channel group t of value head h of linear layer li (0: q, 1: k, 2: v and the gates; the
-    // three are independent): st = the sequence's state of the layer, first: the token at position 0 (the conv state
+    // step 1 for one token, channel group t of linear layer li (0: q, 1: k of key head h; 2: v and the gates of value
+    // head h; all independent): st = the sequence's state of the layer, first: the token at position 0 (the conv state
     // before it is zero: cleared here), row = the token's projections (lin_width: qkv | z | alpha | beta), updated in
     // place; ck != NULL: the checkpoint's state of the layer, which gets the group's conv state after this token;
     // next: the following row of the batch (prefetched), or NULL
@@ -1440,9 +1445,24 @@ DN_EXACT static void dn_prep_part(const RqModel *m, int li, int h, int t, float 
 }
 
 DN_EXACT static void dn_prep(const RqModel *m, int li, int h, float *st, int first, float *ck, float *row) { RQ_FP_EXACT
-    // all three groups
-    for (int t = 0; t < 3; t++)
+    // the groups of value head h's item (decode, batched decode rows): its v and gates, and the q / k of key head h
+    // if h < nk (the value heads h' with h' % nk == h wait for it)
+    for (int t = h < m->hy.nk ? 0 : 2; t < 3; t++)
         dn_prep_part(m, li, h, t, st, first, ck, row, NULL);
+}
+
+static inline int dn_prep_items(const Hybrid *hy) { return 3 * hy->nk + hy->nv - hy->nk; }
+
+static inline void dn_prep_item(const Hybrid *hy, int i, int *h, int *t) {
+    // prefill's dn_prep item i of a segment (0 <= i < dn_prep_items): (key head, 0 q / 1 k) or (value head, 2 v): the
+    // q, k, v of heads 0 .. nk - 1 in turn, then the v of the other value heads
+    if (i < 3 * hy->nk) {
+        *h = i / 3;
+        *t = i % 3;
+    } else {
+        *h = hy->nk + i - 3 * hy->nk;
+        *t = 2;
+    }
 }
 
 // The two passes of dn_rec over a block of S (dk, DN_BW), per v lane, k in order. p1: u = (S * eg)^T k. p2: S = S * eg +
@@ -1506,7 +1526,7 @@ DN_EXACT static void dn_rec_run(const RqModel *m, int h, int jb, float *st, int 
     // (S cleared); ck != NULL: the checkpoint's state of the layer, whose block gets S after token ckrow
     const Hybrid *hy = &m->hy;
     int cd = hy->conv_dim, dk = hy->dk, dv = hy->dv, nv = hy->nv;
-    size_t oq = (size_t)h * dk, ok = (size_t)hy->nk * dk + (size_t)h * dk;
+    size_t oq = (size_t)(h % hy->nk) * dk, ok = (size_t)hy->nk * dk + oq; // (the key head's q / k)
     size_t ov = (size_t)2 * hy->nk * dk + (size_t)h * dv + (size_t)jb * DN_BW, oe = (size_t)cd + hy->vdim + h;
     float *S = dn_sblock(m, st, h, jb);
     float u[DN_BW], un[DN_BW], oa[DN_BW];
@@ -1710,10 +1730,10 @@ static void decode_worker(void *arg, int tid, int nt) {
         int al = m->kv_layer[l], li = m->lin_layer[l];
         if (li >= 0) {
             // Qwen3.5's linear attention, in one phase (dependency counters dc .. dc + 2 nv): item 0 the alpha / beta
-            // rows (counter dc); then per value head its q / k / v / z rows and dn_prep (after item 0; counter
-            // dc + 1 + h); then per (head, block of DN_BW v columns) dn_rec (after the head's prep); the last block of a
-            // head to finish runs dn_out and quantizes the head's outputs for ssm_out (into aq; head slices are whole
-            // groups)
+            // rows (counter dc); then per value head its v / z rows (and if h < nk key head h's q / k rows) and dn_prep
+            // (after item 0; counter dc + 1 + h); then per (head, block of DN_BW v columns) dn_rec (after the prep of
+            // the head and of its key head's item h % nk); the last block of a head to finish runs dn_out and quantizes
+            // the head's outputs for ssm_out (into aq; head slices are whole groups)
             float *st = s->ssm + (size_t)li * m->ssm_layer;
             int nblk = dn_nblk(hy), dc = dn_counter0(m, l);
             PH_BEGIN_DYN(1 + hy->nv + hy->nv * nblk, 1)
@@ -1728,7 +1748,7 @@ static void decode_worker(void *arg, int tid, int nt) {
                 if (it <= hy->nv) {
                     int h = it - 1, i0 = h * hy->dv;
                     int r0[3] = { h * hy->dk, hy->nk * hy->dk + h * hy->dk, 2 * hy->nk * hy->dk + h * hy->dv }, rn[3] = { hy->dk, hy->dk, hy->dv };
-                    for (int t = 0; t < 3; t++)
+                    for (int t = h < hy->nk ? 0 : 2; t < 3; t++)
                         matvec_rows(c->lin, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wqkv + li, dim, r0[t], r0[t] + rn[t]);
                     matvec_rows(c->lin + hy->conv_dim, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wz + li, dim, i0, i0 + hy->dv);
                     rq_wait_count(S, dc, 1);
@@ -1738,6 +1758,8 @@ static void decode_worker(void *arg, int tid, int nt) {
                 }
                 int h = (it - 1 - hy->nv) / nblk, jb = (it - 1 - hy->nv) % nblk, i0 = h * hy->dv;
                 rq_wait_count(S, dc + 1 + h, 1);
+                if (h >= hy->nk) // (its key head's q / k)
+                    rq_wait_count(S, dc + 1 + h % hy->nk, 1);
                 dn_rec(m, h, jb, st, pos == 0, dn_ck(s, li, pos), c->lin, c->xb + i0);
                 if (rq_count(S, dc + 1 + hy->nv + h, 1) < nblk)
                     continue;
@@ -2000,7 +2022,8 @@ static void prefill_worker(void *arg, int tid, int nt) {
 
         if (li >= 0) {
             // Qwen3.5's linear attention: the qkv / z / alpha / beta GEMMs (one phase, into lin_b rows), then dn_prep per
-            // (segment, value head) over the segment's rows in order (the conv state), dn_rec per (segment, head, block
+            // (segment, channel group: q / k of a key head, v of a value head, dn_prep_item) over the segment's rows in
+            // order (the conv state), dn_rec per (segment, value head, block
             // of DN_BW v columns) over the rows in order (the block of S, 16 KB, stays in this thread's L1 for the whole
             // chunk), and per row dn_out + the quantization of the row's outputs for ssm_out
             float *lb = c->lin_b;
@@ -2016,11 +2039,13 @@ static void prefill_worker(void *arg, int tid, int nt) {
                 PH_END_NOEPI
             }
             PPROF(PF_QKV);
-            PH_BEGIN_DYN(job->nseg * hy->nv * 3, 1)
+            int npi = dn_prep_items(hy);
+            PH_BEGIN_DYN(job->nseg * npi, 1)
             for (int it = lo; it < hi; it++) {
-                const PfSeg *sg = &seg[it / (hy->nv * 3)];
+                const PfSeg *sg = &seg[it / npi];
                 RqSeq *sq = sg->seq;
-                int h = it / 3 % hy->nv, t = it % 3;
+                int h, t;
+                dn_prep_item(hy, it % npi, &h, &t);
                 float *st = sq->ssm + (size_t)li * m->ssm_layer;
                 for (int b = sg->b0; b < sg->b0 + sg->n; b++) {
                     int pos = c->row_pos[b];
@@ -2424,8 +2449,9 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
 
         if (li >= 0) {
             // Qwen3.5's linear attention over all rows, as decode_worker's: item 0 alpha / beta (counter cb), then per
-            // value head its q / k / v / z rows and, per row, dn_prep (counter cb + 1 + h), then per (head, block) dn_rec
-            // over the rows (each on its sequence), the last block of a head to finish runs dn_out on every row
+            // value head its v / z rows (h < nk: and key head h's q / k rows) and, per row, dn_prep (counter cb + 1 + h),
+            // then per (head, block) dn_rec (after the preps of h and h % nk) over the rows (each on its sequence), the
+            // last block of a head to finish runs dn_out on every row
             // (the rows are quantized by the next phase)
             int nblk = dn_nblk(hy);
             PH_BEGIN_DYN(1 + hy->nv + hy->nv * nblk, 1)
@@ -2441,7 +2467,7 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
                 if (it <= hy->nv) {
                     int h = it - 1, i0 = h * hy->dv;
                     int r0[3] = { h * hy->dk, hy->nk * hy->dk + h * hy->dk, 2 * hy->nk * hy->dk + h * hy->dv }, rn[3] = { hy->dk, hy->dk, hy->dv };
-                    for (int t = 0; t < 3; t++)
+                    for (int t = h < hy->nk ? 0 : 2; t < 3; t++)
                         rows_mm(w->wqkv + li, lb, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, r0[t], r0[t] + rn[t]);
                     rows_mm(w->wz + li, lb + hy->conv_dim, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, i0, i0 + hy->dv);
                     rq_wait_count(S, cb, 1);
@@ -2455,6 +2481,8 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
                 }
                 int h = (it - 1 - hy->nv) / nblk, jb = (it - 1 - hy->nv) % nblk, i0 = h * hy->dv;
                 rq_wait_count(S, cb + 1 + h, 1);
+                if (h >= hy->nk) // (its key head's q / k)
+                    rq_wait_count(S, cb + 1 + h % hy->nk, 1);
                 for (int b = 0; b < n; b++) {
                     RqSeq *sq = seg[b].seq;
                     int pos = c->row_pos[b];

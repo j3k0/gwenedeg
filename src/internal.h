@@ -81,7 +81,8 @@ typedef struct {
     int interval;  // full_attention_interval
     int conv;      // causal conv kernel (ssm.conv_kernel: 4); the state keeps the last conv - 1 inputs
     int dk, nk;    // key head dim (ssm.state_size: 128), key heads (ssm.group_count: 16)
-    int dv, nv;    // value head dim (ssm.inner_size / nv: 128), value heads (ssm.time_step_rank: 16; == nk)
+    int dv, nv;    // value head dim (ssm.inner_size / nv: 128), value heads (ssm.time_step_rank: 16; a multiple of nk:
+                   // 4B 32; value head h uses key head h % nk, the converter's tiled order)
     int conv_dim;  // 2 nk dk + nv dv: the qkv projection rows = the conv channels [q | k | v] (6144)
     int vdim;      // nv dv: the output gate z and the input of the output projection (2048)
     int n_lin;     // linear-attention layers (18 of 24)

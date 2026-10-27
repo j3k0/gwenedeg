@@ -15,7 +15,7 @@ Decode Qwen3.8-27B (`qwen35`, 64 layers, r = 3, untied, an MTP block) at ~13-18 
 Qwen3.5-0.8B as the draft, the output **exactly** plain decoding's (tokens, greedy and seeded, and each emitted
 token's logits bits). Facts, measurements and decisions: [docs/qwen38-speculative.md](docs/qwen38-speculative.md).
 Added rule for this section: speculative output == plain output (tokens + a hash of each emitted token's logits).
-Order: the preparation items (P1-P6) first, each a no-behaviour-change step checked by the regression net of P1, then
+Order: the preparation items (P1-P5) first, each a no-behaviour-change step checked by the regression net of P1, then
 the steps (S). **Disk and RAM:** ~44 GB free, `models/` 42 GB, `/tmp` is a 16 GB tmpfs (RAM: no models or venvs
 there); check `df` / `MemAvailable` before every download or 27B run, keep >= 15 GB of disk free (58 GB free after
 removing the 4B / 1.7B HF checkpoints, which only regenerate committed goldens: re-download their pinned sets), and use
@@ -54,11 +54,6 @@ Preparation (no output changes; `make test` and `tests/compare_bins.sh` byte-ide
   per-model defaults from `general.sampling.*` (Qwen3.8: 1.0 / 0.95 / 20; the older item "Top-k sampling and
   per-model sampling defaults" is folded in here), with the sampler's exact-order rules. Done when the refactor is
   byte-identical (P1) and top-k matches a numpy reference of the sampler on recorded logits.
-- [ ] **P6. The 27B's shapes without the 27B.** Extend `tests/make_synth_q35.py` with a model cut to the 27B's
-  ratios: untied `token_embd` Q4_K + `output` Q6_K, GQA 6 (24 / 4 heads of 256), r = 3, a dim that is not a power of
-  two, Q5_K / Q4_K / Q6_K matrices as in the Q4_K_M file; and a variant with an extra MTP block (`block_count` n + 1,
-  `nextn_predict_layers` 1, the `nextn.*` tensors) that today must be refused cleanly (S6 makes it load). Done when
-  the synthetic models pass `logits_ref` and the bitwise groups in the default suite.
 
 Steps:
 
@@ -88,11 +83,14 @@ Steps:
 - [ ] **S5. The speculative loop on Qwen3.5.** Target Qwen3.5-4B Q8_0 + draft 0.8B (~6 GB), S3's rollback on both.
   Expect ~1.3-1.6x (a 0.8B guess costs ~18% of a 4B token). Done when outputs equal plain decoding bitwise (greedy,
   seeded, thinking on / off) and tok/s + acceptance are recorded.
-- [ ] **S6. Qwen3.8 specifics** (on P6's synthetic MTP model and a tiny random-init `qwen3_5` with an MTP layer,
-  converted by llama.cpp's converter in a scratch venv off `/tmp`). Loader: `block_count` 65 with
-  `nextn_predict_layers` 1 = 64 main layers + the MTP block (loaded for S9, else skipped), not a layer-pattern
-  error. Chat variant for 3.8, detected by its text (`reasoning_effort`): thinking on by default, the effort's
-  system line merged with the system / developer message, `-r` plus an effort option, the server's
+- [ ] **S6. Qwen3.8 specifics** (on `tests/make_synth_q35.py`'s `synth-q35-27b-mtp.gguf` and a tiny random-init
+  `qwen3_5` with an MTP layer, converted by llama.cpp's converter in a scratch venv off `/tmp`). Loader: `block_count`
+  65 with `nextn_predict_layers` 1 = 64 main layers + the MTP block (loaded for S9, else skipped) instead of today's
+  refusal (`load_model`; the `q35/synth/reject_mtp` check becomes a load whose logits == `synth-q35-27b.gguf`'s,
+  bitwise); and F32 `ssm_alpha` / `ssm_beta` matrices ([48, 5120] in the 27B file, Q8_0 in the 0.8B's:
+  `gguf_matrices` refuses type 0 today; an fp32 matvec, checked on a synthetic model with F32 ones; the file layout:
+  docs/qwen38-speculative.md). Chat variant for 3.8, detected by its text (`reasoning_effort`): thinking on by
+  default, the effort's system line merged with the system / developer message, `-r` plus an effort option, the server's
   `reasoning_effort`; the template in `tests/golden/templates/` (license noted). Done when `-m render` equals HF's
   `apply_chat_template` for thinking off / on x each effort, with and without a system message.
 - [ ] **S7. 27B bring-up** (after P4; Q4_K_M). Download the pinned file with `hf` (into

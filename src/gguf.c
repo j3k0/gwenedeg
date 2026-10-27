@@ -277,6 +277,11 @@ void gguf_config(const Gguf *g, Config *c, float *rope_theta, int *rope_dim, Hyb
     if (gguf_get_int(g, key, &rd) && (rd < 2 || rd > v[6] || rd % 2))
         gguf_fail(g, "%s must be even and at most the head dimension", key);
     memset(hy, 0, sizeof(*hy));
+    // multi-token prediction blocks (llama.cpp's nextn: Qwen3.8-27B's blk.64 with nextn.* tensors, counted in block_count)
+    int64_t nx = 0;
+    snprintf(key, sizeof(key), "%s.nextn_predict_layers", A);
+    if (gguf_get_int(g, key, &nx) && (nx < 0 || nx >= v[0])) gguf_fail(g, "metadata %s out of range", key);
+    hy->nextn = (int)nx;
     if (q35) {
         const char *sk[] = { "ssm.conv_kernel", "ssm.state_size", "ssm.group_count", "ssm.time_step_rank", "ssm.inner_size",
                              "full_attention_interval" };

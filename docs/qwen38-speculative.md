@@ -18,13 +18,15 @@ the same logits bits for every emitted token. Later: the 27B's own MTP layer as 
   re-tokenized every non-thinking 27B answer of the measurement below to the API's ids.
 - **An MTP layer in the file:** `block_count` = 65 and `nextn_predict_layers` = 1. `blk.64` is a full-attention
   layer plus `nextn.eh_proj` [10240 -> 5120], `nextn.enorm`, `nextn.hnorm`, `nextn.shared_head_norm`; it shares
-  `token_embd` and `output` with the main model. runq's loader ignores unknown tensors today, but its layer pattern
-  is computed from `block_count`, so the file needs the nextn handling (TODO S6) before it loads correctly.
+  `token_embd` and `output` with the main model. runq's layer pattern is computed from `block_count`, so the loader
+  refuses a file with `nextn_predict_layers` > 0 (a clear message, before any weight is read; the tokenizer alone
+  loads) until the nextn handling (TODO S6). Details: [file layout](#file-layout).
 - Sampling defaults in the GGUF (`general.sampling.*`): temperature 1.0, top-p 0.95, top-k 20.
 
 **The file:** unsloth `Qwen3.8-27B-Q4_K_M.gguf` at revision `4a03c640833598c0fb5ddd11e846135e906eb764`, 17.1 GB,
 sha256 `7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169`. Types: Q4_K 11.4 GB, Q6_K 4.5, Q5_K 1.0,
-Q8_0 0.06, F32 0.1, all supported by runq. Avoid: `main`'s `UD-Q4_K_M` (16.5 GB: IQ4_XS / Q3_K / IQ4_NL / IQ3_S),
+Q8_0 0.06, F32 0.1, all supported by runq's kernels, but `ssm_alpha` / `ssm_beta` are F32 *matrices* here, which the
+loader does not take yet (TODO S6). Avoid: `main`'s `UD-Q4_K_M` (16.5 GB: IQ4_XS / Q3_K / IQ4_NL / IQ3_S),
 `Q8_0` (29.0 GB, does not fit), `MTP/mtp-...gguf` (a standalone MTP with Q3_K tensors; not needed).
 
 | file (unsloth @ `4a03c64`) | size | types | runq | RSS est. |
@@ -37,6 +39,41 @@ Q8_0 0.06, F32 0.1, all supported by runq. Avoid: `main`'s `UD-Q4_K_M` (16.5 GB:
 
 (No plain Q3_K_L / Q3_K_XL from Unsloth for this model; lmstudio-community's Q4_K_M, 16.8 GB, is Q4_K / Q6_K only.)
 Q3 also decodes faster: ~13.4 GB read per token, ~96 ms, ~10.4 tok/s plain, against ~120 ms at Q4_K_M.
+
+### File layout
+
+The header and tensor directory of the Q4_K_M file (read with `tests/ggufmini.py`, no tensor data; 2026-10-27): GGUF v3,
+51 metadata keys, 866 tensors, alignment 32, data at 10,996,704. Architecture keys (`qwen35.*`): `block_count` 65,
+`nextn_predict_layers` 1 (u32), `context_length` 262,144, `embedding_length` 5120, `feed_forward_length` 17,408,
+`attention.head_count` 24 / `head_count_kv` 4, `key_length` = `value_length` 256, `rope.dimension_count` 64,
+`rope.dimension_sections` [11, 11, 10, 0], `rope.freq_base` 1e7, `layer_norm_rms_epsilon` 1e-6, `ssm.conv_kernel` 4,
+`ssm.state_size` 128, `ssm.group_count` 16, `ssm.time_step_rank` 48, `ssm.inner_size` 6144, `full_attention_interval` 4.
+Keys runq does not read: `nextn_predict_layers` (only to refuse the file), `general.sampling.top_k` (i32 20), `top_p`
+(f32 0.95), `temp` (f32 1.0) (TODO P5), `tokenizer.ggml.bos_token_id` 248044 (absent in the 0.8B's), `general.*`,
+`quantize.imatrix.*`; the tokenizer: `gpt2` / pre `qwen35`, 248,320 tokens, 247,587 merges, eos 248046, pad 248055;
+the 3.8 chat template (9,993 bytes). Tensors (row-major [rows, columns]; llama.cpp's order: `output`, `output_norm`,
+`token_embd`, then per block sorted by name):
+
+| tensors | shape | types |
+|---|---|---|
+| `token_embd` / `output` | [248320, 5120] | Q4_K / Q6_K |
+| linear layers (48: l % 4 != 3) `attn_qkv` | [10240, 5120] | Q6_K (24: 0-2, 4-6, 10, 13, 16, ...) / Q4_K (24) |
+| `attn_gate` (z) / `ssm_out` | [6144, 5120] / [5120, 6144] | Q4_K / Q5_K |
+| `ssm_alpha`, `ssm_beta` | [48, 5120] | **F32** (the 0.8B's: Q8_0) |
+| `ssm_conv1d` [10240, 4], `ssm_a` / `ssm_dt.bias` [48], `ssm_norm` [128] | | F32 |
+| attention layers (16: 3, 7, .., 63) `attn_q` ([q / gate] per head) | [12288, 5120] | Q4_K |
+| `attn_k` / `attn_v` | [1024, 5120] | Q4_K / Q6_K (9) or Q4_K (8) |
+| `attn_output` | [5120, 6144] | Q4_K |
+| `attn_q_norm` / `attn_k_norm` [256], `attn_norm` / `post_attention_norm` [5120] | | F32 |
+| every block: `ffn_gate` / `ffn_up`, `ffn_down` | [17408, 5120], [5120, 17408] | Q4_K, Q6_K (33) or Q4_K (32) |
+| `blk.64` (MTP): the attention layer's tensors (`attn_v`, `ffn_down` Q6_K) + `nextn.eh_proj` | [5120, 10240] | Q8_0 |
+| `nextn.enorm`, `nextn.hnorm`, `nextn.shared_head_norm` | [5120] | F32 |
+
+No `nextn.embed_tokens` / `nextn.shared_head_head`: the MTP block uses `token_embd` and `output`. Two things the loader
+must learn (TODO S6): the main layers are `block_count` - `nextn_predict_layers` (today: refused), and F32 matrices
+for `ssm_alpha` / `ssm_beta` (today: "has ggml type 0, need Q8_0 ..."). `tests/make_synth_q35.py` builds this layout
+at a small scale (`synth-q35-27b.gguf`, dim 768, GQA 6, r = 3, the types per role; `-mtp`: + the MTP block), checked by
+the `q35` group ([tests/README.md](../tests/README.md)).
 
 ## Memory and disk
 

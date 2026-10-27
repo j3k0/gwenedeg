@@ -27,7 +27,8 @@ pre-norm shape (x += mixer(rmsnorm(x)); x += ffn(rmsnorm(x)), SwiGLU), where the
 
 Norm weights: HF's Qwen3_5RMSNorm computes x * (1 + w); llama.cpp's converter stores 1 + w in the GGUF (attn_norm,
 post_attention_norm, output_norm, attn_q_norm, attn_k_norm), so all norms here are x * w on the stored values.
-The gated norm (ssm_norm) has no + 1 in either. The MTP head and the vision tower are not part of the text model.
+The gated norm (ssm_norm) has no + 1 in either. The MTP head and the vision tower are not part of the text model (a GGUF
+MTP block, `nextn_predict_layers`, is skipped).
 
 Weights: GgufWeights(GgufFile) (ggml's dequantization, tests/ggufmini.py) or HfWeights(model dir) (the
 safetensors, converted to the GGUF names and values as llama.cpp's convert_hf_to_gguf.py does, except the value
@@ -57,8 +58,9 @@ class GgufWeights:
         self.f = f
         kv, a = f.kv, "qwen35"
         assert kv.get("general.architecture") == a, "not a qwen35 GGUF"
-        self.c = {
-            "layers": int(kv[f"{a}.block_count"]), "dim": int(kv[f"{a}.embedding_length"]),
+        self.c = {  # (an MTP block, nextn_predict_layers: the last of block_count, not part of the main model)
+            "layers": int(kv[f"{a}.block_count"]) - int(kv.get(f"{a}.nextn_predict_layers", 0)),
+            "dim": int(kv[f"{a}.embedding_length"]),
             "heads": int(kv[f"{a}.attention.head_count"]), "kv_heads": int(kv[f"{a}.attention.head_count_kv"]),
             "hd": int(kv[f"{a}.attention.key_length"]), "theta": float(kv[f"{a}.rope.freq_base"]),
             "rot": int(kv[f"{a}.rope.dimension_count"]), "interval": int(kv.get(f"{a}.full_attention_interval", 4)),

@@ -86,6 +86,8 @@ typedef struct {
     int conv_dim;  // 2 nk dk + nv dv: the qkv projection rows = the conv channels [q | k | v] (6144)
     int vdim;      // nv dv: the output gate z and the input of the output projection (2048)
     int n_lin;     // linear-attention layers (18 of 24)
+    int nextn;     // MTP blocks (<arch>.nextn_predict_layers, either architecture: the last nextn of block_count;
+                   // Qwen3.8-27B: 1, blk.64): read so that load_model can refuse them (not supported yet)
 } Hybrid;
 
 typedef struct {

@@ -12,10 +12,10 @@
 
 #ifdef RUNQ_PROFILE
 // build with -DRUNQ_PROFILE: wall time per batched-prefill phase type (rq_ctx_profile)
-enum { PF_NORM, PF_QKV, PF_ROPE, PF_ATT, PF_WO, PF_FFN13, PF_SWIGLU, PF_FFN2, PF_CLS, PF_BDQKV, PF_BDFFN13, PF_N };
+enum { PF_NORM, PF_QKV, PF_ROPE, PF_ATT, PF_WO, PF_FFN13, PF_SWIGLU, PF_FFN2, PF_CLS, PF_BDQKV, PF_BDFFN13, PF_DNPREP, PF_DNREC, PF_DNOUT, PF_N };
 static const char *pf_name[PF_N] = { "norm+quant+resid", "gemm qkv", "qk-norm+rope+kv", "attention+quant",
                                      "gemm wo", "gemm w1+w3", "swiglu+quant", "gemm w2", "classifier",
-                                     "rows qkv+att", "rows w1+w3+swiglu" };
+                                     "rows qkv+att", "rows w1+w3+swiglu", "dn prep (conv, l2norm)", "dn recurrence", "dn out+quant" };
 #define PROF_START(c) ((c)->pf_t = rq_now())
 #define PROF(c, i) do { double t_ = rq_now(); (c)->pf_time[i] += t_ - (c)->pf_t; (c)->pf_t = t_; } while (0)
 #else
@@ -115,6 +115,10 @@ static int ctx_fail(RqCtx *c, int code, const char *fmt, ...) {
 // Qwen3.5's linear-attention layers: the projections of one row, [qkv (conv_dim) | z (vdim) | alpha (nv) | beta (nv)]
 static inline int lin_width(const Hybrid *hy) { return hy->conv_dim + hy->vdim + 2 * hy->nv; }
 // the floats of one linear layer's conv inputs in a sequence's state (then the S of each head)
+// dependency counters of the linear attention (decode_worker: after the attention layers' 2 per (layer, kv head)):
+// per layer 1 + 2 nv (alpha / beta done, per head its prep done, per head its blocks done)
+static inline int dn_counter0(const RqModel *m, int l) { return 2 * m->config.n_layers * m->config.n_kv_heads + l * (1 + 2 * m->hy.nv); }
+static inline int dn_counters(const RqModel *m) { return m->hy.on ? m->config.n_layers * (1 + 2 * m->hy.nv) : 0; }
 static inline size_t ssm_conv_floats(const Hybrid *hy) { return ((size_t)(hy->conv - 1) * hy->conv_dim + 15) / 16 * 16; }
 
 int forward_model_init(RqModel *m) {
@@ -193,7 +197,7 @@ void rq_seq_free(RqSeq *s) {
 // one at a position, taken by the forward pass that reaches it (each (layer, head) item copies its part,
 // dn_save), or at once if the sequence is there. Truncating / copying to an earlier length goes back to the
 // longest checkpoint at or below it (else to 0): the KV entries up to there are kept, the rest is re-prefilled
-// by the caller (rq_seq_len tells how much was kept). The state of a position-0 token is zero (dn_head), so
+// by the caller (rq_seq_len tells how much was kept). The state of a position-0 token is zero (dn_prep, dn_rec clear it), so
 // the state needs no reset
 static void ck_drop(RqSeq *s, int above) {
     // forget the checkpoints past position `above`
@@ -489,7 +493,9 @@ RqCtx *rq_ctx_new(const RqModel *mc, int nb_max, int max_ctx, int *err) {
     // (prefill_worker with split attention: per (layer, row block), (layer, split row block, kv head))
     if (ncnt < 2 * p->n_kv_heads + c->pf_nrb + c->nb_max * (1 + p->n_kv_heads))
         ncnt = 2 * p->n_kv_heads + c->pf_nrb + c->nb_max * (1 + p->n_kv_heads);
-    if (rq_sync_init(&c->sync, 10 * p->n_layers + 8, p->n_layers * ncnt + 64) != 0) goto fail;
+    if (m->hy.on && ncnt < 1 + 2 * m->hy.nv) ncnt = 1 + 2 * m->hy.nv; // (the linear layers of batch_decode_worker)
+    int dcnt = 2 * p->n_layers * p->n_kv_heads + dn_counters(m); // (decode_worker)
+    if (rq_sync_init(&c->sync, 10 * p->n_layers + 8, dcnt > p->n_layers * ncnt + 64 ? dcnt : p->n_layers * ncnt + 64) != 0) goto fail;
     if (err) *err = RQ_OK;
     return c;
 fail:
@@ -1324,99 +1330,234 @@ DN_EXACT static void dn_gates(float a, float b, float A, float dt, float *eg, fl
     *beta = dn_sigmoid(b);
 }
 
-DN_EXACT static void dn_conv(float *out, const float *x, float *st, const float *w, int n, int K, int cd) { RQ_FP_EXACT
+DN_EXACT static void dn_conv(float *out, const float *x, float *st, const float *w, int n, int K) { RQ_FP_EXACT
     // n channels: out = silu(sum_j w_j x_{t-K+1+j}) with x_t = x (this token's projections) and the last K - 1
-    // inputs in st (rows of stride cd, oldest first), which then shifts x in; w: the taps (rows of stride cd)
+    // inputs in st (K - 1 rows of n, oldest first), which then shifts x in; w: the K taps (rows of n). (The state and
+    // the taps of a channel group are contiguous: with the rows of the whole layer, 6144 floats apart, the 8 or so
+    // streams of an index i all fell on one set of the L1 cache)
     for (int i = 0; i < n; i++)
         out[i] = w[i] * st[i];
     for (int j = 1; j < K - 1; j++)
         for (int i = 0; i < n; i++)
-            out[i] = ATT_FMA(w[(size_t)j * cd + i], st[(size_t)j * cd + i], out[i]);
+            out[i] = ATT_FMA(w[(size_t)j * n + i], st[(size_t)j * n + i], out[i]);
     for (int i = 0; i < n; i++)
-        out[i] = ATT_FMA(w[(size_t)(K - 1) * cd + i], x[i], out[i]);
+        out[i] = ATT_FMA(w[(size_t)(K - 1) * n + i], x[i], out[i]);
     for (int j = 0; j < K - 2; j++)
-        memcpy(st + (size_t)j * cd, st + (size_t)(j + 1) * cd, n * sizeof(float));
-    memcpy(st + (size_t)(K - 2) * cd, x, n * sizeof(float));
+        memcpy(st + (size_t)j * n, st + (size_t)(j + 1) * n, n * sizeof(float));
+    memcpy(st + (size_t)(K - 2) * n, x, n * sizeof(float));
     for (int i = 0; i < n; i++)
         out[i] = out[i] * dn_sigmoid(out[i]);
 }
 
-static void dn_copy_head(const RqModel *m, int h, float *dst, const float *src) {
-    // head h's part of one linear layer's state (its conv channels, its S) from src to dst (the layer's base)
-    const Hybrid *hy = &m->hy;
-    size_t c0[3] = { (size_t)h * hy->dk, (size_t)hy->nk * hy->dk + (size_t)h * hy->dk, (size_t)2 * hy->nk * hy->dk + (size_t)h * hy->dv };
-    int cn[3] = { hy->dk, hy->dk, hy->dv };
-    for (int r = 0; r < hy->conv - 1; r++)
-        for (int t = 0; t < 3; t++)
-            memcpy(dst + (size_t)r * hy->conv_dim + c0[t], src + (size_t)r * hy->conv_dim + c0[t], cn[t] * sizeof(float));
-    size_t so = ssm_conv_floats(hy) + (size_t)h * hy->dk * hy->dv;
-    memcpy(dst + so, src + so, (size_t)hy->dk * hy->dv * sizeof(float));
+// The recurrence is split in three steps (docs/qwen35.md), the same functions in every path, so a sequence's
+// results do not depend on the path or the batch:
+//   dn_prep (per row and head, rows in order: the conv state): conv + SiLU, l2norm of q / k, the gates; the
+//     results go back into the row (q, k, v in place of the conv inputs, exp(g) and beta in place of alpha / beta)
+//   dn_rec (per row, head and block of DN_BW v columns, rows in order: S): the delta rule on a 128 x DN_BW block
+//     of S, which stays in L1; each v lane is independent of the others, so the blocks give the bits of the whole
+//   dn_out (per row and head, once all the blocks of the row are done): the gated RMSNorm over the head's dv outputs
+// The conv state and the conv taps are stored per channel group (a head's q, k or v channels: group g at
+// (conv - 1) * c0 resp. conv * c0, c0 = its first channel, as rows of its channels); S block-major: head h's dk x dv floats are dv / DN_BW blocks of (dk, DN_BW), each contiguous.
+#if defined(__GNUC__) && !defined(__clang__)
+    #define DN_UNROLL _Pragma("GCC unroll 32")
+#else
+    #define DN_UNROLL _Pragma("clang loop unroll(full)")
+#endif
+#define DN_BW 32 // v columns per block (gguf.c checks dv % 32 == 0)
+
+static inline int dn_nblk(const Hybrid *hy) { return hy->dv / DN_BW; }
+
+static inline void dn_chan(const Hybrid *hy, int h, int t, size_t *c0, int *cn) {
+    // the channel group t (0 q, 1 k, 2 v) of value head h: first channel, channels
+    *c0 = t == 0 ? (size_t)h * hy->dk : t == 1 ? (size_t)hy->nk * hy->dk + (size_t)h * hy->dk : (size_t)2 * hy->nk * hy->dk + (size_t)h * hy->dv;
+    *cn = t < 2 ? hy->dk : hy->dv;
+}
+
+static inline float *dn_sblock(const RqModel *m, float *st, int h, int jb) {
+    // block jb of head h's S in the layer's state st
+    return st + ssm_conv_floats(&m->hy) + (size_t)h * m->hy.dk * m->hy.dv + (size_t)jb * m->hy.dk * DN_BW;
 }
 
 #define DN_MAX 512 // head dims (Hybrid dk, dv), checked at load
 
-DN_EXACT static void dn_head(const RqModel *m, int li, int h, float *st, int first, float *ck, const float *row,
-                             float *o) { RQ_FP_EXACT
-    // one token of value head h of linear layer li: st = the sequence's state of the layer (updated), first: the
-    // token at position 0 (the state before it is zero: cleared here, so a sequence never needs a reset), row =
-    // the token's projections (lin_width: qkv | z | alpha | beta), o = the head's dv outputs; ck != NULL: the
-    // checkpoint's state of the layer, which gets the head's state after this token (dn_copy_head)
+static inline void dn_pf(const float *p, int n) {
+    // prefetch n floats from p (the next row's inputs of a head: 512 B pieces of rows 33 KB apart, last written by
+    // other cores' GEMM items: without it each line is a miss that waits for the last one)
+    for (int i = 0; i < n; i += 16)
+        __builtin_prefetch(p + i);
+}
+
+DN_EXACT static void dn_prep_part(const RqModel *m, int li, int h, int t, float *st, int first, float *ck, float *row,
+                                  const float *next) { RQ_FP_EXACT
+    // step 1 for one token, channel group t of value head h of linear layer li (0: q, 1: k, 2: v and the gates; the
+    // three are independent): st = the sequence's state of the layer, first: the token at position 0 (the conv state
+    // before it is zero: cleared here), row = the token's projections (lin_width: qkv | z | alpha | beta), updated in
+    // place; ck != NULL: the checkpoint's state of the layer, which gets the group's conv state after this token;
+    // next: the following row of the batch (prefetched), or NULL
     const Hybrid *hy = &m->hy;
     const TransformerWeights *w = &m->weights;
-    int K = hy->conv, cd = hy->conv_dim, dk = hy->dk, dv = hy->dv, nv = hy->nv;
-    size_t c0[3] = { (size_t)h * dk, (size_t)hy->nk * dk + (size_t)h * dk, (size_t)2 * hy->nk * dk + (size_t)h * dv };
-    int cn[3] = { dk, dk, dv };
-    float qv[DN_MAX], kv[DN_MAX], vv[DN_MAX], u[DN_MAX], *buf[3] = { qv, kv, vv };
-    float *S = st + ssm_conv_floats(hy) + (size_t)h * dk * dv;
-    const float *wc = w->ssm_conv + (size_t)li * K * cd;
-    if (first) {
-        for (int r = 0; r < K - 1; r++)
-            for (int t = 0; t < 3; t++)
-                memset(st + (size_t)r * cd + c0[t], 0, cn[t] * sizeof(float));
-        memset(S, 0, (size_t)dk * dv * sizeof(float));
+    int K = hy->conv, cd = hy->conv_dim, dk = hy->dk, nv = hy->nv, cn;
+    size_t c0;
+    dn_chan(hy, h, t, &c0, &cn);
+    float buf[DN_MAX];
+    float *sg = st + (size_t)(K - 1) * c0;
+    if (next) {
+        dn_pf(next + c0, cn);
+        if (t == 2) {
+            dn_pf(next + cd + hy->vdim + h, 1);
+            dn_pf(next + cd + hy->vdim + nv + h, 1);
+        }
     }
+    if (first)
+        memset(sg, 0, (size_t)(K - 1) * cn * sizeof(float));
+    dn_conv(buf, row + c0, sg, w->ssm_conv + (size_t)li * K * cd + (size_t)K * c0, cn, K);
+    if (t < 2) { // l2norm; q is also scaled by 1 / sqrt(dk)
+        float inv = 1.0f / sqrtf(dn_dot16(buf, buf, dk) + 1e-6f);
+        if (t == 0) {
+            float sc = 1.0f / sqrtf((float)dk);
+            for (int i = 0; i < dk; i++)
+                buf[i] = buf[i] * inv * sc;
+        } else {
+            for (int i = 0; i < dk; i++)
+                buf[i] = buf[i] * inv;
+        }
+    } else {
+        float *ab = row + cd + hy->vdim + h; // alpha, beta -> exp(g), beta
+        float eg, beta;
+        dn_gates(ab[0], ab[nv], w->ssm_a[(size_t)li * nv + h], w->ssm_dt[(size_t)li * nv + h], &eg, &beta);
+        ab[0] = eg;
+        ab[nv] = beta;
+    }
+    memcpy(row + c0, buf, cn * sizeof(float));
+    if (ck)
+        memcpy(ck + (size_t)(K - 1) * c0, sg, (size_t)(K - 1) * cn * sizeof(float));
+}
+
+DN_EXACT static void dn_prep(const RqModel *m, int li, int h, float *st, int first, float *ck, float *row) { RQ_FP_EXACT
+    // all three groups
     for (int t = 0; t < 3; t++)
-        dn_conv(buf[t], row + c0[t], st + c0[t], wc + c0[t], cn[t], K, cd);
-    float iq = 1.0f / sqrtf(dn_dot16(qv, qv, dk) + 1e-6f), ik = 1.0f / sqrtf(dn_dot16(kv, kv, dk) + 1e-6f);
-    float sc = 1.0f / sqrtf((float)dk);
-    for (int i = 0; i < dk; i++) {
-        qv[i] = qv[i] * iq * sc;
-        kv[i] = kv[i] * ik;
-    }
-    float eg, beta;
-    dn_gates(row[cd + hy->vdim + h], row[cd + hy->vdim + nv + h], w->ssm_a[(size_t)li * nv + h], w->ssm_dt[(size_t)li * nv + h],
-             &eg, &beta);
-    // decay, then u = S^T k (per v lane, k in order); delta = beta (v - u)
-    for (int j = 0; j < dv; j++)
+        dn_prep_part(m, li, h, t, st, first, ck, row, NULL);
+}
+
+// The two passes of dn_rec over a block of S (dk, DN_BW), per v lane, k in order. p1: u = (S * eg)^T k. p2: S = S * eg +
+// k delta^T and o = S^T q. p21: p2 of one row fused with p1 of the next row of the same sequence (the next row's p1
+// reads each S row right after this row's p2 wrote it: the same floats, S * eg' of the stored value), which gives
+// the FMA chains (u', o: dk dependent FMAs per lane each) twice the independent work. The decay S * eg is recomputed
+// in p2 instead of being stored by p1 (the same product of the same floats). The j loops are unrolled so that the
+// accumulators live in registers (a chain through memory would wait for a store forward at every step)
+DN_EXACT static DN_INLINE void dn_p1(const float *S, const float *kv, float eg, float *u, int dk) { RQ_FP_EXACT
+    DN_UNROLL
+    for (int j = 0; j < DN_BW; j++)
         u[j] = 0.0f;
     for (int k = 0; k < dk; k++) {
-        float *Sk = S + (size_t)k * dv, kk = kv[k];
-        for (int j = 0; j < dv; j++) {
-            float sv = Sk[j] * eg;
-            Sk[j] = sv;
-            u[j] = ATT_FMA(sv, kk, u[j]);
-        }
+        const float *restrict Sk = S + (size_t)k * DN_BW, kk = kv[k];
+        DN_UNROLL
+        for (int j = 0; j < DN_BW; j++)
+            u[j] = ATT_FMA(Sk[j] * eg, kk, u[j]);
     }
-    for (int j = 0; j < dv; j++)
-        u[j] = (vv[j] - u[j]) * beta;
-    // S += k delta^T, then o = S^T q
-    for (int j = 0; j < dv; j++)
-        o[j] = 0.0f;
+}
+
+DN_EXACT static DN_INLINE void dn_p2(float *S, const float *qv, const float *kv, float eg, const float *u, float *oa,
+                                     int dk) { RQ_FP_EXACT
+    DN_UNROLL
+    for (int j = 0; j < DN_BW; j++)
+        oa[j] = 0.0f;
     for (int k = 0; k < dk; k++) {
-        float *Sk = S + (size_t)k * dv, kk = kv[k], qq = qv[k];
-        for (int j = 0; j < dv; j++) {
-            float sv = ATT_FMA(kk, u[j], Sk[j]);
+        float *restrict Sk = S + (size_t)k * DN_BW, kk = kv[k], qq = qv[k];
+        DN_UNROLL
+        for (int j = 0; j < DN_BW; j++) {
+            float sv = ATT_FMA(kk, u[j], Sk[j] * eg);
             Sk[j] = sv;
-            o[j] = ATT_FMA(sv, qq, o[j]);
+            oa[j] = ATT_FMA(sv, qq, oa[j]);
         }
     }
-    // the gated RMSNorm (the form of rmsnorm: weight * (1 / rms * x)), times silu(z)
+}
+
+DN_EXACT static DN_INLINE void dn_p21(float *S, const float *qv, const float *kv, float eg, const float *u, float *oa,
+                                      const float *kn, float egn, float *un, int dk) { RQ_FP_EXACT
+    DN_UNROLL
+    for (int j = 0; j < DN_BW; j++) {
+        oa[j] = 0.0f;
+        un[j] = 0.0f;
+    }
+    for (int k = 0; k < dk; k++) {
+        float *restrict Sk = S + (size_t)k * DN_BW, kk = kv[k], qq = qv[k], kk2 = kn[k];
+        DN_UNROLL
+        for (int j = 0; j < DN_BW; j++) {
+            float sv = ATT_FMA(kk, u[j], Sk[j] * eg);
+            Sk[j] = sv;
+            oa[j] = ATT_FMA(sv, qq, oa[j]);
+            un[j] = ATT_FMA(sv * egn, kk2, un[j]);
+        }
+    }
+}
+
+DN_EXACT static void dn_rec_run(const RqModel *m, int h, int jb, float *st, int first, const float *row, size_t rs, float *o,
+                                size_t os, int n, float *ck, int ckrow) { RQ_FP_EXACT
+    // step 2 for n consecutive tokens of one sequence, value head h, v columns jb * DN_BW ..: row = the first
+    // token's projections as dn_prep left them (the next ones rs floats on), o = its head's dv outputs (os floats
+    // to the next; only this block's columns are written: the raw S^T q); first: the first token is at position 0
+    // (S cleared); ck != NULL: the checkpoint's state of the layer, whose block gets S after token ckrow
+    const Hybrid *hy = &m->hy;
+    int cd = hy->conv_dim, dk = hy->dk, dv = hy->dv, nv = hy->nv;
+    size_t oq = (size_t)h * dk, ok = (size_t)hy->nk * dk + (size_t)h * dk;
+    size_t ov = (size_t)2 * hy->nk * dk + (size_t)h * dv + (size_t)jb * DN_BW, oe = (size_t)cd + hy->vdim + h;
+    float *S = dn_sblock(m, st, h, jb);
+    float u[DN_BW], un[DN_BW], oa[DN_BW];
+    if (first)
+        memset(S, 0, (size_t)dk * DN_BW * sizeof(float));
+    dn_p1(S, row + ok, row[oe], u, dk);
+    for (int t = 0; t < n; t++) {
+        const float *r = row + (size_t)t * rs;
+        if (t + 2 < n) { // (the inputs of the row after next: pieces of rows 33 KB apart that other cores wrote)
+            const float *r2 = r + 2 * rs;
+            dn_pf(r2 + oq, dk);
+            dn_pf(r2 + ok, dk);
+            dn_pf(r2 + ov, DN_BW);
+            dn_pf(r2 + oe, 1);
+            dn_pf(r2 + oe + nv, 1);
+        }
+        float beta = r[oe + nv];
+        DN_UNROLL
+        for (int j = 0; j < DN_BW; j++)
+            u[j] = (r[ov + j] - u[j]) * beta;
+        if (t + 1 < n) {
+            dn_p21(S, r + oq, r + ok, r[oe], u, oa, r + rs + ok, r[rs + oe], un, dk);
+            DN_UNROLL
+            for (int j = 0; j < DN_BW; j++)
+                u[j] = un[j];
+        } else {
+            dn_p2(S, r + oq, r + ok, r[oe], u, oa, dk);
+        }
+        float *ob = o + (size_t)t * os + (size_t)jb * DN_BW;
+        DN_UNROLL
+        for (int j = 0; j < DN_BW; j++)
+            ob[j] = oa[j];
+        if (ck && t == ckrow)
+            memcpy(dn_sblock(m, ck, h, jb), S, (size_t)dk * DN_BW * sizeof(float));
+    }
+}
+
+static inline int dn_ckrow(const RqSeq *s, int pos0, int n) {
+    // the row of a run at positions pos0 .. pos0 + n - 1 after which the checkpoint is taken (rq_seq_checkpoint_at), or -1
+    return s->ck_slot >= 0 && s->ck_at > pos0 && s->ck_at <= pos0 + n ? s->ck_at - 1 - pos0 : -1;
+}
+
+DN_EXACT static void dn_rec(const RqModel *m, int h, int jb, float *st, int first, float *ck, const float *row,
+                            float *o) { RQ_FP_EXACT
+    // dn_rec_run for one token
+    dn_rec_run(m, h, jb, st, first, row, 0, o, 0, 1, ck, 0);
+}
+
+DN_EXACT static void dn_out(const RqModel *m, int li, int h, const float *row, float *o) { RQ_FP_EXACT
+    // step 3: the gated RMSNorm (the form of rmsnorm: weight * (1 / rms * x)), times silu(z), in place on the head's
+    // dv outputs o; row: the token's projections (z is untouched by the steps before)
+    const Hybrid *hy = &m->hy;
+    int dv = hy->dv;
     float ss = 1.0f / sqrtf(dn_dot16(o, o, dv) * (1.0f / dv) + 1e-6f);
-    const float *nw = w->ssm_norm + (size_t)li * dv, *z = row + cd + (size_t)h * dv;
+    const float *nw = m->weights.ssm_norm + (size_t)li * dv, *z = row + hy->conv_dim + (size_t)h * dv;
     for (int j = 0; j < dv; j++)
         o[j] = nw[j] * (ss * o[j]) * (z[j] * dn_sigmoid(z[j]));
-    if (ck)
-        dn_copy_head(m, h, ck, st);
 }
 
 DN_EXACT static void attn_gate(float *o, const float *gate, int n) { RQ_FP_EXACT
@@ -1510,7 +1651,7 @@ typedef struct { RqCtx *c; RqSeq *s; int pos; float *logits; } DecodeJob;
 // tile pre-fault every ATT_T positions; dependency counters: per (layer, kv head) its qkv items
 // done, and its attention blocks done
 static int decode_phases(const Config *p) { return 4 * p->n_layers + 2; }
-static int decode_counters(const Config *p) { return 2 * p->n_layers * p->n_kv_heads; }
+static int decode_counters(const RqModel *m) { return 2 * m->config.n_layers * m->config.n_kv_heads + dn_counters(m); }
 
 static void decode_norm(RqCtx *c, const Config *p, const TransformerWeights *w, int l, int resid) {
     // (x += xb,) rmsnorm with layer l's attention weights (l < n_layers) or the final ones (l ==
@@ -1562,26 +1703,39 @@ static void decode_worker(void *arg, int tid, int nt) {
     for (int l = 0; l < p->n_layers; l++) {
         int al = m->kv_layer[l], li = m->lin_layer[l];
         if (li >= 0) {
-            // Qwen3.5's linear attention, in one phase: item 0 the alpha / beta rows (all heads; dependency counter
-            // l * nkv), then per value head its q / k / v / z rows, the conv + recurrence + gated norm (dn_head,
-            // after item 0) and the quantization of its outputs for ssm_out (into aq; head slices are whole groups)
+            // Qwen3.5's linear attention, in one phase (dependency counters dc .. dc + 2 nv): item 0 the alpha / beta
+            // rows (counter dc); then per value head its q / k / v / z rows and dn_prep (after item 0; counter
+            // dc + 1 + h); then per (head, block of DN_BW v columns) dn_rec (after the head's prep); the last block of a
+            // head to finish runs dn_out and quantizes the head's outputs for ssm_out (into aq; head slices are whole
+            // groups)
             float *st = s->ssm + (size_t)li * m->ssm_layer;
-            PH_BEGIN_DYN(1 + hy->nv, 1)
+            int nblk = dn_nblk(hy), dc = dn_counter0(m, l);
+            PH_BEGIN_DYN(1 + hy->nv + hy->nv * nblk, 1)
             for (int it = lo; it < hi; it++) {
                 if (it == 0) {
                     matvec_rows(c->lin + hy->conv_dim + hy->vdim, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wa + li, dim, 0, hy->nv);
                     matvec_rows(c->lin + hy->conv_dim + hy->vdim + hy->nv, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wb + li, dim, 0,
                                 hy->nv);
-                    rq_count(S, l * nkv, 1);
+                    rq_count(S, dc, 1);
                     continue;
                 }
-                int h = it - 1, i0 = h * hy->dv;
-                int r0[3] = { h * hy->dk, hy->nk * hy->dk + h * hy->dk, 2 * hy->nk * hy->dk + h * hy->dv }, rn[3] = { hy->dk, hy->dk, hy->dv };
-                for (int t = 0; t < 3; t++)
-                    matvec_rows(c->lin, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wqkv + li, dim, r0[t], r0[t] + rn[t]);
-                matvec_rows(c->lin + hy->conv_dim, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wz + li, dim, i0, i0 + hy->dv);
-                rq_wait_count(S, l * nkv, 1);
-                dn_head(m, li, h, st, pos == 0, dn_ck(s, li, pos), c->lin, c->xb + i0);
+                if (it <= hy->nv) {
+                    int h = it - 1, i0 = h * hy->dv;
+                    int r0[3] = { h * hy->dk, hy->nk * hy->dk + h * hy->dk, 2 * hy->nk * hy->dk + h * hy->dv }, rn[3] = { hy->dk, hy->dk, hy->dv };
+                    for (int t = 0; t < 3; t++)
+                        matvec_rows(c->lin, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wqkv + li, dim, r0[t], r0[t] + rn[t]);
+                    matvec_rows(c->lin + hy->conv_dim, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wz + li, dim, i0, i0 + hy->dv);
+                    rq_wait_count(S, dc, 1);
+                    dn_prep(m, li, h, st, pos == 0, dn_ck(s, li, pos), c->lin);
+                    rq_count(S, dc + 1 + h, 1);
+                    continue;
+                }
+                int h = (it - 1 - hy->nv) / nblk, jb = (it - 1 - hy->nv) % nblk, i0 = h * hy->dv;
+                rq_wait_count(S, dc + 1 + h, 1);
+                dn_rec(m, h, jb, st, pos == 0, dn_ck(s, li, pos), c->lin, c->xb + i0);
+                if (rq_count(S, dc + 1 + hy->nv + h, 1) < nblk)
+                    continue;
+                dn_out(m, li, h, c->lin, c->xb + i0);
                 QuantizedTensor ag = qsub(&c->aq, i0);
                 quantize(&ag, c->xb + i0, hy->dv);
                 matvec_prep(c->aq_corr, c->aq_xf, c->aq_c16, &c->aq, i0, hy->dv);
@@ -1715,7 +1869,7 @@ static int decode_step(RqCtx *c, RqSeq *s, int token, float *logits) {
     rope_row(c->rope, c->m->rope_dim, pos, c->m->rope_log_theta);
     decode_norm(c, p, &c->m->weights, 0, 0); // layer 0's attention rmsnorm + quantize
 
-    if (rq_begin(&c->sync, decode_phases(p), decode_counters(p), rq_nthreads(), rq_spin_dec) != 0)
+    if (rq_begin(&c->sync, decode_phases(p), decode_counters(c->m), rq_nthreads(), rq_spin_dec) != 0)
         return ctx_fail(c, RQ_ERR_NOMEM, "malloc failed!");
     DecodeJob job = { c, s, pos, logits };
     ck_plan(s, pos, 1);
@@ -1762,7 +1916,7 @@ typedef struct {
     int nbmax;   // blocks of ATT_P positions of the longest split row (att_sp layout)
 } PrefillJob;
 
-static int prefill_phases(const Config *p) { return 9 * p->n_layers + 4; }
+static int prefill_phases(const Config *p) { return 10 * p->n_layers + 4; } // (a linear layer: 10 with its 3 recurrence phases)
 
 #ifdef RUNQ_PROFILE
 #define PPROF(i) do { if (tid == 0) PROF(c, i); } while (0)
@@ -1839,10 +1993,11 @@ static void prefill_worker(void *arg, int tid, int nt) {
         }
 
         if (li >= 0) {
-            // Qwen3.5's linear attention: the qkv / z / alpha / beta GEMMs (one phase, into lin_b rows), then per
-            // (segment, value head) the recurrence over the segment's rows in order (dn_head; the state stays in
-            // this thread's cache for the whole chunk) and the quantization of the head's outputs for ssm_out
-            const float *lb = c->lin_b;
+            // Qwen3.5's linear attention: the qkv / z / alpha / beta GEMMs (one phase, into lin_b rows), then dn_prep per
+            // (segment, value head) over the segment's rows in order (the conv state), dn_rec per (segment, head, block
+            // of DN_BW v columns) over the rows in order (the block of S, 16 KB, stays in this thread's L1 for the whole
+            // chunk), and per row dn_out + the quantization of the row's outputs for ssm_out
+            float *lb = c->lin_b;
             MatJob lj[4] = { { c->lin_b, lw, w->wqkv + li, hy->conv_dim }, { c->lin_b + hy->conv_dim, lw, w->wz + li, hy->vdim },
                              { c->lin_b + hy->conv_dim + hy->vdim, lw, w->wa + li, hy->nv },
                              { c->lin_b + hy->conv_dim + hy->vdim + hy->nv, lw, w->wb + li, hy->nv } };
@@ -1855,24 +2010,43 @@ static void prefill_worker(void *arg, int tid, int nt) {
                 PH_END_NOEPI
             }
             PPROF(PF_QKV);
-            PH_BEGIN_DYN(job->nseg * hy->nv, 1)
+            PH_BEGIN_DYN(job->nseg * hy->nv * 3, 1)
             for (int it = lo; it < hi; it++) {
-                const PfSeg *sg = &seg[it / hy->nv];
+                const PfSeg *sg = &seg[it / (hy->nv * 3)];
                 RqSeq *sq = sg->seq;
-                int h = it % hy->nv, i0 = h * hy->dv;
+                int h = it / 3 % hy->nv, t = it % 3;
                 float *st = sq->ssm + (size_t)li * m->ssm_layer;
                 for (int b = sg->b0; b < sg->b0 + sg->n; b++) {
                     int pos = c->row_pos[b];
-                    dn_head(m, li, h, st, pos == 0, dn_ck(sq, li, pos), lb + (size_t)b * lw, c->xb_b + (size_t)b * xs + i0);
-                    QuantizedTensor xr = qrow(&c->xq_b, b, xs), xg = qsub(&xr, i0);
-                    quantize(&xg, c->xb_b + (size_t)b * xs + i0, hy->dv);
-                    int k = hy->vdim;
-                    matvec_prep(c->bq_corr + (size_t)b * (k / GS), c->bq_xf ? c->bq_xf + (size_t)b * (k / GS) : NULL,
-                                c->bq_c16 ? c->bq_c16 + (size_t)b * (k / 16) : NULL, &xr, i0, hy->dv);
+                    dn_prep_part(m, li, h, t, st, pos == 0, dn_ck(sq, li, pos), lb + (size_t)b * lw,
+                                 b + 1 < sg->b0 + sg->n ? lb + (size_t)(b + 1) * lw : NULL);
                 }
             }
             PH_END_NOEPI
-            PPROF(PF_ATT);
+                        PPROF(PF_DNPREP);
+            int nblk = dn_nblk(hy);
+            PH_BEGIN_DYN(job->nseg * hy->nv * nblk, 1)
+            for (int it = lo; it < hi; it++) {
+                const PfSeg *sg = &seg[it / (hy->nv * nblk)];
+                RqSeq *sq = sg->seq;
+                int h = it / nblk % hy->nv, jb = it % nblk, i0 = h * hy->dv;
+                float *st = sq->ssm + (size_t)li * m->ssm_layer;
+                int ckr = dn_ckrow(sq, sg->pos0, sg->n);
+                dn_rec_run(m, h, jb, st, sg->pos0 == 0, lb + (size_t)sg->b0 * lw, lw, c->xb_b + (size_t)sg->b0 * xs + i0, xs, sg->n,
+                           ckr >= 0 ? dn_ck(sq, li, sg->pos0 + ckr) : NULL, ckr);
+            }
+            PH_END_NOEPI
+            PPROF(PF_DNREC);
+            PH_BEGIN(n, rch)
+            for (int b = lo; b < hi; b++) {
+                for (int h = 0; h < hy->nv; h++)
+                    dn_out(m, li, h, lb + (size_t)b * lw, c->xb_b + (size_t)b * xs + h * hy->dv);
+                QuantizedTensor xr = qrow(&c->xq_b, b, xs);
+                quantize(&xr, c->xb_b + (size_t)b * xs, hy->vdim);
+                act_prep_row(&xr, hy->vdim, c->bq_corr, c->bq_xf, c->bq_c16, b);
+            }
+            PH_END_NOEPI
+            PPROF(PF_DNOUT);
             MatJob so = { c->xb_b, xs, w->wso + li, dim };
             gemm_plan(c, &G, 1, &so, &c->xq_b, xs, n, hy->vdim, c->bq_corr, c->bq_xf, c->bq_c16, nt);
             {
@@ -2160,7 +2334,10 @@ typedef struct {
 static int bd_phases(const RqModel *m, int epi) { return ((epi ? 4 : 6) + m->hy.on) * m->config.n_layers + 4; } // (+ Qwen3.5's quantization)
 // per layer: per kv head its q / k / v items done, its QK-norm + RoPE + stores done; per row its kv heads'
 // attention done; per (row, kv head) its blocks done (split attention)
-static int bd_counters(int nkv, int n) { return 2 * nkv + n * (1 + nkv); }
+static int bd_counters(int nkv, int n, int nv) { // (nv: Qwen3.5's value heads: a linear layer needs 1 + 2 nv)
+    int a = 2 * nkv + n * (1 + nkv), b = nv ? 1 + 2 * nv : 0;
+    return a > b ? a : b;
+}
 #ifndef BD_QKV_ROWS
 #define BD_QKV_ROWS 64 // weight rows per q / k / v item (a multiple of 16 dividing head_dim; else whole heads)
 #endif
@@ -2206,7 +2383,7 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
     int qh = m->qh, qd = nh * qh, rd = m->rope_dim, lw = hy->on ? lin_width(hy) : 0;
     // q / k / v items per kv head, qr rows each (Qwen3.5: a query head's rows are [q | gate], 2 hd)
     int qr = hd % BD_QKV_ROWS ? hd : BD_QKV_ROWS, ng = (kv_mul * qh + 2 * hd) / qr;
-    int ncl = bd_counters(nkv, n); // dependency counters per layer (bd_counters)
+    int ncl = bd_counters(nkv, n, hy->nv); // dependency counters per layer (bd_counters)
     int nat = job->split ? c->row_it0[n] : n; // attention items per kv head
     size_t bs = (size_t)nkv * ATT_P * hd, pst = ATT_PSTRIDE(hd);
     float *att = c->att_b + (size_t)tid * m->att_rows * kv_mul * c->att_nb * ATT_P;
@@ -2241,8 +2418,11 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
 
         if (li >= 0) {
             // Qwen3.5's linear attention over all rows, as decode_worker's: item 0 alpha / beta (counter cb), then per
-            // value head its q / k / v / z rows, and per row the recurrence on that row's sequence + quantization
-            PH_BEGIN_DYN(1 + hy->nv, 1)
+            // value head its q / k / v / z rows and, per row, dn_prep (counter cb + 1 + h), then per (head, block) dn_rec
+            // over the rows (each on its sequence), the last block of a head to finish runs dn_out on every row
+            // (the rows are quantized by the next phase)
+            int nblk = dn_nblk(hy);
+            PH_BEGIN_DYN(1 + hy->nv + hy->nv * nblk, 1)
             for (int it = lo; it < hi; it++) {
                 float *lb = c->lin_b;
                 if (it == 0) {
@@ -2252,18 +2432,33 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
                     rq_count(S, cb, 1);
                     continue;
                 }
-                int h = it - 1, i0 = h * hy->dv;
-                int r0[3] = { h * hy->dk, hy->nk * hy->dk + h * hy->dk, 2 * hy->nk * hy->dk + h * hy->dv }, rn[3] = { hy->dk, hy->dk, hy->dv };
-                for (int t = 0; t < 3; t++)
-                    rows_mm(w->wqkv + li, lb, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, r0[t], r0[t] + rn[t]);
-                rows_mm(w->wz + li, lb + hy->conv_dim, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, i0, i0 + hy->dv);
-                rq_wait_count(S, cb, 1);
+                if (it <= hy->nv) {
+                    int h = it - 1, i0 = h * hy->dv;
+                    int r0[3] = { h * hy->dk, hy->nk * hy->dk + h * hy->dk, 2 * hy->nk * hy->dk + h * hy->dv }, rn[3] = { hy->dk, hy->dk, hy->dv };
+                    for (int t = 0; t < 3; t++)
+                        rows_mm(w->wqkv + li, lb, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, r0[t], r0[t] + rn[t]);
+                    rows_mm(w->wz + li, lb + hy->conv_dim, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, i0, i0 + hy->dv);
+                    rq_wait_count(S, cb, 1);
+                    for (int b = 0; b < n; b++) {
+                        RqSeq *sq = seg[b].seq;
+                        int pos = c->row_pos[b];
+                        dn_prep(m, li, h, sq->ssm + (size_t)li * m->ssm_layer, pos == 0, dn_ck(sq, li, pos), lb + (size_t)b * lw);
+                    }
+                    rq_count(S, cb + 1 + h, 1);
+                    continue;
+                }
+                int h = (it - 1 - hy->nv) / nblk, jb = (it - 1 - hy->nv) % nblk, i0 = h * hy->dv;
+                rq_wait_count(S, cb + 1 + h, 1);
                 for (int b = 0; b < n; b++) {
                     RqSeq *sq = seg[b].seq;
                     int pos = c->row_pos[b];
-                    dn_head(m, li, h, sq->ssm + (size_t)li * m->ssm_layer, pos == 0, dn_ck(sq, li, pos), lb + (size_t)b * lw,
-                            c->xb_b + (size_t)b * xs + i0);
+                    dn_rec(m, h, jb, sq->ssm + (size_t)li * m->ssm_layer, pos == 0, dn_ck(sq, li, pos), lb + (size_t)b * lw,
+                           c->xb_b + (size_t)b * xs + i0);
                 }
+                if (rq_count(S, cb + 1 + hy->nv + h, 1) < nblk)
+                    continue;
+                for (int b = 0; b < n; b++)
+                    dn_out(m, li, h, lb + (size_t)b * lw, c->xb_b + (size_t)b * xs + i0);
             }
             PH_END_NOEPI
             PPROF(PF_BDQKV);
@@ -2461,7 +2656,7 @@ static int batch_decode(RqCtx *c, int n, int nsel, float *out) {
             c->row_it0[b + 1] = c->row_it0[b] + (c->row_pos[b] + 1 + ATT_P - 1) / ATT_P;
     }
     PROF_START(c);
-    if (rq_begin(&c->sync, bd_phases(c->m, job.epi), p->n_layers * bd_counters(nkv, n), nt, rq_spin_dec) != 0)
+    if (rq_begin(&c->sync, bd_phases(c->m, job.epi), p->n_layers * bd_counters(nkv, n, c->m->hy.on ? c->m->hy.nv : 0), nt, rq_spin_dec) != 0)
         return ctx_fail(c, RQ_ERR_NOMEM, "malloc failed!");
     rq_parallel(batch_decode_worker, &job);
     return RQ_OK;

@@ -8,6 +8,10 @@ by its int8 activations only (as the 0.6B Q4_K_M file vs golden/logits_q4).
 Usage: .venv/bin/python tests/make_model_ref.py TAG FILE.gguf     (numpy + the HF tokenizer of models/Qwen3-0.6B)
 A qwen35 file (Qwen3.5) uses tests/ref_qwen35.py and the tokenizer of models/Qwen3.5-0.8B (248,320 ids; needs
 a transformers that knows its tokenizer: .venv-hf5, docs/qwen35.md).
+       .venv-hf5/bin/python tests/make_model_ref.py TAG --hf HF_DIR   (Qwen3.5: tests/ref_qwen35.py on the HF
+checkpoint's bf16 weights, layer by layer, in HF's value head order: the HF golden of a model whose fp32
+transformers forward does not fit in memory (Qwen3.5-4B: 17 GB; this needs ~4 GB). That reference matches
+transformers 5.21 fp32 to 2-6e-5 (0.8B) and on a tiny random-init model with num_v_heads = 2 num_k_heads.
 Writes en / code / chat (tests/make_golden.py's prompts: every position) and long2 (check.py's 297-token prompt:
 positions 248, 256, .., 296, past the first attention block): the golden format of make_golden.py with a
 1,024-id vocab subset (files of ~20-60 KB) and `positions` for long2. ~1-4 min per model (8 threads).
@@ -54,12 +58,18 @@ def save(path, text, ids, logits, subset_ids, positions=None):
 
 
 def main():
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 4):
         sys.exit(__doc__)
     tag, path = sys.argv[1], sys.argv[2]
     from transformers import AutoTokenizer
-    f = G.GgufFile(path)
-    q35 = f.kv.get("general.architecture") == "qwen35"
+    hf = path == "--hf"
+    if hf:
+        if len(sys.argv) != 4:
+            sys.exit(__doc__)
+        f, q35 = None, True
+    else:
+        f = G.GgufFile(path)
+        q35 = f.kv.get("general.architecture") == "qwen35"
     tok = AutoTokenizer.from_pretrained(os.path.join(ROOT, "models", "Qwen3.5-0.8B" if q35 else "Qwen3-0.6B"),
                                         local_files_only=True)
     texts = prompts()
@@ -67,7 +77,8 @@ def main():
     ids = [tok.encode(texts[n], add_special_tokens=False) for n in names]
     t0 = time.time()
     with np.errstate(over="ignore"):
-        outs = R35.forward(R35.GgufWeights(f), ids, verbose=True) if q35 else R.forward(f, ids, verbose=True)
+        W = R35.HfWeights(sys.argv[3]) if hf else R35.GgufWeights(f) if q35 else None
+        outs = R35.forward(W, ids, verbose=True) if q35 else R.forward(f, ids, verbose=True)
     vocab = outs[0].shape[1]
     subset_ids = np.sort(np.random.default_rng(0).choice(vocab, SUBSET, replace=False)).astype(np.int32)
     out = os.path.join(ROOT, "tests", "golden", "models", tag)
@@ -79,7 +90,7 @@ def main():
         else:
             save(p, texts[n], i, lg, subset_ids)
         print(f"wrote {p} ({len(i)} tokens, {os.path.getsize(p)} bytes)")
-    c = R35.GgufWeights(f).c if q35 else R.config(f)
+    c = W.c if q35 else R.config(f)
     print(f"{tag}: {time.time() - t0:.0f} s, theta {c['theta']:g}, tied {c['tied']}")
     return 0
 

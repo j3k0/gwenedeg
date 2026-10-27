@@ -1221,6 +1221,7 @@ def main():
     ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv,api,server,synth,q35",
                     help="comma-separated subset of tests to run (models: the bigger Qwen3 models, opt-in)")
     ap.add_argument("--update-models", action="store_true", help="write the models group's greedy goldens")
+    ap.add_argument("--model-tags", default="", help="models group: only these FAMILY tags (comma-separated; default all)")
     ap.add_argument("--update-greedy", action="store_true", help="regenerate the greedy goldens")
     ap.add_argument("--jobs", type=int, default=8, help="parallel runq processes for the tokenizer test")
     ap.add_argument("-v", "--verbose", action="store_true", help="per-position logits metrics")
@@ -1270,7 +1271,8 @@ def main():
                          ("server", lambda: test_server(a, res, server)),
                          ("synth", lambda: check_models.test_synth(a, res, synth, texts)),
                          ("q35", lambda: check_models.test_q35(a, res, tmp, texts, q35)),
-                         ("models", lambda: check_models.test_models(a, res, tmp, texts, a.update_models))]:
+                         ("models", lambda: check_models.test_models(a, res, tmp, texts, a.update_models,
+                                                                     set(a.model_tags.split(",")) if a.model_tags else None))]:
             if name in only:
                 t = time.time()
                 print(f"== {name}")

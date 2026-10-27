@@ -10,8 +10,9 @@ synth   (default suite) synthetic GGUF models cut out of Qwen3-0.6B-Q4_K_M.gguf 
 q35     (default suite, if models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf is there: --q35) Qwen3.5-0.8B, the hybrid
         architecture (docs/qwen35.md): the Qwen3.5 tokenizer golden (golden/tokenizer_qwen35.json), CLI chats whose
         history diverges (-r 1: the cache goes back to a checkpoint, the logits must equal a single-shot run's), and
-        the models group's checks on the file (Q35_TAG); no synthetic model: the 248k-token vocabulary keeps a
-        cut-out near the real file's size, and the real file is small
+        the models group's checks on the file (Q35_TAG); and two synthetic models cut out of it (tests/make_synth_q35.py,
+        cached in build/synth-q35: value heads = 2 / 3 x key heads, the shapes of Qwen3.5-4B / 9B / 27B's linear
+        layers, ~87 MB each with the 248k-token embedding): logits vs tests/ref_qwen35.py, bitwise invariants, api_test
 models  (opt-in: tests/run_tests.sh --models, make test-models) every downloaded family model
         (scripts/download_models.py family; missing files are skipped): logits vs HF fp32 (Qwen3-1.7B) and vs
         the dequantized-weights reference (tests/golden/models, tests/make_model_ref.py), bitwise invariants
@@ -280,13 +281,18 @@ FAMILY = [
     ("3.5-0.8b-q8", "Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf", "qwen3.5", [("3.5-0.8b-hf", "q8_hf"), ("3.5-0.8b-q8", "ref")]),
     # Unsloth's Q4_K_M: attn_qkv / ssm_out of the linear layers Q5_K (Q4_K, Q6_K, Q8_0 for the rest)
     ("3.5-0.8b-q4km", "Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf", "qwen3.5", [("3.5-0.8b-hf", "q35q4_hf"), ("3.5-0.8b-q4km", "ref")]),
+    # Qwen3.5-4B Q8_0: 32 value heads on 16 key heads (llama.cpp's tiled order: value head h uses key head h % 16). Its
+    # HF golden is tests/ref_qwen35.py on the HF bf16 weights (make_model_ref.py --hf: transformers' fp32 forward needs
+    # ~17 GB), which matches transformers on 0.8B and on tiny models with nv = 2 / 3 nk (docs/qwen35.md)
+    ("3.5-4b-q8", "Qwen3.5-4B-GGUF/Qwen3.5-4B-Q8_0.gguf", "qwen3.5", [("3.5-4b-hf", "q8_hf"), ("3.5-4b-q8", "ref")]),
 ]
 # dequantized rows vs gguf-py (tests/golden/dequant, tests/make_dequant_golden.py --q5), bitwise, per FAMILY tag:
 # from the file's blocks and from the repacked layouts (`runq -m dequant`)
 DEQUANT = {"3.5-0.8b-q4km": "q5_k.npz"}
-# more kernel checks for the files with a new kernel type (Q5_K): AVX-512 vs generic logits at -b 64 (the GEMM tiles of
-# every Q5_K matrix: 15 rows = 6 + 6 + 3), and the batched passes' api_test digests (--digest-small) of both builds
-EXTRA_KERNELS = {"3.5-0.8b-q4km": [("en", 64)], "0.6b-q5km": [("en", 64)]}
+# more kernel checks for the files with a new kernel type (Q5_K) or code path (4B: value heads != key heads): AVX-512 vs
+# generic logits at -b 64 (the GEMM tiles of every Q5_K matrix: 15 rows = 6 + 6 + 3; the batched DeltaNet items), and
+# the batched passes' api_test digests (--digest-small) of both builds
+EXTRA_KERNELS = {"3.5-0.8b-q4km": [("en", 64)], "0.6b-q5km": [("en", 64)], "3.5-4b-q8": [("en", 64)]}
 Q35_TAG = "3.5-0.8b-q8"
 Q35_Q4_TAG = "3.5-0.8b-q4km"    # in the q35 group too, if its file is next to the Q8_0 one (~20 s)
 # chats on Qwen3.5 (check.py's chat_case): -r 1, the history drops turn 1's reasoning (and its "<think>\n"): the cache
@@ -509,6 +515,119 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
 
 # ------------------------------------------------------------------------------------------ q35
 
+# the q35 group's synthetic models (tests/make_synth_q35.py, cut out of the 0.8B Q8_0 file): value heads = 2 / 3 x key
+# heads, as Qwen3.5-4B / 9B and 27B. Logits vs tests/ref_qwen35.py on the file (value head h uses key head h % nk; a
+# 4,096-row classifier subset), measured: cos mean 0.9996-0.9999, min 0.9971, top-1 0.87-1 (flat distributions);
+# with the wrong head mapping (h // r) the cos means drop to 0.60-0.89. Bitwise: batched vs sequential, chunkings,
+# threads, AVX-512 vs generic, api_test (batched decode rows == alone, checkpoints) and its digests across builds
+Q35_SYNTH = {"synth-q35-r2.gguf": True, "synth-q35-r3.gguf": False}  # file: full api_test (else its digests only)
+Q35_SYNTH_REF = ["en", "code", "long2"]
+TH_Q35_SYNTH = dict(cos_mean=0.999, cos_pos=0.99, top1=0.8)
+Q35_SYNTH_SAME = [(("en", 1), ("en", 7)), (("en", 1), ("en", 64)), (("all", 1), ("all", 64)), (("long2", 1), ("long2", 64)),
+                  (("long2", 64), ("long2", 512)), (("long2", 64), ("long2", 64, 3)),
+                  (("en", 1), ("en", 1, "gen")), (("en", 7), ("en", 7, "gen")), (("long2", 64), ("long2", 64, "gen"))]
+
+
+def q35_synth_build(a):
+    """build/synth-q35 (tests/make_synth_q35.py) from the 0.8B Q8_0 file: the directory"""
+    p = run([sys.executable, "-I", os.path.join(HERE, "make_synth_q35.py"), "--src", a.q35])
+    if p.returncode != 0:
+        raise RuntimeError(f"make_synth_q35.py failed: {p.stderr.decode(errors='replace')[-400:]}")
+    return p.stdout.decode().strip()
+
+
+Q35_BAD = [("bad-q35-nv.gguf", "is not a multiple of ssm.group_count"),
+           ("bad-q35-hadamard.gguf", "Hadamard-folded weights (prism.hadamard.* metadata) are not supported")]
+
+
+def q35_bad_run(a, d):
+    """the rejected files of make_synth_q35.py: [(ok, name, detail)]"""
+    out = []
+    for fn, msg in Q35_BAD:
+        p = run([a.runq, os.path.join(d, fn), "-n", "1", "-i", "hi"], 1)
+        err = p.stderr.decode(errors="replace").strip()
+        out.append((p.returncode == 1 and msg in err, f"q35/synth/reject_{fn[8:-5]}", f"exit status {p.returncode}: {err[-160:]!r}"))
+    return out
+
+
+def q35_synth_run(a, tmp, model, texts, full_api):
+    """the checks of one synthetic model, run in the background: [(ok, name, detail)]. The logits files (248k ids per
+    position: long2 is 0.3 GB) are reduced to a sha256 and the reference's classifier rows, then removed"""
+    import hashlib
+    import ref_qwen35 as R35
+    tag = os.path.basename(model)[:-5]
+    pre = f"q35/{tag}"
+    out = []
+    f = G.GgufFile(model)
+    sub = np.sort(np.random.default_rng(0).choice(f.tensors["token_embd.weight"][0][1], 4096, replace=False))
+    runs = {}
+
+    def lf(key):
+        # key (prompt, -b[, 3 threads | "gen": the generic build, 3 threads]): (sha256, ids, logits[:, sub])
+        if key not in runs:
+            name, chunk = key[:2]
+            gen = len(key) > 2 and key[2] == "gen"
+            th = 3 if len(key) > 2 else SYNTH_THREADS
+            path = os.path.join(tmp, f"{tag}_{name}_b{chunk}_{th}{'_gen' if gen else ''}.bin")
+            logits_run(a.generic if gen else a.runq, model, texts[name], path, chunk, th)
+            with open(path, "rb") as fh:
+                h = hashlib.sha256(fh.read()).hexdigest()
+            ids, lg = read_logits(path)
+            runs[key] = (h, ids, lg[:, sub].copy(), bool(np.isfinite(lg).all()))
+            del lg
+            os.remove(path)
+        return runs[key]
+    # logits vs the numpy reference
+    got = {n: lf((n, 64)) for n in Q35_SYNTH_REF}
+    with np.errstate(all="ignore"):
+        refs = R35.forward(R35.GgufWeights(f), [got[n][1].tolist() for n in Q35_SYNTH_REF], rows=sub)
+    t1 = []
+    for n, ref in zip(Q35_SYNTH_REF, refs):
+        _, ids, lg, finite = got[n]
+        if not finite:
+            out.append((False, f"{pre}/logits_ref/{n}", "non-finite logits"))
+            continue
+        c = cos_rows(lg, ref)
+        top1 = lg.argmax(1) == ref.argmax(1)
+        t1.extend(top1.tolist())
+        why = []
+        if not c.mean() >= TH_Q35_SYNTH["cos_mean"]: why.append(f"cos mean < {TH_Q35_SYNTH['cos_mean']}")
+        if not c.min() >= TH_Q35_SYNTH["cos_pos"]: why.append(f"cos min < {TH_Q35_SYNTH['cos_pos']} at pos {int(c.argmin())}")
+        out.append((not why, f"{pre}/logits_ref/{n}", f"n={len(ids)}: cos mean {c.mean():.5f} min {c.min():.5f}, top1 "
+                    f"{int(top1.sum())}/{len(top1)} vs the numpy reference" + ("  <- " + "; ".join(why) if why else "")))
+    if t1:
+        out.append((bool(np.mean(t1) >= TH_Q35_SYNTH["top1"]), f"{pre}/logits_ref/top1_pooled",
+                    f"{int(np.sum(t1))}/{len(t1)} (min {TH_Q35_SYNTH['top1']})"))
+    # bitwise invariants
+    for x, y in Q35_SYNTH_SAME:
+        if len(y) > 2 and y[2] == "gen" and not a.generic:
+            continue
+        kind = "kernels" if len(y) > 2 and y[2] == "gen" else "threads" if len(y) > 2 else "batched"
+        what = "AVX-512 vs generic" if kind == "kernels" else f"{SYNTH_THREADS} vs 3 threads" if kind == "threads" else \
+            f"-b {y[1]} vs -b {x[1]}"
+        ok = lf(x)[0] == lf(y)[0]
+        out.append((ok, f"{pre}/{kind}/{y[0]}_b{y[1]}", f"{what}: " + ("bit-identical" if ok else "DIFFER")))
+    # the library API: batched decode rows == alone, checkpoints (full run), the batched passes' digests vs generic
+    if a.api_test:
+        if full_api:
+            p = run([a.api_test, model], SYNTH_THREADS)
+            lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
+            bad = [l[5:].split("  ")[0] for l in lines if l.startswith("FAIL ")]
+            out.append((p.returncode == 0 and bool(lines) and not bad, f"{pre}/api", f"api_test (batched decode rows == alone, "
+                        f"checkpoints, ...): {len(lines) - len(bad)}/{len(lines)} passed" + (f"; failed: {', '.join(bad)}" if bad else "")))
+        gen_api = a.api_test + "-generic"
+        if os.path.exists(gen_api):
+            dg = []
+            for exe, th in ((a.api_test, SYNTH_THREADS), (gen_api, 3)):
+                q = run([exe, model, "--digest-small"], th)
+                dg.append(dict(l.split()[1:3] for l in q.stdout.decode(errors="replace").splitlines() if l.startswith("DIGEST ")))
+            diff = [k for k in dg[0] if dg[1].get(k) != dg[0][k]]
+            out.append((len(dg[0]) >= 1 and not diff and set(dg[0]) == set(dg[1]), f"{pre}/api_digest_generic",
+                        f"{len(dg[0])} batched passes (batched decode rows, ...): AVX-512 ({SYNTH_THREADS} threads) == generic (3)"
+                        + (f"; differ: {diff}" if diff else "")))
+    return out
+
+
 class Recorded:
     """a Results stand-in that keeps the reports, for a group run in the background (replayed at its turn)"""
     def __init__(self):
@@ -531,7 +650,15 @@ def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
     os.makedirs(os.path.join(t, "q4"), exist_ok=True)
     q4 = os.path.join(os.path.dirname(a.q35), "Qwen3.5-0.8B-Q4_K_M.gguf")
     q4 = q4 if os.path.exists(q4) else None
-    return {"a": a2, "tok_test": tok_test, "chats": [ex.submit(chat_case, a2, tmp, vocab, d, *c) for c in Q35_CHAT_CASES],
+    try:
+        sd, serr = q35_synth_build(a), None
+    except RuntimeError as e:
+        sd, serr = None, str(e)
+    os.makedirs(os.path.join(t, "synth"), exist_ok=True)
+    synth = [ex.submit(q35_synth_run, a, os.path.join(t, "synth"), os.path.join(sd, fn), texts, full)
+             for fn, full in Q35_SYNTH.items()] + [ex.submit(q35_bad_run, a, sd)] if sd else []
+    return {"a": a2, "tok_test": tok_test, "synth": synth, "synth_err": serr,
+            "chats": [ex.submit(chat_case, a2, tmp, vocab, d, *c) for c in Q35_CHAT_CASES],
             "rec": rec, "models": [mx.submit(test_models, a, rec, t, texts, False, {Q35_TAG}, "q35", a.q35)] + (
                 [mx.submit(test_models, a, rec4, os.path.join(t, "q4"), texts, False, {Q35_Q4_TAG}, "q35", q4)] if q4 else []),
             "rec4": rec4}
@@ -545,6 +672,11 @@ def test_q35(a, res, tmp, texts, S):
     for f in S["chats"]:
         for ok, n, detail in f.result():
             res.report(ok, n.replace("chat/", "q35/chat/"), detail)
+    if S["synth_err"]:
+        res.report(False, "q35/synth/build", S["synth_err"])
+    for f in S["synth"]:
+        for ok, n, detail in f.result():
+            res.report(ok, n, detail)
     for f in S["models"]:
         f.result()
     for ok, n, detail, xfail in S["rec"].reports + S["rec4"].reports:

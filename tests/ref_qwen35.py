@@ -6,10 +6,15 @@ pre-norm shape (x += mixer(rmsnorm(x)); x += ffn(rmsnorm(x)), SwiGLU), where the
 
   linear attention (Gated DeltaNet; layers with (l + 1) % full_attention_interval != 0, 18 of 24):
     qkv = conv(W_qkv h)       causal depthwise conv over the last 4 positions (kernel ssm_conv1d, no bias), SiLU;
-                              channels [q: 16 heads x 128 | k: 16 x 128 | v: 16 x 128]
+                              channels [q: nk heads x 128 | k: nk x 128 | v: nv x 128] (0.8B: nk = nv = 16; 4B: 16 / 32)
     q, k = l2norm(q), l2norm(k) per head (x * 1 / sqrt(sum x^2 + 1e-6)); q *= 1 / sqrt(128)
     beta = sigmoid(W_beta h), g = ssm_a * softplus(W_alpha h + ssm_dt)    per value head (ssm_a = -exp(A_log))
-    per head, the 128 x 128 state S (k index, v index), per token:
+    value head i uses the q / k of key head i // r in HF's order (r = nv / nk: grouped, repeat_interleave), of key
+    head i % nk in the GGUF's (llama.cpp's converter reorders the value heads to a tiled order: GGUF value head j =
+    HF value head (j % nk) * r + j // nk, in the v rows of W_qkv, W_z, W_alpha, W_beta, ssm_a, ssm_dt, the v channels
+    of the conv and the input columns of W_out; not in q / k nor ssm_norm). Each set of weights is used in its own
+    order here (HfWeights.vorder), so the two references check both mappings.
+    per value head, the 128 x 128 state S (k index, v index), per token:
         S *= exp(g); delta = beta * (v - S^T k); S += k delta^T; o = S^T q
     o = rmsnorm(o per head, ssm_norm) * silu(W_z h); out = W_out o
 
@@ -25,8 +30,13 @@ post_attention_norm, output_norm, attn_q_norm, attn_k_norm), so all norms here a
 The gated norm (ssm_norm) has no + 1 in either. The MTP head and the vision tower are not part of the text model.
 
 Weights: GgufWeights(GgufFile) (ggml's dequantization, tests/ggufmini.py) or HfWeights(model dir) (the
-safetensors, converted to the GGUF names and values as llama.cpp's convert_hf_to_gguf.py does; validates this
-file against transformers: tests/make_qwen35_golden.py --check-ref).
+safetensors, converted to the GGUF names and values as llama.cpp's convert_hf_to_gguf.py does, except the value
+head order (kept grouped); against transformers 5.21 fp32 this file is within 2-6e-5 on Qwen3.5-0.8B (golden/models/
+3.5-0.8b-hf vs make_model_ref.py --hf) and 1e-4 on tiny random models with 2 / 3 value heads per key head, also on
+their GGUF conversions by llama.cpp (docs/qwen35.md, design 8)).
+Memory: forward() reads one layer's weights at a time (dequantized / bf16 -> fp32 once per layer for all prompts),
+the embedding rows it needs and the classifier in chunks; HfWeights reads the safetensors with pread (numpy only,
+no torch): 1.3 GB peak for 4B (make_model_ref.py, incl. the logits).
 
 forward(w, prompts, rows=None) -> list of float32 (n_i, len(rows) or vocab) logits per prompt (all positions).
 The recurrence runs token by token (the form of a decode step), in fp32 as runq does; HF's prefill uses the
@@ -41,6 +51,8 @@ EPS = 1e-6
 
 
 class GgufWeights:
+    vorder = "tiled"  # GGUF value head j uses key head j % nk
+
     def __init__(self, f):
         self.f = f
         kv, a = f.kv, "qwen35"
@@ -71,10 +83,11 @@ class GgufWeights:
 
 
 class HfWeights:
-    """the HF checkpoint under the GGUF tensor names, with the converter's value transforms"""
+    """the HF checkpoint under the GGUF tensor names, with the converter's value transforms (not its value head
+    reorder: HF's grouped order, value head i uses key head i // r)"""
+    vorder = "grouped"
 
     def __init__(self, model_dir):
-        from safetensors import safe_open
         cfg = json.load(open(os.path.join(model_dir, "config.json")))
         tc = cfg.get("text_config", cfg)
         rp = tc.get("rope_parameters") or {}
@@ -87,18 +100,54 @@ class HfWeights:
             "nv": tc["linear_num_value_heads"], "dv": tc["linear_value_head_dim"], "vocab": tc["vocab_size"],
             "tied": tc.get("tie_word_embeddings", cfg.get("tie_word_embeddings", True)),
         }
-        assert self.c["nk"] == self.c["nv"], "num_k_heads != num_v_heads: the converter reorders heads (not mirrored here)"
-        self.files = {}
-        idx = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))["weight_map"]
+        assert self.c["nv"] % self.c["nk"] == 0, "num_v_heads is not a multiple of num_k_heads"
+        self.heads = {}  # file -> (data offset, header)
+        ix = os.path.join(model_dir, "model.safetensors.index.json")
+        if os.path.exists(ix):
+            idx = json.load(open(ix))["weight_map"]
+        else:  # one file (e.g. a small Qwen3_5ForCausalLM)
+            one = os.path.join(model_dir, "model.safetensors")
+            idx = {k: "model.safetensors" for k in self._header(one)[1] if k != "__metadata__"}
         self.where = {k: os.path.join(model_dir, v) for k, v in idx.items()}
-        self._open = safe_open
-        self._embd = None  # the embedding / tied classifier (fp32, 1 GB for 0.8B), read once
+        # the text model's tensors: model.language_model.* (Qwen3_5ForConditionalGeneration) or model.* (ForCausalLM)
+        self.P = "model.language_model." if "model.language_model.embed_tokens.weight" in self.where else "model."
+        self._BIG = {"token_embd.weight": self.P + "embed_tokens.weight", "output.weight": "lm_head.weight"}
 
-    def _get(self, key):
+    def _header(self, p):
+        if p not in self.heads:
+            with open(p, "rb") as fh:
+                hn = int.from_bytes(fh.read(8), "little")
+                self.heads[p] = (8 + hn, json.loads(fh.read(hn)))
+        return self.heads[p]
+
+    _DT = {"BF16": (np.uint16, 2), "F16": (np.float16, 2), "F32": (np.float32, 4)}
+
+    def _get(self, key, r0=0, n=None, idx=None):
+        """tensor key as float32 (bf16 widened exactly), read with pread (no mmap: its pages would count in the RSS
+        of a 9 GB checkpoint): all of it, rows r0 .. r0 + n - 1, or the rows idx of a 2-D tensor"""
         p = self.where[key]
-        if p not in self.files:
-            self.files[p] = self._open(p, "pt")
-        return self.files[p].get_tensor(key).float().numpy()
+        off, head = self._header(p)
+        e = head[key]
+        dt, sz = self._DT[e["dtype"]]
+        shape = e["shape"]
+        a, b = e["data_offsets"]
+        row = int(np.prod(shape[1:])) * sz if len(shape) > 1 else sz
+        with open(p, "rb") as fh:
+            if idx is not None:
+                x = np.empty((len(idx), row // sz), dt)
+                for j, i in enumerate(idx):
+                    x[j] = np.frombuffer(os.pread(fh.fileno(), row, off + a + int(i) * row), dt)
+                shape = [len(idx)] + list(shape[1:])
+            else:
+                n = shape[0] - r0 if n is None else n
+                if len(shape) > 1 or n != shape[0]:
+                    x = np.frombuffer(os.pread(fh.fileno(), n * row, off + a + r0 * row), dt)
+                    shape = [n] + list(shape[1:])
+                else:
+                    x = np.frombuffer(os.pread(fh.fileno(), b - a, off + a), dt)
+        if e["dtype"] == "BF16":
+            x = (x.astype(np.uint32) << 16).view(np.float32)
+        return x.astype(np.float32).reshape(shape)
 
     _MAP = {"attn_qkv": "linear_attn.in_proj_qkv", "attn_gate": "linear_attn.in_proj_z",
             "ssm_alpha": "linear_attn.in_proj_a", "ssm_beta": "linear_attn.in_proj_b", "ssm_out": "linear_attn.out_proj",
@@ -110,15 +159,11 @@ class HfWeights:
     _PLUS1 = {"attn_norm", "post_attention_norm", "attn_q_norm", "attn_k_norm"}
 
     def _hf(self, name):
-        P = "model.language_model."
-        if name == "token_embd.weight":
-            if self._embd is None:
-                self._embd = self._get(P + "embed_tokens.weight")
-            return self._embd
+        P = self.P
+        if name in self._BIG:
+            return self._get(self._BIG[name])
         if name == "output_norm.weight":
             return 1.0 + self._get(P + "norm.weight")
-        if name == "output.weight":
-            return self._get("lm_head.weight")
         _, l, r = name.split(".", 2)
         r = r.removesuffix(".weight").removesuffix(".bias")
         if r == "ssm_a":
@@ -139,10 +184,10 @@ class HfWeights:
         return self._hf(name).reshape(-1)
 
     def take(self, name, idx):
-        return self._hf(name)[np.asarray(idx)]
+        return self._get(self._BIG[name], idx=np.asarray(idx)) if name in self._BIG else self._hf(name)[np.asarray(idx)]
 
     def chunk(self, name, r0, n):
-        return self._hf(name)[r0:r0 + n]
+        return self._get(self._BIG[name], r0, n) if name in self._BIG else self._hf(name)[r0:r0 + n]
 
 
 def _rmsnorm(x, w):
@@ -203,7 +248,10 @@ def _linear_attn(w, c, l, h):
     q = _l2norm(q) * np.float32(1 / np.sqrt(dk))
     k = _l2norm(k)
     rep = nv // nk
-    q, k = np.repeat(q, rep, axis=1), np.repeat(k, rep, axis=1)     # value head i uses key head i // rep
+    if w.vorder == "grouped":  # HF: value head i uses key head i // rep
+        q, k = np.repeat(q, rep, axis=1), np.repeat(k, rep, axis=1)
+    else:                      # GGUF (tiled): value head i uses key head i % nk
+        q, k = np.tile(q, (1, rep, 1)), np.tile(k, (1, rep, 1))
     S = np.zeros((nv, dk, dv), np.float32)
     o = np.empty((n, nv, dv), np.float32)
     eg = np.exp(g).astype(np.float32)
@@ -237,22 +285,39 @@ def _full_attn(w, c, l, h, pos):
     return (o * _sigmoid(gate)) @ w.mat(p + "attn_output.weight").T
 
 
+class _LayerCache:
+    """one layer's weights, read (dequantized / converted to fp32) once for all the prompts"""
+
+    def __init__(self, w):
+        self.w, self.c, self.vorder, self.m = w, w.c, w.vorder, {}
+
+    def mat(self, name):
+        if name not in self.m:
+            self.m[name] = self.w.mat(name)
+        return self.m[name]
+
+    def vec(self, name):
+        return self.mat(name).reshape(-1)
+
+
 def forward(w, prompts, rows=None, chunk=16384, verbose=False):
     """w: GgufWeights / HfWeights; prompts: lists of token ids; rows: classifier rows to compute (None: all)"""
     c = w.c
     xs = [w.take("token_embd.weight", p).astype(np.float32) for p in prompts]
     for l in range(c["layers"]):
-        an, fn = w.vec(f"blk.{l}.attn_norm.weight"), w.vec(f"blk.{l}.post_attention_norm.weight")
-        ffn = {r: w.mat(f"blk.{l}.{r}.weight") for r in ("ffn_gate", "ffn_up", "ffn_down")}
+        lw = _LayerCache(w)
+        an, fn = lw.vec(f"blk.{l}.attn_norm.weight"), lw.vec(f"blk.{l}.post_attention_norm.weight")
+        ffn = {r: lw.mat(f"blk.{l}.{r}.weight") for r in ("ffn_gate", "ffn_up", "ffn_down")}
         for i, x in enumerate(xs):
             h = _rmsnorm(x, an)
             if is_linear(c, l):
-                x = x + _linear_attn(w, c, l, h)
+                x = x + _linear_attn(lw, c, l, h)
             else:
-                x = x + _full_attn(w, c, l, h, np.arange(x.shape[0]))
+                x = x + _full_attn(lw, c, l, h, np.arange(x.shape[0]))
             h = _rmsnorm(x, fn)
             x = x + (_silu(h @ ffn["ffn_gate"].T) * (h @ ffn["ffn_up"].T)) @ ffn["ffn_down"].T
             xs[i] = x.astype(np.float32)
+        del lw, ffn
         if verbose:
             print(f"  layer {l} ({'linear' if is_linear(c, l) else 'full'})", flush=True)
     hs = [_rmsnorm(x, w.vec("output_norm.weight")).astype(np.float32) for x in xs]

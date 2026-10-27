@@ -1,10 +1,12 @@
 # Qwen3.5: design notes
 
-Status (2026-10-27): **Qwen3.5-0.8B Q8_0 and Unsloth's Q4_K_M are supported** (GGUF `general.architecture == qwen35`): loader, the
+Status (2026-10-27): **Qwen3.5-0.8B Q8_0 and Unsloth's Q4_K_M, and Qwen3.5-4B Q8_0 are supported** (GGUF
+`general.architecture == qwen35`; 4B since Step 14: more value heads than key heads, design 8 below): loader, the
 `qwen35` pre-tokenizer, the chat template variant, the hybrid forward pass in every path (decode, batched prefill,
 batched decode rows) with the bitwise invariants, recurrent-state checkpoints for truncate / copy, the CLI chat and
 `runq serve`, and the tests (`tests/check_models.py` group `q35` in `make test`, the file in the `models` group).
-Open: the NEON check of the recurrence, the bigger Qwen3.5 / 3.6 models ([TODO.md](../TODO.md)).
+Open: the NEON check of the recurrence, the MoE models ([TODO.md](../TODO.md)); 2B (16 / 16 heads, as 0.8B), 9B and 27B
+(2x / 3x as many value heads as key heads, as 4B) should load but are untested.
 This file records what Qwen3.5 is, what was verified, and the design. Test model: **Qwen3.5-0.8B**: the same layer
 types as the larger Qwen3.5 / 3.6 models, with a dense FFN instead of MoE.
 
@@ -47,8 +49,30 @@ interleaved with the Q8_0 file):
   `attn_output`, half of `ffn_down` and 2 `attn_v`; Q6_K: the other `ffn_down`, 4 `attn_v` and `token_embd`; Q8_0:
   `ssm_alpha` / `ssm_beta`.
 
+Qwen3.5-4B Q8_0 (Unsloth, 4.48 GB; Step 14, 2026-10-27):
+
+- Logits vs the HF-weights reference (`tests/golden/models/3.5-4b-hf`: **`tests/ref_qwen35.py` on HF's bf16
+  safetensors, not transformers**, whose fp32 forward needs ~17 GB; that reference matches transformers to 2-6e-5 on
+  0.8B and on tiny models with nv = 2 / 3 nk, see design 8): cos means 0.99985 / 0.99991 / 0.99988 / 0.99934 (chat,
+  code, en, long2), min 0.99849, position 0 >= 0.9999, top-1 62/62, pooled 0.99982 (0.8B Q8_0 vs HF: 0.99976); vs the
+  Q8_0 file's own reference (`3.5-4b-q8`): pooled 0.99987, min 0.99887, top-1 62/62. The two references agree to cos
+  >= 0.999 per position, top-1 100%.
+- Greedy "capital of Australia": "Australia does not have a single capital city; instead, it has three capitals:
+  Canberra (the capital of the Commonwealth of" -- the model's own answer: the same 24 tokens from a greedy decode of
+  the HF-weights reference (the closest call, token 20, by a margin of 0.03).
+- Bit-identical: `-b 1 / 7 / 64 / 512`, 8 vs 3 threads, AVX-512 vs generic (`-b 1 / 7 / 64`, and the batched passes of
+  `api_test --digest-small`), `api_test` 25/25 (batched decode rows == alone, checkpoints); `runq serve`'s greedy reply ==
+  the CLI's. (`tests/run_tests.sh --models --model-tags 3.5-4b-q8`: 36 checks, ~100 s.)
+- Speed (`scripts/bench_models.py -t 8,12 -r 3`, load 13-15 incl. the run's own threads; prefill of 448 / 1,492 tokens,
+  decode short / after 1,500 tokens, tok/s): 8 threads 308 / 298, 30.6 / 26.4; 12 threads 443 / 421, 29.5 / 31.9.
+  Qwen3-4B Q8_0 alongside: 314 / 281, 30.7 / 31.7 and 440 / 397, 30.8 / 31.5: the same (they read ~4.3-4.5 GB per token;
+  the 4B's linear layers have 24 x 32 heads of state, 50 MB per sequence, its 8 attention layers 32 KB per token at
+  f16). Peak RSS 4,813 MB (1,500 + 128 tokens, `-c 4096`; Qwen3-4B 4,653), startup 0.7-0.8 s. Perplexity on
+  `bench/ppl_beagle_ch1.txt`: 10.592 (full text), 12.645 (512-token windows); Qwen3-4B Q8_0: 15.65.
+
 Tools: `models/Qwen3.5-0.8B` (HF safetensors, bf16, with the tokenizer files) and `models/Qwen3.5-0.8B-GGUF`
-(Unsloth `Q8_0`, 812 MB, and `Q4_K_M`, 533 MB): `scripts/download_models.py qwen35`. `tests/ref_qwen35.py`: a numpy
+(Unsloth `Q8_0`, 812 MB, and `Q4_K_M`, 533 MB): `scripts/download_models.py qwen35`; `models/Qwen3.5-4B` (9.3 GB) and
+`models/Qwen3.5-4B-GGUF` (`Q8_0`, 4.48 GB): `qwen35-4b`. `tests/ref_qwen35.py`: a numpy
 reference forward pass (the spec), on the GGUF's dequantized weights or on the HF checkpoint; on the HF weights it
 matches transformers 5.21 fp32 to 2-6e-5 max abs logit error (KL ~1e-11, top-1 100%), so the token-by-token
 recurrence below equals HF's chunked prefill up to rounding. `.venv-hf5` (git-ignored): transformers 5.21 / torch
@@ -105,8 +129,13 @@ Value transforms by llama.cpp's converter, checked bit-exactly (`maxabs 0`) on l
   `attn_k_norm`. HF's `Qwen3_5RMSNorm` computes `x * (1 + w)`, so runq's `x * w` on the stored weight is
   right as it is. `ssm_norm` has no `+ 1` in either.
 - `ssm_a = -exp(A_log)` (1e-7 rounding).
-- With 16 = 16 heads (0.8B), there is no head reordering. When `num_v_heads > num_k_heads` (larger models),
-  the converter reorders the v heads. Check this when going past 0.8B.
+- With 16 = 16 heads (0.8B, 2B), there is no head reordering. With `num_v_heads` = r x `num_k_heads` (4B, 9B: r = 2;
+  27B: r = 3), the converter reorders the value heads from HF's grouped order to a tiled one: GGUF value head j =
+  HF value head (j % nk) r + j / nk, i.e. **GGUF value head j uses key head j % nk** (HF: i // r). Reordered: the v
+  rows of `attn_qkv`, `attn_gate`, `ssm_alpha`, `ssm_beta`, `ssm_a`, `ssm_dt.bias`, the v channels of `ssm_conv1d`,
+  the input columns of `ssm_out`; not the q / k rows and channels, nor `ssm_norm`. Checked on the 4B Q8_0 file,
+  layers 0 / 1 / 4 / 28, whole tensors: max |GGUF - HF| under the tiled permutation 0 (F32 tensors) to 2e-3 (Q8_0
+  rounding), under the identity 0.17-48. Design 8.
 
 Tensor types: the Unsloth **Q8_0** file is Q8_0 + F32 only, so runq's kernels cover it. The Unsloth **Q4_K_M**
 uses Q4_K / Q6_K, plus **Q5_K** for `attn_qkv` and `ssm_out` of every linear layer (36 tensors), and Q8_0 for
@@ -205,6 +234,34 @@ Qwen3's arithmetic is unchanged). The layer maps `kv_layer` / `lin_layer` (from 
 attention weights, norms and the KV cache are indexed by attention layer, the linear ones by linear layer.
 `head_dim` 256 is fine for the attention kernels. The default context cap stays at 40,960.
 
+**8. More value heads than key heads (4B, Step 14).** 4B has 16 key heads and 32 value heads per linear layer (9B
+the same, 27B 16 / 48). In the GGUF, value head h uses the q / k of key head h % nk (above). So `dn_rec`'s q / k
+offsets are those of key head h % nk, and everything else stays indexed by h as before (z, alpha / beta, `ssm_a` /
+`ssm_dt`, the v channels, S, the outputs' slot in `ssm_out`). The q / k conv state, though, belongs to the key head:
+it must advance once per token, not once per value head (with two value heads each running the q / k conv, the
+second would shift the state again and read the first one's in-place results; and the two items race). So
+`dn_prep`'s channel groups are now q and k per key head and v (+ the gates) per value head:
+- decode and batched decode rows: the item of value head h computes its v / z rows and, if h < nk, the q / k rows of
+  key head h, then `dn_prep` on those groups; `dn_rec` of head h waits for the preps of h and of h % nk (two counters
+  of the existing ones). With nk == nv this is exactly the old schedule;
+- prefill: the items of a segment are the groups (`dn_prep_item`): q, k, v of heads 0 .. nk - 1 in turn (the old
+  order when nk == nv), then the v of the other value heads: 3 nk + nv - nk per segment;
+- checkpoints: each group copies its own conv state, so the q / k part once per key head; S per (value head, block).
+The arithmetic of each group did not change, so 0.8B's outputs are byte-identical to before (the logits at `-b 1 / 7 /
+64 / 512`, 3 / 8 threads, both builds, Q8_0 and Q4_K_M; Qwen3 via `tests/compare_bins.sh`: 360 jobs identical).
+Load checks: nv % nk == 0, and files with `prism.hadamard.*` keys (Hadamard-folded weights, llama.cpp #29600: their
+`ssm_out` keeps HF's grouped order) are rejected.
+
+How the mapping was verified, end to end: tiny random-init `qwen3_5` models (transformers 5.21: 8 layers, dim 128, 2
+key heads with 4 resp. 6 value heads, the matrices snapped to the Q8_0 grid so that the conversion is exact),
+converted by llama.cpp's `convert_hf_to_gguf.py` (master 7aca0d2, 2026-10-26; `--no-mtp --outtype q8_0`). Against
+transformers' fp32 logits (its torch fallback of the chunked delta rule): `ref_qwen35.py` on the HF weights (h // r)
+max |diff| 4-9e-5, on the GGUF (h % nk) 4e-5-1e-4, on the GGUF with h // r cos means 0.91-0.95; runq on the GGUF cos >=
+0.9991 at every position (means 0.99986-0.99993), top-1 100%. (Too big to commit: the 248k-token embedding; and the
+converter and transformers 5.x are not test dependencies.) In `make test`: two synthetic models cut out of the 0.8B
+file with 4 / 8 and 2 / 6 heads (`tests/make_synth_q35.py`), runq vs `ref_qwen35.py` on them and the bitwise
+invariants; scratch builds with HF's mapping in `dn_rec`, or with the q / k conv redone by every value head, fail it.
+
 ## Performance
 
 Estimated before: decode ~0.8x Qwen3-0.6B's rate (the Q8_0 file reads ~810 MB per token vs ~640 MB; the tied
@@ -245,6 +302,9 @@ per-head copy written by `dn_prep` could help).
 
 ```
 .venv-hf5/bin/python tests/make_golden.py --model-dir models/Qwen3.5-0.8B --out-dir tests/golden/models/3.5-0.8b-hf
+.venv-hf5/bin/python tests/make_model_ref.py 3.5-4b-hf --hf models/Qwen3.5-4B      # ref_qwen35.py on HF bf16, ~30 s
+.venv-hf5/bin/python tests/make_model_ref.py 3.5-4b-q8 models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q8_0.gguf
+tests/run_tests.sh --models --model-tags 3.5-4b-q8                     # the 4B's checks (~100 s)
 .venv-hf5/bin/python tests/make_model_ref.py 3.5-0.8b-q8 models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf
 .venv/bin/python tests/make_golden.py --tokenizer-qwen35          # golden/tokenizer_qwen35.json
 .venv/bin/python tests/make_chat_golden.py                        # golden/chat_render.json (incl. qwen3.5)
@@ -260,4 +320,6 @@ Re-creating `.venv-hf5`: `python3 -m venv .venv-hf5 && .venv-hf5/bin/pip install
 https://download.pytorch.org/whl/cpu && .venv-hf5/bin/pip install "transformers>=5.2" safetensors numpy jinja2`
 (5.21.0 used). Downloads: `https://huggingface.co/Qwen/Qwen3.5-0.8B` (config, tokenizer files, the
 safetensors) and `https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF` (`Qwen3.5-0.8B-Q8_0.gguf`,
-`Qwen3.5-0.8B-Q4_K_M.gguf`).
+`Qwen3.5-0.8B-Q4_K_M.gguf`), `Qwen/Qwen3.5-4B` @ 851bf6e and `unsloth/Qwen3.5-4B-GGUF` @ e87f176
+(`Qwen3.5-4B-Q8_0.gguf`). The tiny models of design 8 were made by a scratch script (transformers 5.21) and
+converted with llama.cpp's converter in a scratch venv; neither is kept.

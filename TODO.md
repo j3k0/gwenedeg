@@ -77,8 +77,10 @@ and generic kernels, a request batched or alone), and a change of numerics must 
 
 ## Qwen3.5 (hybrid: Gated DeltaNet + gated attention)
 
-Qwen3.5-0.8B (Q8_0 and Unsloth's Q4_K_M) runs and is tested (`make test`'s `q35` group); design, results and measurements in
-[docs/qwen35.md](docs/qwen35.md). The rules stay: `make test` green, Qwen3's outputs byte-identical
+Qwen3.5-0.8B (Q8_0 and Unsloth's Q4_K_M) and Qwen3.5-4B (Q8_0: more value heads than key heads) run and are tested
+(`make test`'s `q35` group, the 4B in the `models` group); design, results and measurements in
+[docs/qwen35.md](docs/qwen35.md). Untested but expected to load: 2B, 9B, 27B / Qwen3.6-27B (Q8_0 or Unsloth's Q4_K_M /
+Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M. The rules stay: `make test` green, Qwen3's outputs byte-identical
 (`tests/compare_bins.sh`), the bitwise invariants on the new paths.
 
 - [ ] **NEON check of the recurrence.** The blocked recurrence (`dn_prep` / `dn_rec` / `dn_out`, docs/qwen35.md) is
@@ -86,27 +88,17 @@ Qwen3.5-0.8B (Q8_0 and Unsloth's Q4_K_M) runs and is tested (`make test`'s `q35`
   so it should be bit-identical to the generic build on arm64 too, and as fast as the new layouts allow; untested
   (the q35 group's AVX-512 vs generic checks, `tests/check_models.py`, on the Mac; then `-DRUNQ_PROFILE` for the
   split). Speed left: `dn_prep` scales poorly past 8 threads and `dn_rec` is ~2x its hot-cache cost (docs/qwen35.md).
-- [ ] **The other sizes**: the text models of Qwen3.5 / 3.6 are dense or MoE; **images are out of scope for this
-  project** (ideas: [IDEAS.md](IDEAS.md#images-qwen35-vision)).
-  - Qwen3.5-0.8B and 2B have as many value heads as key heads and should load (2B: untested). 4B / 9B / 27B have
-    `num_v_heads` = 2 x `num_k_heads` (rejected at load). llama.cpp's converter reorders the value heads from
-    HF's grouped order to a tiled one in every GGUF (the v rows of `attn_qkv`, `attn_gate`, `ssm_alpha` / `ssm_beta`
-    / `ssm_a` / `ssm_dt`, the v channels of `ssm_conv1d`, the input columns of `ssm_out`; not the q / k rows nor
-    `ssm_norm`): GGUF value head h uses q / k head `h % nk` (HF: `h // r`). In `dn_rec` that is the q / k channel
-    offset `(h % nk) * dk`, but the q / k conv state then advances once per **key** head, not per value head (two
-    value heads would shift the same channels: wrong, and a race): `dn_prep`'s q / k conv + SiLU + l2norm per
-    (row, key head), the v part and the gates per (row, value head), and the checkpoint copy likewise. `tests/ref_qwen35.py` takes `h % nk` on GGUF weights and `h // r`
-    on HF weights. Reject files with `prism.hadamard.*` keys. Test model: unsloth `Qwen3.5-4B-Q8_0.gguf`
-    (4.48 GB, Q8_0 + F32, tied embedding, no MTP). Its HF fp32 reference (16.8 GB) does not fit next to other work:
-    run `ref_qwen35.py` on the HF weights layer by layer (~4 GB), and test the reorder end to end on a tiny
-    random-init `qwen3_5` model converted with llama.cpp's converter.
-  - MoE (`qwen35moe`, Qwen3.6-35B-A3B and a tiny test model): router `ffn_gate_inp` (F32), experts
+- [ ] **MoE** (`qwen35moe`: Qwen3.5 / 3.6-35B-A3B and up; images are out of scope for this project, ideas:
+  [IDEAS.md](IDEAS.md#images-qwen35-vision)).
+  - Qwen3.6-35B-A3B and a tiny test model: router `ffn_gate_inp` (F32), experts
     `ffn_{gate,up,down}_exps` (3-D tensors), a shared expert `ffn_*_shexp` with its sigmoid gate
     `ffn_gate_inp_shexp`; softmax, top-8, always renormalized (as `qwen3moe`, which has no shared expert). The 35B's
     Q4_K_M file is 22 GB: runq copies and repacks all weights into RAM today, so the experts (19.5 GB) would be read
     in place from the mmap'd file (`ffn_down_exps` is Q5_K, supported now). Estimate: ~2.6 GB read per token, 30-40 tok/s
     with everything cached, a few tok/s on the 30 GB dev box. Reference: a numpy forward that dequantizes only the
-    routed experts (HF's 67 GB bf16 is out of reach). Order: 4B Q8_0, a tiny MoE, then the 35B.
+    routed experts (HF's 67 GB bf16 is out of reach). Its linear layers have 16 key / 32 value heads, as 4B (done).
+    Order: a tiny MoE (random-init `qwen3_5_moe`, converted by llama.cpp's converter: docs/qwen35.md design 8 did the
+    same for the head mapping), then the 35B.
 - [ ] **Checkpoints, measured**: `RQ_SEQ_CK` = 2 per sequence (18.9 MB each) at the prompt's assistant header
   (docs/qwen35.md). Not measured on real traffic: how often `runq serve`'s requests roll back further (a
   re-prefill of the whole conversation), and whether a checkpoint at the end of each reply would pay off.

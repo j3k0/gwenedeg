@@ -121,12 +121,34 @@ SETS = {
     "3.5-0.8b-q4km": ("unsloth/Qwen3.5-0.8B-GGUF", "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0", "Qwen3.5-0.8B-GGUF", [
         ("Qwen3.5-0.8B-Q4_K_M.gguf", 532517120, "sha256", "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517"),
     ]),
+    # Qwen3.5-4B: 32 layers (24 linear / 8 attention), dim 2560, ffn 9216, 16 / 4 attention heads, 16 key heads but
+    # 32 value heads in the linear layers (nv = 2 nk: the GGUF's value heads are in llama.cpp's tiled order,
+    # docs/qwen35.md), tied. The HF checkpoint (bf16, 9.3 GB, with the vision tower and MTP) is the input of
+    # tests/ref_qwen35.py's HF golden (3.5-4b-hf: transformers' fp32 forward needs ~17 GB)
+    "3.5-4b-hf": ("Qwen/Qwen3.5-4B", "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a", "Qwen3.5-4B", [
+        ("LICENSE", 11544, "blob", "f938136e3adacfd92be087f6e113b5d6d97f678f"),
+        ("README.md", 77661, "blob", "7950a3aadf378cd13758097bc52f0ed849a59007"),
+        ("config.json", 3161, "blob", "557d961b205319c6a7da5f757f565b69b3967b7d"),
+        ("chat_template.jinja", 7756, "blob", "a585dec894e63da457d9440ec6aa7caa16d20860"),
+        ("merges.txt", 3353259, "blob", "a494e019ca1502219fd0128658b979e5f05ae8e8"),
+        ("tokenizer_config.json", 16710, "blob", "eda48d3e75a8e59a8479ee4ec8b37f76e711d9c1"),
+        ("vocab.json", 6722759, "blob", "0aa0ce0658d60ac4a5d609f4eadb0e8e43514176"),
+        ("tokenizer.json", 12807982, "sha256", "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"),
+        ("model.safetensors.index.json", 76196, "blob", "fddda6039f7c1d17260c9e923b8a72fd025d9a86"),
+        ("model.safetensors-00001-of-00002.safetensors", 5329398688, "sha256", "26a93f066e1916adb13453dae5a0c707c0fbc71299ed98779571a907b8e74c61"),
+        ("model.safetensors-00002-of-00002.safetensors", 3990429408, "sha256", "cb544bd9bfae93dc59b0f22b292f5933573854a7f9b97835c67060d7d910e188"),
+    ]),
+    # Unsloth's Q8_0 (Q8_0 + F32 only, no MTP block)
+    "3.5-4b-q8": ("unsloth/Qwen3.5-4B-GGUF", "e87f176479d0855a907a41277aca2f8ee7a09523", "Qwen3.5-4B-GGUF", [
+        ("Qwen3.5-4B-Q8_0.gguf", 4482403488, "sha256", "10cc391b403021dd11c614679d2fd92f611c3681d29e29651b717316965d61e1"),
+    ]),
 }
 DEFAULT_SETS = ["hf", "q4km", "q8gguf"]
 # names that stand for several sets
 GROUPS = {
     "family": ["q5km", "1.7b-q8", "1.7b-q4km", "1.7b-hf", "4b-q4km", "4b-q8", "4b-2507i-q4km", "8b-q4km"],
     "qwen35": ["3.5-0.8b-hf", "3.5-0.8b-q8", "3.5-0.8b-q4km"],
+    "qwen35-4b": ["3.5-4b-q8", "3.5-4b-hf"],
 }
 CHUNK = 1 << 20
 

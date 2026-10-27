@@ -399,7 +399,7 @@ RqCtx *rq_ctx_new(const RqModel *mc, int nb_max, int max_ctx, int *err) {
     int mix = all_heads_dim > m->hy.vdim ? all_heads_dim : m->hy.vdim; // (the input of wo, Qwen3.5's ssm_out)
     int lw = m->hy.on ? lin_width(&m->hy) : 0;
     c->m = m;
-    c->nt = rq_nthreads();
+    c->nt = rq_threads_fix(); // (every later job has at most this many threads: the per-thread scratch below)
     c->nb_max = nb_max < 0 ? 0 : nb_max > B_MAX ? B_MAX : nb_max;
     smb_config(c);
     if (max_ctx <= 0 || max_ctx > p->seq_len) max_ctx = p->seq_len;

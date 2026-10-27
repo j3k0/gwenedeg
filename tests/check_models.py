@@ -12,7 +12,8 @@ q35     (default suite, if models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf is th
         history diverges (-r 1: the cache goes back to a checkpoint, the logits must equal a single-shot run's), and
         the models group's checks on the file (Q35_TAG); and two synthetic models cut out of it (tests/make_synth_q35.py,
         cached in build/synth-q35: value heads = 2 / 3 x key heads, the shapes of Qwen3.5-4B / 9B / 27B's linear
-        layers, ~87 MB each with the 248k-token embedding): logits vs tests/ref_qwen35.py, bitwise invariants, api_test
+        layers, ~87 MB each with the 248k-token embedding): logits vs tests/ref_qwen35.py, bitwise invariants, api_test;
+        the 0.8B file and the r = 3 model in one process (api_test --two: interleaved == each alone)
 models  (opt-in: tests/run_tests.sh --models, make test-models) every downloaded family model
         (scripts/download_models.py family; missing files are skipped): logits vs HF fp32 (Qwen3-1.7B) and vs
         the dequantized-weights reference (tests/golden/models, tests/make_model_ref.py), bitwise invariants
@@ -550,6 +551,17 @@ def q35_bad_run(a, d):
     return out
 
 
+def q35_two_run(a, d):
+    """api_test --two on the 0.8B Q8_0 file and the synthetic r = 3 model (two models in one process: interleaved
+    prefills, decodes, batched passes and truncations to checkpoints == each alone; one freed): [(ok, name, detail)]"""
+    p = run([a.api_test, "--two", a.q35, os.path.join(d, "synth-q35-r3.gguf")], SYNTH_THREADS)
+    lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
+    out = [(l.startswith("PASS "), f"q35/two/{l[5:].partition('  ')[0].strip()}", l[5:].partition("  ")[2].strip()) for l in lines]
+    if p.returncode not in (0, 1) or not lines:
+        out.append((False, "q35/two/run", f"exit status {p.returncode}: {p.stderr.decode(errors='replace')[-300:]}"))
+    return out
+
+
 def q35_synth_run(a, tmp, model, texts, full_api):
     """the checks of one synthetic model, run in the background: [(ok, name, detail)]. The logits files (248k ids per
     position: long2 is 0.3 GB) are reduced to a sha256 and the reference's classifier rows, then removed"""
@@ -656,7 +668,8 @@ def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
         sd, serr = None, str(e)
     os.makedirs(os.path.join(t, "synth"), exist_ok=True)
     synth = [ex.submit(q35_synth_run, a, os.path.join(t, "synth"), os.path.join(sd, fn), texts, full)
-             for fn, full in Q35_SYNTH.items()] + [ex.submit(q35_bad_run, a, sd)] if sd else []
+             for fn, full in Q35_SYNTH.items()] + [ex.submit(q35_bad_run, a, sd)] + \
+        ([ex.submit(q35_two_run, a, sd)] if a.api_test else []) if sd else []
     return {"a": a2, "tok_test": tok_test, "synth": synth, "synth_err": serr,
             "chats": [ex.submit(chat_case, a2, tmp, vocab, d, *c) for c in Q35_CHAT_CASES],
             "rec": rec, "models": [mx.submit(test_models, a, rec, t, texts, False, {Q35_TAG}, "q35", a.q35)] + (

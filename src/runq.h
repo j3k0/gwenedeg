@@ -3,14 +3,18 @@
  * Three kinds of objects (README.md, Architecture):
  *   RqModel  the model: hyperparameters, weights (repacked for the kernels at load), tokenizer, chat
  *            templates. Loaded once, read-only afterwards: any number of sequences and compute
- *            contexts may use it (one model per process for now: the activation group size is a
- *            process-wide setting of the kernels).
+ *            contexts may use it. Several models can be loaded at once (a draft and a target model;
+ *            tests/api_test.c --two: each gives the bits it gives alone) if they have the same
+ *            activation group size, a process-wide setting of the kernels (GGUF 32, .bin 64:
+ *            rq_model_load refuses another one while a model is loaded).
  *   RqSeq    a sequence: its own KV cache (capacity and element type chosen per sequence), the
  *            number of positions in it, the tokens at those positions, and an RNG state for sampling.
  *   RqCtx    a compute context: the activation / scratch buffers of the forward passes (decode and
  *            batched prefill, for up to max_batch rows), the threads' synchronization state, the
- *            logits of the last call, profiling. One forward pass at a time per context; the threads
- *            are a process-wide pool (rq_threads_init).
+ *            logits of the last call, profiling. The threads are a process-wide pool (rq_threads_init)
+ *            that runs one job at a time: one forward pass (or rq_sample_batch, rq_seq_copy, a load)
+ *            at a time per process, so the passes of several contexts (models) alternate on one
+ *            calling thread, never concurrently. A context and its sequences belong to one model.
  * The forward passes take the sequence(s) explicitly: rq_decode (one token of one sequence),
  * rq_prefill (tokens of one sequence, in chunks), rq_forward_batch (one chunk of rows from several
  * sequences, each row at its own sequence's next position).
@@ -42,8 +46,8 @@ double rq_now(void); // monotonic clock, seconds
 // ---------------------------------------------------------------------------------------- threads
 // Threads per job of the process-wide pool: n > 0, else OMP_NUM_THREADS, else nproc - nproc/8
 // (Apple Silicon: the performance cores). Call before loading a model; later calls do not resize a
-// started pool. Also reads the tuning knobs RUNQ_SPIN / RUNQ_SYNC (src/threads.h); returns a warning
-// about them to show, or NULL
+// started pool, nor change the count once a compute context exists. Also reads the tuning knobs
+// RUNQ_SPIN / RUNQ_SYNC (src/threads.h); returns a warning about them to show, or NULL
 const char *rq_threads_init(int n);
 int rq_threads(void);
 

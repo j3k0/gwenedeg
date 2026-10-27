@@ -321,7 +321,8 @@ static inline void rq_wait_count(RqSync *s, int i, int target) {
 
 typedef void (*RqFn)(void *ctx, int tid, int nt);
 
-void rq_set_threads(int n);   // threads per job (before the first job: the pool's size)
+void rq_set_threads(int n);   // threads per job (before the first job: the pool's size); ignored after rq_threads_fix
+int rq_threads_fix(void);     // rq_nthreads(), fixed from now on (rq_ctx_new: the per-thread scratch)
 int rq_env_threads(void);     // OMP_NUM_THREADS (its first value), 0 if unset or invalid
 int rq_ncpu(void);            // online CPUs
 int rq_ncpu_perf(void);       // Apple Silicon: the performance cores, else 0

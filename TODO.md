@@ -17,8 +17,8 @@ token's logits bits). Facts, measurements and decisions: [docs/qwen38-speculativ
 Added rule for this section: speculative output == plain output (tokens + a hash of each emitted token's logits).
 Order: the preparation items (P3-P5) first, each a no-behaviour-change step checked by the regression net
 (`tests/compare_bins.sh REF_DIR NEW_DIR`: every model family, Qwen3.5 and the synthetic r = 2 / 3 models too), then
-the steps (S). **Disk and RAM:** ~42 GB free with the 27B Q4_K_M downloaded (`models/Qwen3.8-27B-GGUF`, sha256 checked),
-`models/` 46 GB; `/tmp` is a 16 GB tmpfs (RAM: no models or venvs there); check `df` / `MemAvailable` before every
+the steps (S). **Disk and RAM:** ~40 GB free with the 27B Q4_K_M downloaded (`models/Qwen3.8-27B-GGUF`, sha256 checked),
+`models/` 45 GB; `/tmp` is a 16 GB tmpfs (RAM: no models or venvs there); check `df` / `MemAvailable` before every
 download or 27B run, keep >= 15 GB of disk free (the 4B / 1.7B HF checkpoints were removed: they only regenerate
 committed goldens, re-download their pinned sets), and use
 `flock /tmp/cwayn-bench.lock` for timings (several agents share the box).

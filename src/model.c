@@ -130,9 +130,9 @@ static void gguf_matrices(RqModel *m, QuantizedTensor **dst, int L, const int *s
         snprintf(name, sizeof(name), fmt, l0);
         const GgufTensor *t = gguf_tensor(g, name);
         uint32_t type = t ? t->type : GGML_Q8_0; // (missing: gguf_weight reports it)
-        if (type != GGML_Q8_0 && type != GGML_Q4_K && type != GGML_Q6_K) {
+        if (type != GGML_Q8_0 && type != GGML_Q4_K && type != GGML_Q5_K && type != GGML_Q6_K) {
             char msg[160];
-            snprintf(msg, sizeof(msg), "tensor %%s has ggml type %u, need Q8_0 (8), Q4_K (12) or Q6_K (14)", type);
+            snprintf(msg, sizeof(msg), "tensor %%s has ggml type %u, need Q8_0 (8), Q4_K (12), Q5_K (13) or Q6_K (14)", type);
             gguf_fail(g, msg, name);
         }
         res[l].b = gguf_weight(g, name, type, k, d);
@@ -298,7 +298,7 @@ static void prepare_worker(void *arg, int tid, int nt) {
         int nb = nblk - rb0 < job[jj].bpi ? nblk - rb0 : job[jj].bpi;
         size_t r0 = (size_t)rb0 * 16, nr = (size_t)nb * 16;
         if (r0 + nr > (size_t)job[jj].d) nr = job[jj].d - r0;
-        if (t->kp) { // Q4_K / Q6_K: blocks of nr rows (k / 256 each) -> Q4P / Q6P
+        if (t->kp) { // Q4_K / Q5_K / Q6_K: blocks of nr rows (k / 256 each) -> Q4P / Q5P / Q6P
             size_t rowb = (size_t)(k / QK_K) * kq_block_bytes(t->type);
             read_at(fd, P->base, bb, nr * rowb, t->b + r0 * rowb);
             for (size_t i = 0; i < nr * (k / QK_K); i++)
@@ -335,7 +335,7 @@ static void prepare_weights(RqModel *m, int fd, LoadErr *e, char *warning, size_
     //   generic kernels on a GGUF file: its Q8_0 blocks (fp16 scale + 32 int8) into the q / s
     //     arrays the .bin format has (fp16 -> fp32 is exact)
     //   generic kernels on a .bin file: nothing to do, q / s are the mapping
-    //   GGUF Q4_K / Q6_K tensors (any build): repacked into the Q4P / Q6P layouts of kquants.h
+    //   GGUF Q4_K / Q5_K / Q6_K tensors (any build): repacked into the Q4P / Q5P / Q6P layouts of kquants.h
     // The source rows are read with pread (read_at), not through the mapping: only the norms and
     // the token embedding rows looked up later (the classifier is shared with them) are ever
     // mapped. The destination is pre-faulted in parallel (MADV_POPULATE_WRITE, 2 MB per call).
@@ -391,7 +391,7 @@ static void prepare_weights(RqModel *m, int fd, LoadErr *e, char *warning, size_
             job[j].bpi = bpi > 0 ? bpi : 1;
             job[j].off = off;
             job[j].it0 = nit;
-            if (t->type != GGML_Q8_0) // Q4_K / Q6_K (GGUF; d % 16 == 0, k % 256 == 0 checked)
+            if (t->type != GGML_Q8_0) // Q4_K / Q5_K / Q6_K (GGUF; d % 16 == 0, k % 256 == 0 checked)
                 sz = kq_size(t->type, mt[i].d, mt[i].k);
 #ifdef RUNQ_Q8X
             else if (pack)

@@ -1,5 +1,5 @@
 /* AVX-512 VNNI Q8_0 kernels for the forward passes (forward.c: GEMM for the batched prefill, GEMV for decode); further down
- * the same for the K-quants (Q4_K / Q6_K on the Q4P / Q6P layouts of kquants.h) and the attention.
+ * the same for the K-quants (Q4_K / Q5_K / Q6_K on the Q4P / Q5P / Q6P layouts of kquants.h) and the attention.
  *
  * Enabled when the compiler targets AVX-512 F/BW/VNNI (e.g. -march=native on Zen 4 / Ice Lake+)
  * and RUNQ_GENERIC is not defined; it then defines RUNQ_VNNI. Otherwise this header is empty and
@@ -267,12 +267,13 @@ static void q8p_gemv_rows(float *out, const int8_t *xq, const float *xs, const i
 }
 
 /* ---------------------------------------------------------------------------------------------
- * K-quants (GGUF Q4_K / Q6_K) on the repacked Q4P / Q6P layouts of kquants.h: GEMV (decode) and
- * GEMM (prefill). The arithmetic is the definition in kquants.h's header comment, as the generic
- * q4p_dot / q6p_dot compute it: exact int32 sums (vpdpbusd, q as u8 0..15 / 0..63 x xq as s8),
+ * K-quants (GGUF Q4_K / Q5_K / Q6_K) on the repacked Q4P / Q5P / Q6P layouts of kquants.h: GEMV
+ * (decode) and GEMM (prefill). The arithmetic is the definition in kquants.h's header comment, as the
+ * generic q4p_dot / q5p_dot / q6p_dot compute it: exact int32 sums (vpdpbusd, q as u8 0..15 / 0..31 /
+ * 0..63 x xq as s8),
  * then per (16-row block, activation row, group of 32) the float fold with explicit-rounding
  * intrinsics (no contraction, no reassociation), groups in order:
- *   Q4_K: val = val + ((ds * xs) * (float) isum - dm * xf),  ds = d * sc, dm = dmin * m (exact)
+ *   Q4_K / Q5_K: val = val + ((ds * xs) * (float) isum - dm * xf),  ds = d * sc, dm = dmin * m (exact)
  *   Q6_K: val = val + (d * xs) * (float) (sc_j0 * t_j0 + sc_j1 * t_j1),
  *         t_j = sum of q * xq over the 16 values of sub-block j - 32 * (sum of their 16 xq)
  * The 16 lanes of a zmm are the 16 rows of a block (d, dmin, sc, m per lane; xs, xf broadcast).
@@ -280,18 +281,19 @@ static void q8p_gemv_rows(float *out, const int8_t *xq, const float *xs, const i
  * at 16 i) (kq512_c16): Q6_K's accumulators start there, so the -32 costs nothing per weight.
  *
  * GEMV: one 16-row block at a time, streamed (decode is memory-bound: the 4 / 6-bit data is read
- * once, packed, and unpacked in registers: and 0x0f / shift right 4 for the nibbles, Q6_K's high
+ * once, packed, and unpacked in registers: and 0x0f / shift right 4 for the nibbles, Q5_K's high
+ * bit from the masks (maskz_mov_epi8, or), Q6_K's high
  * 2 bits shifted into bits 4-5 of each byte and or'ed in).
  * GEMM: work items (2-block = 32-row weight tile, chunk of activation rows), as q8p_gemm_item. Each
  * thread unpacks its weight tile once into a per-thread scratch ("KQS": per block and group of 32
  * columns 8 steps of 64 bytes of u8 q, lane r = row r, 4 consecutive columns per step, the Q8P
- * step layout; Q4_K: + ds, dm as fp32; Q6_K: + sc_j0, sc_j1 as int32, d as fp32) and reuses it
+ * step layout; Q4_K / Q5_K: + ds, dm as fp32; Q6_K: + sc_j0, sc_j1 as int32, d as fp32) and reuses it
  * for all its activation rows (consecutive items of the same tile: unpacked once); the register
  * tile then reads u8 weights as the Q8 GEMM does, with no unpacking in the inner loop.
  */
 #include "kquants.h"
 
-#define KQS_Q4 640 // scratch bytes per (block, group): 8 x 64 q, 64 ds, 64 dm
+#define KQS_Q4 640 // scratch bytes per (block, group): 8 x 64 q, 64 ds, 64 dm (Q5_K: the same, u8 0..31)
 #define KQS_Q6 704 // 8 x 64 q, 64 sc_j0 (int32), 64 sc_j1, 64 d
 // GEMM register tiles: KQ_RB blocks x KQ4_C / KQ6_C activation rows. Q4: 2 x C int32 + 2 x C
 // float accumulators; Q6: 3 x 2 x C (the two sub-block sums t_j and I are live together)
@@ -378,6 +380,42 @@ static void kq4_gemv_rows(float *out, const int8_t *xq, const float *xs, const f
     }
 }
 
+static void kq5_gemv_rows(float *out, const int8_t *xq, const float *xs, const float *xf, const uint8_t *wp, int k,
+                          int rb0, int rb1) {
+    // out[i] = W[i, :] . x for the rows of the 16-row Q5P blocks rb0..rb1-1 (decode, no OpenMP here)
+    int nsb = k / QK_K;
+    const __m512i m4 = _mm512_set1_epi8(0x0f), m16 = _mm512_set1_epi8(0x10);
+    for (int rb = rb0; rb < rb1; rb++) {
+        const uint8_t *wb = wp + (size_t)rb * nsb * Q5P_SB;
+        __m512 f = _mm512_setzero_ps();
+        for (int s = 0; s < nsb; s++) {
+            const uint8_t *o = wb + (size_t)s * Q5P_SB;
+            __m512 d = _mm512_cvtph_ps(_mm256_load_si256((const __m256i *)o));
+            __m512 dmin = _mm512_cvtph_ps(_mm256_load_si256((const __m256i *)(o + 32)));
+            #pragma GCC unroll 2
+            for (int j = 0; j < 8; j++) {
+                int g = 8 * s + j;
+                const uint8_t *qs = o + 320 + 320 * j, *mp = qs + 256;
+                const int8_t *x = xq + 32 * g;
+                __m512i a0 = _mm512_setzero_si512(), a1 = _mm512_setzero_si512();
+                #pragma GCC unroll 4
+                for (int c = 0; c < 4; c++) {
+                    __m512i v = _mm512_load_si512((const void *)(qs + 64 * c));
+                    __m512i h0 = _mm512_maskz_mov_epi8((__mmask64)kq_u64(mp + 8 * (2 * c)), m16);
+                    __m512i h1 = _mm512_maskz_mov_epi8((__mmask64)kq_u64(mp + 8 * (2 * c + 1)), m16);
+                    a0 = _mm512_dpbusd_epi32(a0, _mm512_or_si512(_mm512_and_si512(v, m4), h0), q8p_bcast4(x + 8 * c));
+                    a1 = _mm512_dpbusd_epi32(a1, _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(v, 4), m4), h1),
+                                             q8p_bcast4(x + 8 * c + 4));
+                }
+                __m512 ds = _mm512_mul_round_ps(d, kq512_u8ps(o + 64 + 16 * j), Q8P_RND);
+                __m512 dm = _mm512_mul_round_ps(dmin, kq512_u8ps(o + 192 + 16 * j), Q8P_RND);
+                f = kq4_fold(f, ds, dm, xs[g], xf[g], _mm512_add_epi32(a0, a1));
+            }
+        }
+        _mm512_storeu_ps(out + (size_t)rb * KQ_ROWS, f);
+    }
+}
+
 static void kq6_gemv_rows(float *out, const int8_t *xq, const float *xs, const int32_t *c16, const uint8_t *wp, int k,
                           int rb0, int rb1) {
     // the same for Q6P blocks (c16: kq512_c16 of xq)
@@ -416,15 +454,17 @@ static void kq512_gemv_rows(int type, float *out, const int8_t *xq, const float 
                             const uint8_t *wp, int k, int rb0, int rb1) {
     if (type == GGML_Q4_K)
         kq4_gemv_rows(out, xq, xs, xf, wp, k, rb0, rb1);
+    else if (type == GGML_Q5_K)
+        kq5_gemv_rows(out, xq, xs, xf, wp, k, rb0, rb1);
     else
         kq6_gemv_rows(out, xq, xs, c16, wp, k, rb0, rb1);
 }
 
 static void kq_unpack_tile(int type, uint8_t *scr, const uint8_t *wp, int nblk, int k) {
-    // nblk (<= KQ_RB) consecutive Q4P / Q6P blocks at wp -> the KQS scratch layout (block r at
+    // nblk (<= KQ_RB) consecutive Q4P / Q5P / Q6P blocks at wp -> the KQS scratch layout (block r at
     // scr + r * (k / 32) * KQS_Q4 / KQS_Q6)
     int nsb = k / QK_K, ng = k / 32;
-    const __m512i m4 = _mm512_set1_epi8(0x0f);
+    const __m512i m4 = _mm512_set1_epi8(0x0f), m16 = _mm512_set1_epi8(0x10);
     for (int r = 0; r < nblk; r++)
         for (int s = 0; s < nsb; s++) {
             if (type == GGML_Q4_K) {
@@ -437,6 +477,24 @@ static void kq_unpack_tile(int type, uint8_t *scr, const uint8_t *wp, int nblk, 
                         __m512i v = _mm512_load_si512((const void *)(o + 320 + 256 * j + 64 * c));
                         _mm512_store_si512((void *)(dst + 128 * c), _mm512_and_si512(v, m4));
                         _mm512_store_si512((void *)(dst + 128 * c + 64), _mm512_and_si512(_mm512_srli_epi16(v, 4), m4));
+                    }
+                    _mm512_store_ps((float *)(dst + 512), _mm512_mul_round_ps(d, kq512_u8ps(o + 64 + 16 * j), Q8P_RND));
+                    _mm512_store_ps((float *)(dst + 576), _mm512_mul_round_ps(dmin, kq512_u8ps(o + 192 + 16 * j), Q8P_RND));
+                }
+            } else if (type == GGML_Q5_K) {
+                const uint8_t *o = wp + ((size_t)r * nsb + s) * Q5P_SB;
+                __m512 d = _mm512_cvtph_ps(_mm256_load_si256((const __m256i *)o));
+                __m512 dmin = _mm512_cvtph_ps(_mm256_load_si256((const __m256i *)(o + 32)));
+                for (int j = 0; j < 8; j++) {
+                    uint8_t *dst = scr + ((size_t)r * ng + 8 * s + j) * KQS_Q4;
+                    const uint8_t *qs = o + 320 + 320 * j, *mp = qs + 256;
+                    for (int c = 0; c < 4; c++) { // the 5-bit values (u8 0..31): nibbles | mask bit << 4
+                        __m512i v = _mm512_load_si512((const void *)(qs + 64 * c));
+                        __m512i h0 = _mm512_maskz_mov_epi8((__mmask64)kq_u64(mp + 8 * (2 * c)), m16);
+                        __m512i h1 = _mm512_maskz_mov_epi8((__mmask64)kq_u64(mp + 8 * (2 * c + 1)), m16);
+                        _mm512_store_si512((void *)(dst + 128 * c), _mm512_or_si512(_mm512_and_si512(v, m4), h0));
+                        _mm512_store_si512((void *)(dst + 128 * c + 64),
+                                           _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(v, 4), m4), h1));
                     }
                     _mm512_store_ps((float *)(dst + 512), _mm512_mul_round_ps(d, kq512_u8ps(o + 64 + 16 * j), Q8P_RND));
                     _mm512_store_ps((float *)(dst + 576), _mm512_mul_round_ps(dmin, kq512_u8ps(o + 192 + 16 * j), Q8P_RND));
@@ -462,10 +520,11 @@ static void kq_unpack_tile(int type, uint8_t *scr, const uint8_t *wp, int nblk, 
 }
 
 static inline __attribute__((always_inline))
-void kq4_tile(const int RB, const int C, const uint8_t *ws, size_t bstride, int ng, const int8_t *x, size_t ldx,
+void kq45_tile(const int RB, const int C, const uint8_t *ws, size_t bstride, int ng, const int8_t *x, size_t ldx,
               const float *xs, size_t ldxs, const float *xf, size_t ldxf, float *out, size_t ldo) {
-    // out[c * ldo + 16 * r + lane] for r < RB blocks of the Q4 scratch tile ws (block stride bstride),
-    // c < C activation rows (x + c * ldx, scales xs + c * ldxs, group sums xf + c * ldxf)
+    // out[c * ldo + 16 * r + lane] for r < RB blocks of the Q4 / Q5 scratch tile ws (block stride
+    // bstride: the same KQS layout, Q5's q are 0..31), c < C activation rows (x + c * ldx, scales
+    // xs + c * ldxs, group sums xf + c * ldxf)
     __m512 f[KQ_RB][8];
     for (int r = 0; r < RB; r++)
         for (int c = 0; c < C; c++)
@@ -556,7 +615,7 @@ static void kq_tile_any(int type, int rb, int c, const uint8_t *ws, size_t bstri
     // dispatch to the instance with compile-time RB (1..2) and C (1..KQ4_C / KQ6_C)
     #define KQ_CASE(R, CC) \
         case (R) * 16 + (CC): \
-            if (type == GGML_Q4_K) { if ((CC) <= KQ4_C) kq4_tile(R, (CC) <= KQ4_C ? (CC) : 1, ws, bstride, ng, x, ldx, xs, ldxs, xf, ldxf, out, ldo); } \
+            if (type != GGML_Q6_K) { if ((CC) <= KQ4_C) kq45_tile(R, (CC) <= KQ4_C ? (CC) : 1, ws, bstride, ng, x, ldx, xs, ldxs, xf, ldxf, out, ldo); } \
             else if ((CC) <= KQ6_C) kq6_tile(R, (CC) <= KQ6_C ? (CC) : 1, ws, bstride, ng, x, ldx, xs, ldxs, c16, ldc, out, ldo); \
             break;
     switch (rb * 16 + c) {
@@ -580,13 +639,13 @@ static void kq512_gemm_item(float *out, int ldo, const uint8_t *kp, int type, in
     size_t ldxs = (size_t)ldx / 32;
     int nblk = d / KQ_ROWS, rb0 = t * KQ_RB;
     int rb = nblk - rb0 < KQ_RB ? nblk - rb0 : KQ_RB;
-    size_t bstride = (size_t)ng * (type == GGML_Q4_K ? KQS_Q4 : KQS_Q6);
+    size_t bstride = (size_t)ng * (type == GGML_Q6_K ? KQS_Q6 : KQS_Q4);
     const uint8_t *wt = kp + (size_t)rb0 * (k / QK_K) * sbb;
     if (*last != wt) {
         kq_unpack_tile(type, scr, wt, rb, k);
         *last = wt;
     }
-    int b1 = (ch + 1) * nbi < nb ? (ch + 1) * nbi : nb, C = type == GGML_Q4_K ? KQ4_C : KQ6_C;
+    int b1 = (ch + 1) * nbi < nb ? (ch + 1) * nbi : nb, C = type == GGML_Q6_K ? KQ6_C : KQ4_C;
     for (int b = ch * nbi; b < b1; b += C) {
         int c = b1 - b < C ? b1 - b : C;
         kq_tile_any(type, rb, c, scr, bstride, ng, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
@@ -686,6 +745,46 @@ void kq4_smb_block(const int C, const uint8_t *wb, int nsb, const int8_t *x, siz
 }
 
 static inline __attribute__((always_inline))
+void kq5_smb_block(const int C, const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs,
+                   const float *xf, size_t ldxf, float *out, size_t ldo) {
+    // one Q5P block (wb: its nsb super-blocks) x C activation rows, as kq4_smb_block with the masks
+    const __m512i m4 = _mm512_set1_epi8(0x0f), m16 = _mm512_set1_epi8(0x10);
+    __m512 f[8];
+    for (int c = 0; c < C; c++)
+        f[c] = _mm512_setzero_ps();
+    for (int s = 0; s < nsb; s++) {
+        const uint8_t *o = wb + (size_t)s * Q5P_SB;
+        __m512 d = _mm512_cvtph_ps(_mm256_load_si256((const __m256i *)o));
+        __m512 dmin = _mm512_cvtph_ps(_mm256_load_si256((const __m256i *)(o + 32)));
+        for (int j = 0; j < 8; j++) {
+            int g = 8 * s + j;
+            const uint8_t *qs = o + 320 + 320 * j, *mp = qs + 256;
+            __m512i w[8];
+            for (int cc = 0; cc < 4; cc++) {
+                __m512i v = _mm512_load_si512((const void *)(qs + 64 * cc));
+                w[2 * cc] = _mm512_or_si512(_mm512_and_si512(v, m4),
+                                            _mm512_maskz_mov_epi8((__mmask64)kq_u64(mp + 8 * (2 * cc)), m16));
+                w[2 * cc + 1] = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(v, 4), m4),
+                                                _mm512_maskz_mov_epi8((__mmask64)kq_u64(mp + 8 * (2 * cc + 1)), m16));
+            }
+            __m512 ds = _mm512_mul_round_ps(d, kq512_u8ps(o + 64 + 16 * j), Q8P_RND);
+            __m512 dm = _mm512_mul_round_ps(dmin, kq512_u8ps(o + 192 + 16 * j), Q8P_RND);
+            for (int c = 0; c < C; c++) {
+                const int8_t *xg = x + (size_t)c * ldx + 32 * g;
+                __m512i a0 = _mm512_setzero_si512(), a1 = _mm512_setzero_si512();
+                for (int cc = 0; cc < 4; cc++) {
+                    a0 = _mm512_dpbusd_epi32(a0, w[2 * cc], q8p_bcast4(xg + 8 * cc));
+                    a1 = _mm512_dpbusd_epi32(a1, w[2 * cc + 1], q8p_bcast4(xg + 8 * cc + 4));
+                }
+                f[c] = kq4_fold(f[c], ds, dm, xs[(size_t)c * ldxs + g], xf[(size_t)c * ldxf + g], _mm512_add_epi32(a0, a1));
+            }
+        }
+    }
+    for (int c = 0; c < C; c++)
+        _mm512_storeu_ps(out + (size_t)c * ldo, f[c]);
+}
+
+static inline __attribute__((always_inline))
 void kq6_smb_block(const int C, const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs,
                    const int32_t *c16, size_t ldc, float *out, size_t ldo) {
     // one Q6P block x C activation rows: per sub-block the 4 steps unpacked once
@@ -733,16 +832,20 @@ void kq6_smb_block(const int C, const uint8_t *wb, int nsb, const int8_t *x, siz
     size_t ldc, float *out, size_t ldo) { q8p_smb_block(C, 32, wb, ng, x, ldx, xs, ldxs, corr, ldc, out, ldo); }
 #define SMB_KQ4(C) (const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs, const float *xf, \
     size_t ldxf, float *out, size_t ldo) { kq4_smb_block(C, wb, nsb, x, ldx, xs, ldxs, xf, ldxf, out, ldo); }
+#define SMB_KQ5(C) (const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs, const float *xf, \
+    size_t ldxf, float *out, size_t ldo) { kq5_smb_block(C, wb, nsb, x, ldx, xs, ldxs, xf, ldxf, out, ldo); }
 #define SMB_KQ6(C) (const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs, const int32_t *c16, \
     size_t ldc, float *out, size_t ldo) { kq6_smb_block(C, wb, nsb, x, ldx, xs, ldxs, c16, ldc, out, ldo); }
 SMB_INST(q8p_smb64, SMB_Q8_64)
 SMB_INST(q8p_smb32, SMB_Q8_32)
 SMB_INST(kq4_smb, SMB_KQ4)
+SMB_INST(kq5_smb, SMB_KQ5)
 SMB_INST(kq6_smb, SMB_KQ6)
 #undef SMB_INST
 #undef SMB_Q8_64
 #undef SMB_Q8_32
 #undef SMB_KQ4
+#undef SMB_KQ5
 #undef SMB_KQ6
 
 typedef void (*SmbQ8Fn)(const uint8_t *, int, const int8_t *, size_t, const float *, size_t, const int32_t *, size_t, float *, size_t);
@@ -751,14 +854,15 @@ typedef void (*SmbKq6Fn)(const uint8_t *, int, const int8_t *, size_t, const flo
 static const SmbQ8Fn smb_q8_64[8] = { q8p_smb64_1, q8p_smb64_2, q8p_smb64_3, q8p_smb64_4, q8p_smb64_5, q8p_smb64_6, q8p_smb64_7, q8p_smb64_8 };
 static const SmbQ8Fn smb_q8_32[8] = { q8p_smb32_1, q8p_smb32_2, q8p_smb32_3, q8p_smb32_4, q8p_smb32_5, q8p_smb32_6, q8p_smb32_7, q8p_smb32_8 };
 static const SmbKq4Fn smb_kq4[8] = { kq4_smb_1, kq4_smb_2, kq4_smb_3, kq4_smb_4, kq4_smb_5, kq4_smb_6, kq4_smb_7, kq4_smb_8 };
+static const SmbKq4Fn smb_kq5[8] = { kq5_smb_1, kq5_smb_2, kq5_smb_3, kq5_smb_4, kq5_smb_5, kq5_smb_6, kq5_smb_7, kq5_smb_8 };
 static const SmbKq6Fn smb_kq6[8] = { kq6_smb_1, kq6_smb_2, kq6_smb_3, kq6_smb_4, kq6_smb_5, kq6_smb_6, kq6_smb_7, kq6_smb_8 };
 
 static void smb512_rows(int type, float *out, size_t ldo, const int8_t *xq, size_t ldx, const float *xs, const int32_t *corr,
                         const float *xf, const int32_t *c16, int nb, const uint8_t *wp, int k, int gs, int rb0, int rb1) {
-    // the small-batch kernel over blocks rb0..rb1-1 of W (Q4P / Q6P by type; any other type: Q8P with
-    // group size gs) and activation rows 0..nb-1, SMB_C rows per pass over a block
+    // the small-batch kernel over blocks rb0..rb1-1 of W (Q4P / Q5P / Q6P by type; any other type: Q8P
+    // with group size gs) and activation rows 0..nb-1, SMB_C rows per pass over a block
     size_t ldxs = (size_t)ldx / gs;
-    if (type != GGML_Q4_K && type != GGML_Q6_K) {
+    if (type != GGML_Q4_K && type != GGML_Q5_K && type != GGML_Q6_K) {
         int ng = k / gs;
         size_t bstride = (size_t)ng * Q8P_GROUP(gs);
         const SmbQ8Fn *fn = gs == 64 ? smb_q8_64 : smb_q8_32;
@@ -775,9 +879,10 @@ static void smb512_rows(int type, float *out, size_t ldo, const int8_t *xq, size
     for (int rb = rb0; rb < rb1; rb++)
         for (int b = 0; b < nb; b += SMB_C) {
             int c = nb - b < SMB_C ? nb - b : SMB_C;
-            if (type == GGML_Q4_K)
-                smb_kq4[c - 1](wp + (size_t)rb * bstride, nsb, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
-                               xf + (size_t)b * ng, ng, out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo);
+            if (type == GGML_Q4_K || type == GGML_Q5_K)
+                (type == GGML_Q4_K ? smb_kq4 : smb_kq5)[c - 1](wp + (size_t)rb * bstride, nsb, xq + (size_t)b * ldx, ldx,
+                                                              xs + (size_t)b * ldxs, ldxs, xf + (size_t)b * ng, ng,
+                                                              out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo);
             else
                 smb_kq6[c - 1](wp + (size_t)rb * bstride, nsb, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
                                c16 + (size_t)b * n16, n16, out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo);

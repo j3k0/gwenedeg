@@ -441,7 +441,7 @@ static void dump_logits(const RqModel *m, RqCtx *c, RqSeq *s, char *text, char *
 
 static void dump_dequant(const RqModel *m, const char *spec, const char *out_path) {
     // -m dequant -i NAME[:ROW0[:NROWS]] -o FILE (GGUF only) writes rows ROW0.. (default 0, 1 row) of the
-    // matrix NAME (llama.cpp tensor name) dequantized from the file's blocks and, for Q4_K / Q6_K, also
+    // matrix NAME (llama.cpp tensor name) dequantized from the file's blocks and, for the K-quants, also
     // from the repacked weights. FILE: int32 nrows, ncols, npacked (0 or 1), float32 [nrows][ncols]
     // from the blocks, then [nrows][ncols] from the repacked layout if npacked
     RqModelInfo info;

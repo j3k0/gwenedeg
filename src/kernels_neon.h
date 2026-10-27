@@ -1,22 +1,22 @@
 /* NEON (AArch64 + dot product: Apple M1 and later, Graviton 2+, ...) kernels for the GGUF K-quants
- * (Q4_K / Q6_K on the repacked Q4P / Q6P layouts of kquants.h): GEMV (decode) and GEMM (prefill).
- * Experimental (Step 8: Mac port). Further down: Q8_0 (GEMV, GEMM) and the attention (fp32 arithmetic
- * on the f32 / bf16 / f16 KV cache).
+ * (Q4_K / Q5_K / Q6_K on the repacked Q4P / Q5P / Q6P layouts of kquants.h): GEMV (decode) and GEMM
+ * (prefill). Experimental (Step 8: Mac port). Further down: Q8_0 (GEMV, GEMM) and the attention (fp32
+ * arithmetic on the f32 / bf16 / f16 KV cache).
  *
- * The arithmetic is the definition in kquants.h's header comment, as the generic q4p_dot / q6p_dot
- * (and the AVX-512 kernels) compute it: exact int32 sums, then per (row, activation row, group of 32)
+ * The arithmetic is the definition in kquants.h's header comment, as the generic q4p_dot / q5p_dot /
+ * q6p_dot (and the AVX-512 kernels) compute it: exact int32 sums, then per (row, activation row, group of 32)
  * the float fold, every operation rounded, groups in order, so the results are bit-identical to the
  * generic build (make test: the q4_kernels group). The float code runs under RQ_FP_EXACT (no contraction of
  * the vmulq / vaddq intrinsics into FMAs, no reassociation, whatever -ffast-math says).
  *
- * Mapping of the layouts to NEON: a Q4P / Q6P 64-byte chunk holds 4 consecutive columns of each of the
- * 16 rows of a block (lane r = bytes 4 r .. 4 r + 3), i.e. 4 q registers of 4 rows ("quads"); sdot by
+ * Mapping of the layouts to NEON: a Q4P / Q5P / Q6P 64-byte chunk holds 4 consecutive columns of each of
+ * the 16 rows of a block (lane r = bytes 4 r .. 4 r + 3), i.e. 4 q registers of 4 rows ("quads"); sdot by
  * element (vdotq_laneq_s32) multiplies such a register by 4 activation bytes broadcast from a register,
  * the vpdpbusd pattern. The weights are 0..15 / 0..63 after unpacking, valid as s8: no +128 offset
  * (sdot is s8 x s8). Rows stay in lanes, so the fold has no horizontal operation.
  *
  * GEMV: one 16-row block at a time, the packed data unpacked in registers (Q4: and / shift by 4;
- * Q6: the 2 high bits shift-inserted, vsli). GEMM: as the AVX-512 one, per work item (32-row tile,
+ * Q5: or'ed with the high bits of the masks, kqn5_hbits; Q6: the 2 high bits shift-inserted, vsli). GEMM: as the AVX-512 one, per work item (32-row tile,
  * chunk of activation rows) the thread unpacks the tile once into its scratch (the KQS layout of
  * kernels_avx512.h: per block and group 8 steps of 64 bytes of q, step st = columns 4 st .. 4 st + 3
  * of the group, then Q4: ds, dm as fp32; Q6: sc_j0, sc_j1 as int32, d as fp32), then register tiles
@@ -44,7 +44,7 @@
 #endif
 #include "kquants.h"
 
-#define KQS_Q4 640 // scratch bytes per (block, group): 8 x 64 q, 64 ds, 64 dm
+#define KQS_Q4 640 // scratch bytes per (block, group): 8 x 64 q, 64 ds, 64 dm (Q5_K: the same, s8 0..31)
 #define KQS_Q6 704 // 8 x 64 q, 64 sc_j0 (int32), 64 sc_j1, 64 d
 // GEMM register tiles: KQN*_RQ quads (4 rows each; 1, 2 or 4) x KQN*_C activation rows (1..KQN_CMAX)
 #ifndef KQN4_RQ
@@ -181,6 +181,70 @@ static void kqn4_gemv_rows(float *out, const int8_t *xq, const float *xs, const 
     }
 }
 
+static inline uint8x16_t kqn5_hbits(uint64_t mask, int qd) {
+    // the 4 high bits of the 4 rows of quad qd (bits 16 qd .. 16 qd + 15 of a Q5P mask) as 16 bytes of
+    // 0x10 / 0x00: byte j = bit j of the quad's mask, shifted into bit 4. (vshlq_u8 with a negative
+    // count is a logical right shift: byte j = (m >> j) & 1, then << 4)
+    uint16_t m = (uint16_t)(mask >> (16 * qd));
+    uint8x16_t v = vcombine_u8(vdup_n_u8((uint8_t)m), vdup_n_u8((uint8_t)(m >> 8)));
+    const int8x16_t sh = { 0, -1, -2, -3, -4, -5, -6, -7, 0, -1, -2, -3, -4, -5, -6, -7 };
+    return vshlq_n_u8(vandq_u8(vshlq_u8(v, sh), vdupq_n_u8(1)), 4);
+}
+
+static void kqn5_gemv_rows(float *out, const int8_t *xq, const float *xs, const float *xf, const uint8_t *wp, int k,
+                           int rb0, int rb1) { RQ_FP_EXACT
+    // out[i] = W[i, :] . x for the rows of the 16-row Q5P blocks rb0..rb1-1 (decode): kqn4_gemv_rows with
+    // the masks' high bits or'ed into the nibbles (steps 2 c and 2 c + 1 of a chunk c)
+    int nsb = k / QK_K;
+    const uint8x16_t m4 = vdupq_n_u8(0x0f);
+    for (int rb = rb0; rb < rb1; rb++) {
+        const uint8_t *wb = wp + (size_t)rb * nsb * Q5P_SB;
+        float32x4_t f[4];
+        for (int qd = 0; qd < 4; qd++)
+            f[qd] = vdupq_n_f32(0.0f);
+        for (int s = 0; s < nsb; s++) {
+            const uint8_t *o = wb + (size_t)s * Q5P_SB;
+            float32x4_t d[4], dmin[4];
+            kqn_h2f(o, d);
+            kqn_h2f(o + 32, dmin);
+            for (int j = 0; j < 8; j++) {
+                int g = 8 * s + j;
+                const uint8_t *qs = o + 320 + 320 * j;
+                uint64_t mask[8];
+                memcpy(mask, qs + 256, sizeof(mask));
+                int8x16_t x0 = vld1q_s8(xq + 32 * g), x1 = vld1q_s8(xq + 32 * g + 16);
+                int32x4_t a[4], b[4];
+                for (int qd = 0; qd < 4; qd++) {
+                    const uint8_t *p = qs + 16 * qd;
+                    uint8x16_t v0 = vld1q_u8(p), v1 = vld1q_u8(p + 64), v2 = vld1q_u8(p + 128), v3 = vld1q_u8(p + 192);
+                    int32x4_t A = vdupq_n_s32(0), B = vdupq_n_s32(0);
+                    A = vdotq_laneq_s32(A, vreinterpretq_s8_u8(vorrq_u8(vandq_u8(v0, m4), kqn5_hbits(mask[0], qd))), x0, 0);
+                    B = vdotq_laneq_s32(B, vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(v0, 4), kqn5_hbits(mask[1], qd))), x0, 1);
+                    A = vdotq_laneq_s32(A, vreinterpretq_s8_u8(vorrq_u8(vandq_u8(v1, m4), kqn5_hbits(mask[2], qd))), x0, 2);
+                    B = vdotq_laneq_s32(B, vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(v1, 4), kqn5_hbits(mask[3], qd))), x0, 3);
+                    A = vdotq_laneq_s32(A, vreinterpretq_s8_u8(vorrq_u8(vandq_u8(v2, m4), kqn5_hbits(mask[4], qd))), x1, 0);
+                    B = vdotq_laneq_s32(B, vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(v2, 4), kqn5_hbits(mask[5], qd))), x1, 1);
+                    A = vdotq_laneq_s32(A, vreinterpretq_s8_u8(vorrq_u8(vandq_u8(v3, m4), kqn5_hbits(mask[6], qd))), x1, 2);
+                    B = vdotq_laneq_s32(B, vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(v3, 4), kqn5_hbits(mask[7], qd))), x1, 3);
+                    a[qd] = A;
+                    b[qd] = B;
+                }
+                float32x4_t sc[4], mn[4];
+                kqn_u8f(o + 64 + 16 * j, sc);
+                kqn_u8f(o + 192 + 16 * j, mn);
+                for (int qd = 0; qd < 4; qd++) {
+                    float32x4_t ds = vmulq_f32(d[qd], sc[qd]), dm = vmulq_f32(dmin[qd], mn[qd]);
+                    float32x4_t A = vmulq_f32(vmulq_n_f32(ds, xs[g]), vcvtq_f32_s32(vaddq_s32(a[qd], b[qd])));
+                    float32x4_t B = vmulq_n_f32(dm, xf[g]);
+                    f[qd] = vaddq_f32(f[qd], vsubq_f32(A, B));
+                }
+            }
+        }
+        for (int qd = 0; qd < 4; qd++)
+            vst1q_f32(out + (size_t)rb * KQ_ROWS + 4 * qd, f[qd]);
+    }
+}
+
 static void kqn6_gemv_rows(float *out, const int8_t *xq, const float *xs, const int32_t *c16, const uint8_t *wp, int k,
                            int rb0, int rb1) { RQ_FP_EXACT
     // the same for Q6P blocks (c16: kqx_c16 of xq)
@@ -229,6 +293,8 @@ static void kqx_gemv_rows(int type, float *out, const int8_t *xq, const float *x
                           const uint8_t *wp, int k, int rb0, int rb1) {
     if (type == GGML_Q4_K)
         kqn4_gemv_rows(out, xq, xs, xf, wp, k, rb0, rb1);
+    else if (type == GGML_Q5_K)
+        kqn5_gemv_rows(out, xq, xs, xf, wp, k, rb0, rb1);
     else
         kqn6_gemv_rows(out, xq, xs, c16, wp, k, rb0, rb1);
 }
@@ -236,24 +302,33 @@ static void kqx_gemv_rows(int type, float *out, const int8_t *xq, const float *x
 // ------------------------------------------------------------------------------------------- GEMM
 
 static void kqn_unpack_tile(int type, uint8_t *scr, const uint8_t *wp, int nblk, int k) { RQ_FP_EXACT
-    // nblk (<= 2) consecutive Q4P / Q6P blocks at wp -> the KQS scratch layout (block r at
+    // nblk (<= 2) consecutive Q4P / Q5P / Q6P blocks at wp -> the KQS scratch layout (block r at
     // scr + r * (k / 32) * KQS_Q4 / KQS_Q6)
     int nsb = k / QK_K, ng = k / 32;
     const uint8x16_t m4 = vdupq_n_u8(0x0f);
     for (int r = 0; r < nblk; r++)
         for (int s = 0; s < nsb; s++) {
-            if (type == GGML_Q4_K) {
-                const uint8_t *o = wp + ((size_t)r * nsb + s) * Q4P_SB;
+            if (type == GGML_Q4_K || type == GGML_Q5_K) {
+                int q5 = type == GGML_Q5_K;
+                const uint8_t *o = wp + ((size_t)r * nsb + s) * (q5 ? Q5P_SB : Q4P_SB);
                 float32x4_t d[4], dmin[4];
                 kqn_h2f(o, d);
                 kqn_h2f(o + 32, dmin);
                 for (int j = 0; j < 8; j++) {
                     uint8_t *dst = scr + ((size_t)r * ng + 8 * s + j) * KQS_Q4;
+                    uint64_t mask[8];
+                    if (q5)
+                        memcpy(mask, o + 320 + 320 * j + 256, sizeof(mask));
                     for (int c = 0; c < 4; c++)
                         for (int qd = 0; qd < 4; qd++) {
-                            uint8x16_t v = vld1q_u8(o + 320 + 256 * j + 64 * c + 16 * qd);
-                            vst1q_u8(dst + 128 * c + 16 * qd, vandq_u8(v, m4));
-                            vst1q_u8(dst + 128 * c + 64 + 16 * qd, vshrq_n_u8(v, 4));
+                            uint8x16_t v = vld1q_u8(o + 320 + (q5 ? 320 : 256) * j + 64 * c + 16 * qd);
+                            uint8x16_t lo = vandq_u8(v, m4), hi = vshrq_n_u8(v, 4);
+                            if (q5) {
+                                lo = vorrq_u8(lo, kqn5_hbits(mask[2 * c], qd));
+                                hi = vorrq_u8(hi, kqn5_hbits(mask[2 * c + 1], qd));
+                            }
+                            vst1q_u8(dst + 128 * c + 16 * qd, lo);
+                            vst1q_u8(dst + 128 * c + 64 + 16 * qd, hi);
                         }
                     float32x4_t sc[4], mn[4];
                     kqn_u8f(o + 64 + 16 * j, sc);
@@ -301,8 +376,9 @@ static void kqn_unpack_tile(int type, uint8_t *scr, const uint8_t *wp, int nblk,
 static inline __attribute__((always_inline))
 void kqn4_tile(const int RQ, const int C, const uint8_t *ws, int ng, const int8_t *x, size_t ldx, const float *xs,
                size_t ldxs, const float *xf, size_t ldxf, float *out, size_t ldo) { RQ_FP_EXACT
-    // out[c * ldo + 4 q + lane] for RQ quads of a Q4 scratch block (ws: the block's group 0, plus
-    // 16 * first quad), c < C activation rows (x + c * ldx, scales xs + c * ldxs, sums xf + c * ldxf)
+    // out[c * ldo + 4 q + lane] for RQ quads of a Q4 / Q5 scratch block (ws: the block's group 0, plus
+    // 16 * first quad; Q5's q are 0..31 in the same layout), c < C activation rows (x + c * ldx, scales
+    // xs + c * ldxs, sums xf + c * ldxf)
     float32x4_t f[4][KQN_CMAX];
     for (int q = 0; q < RQ; q++)
         for (int c = 0; c < C; c++)
@@ -377,7 +453,7 @@ static void kqn_tile_any(int type, int c, const uint8_t *ws, int ng, const int8_
     // dispatch to the instance with compile-time C (1..KQN4_C / KQN6_C); RQ = KQN4_RQ / KQN6_RQ quads
     #define KQN_CASE(CC) \
         case CC: \
-            if (type == GGML_Q4_K) { if ((CC) <= KQN4_C) kqn4_tile(KQN4_RQ, (CC) <= KQN4_C ? (CC) : 1, ws, ng, x, ldx, xs, ldxs, xf, ldxf, out, ldo); } \
+            if (type != GGML_Q6_K) { if ((CC) <= KQN4_C) kqn4_tile(KQN4_RQ, (CC) <= KQN4_C ? (CC) : 1, ws, ng, x, ldx, xs, ldxs, xf, ldxf, out, ldo); } \
             else if ((CC) <= KQN6_C) kqn6_tile(KQN6_RQ, (CC) <= KQN6_C ? (CC) : 1, ws, ng, x, ldx, xs, ldxs, c16, ldc, out, ldo); \
             break;
     switch (c) {
@@ -397,14 +473,14 @@ static void kqx_gemm_item(float *out, int ldo, const uint8_t *kp, int type, int 
     size_t ldxs = (size_t)ldx / 32;
     int nblk = d / KQ_ROWS, rb0 = t * 2;
     int rb = nblk - rb0 < 2 ? nblk - rb0 : 2;
-    size_t bstride = (size_t)ng * (type == GGML_Q4_K ? KQS_Q4 : KQS_Q6);
+    size_t bstride = (size_t)ng * (type == GGML_Q6_K ? KQS_Q6 : KQS_Q4);
     const uint8_t *wt = kp + (size_t)rb0 * (k / QK_K) * sbb;
     if (*last != wt) {
         kqn_unpack_tile(type, scr, wt, rb, k);
         *last = wt;
     }
     int b1 = (ch + 1) * nbi < nb ? (ch + 1) * nbi : nb;
-    int C = type == GGML_Q4_K ? KQN4_C : KQN6_C, RQ = type == GGML_Q4_K ? KQN4_RQ : KQN6_RQ;
+    int C = type == GGML_Q6_K ? KQN6_C : KQN4_C, RQ = type == GGML_Q6_K ? KQN6_RQ : KQN4_RQ;
     for (int b = ch * nbi; b < b1; b += C) {
         int c = b1 - b < C ? b1 - b : C;
         for (int Q = 0; Q < 4 * rb; Q += RQ) // quads of the tile (RQ divides 4: within one block)

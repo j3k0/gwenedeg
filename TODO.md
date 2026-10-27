@@ -11,6 +11,7 @@ and generic kernels, a request batched or alone), and a change of numerics must 
 
 ## Qwen3.8-27B with speculative decoding (the current target)
 
+(The use it serves: the next section, agentic development at 96k context.)
 Decode Qwen3.8-27B (`qwen35`, 64 layers, r = 3, untied, an MTP block) at ~13-18 tok/s on the dev box with
 Qwen3.5-0.8B as the draft, the output **exactly** plain decoding's (tokens, greedy and seeded, and each emitted
 token's logits bits). Facts, measurements and decisions: [docs/qwen38-speculative.md](docs/qwen38-speculative.md).
@@ -65,6 +66,97 @@ RAM for the 27B runs (decided 2026-10-27): the parcolab, billing and triominos-s
 for the runs (`docker compose -p NAME stop`; `start` brings them back), which leaves ~24 GB available: the Q4_K_M
 file (measured at S7: 16.3 GiB of RSS alone, 17.4 GiB with the draft and its checkpoints; `api_test` on it alone
 22.4 GiB), no Q3_K needed. Keep other jobs small while a 27B run is going.
+
+## Agentic development at 96k context (pi), on Qwen3.8-27B
+
+The use the 27B work is for: an agent harness such as pi (`openai-completions` provider: streamed chat completions
+with tools, `reasoning_effort` / `chat_template_kwargs`, usage in the stream) driving `runq serve` with Qwen3.8-27B
+and its draft. A context window of **96k tokens** is the minimum. A session grows by **2-3k tokens per turn** (tool
+results, file contents) followed by a reply (reasoning, then a tool call or a code edit). When the context nears
+the window, pi compacts: it summarizes the old messages in a separate request (the conversation serialized as text,
+reasoning omitted, tool results cut to 2,000 characters: no prefix to reuse) and continues with the system prompt +
+the summary + the last ~20k tokens (`keepRecentTokens`). Every item keeps the project's rules (bitwise paths;
+speculative == plain).
+
+Where it stands (estimates from measured rates: S7, S2 and `IDEAS.md`'s ~590 GFLOPS of prefill attention at 8
+threads; G0 replaces them):
+- **Memory:** runq's own estimate for one 27B sequence at `-c 98304` is 22.38 GiB (64 KiB of f16 KV per position:
+  6 GiB at 96k), plus the 0.8B Q4_K_M draft (2.03 GiB at the same `-c`) and 3 more checkpoints for speculation at
+  k = 3 (0.44 GiB): ~24.9 GiB against ~23.9 GiB available with the other services stopped. **Does not fit yet.**
+- **Prefill per turn:** a 2.5k-token chunk at ~90k positions costs ~55 s of matrix multiplies (45 tok/s at 8
+  threads; ~33 s at 16) plus ~150 s of attention (2.5k x 90k positions x 393 kFLOP / ~0.59 TFLOPS): **~3 min**.
+- **Decode at ~90k:** each token reads ~17 GB of weights + ~6 GB of KV and does ~35 GFLOP of attention: ~4-5 tok/s
+  plain (8.5 at short context). Speculation's gain shrinks there: a verify segment shares the KV read, but its
+  attention work grows with its rows.
+- **Compaction:** the summary request prefills the serialized history from scratch (20-60k tokens: tens of
+  minutes), then the next request re-prefills the kept ~20k after the system prompt.
+- **Tools:** `runq serve` rejects them, so pi cannot run its agent loop against it at all today.
+
+Goal (provisional, G0 sets it from measurements): a 96k session with the draft fits with >= 2 GiB to spare; a
+2.5k-token turn at 90k positions prefills in ~1 min; decode >= 8 tok/s at 90k with speculation; no turn re-prefills
+more than its new tokens plus the last reply.
+
+- [ ] **G0. Measure the agentic turn first.** (a) A replay benchmark: pi's recorded sessions (`~/.pi/agent/sessions`,
+  local only, never committed) replayed against `runq serve` request by request, recording per turn the reused
+  prefix, the prefilled tokens, the prefill and decode times and the speculation stats. (b) Long-context costs
+  without hours of prefill: decode, verify passes of 2-8 rows (`build/bench_verify`) and the prefill of a
+  2.5k-token chunk at 16k / 32k / 64k / 96k positions on a KV cache filled with synthetic values (the timing does
+  not depend on them), 8 and 16 threads; this answers "Long-context decode: find the real bound" (Performance) for
+  the 27B. (c) Draft acceptance on the sessions' real replies (`scripts/spec_accept.py`, teacher-forced): the 0.8B
+  draft, prompt lookup (G6), both. Done when docs/qwen38-speculative.md has a turn-latency model checked against the
+  replay, and the goal above has real numbers.
+- [ ] **G1. Tool calls in `runq serve`.** Requests with `tools` (OpenAI format) rendered by the Qwen3.8 template
+  (the tool list in the system prompt; `tool` messages and earlier `tool_calls` in the history, as
+  `tests/golden/templates/qwen3.8-hf.jinja`), and replies parsed from Qwen3.8's XML format
+  (`<tool_call><function=NAME><parameter=P>value</parameter>...</function></tool_call>`) into `tool_calls`, with
+  `finish_reason: tool_calls`, streamed as `tool_calls` deltas; text before the call stays content. Arguments are
+  converted to the JSON types of the tool's schema; optionally constrained by it while decoding (`src/constrain.c`
+  already does `json_schema`). Also check pi's other expectations end to end: `stream_options.include_usage`,
+  `reasoning_content` on replayed assistant messages, `reasoning_effort` / `chat_template_kwargs` (both accepted
+  since S6), `max_tokens` vs `max_completion_tokens`. Tests: render goldens with tools vs HF's
+  `apply_chat_template`; parsing (malformed calls, several calls, multi-line parameters, calls inside reasoning not
+  parsed); `tests/server_test.py` with a tool round trip; a short pi session against the 0.8B. Done when pi runs a
+  multi-turn agent session (read / edit / bash tools) against `runq serve` with the 0.8B, then the 27B.
+- [ ] **G2. Correctness at long context.** Nothing in the tests goes past ~2,000 positions; Qwen3.8's native window
+  is 262,144 (RoPE theta 1e7, no scaling, `-c` accepts it). Check runq against a reference at 32k-96k positions
+  (Qwen3.5-0.8B: HF fp32 with SDPA, or `tests/ref_qwen35.py` with chunked attention; logits at sampled positions and
+  the attention's split / combine path), and a retrieval test (a fact placed early in a 90k context, asked at the
+  end) on the 0.8B and the 27B. Done when both pass and the long-context check is in an opt-in group.
+- [ ] **G3. Memory: a 96k session with its draft fits** (from `IDEAS.md`, "int8 (or 8-bit float) KV cache").
+  - An 8-bit KV cache: V first (its bf16 rounding was harmless), then K, which needs per-tile scales: |K| reaches
+    ~500 and bf16 K alone already cost +4.4% KL against HF fp32. Each variant judged by the KL measurement of the 16-bit
+    types and G2's checks (its baseline: the 16-bit numbers of "KV cache with f16 K and bf16 V", Performance);
+    generic, AVX-512 and NEON kernels on one definition. Halves the KV (3 GiB at 96k) and its read per token.
+  - The draft's own cost: its KV cache at 96k (~1.1 GiB) and its attention there. Its guesses never change the
+    output, so it can run on a shorter recent window (measure the acceptance lost, G0).
+  - The checkpoint budget: 150 MiB each for the 27B (the prompt's, the speculative ones, a reply's end: G5).
+  Done when runq's estimate for a 96k session with the draft and speculation leaves >= 2 GiB of the available memory.
+- [ ] **G4. Prefill attention against a long cache** (from `IDEAS.md`, "bf16 dot products in prefill attention").
+  A turn's chunk is ~2.5k queries against a ~90k-position cache: ~2.5x the matrix multiplies' time. (a) Spread the
+  work: the queries x KV blocks over all threads with the decode path's split / combine (see "Prefill attention
+  balance", Performance). (b) `vdpbf16ps`: it doubles the dot-product rate (prefill attention runs at ~590 GFLOPS of
+  a ~900 FMA peak at 8 threads), but q and the softmax weights become bf16, so the logits-vs-HF test and the KL
+  measurement decide; the instruction's exact rounding (two FMAs per pair, DAZ / FTZ, the odd element first) needs
+  a C twin for the generic build, verified per CPU. Done when G0's 2.5k-chunk-at-90k prefill is ~2x faster, the
+  thresholds hold, and the paths stay bitwise.
+- [ ] **G5. No re-prefill between turns, and cheaper compaction.** (Folds in "Checkpoints, measured", Qwen3.5.) A
+  turn appends to the cache, unless the harness sends the history differently from what was generated (reasoning
+  dropped, a reply re-serialized, a stop string): then the hybrid state rolls back to the last checkpoint at or
+  before the divergence. Take checkpoints at the end of the system prompt + tools (shared by every request, and kept
+  through compaction) and at each reply's end, besides the prompt's assistant header; the server keeps a session's
+  slot between turns (G0's replay shows the reused prefix per turn). Compaction: measure its two big prefills, then
+  the cheapest fix: e.g. pi's summary request served by a smaller model, or compaction settings
+  (`keepRecentTokens`, `reserveTokens`) that keep the re-prefill short. Done when the replay shows every non-compaction
+  turn prefilling only its new tokens (plus the last reply when the harness changed it).
+- [ ] **G6. Prompt-lookup drafting** (from `IDEAS.md`, "Speculative decoding by prompt lookup"). Agentic replies copy
+  from the context (an edit's old text, paths, identifiers, JSON echoing a tool result): draft the next tokens by
+  finding the last n-gram earlier in the context (no model, no memory), verified in the same loop as the model draft
+  (`rq_spec_run`; exact by construction). Combine them: the lookup when it finds a match, else the 0.8B. Measure the
+  acceptance on the recorded sessions first (G0); in the server as part of S8.
+- [ ] **G7. Speculation at long context.** A verify segment of k + 1 rows shares the KV read but multiplies the
+  attention work (k = 3: 4x), so the best k falls as the context grows. Choose k (and tau) per pass from the
+  position and the measured costs (G0), in the CLI and the server. Done when speculation is never slower than plain
+  decoding at any context length in G0's benchmark, and its gain at 90k is recorded.
 
 ## Platforms
 
@@ -156,9 +248,6 @@ Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M (Qwen3.8-27B Q4_K_M, the same
     routed experts (HF's 67 GB bf16 is out of reach). Its linear layers have 16 key / 32 value heads, as 4B (done).
     Order: a tiny MoE (random-init `qwen3_5_moe`, converted by llama.cpp's converter: docs/qwen35.md design 8 did the
     same for the head mapping), then the 35B.
-- [ ] **Checkpoints, measured**: `RQ_SEQ_CK` = 2 per sequence (18.9 MB each) at the prompt's assistant header
-  (docs/qwen35.md). Not measured on real traffic: how often `runq serve`'s requests roll back further (a
-  re-prefill of the whole conversation), and whether a checkpoint at the end of each reply would pay off.
 
 ## Models and formats
 

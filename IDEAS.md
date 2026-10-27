@@ -1,32 +1,10 @@
 # Ideas
 
 Possible directions for Gwenedeg that nobody has committed to: each would need a measurement or a design decision
-before it becomes work. Concrete next steps are in [TODO.md](TODO.md). Numbers are from the 16-vCPU AMD EPYC Genoa
+before it becomes work. Concrete next steps are in [TODO.md](TODO.md) (prompt-lookup drafting, an 8-bit KV cache and bf16
+dot products in prefill attention moved there: the section on agentic development at 96k context). Numbers are from the 16-vCPU AMD EPYC Genoa
 VM of [BENCHMARKS.md](BENCHMARKS.md) with Qwen3-0.6B unless noted. Every idea has to keep the project's rule: a
 sequence's logits never depend on the path, the thread count or what it is batched with.
-
-## Speculative decoding by prompt lookup
-
-(A draft *model* for Qwen3.8-27B is planned work: TODO.md, docs/qwen38-speculative.md. Prompt lookup would plug into
-the same verify loop.)
-
-Draft the next few tokens by finding the last n-gram of the sequence earlier in the context (prompt lookup: no
-draft model), then verify them in one pass: the sequence's last token plus the k drafted tokens as one segment of
-k + 1 rows, with logits for every row. Accept drafts while they equal the token sampled at their position.
-
-- Why: decode is memory-bound, so a pass over a few rows costs much less than that many single-row steps. Measured
-  (TODO S2, docs/qwen38-speculative.md "Verify-pass cost"; 8 threads, 500 / 2,000 positions): a segment of 4 rows
-  of one sequence costs 1.21-1.24x a decode step on Qwen3-1.7B Q8_0, 1.28-1.34x on Qwen3-8B Q4_K_M, 1.42-1.64x on
-  the 0.6B (its attention weighs more per row).
-- Exactness for free: the verification rows' logits are bit-identical to plain decoding (batched == sequential).
-  If every position is sampled with the sequence's own RNG in order, and the pass stops at the first mismatch,
-  then greedy and seeded outputs equal non-speculative decoding exactly. The price is a lower acceptance rate than
-  rejection sampling.
-- Gain depends on how repetitive the output is (code edits, quoting, extraction, JSON echoing the prompt). In
-  `runq serve` the draft rows would simply enlarge the job's segment in the batched pass.
-- Qwen3.5 ships its own draft model: a multi-token-prediction head (`mtp.*` in the HF checkpoint, 15 tensors; not in
-  the Unsloth GGUFs, docs/qwen35.md). On a hybrid model a rejected draft also needs the recurrent state from before
-  it: a checkpoint per verification pass (18.9 MB for 0.8B), or verification rows that keep the state per position.
 
 ## A classification endpoint that returns label probabilities
 
@@ -55,23 +33,6 @@ interactive calls, such as router classifications, pass long generations, and co
 its slot when memory runs out (with the previous idea). Related effect: in a cold burst, all requests deferred
 behind a shared prefix finish in the same pass, so the median latency rises (~300 -> ~400 ms for 16 at once)
 while the wall time and p95 fall.
-
-## int8 (or 8-bit float) KV cache
-
-At long contexts, batched decode is bound by KV traffic: each row reads 115 KB per position per token, so at
-2,000 positions aggregate throughput stops at ~350-480 tok/s from 8 sequences on, whatever the batch size. An
-8-bit cache would halve that again. Accuracy is the question: |K| reaches ~500, and bf16 K alone (8 significant
-bits) already costs +4.4% KL against HF fp32. Per-tile scales, or 8 bits for V only (V's rounding was harmless in
-bf16), would be the things to try, with the KL measurement used for the 16-bit types.
-
-## bf16 dot products in prefill attention (`vdpbf16ps`)
-
-Prefill attention is compute-bound at long prompts (~590 GFLOPS of a ~900 FMA peak at 8 threads; PV ~710, scores
-and softmax ~500), and `vdpbf16ps` doubles the dot-product rate. But q and the softmax weights would have to be
-rounded to bf16 too: the logits-vs-HF test and the KL measurement would decide whether that is acceptable. The
-instruction's exact rounding and denormal behaviour (two FMAs per pair, DAZ / FTZ, the odd element first in
-Intel's pseudocode) would need a C twin for the generic build, verified on each target CPU. Without that, AVX-512
-and generic results would differ.
 
 ## Qwen3 MoE models
 

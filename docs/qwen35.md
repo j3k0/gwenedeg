@@ -107,7 +107,7 @@ MRoPE (sections 11 / 11 / 10, interleaved). For text, the three position ids are
 plain partial RoPE above. Images would need the 3-D positions, which are out of scope for the project ([IDEAS.md](../IDEAS.md#images-qwen35-vision)).
 
 **Not part of the text model:** the vision tower (153 tensors) and the MTP head (15 tensors, `mtp.*`;
-speculative decoding, see IDEAS.md). The Unsloth GGUFs contain neither: 24 blocks, no `nextn` tensors.
+a draft model for speculative decoding: TODO.md, S9 for Qwen3.8's). The Unsloth GGUFs contain neither: 24 blocks, no `nextn` tensors.
 
 ## The GGUF layout (verified against the safetensors)
 

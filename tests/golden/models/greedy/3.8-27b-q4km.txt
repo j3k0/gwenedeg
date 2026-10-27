@@ -1,0 +1,2 @@
+<think>
+We need to answer user: "What is the capital of Australia? Answer in one sentence." Simple. Final one sentence

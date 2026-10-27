@@ -1,11 +1,18 @@
-/* K-quants (GGUF Q4_K, Q5_K and Q6_K, as in llama.cpp's Q4_K_M / Q5_K_M files) for the forward passes
- * (forward.c): the block formats, their dequantization, the repacked layouts (Q4P, Q5P, Q6P) the matmul
- * kernels read, and the generic C kernels. The arithmetic of a matmul output is defined here (below);
- * the generic kernels follow it, and so do the AVX-512 ones (kernels_avx512.h: kq4_gemv_rows /
- * kq5_gemv_rows / kq6_gemv_rows, kq512_gemm_item), so that every build gives bit-identical logits
- * (checked by make test's q4_kernels / q5_kernels groups).
+/* K-quants (GGUF Q3_K, Q4_K, Q5_K and Q6_K, as in llama.cpp's Q3_K_M / Q4_K_M / Q5_K_M files) for the forward
+ * passes (forward.c): the block formats, their dequantization, the repacked layouts (Q3P, Q4P, Q5P, Q6P) the
+ * matmul kernels read, and the generic C kernels. The arithmetic of a matmul output is defined here (below);
+ * the generic kernels follow it, and so do the AVX-512 ones (kernels_avx512.h: kq3_gemv_rows / kq4_gemv_rows /
+ * kq5_gemv_rows / kq6_gemv_rows, kq512_gemm_item, the small-batch kernels) and the NEON ones (kernels_neon.h),
+ * so that every build gives bit-identical logits (checked by make test's q4_kernels group and the kernels /
+ * api_digest_generic checks of the Q5_K and Q3_K files).
  *
  * Block formats (ggml-common.h, ggml-quants.c; super-blocks of QK_K = 256 values of one row):
+ *   Q3_K, 110 bytes: hmask[32], qs[64], scales[12], fp16 d. 16 sub-blocks j of 16 values, a 6-bit scale
+ *     sc_j each, packed in scales[] (s): low 4 bits = j < 8 ? s[j] & 15 : s[j - 8] >> 4, high 2 bits =
+ *     (s[8 + j % 4] >> 2 (j / 4)) & 3 (ggml's kmask shuffle). Value i = 128 n + 32 p + l (n < 2, p < 4,
+ *     l < 32): j = i / 16, low 2 bits q2 = (qs[32 n + l] >> 2 p) & 3, high bit h = bit i / 32 of hmask[l];
+ *     q = q2 - (h ? 0 : 4) in -4..3 (stored below as q' = q2 | h << 2 = q + 4, 0..7).
+ *     w = (d * (sc_j - 32)) * q
  *   Q4_K, 144 bytes: fp16 d, fp16 dmin, scales[12], qs[128]. 8 sub-blocks j of 32 values, a 6-bit
  *     scale sc_j and min m_j each, packed in scales[] (get_scale_min_k4: j < 4: sc = s[j] & 63,
  *     m = s[j + 4] & 63; else sc = (s[j + 4] & 15) | (s[j - 4] >> 6) << 4, m = (s[j + 4] >> 4) |
@@ -20,16 +27,28 @@
  *     q = ((ql[64 n + 32 (p & 1) + l] >> 4 (p >> 1)) & 15) | ((qh[32 n + l] >> 2 p) & 3) << 4,
  *     0..63. w = (d * scales[j]) * (q - 32)
  * Dequantization (kq_dequant_row: embedding rows, the -m dequant test hook) uses exactly these
- * fp32 expressions, i.e. ggml's dequantize_row_q4_K / _q5_K / _q6_K (and gguf-py's numpy version):
- * d * sc, dmin * m and (d * sc) * q are exact in fp32 (11 + 6 + 5 bits; 11 + 8 + 6), so each value
- * is one rounding of an exact expression, whatever FP contraction or reassociation the compiler
- * applies.
+ * fp32 expressions, i.e. ggml's dequantize_row_q3_K / _q4_K / _q5_K / _q6_K (and gguf-py's numpy version):
+ * d * sc, dmin * m and (d * sc) * q are exact in fp32 (11 + 6 + 5 bits; 11 + 8 + 6; Q3_K 11 + 6 + 3: the
+ * value itself is exact), so each value is one rounding of an exact expression, whatever FP contraction
+ * or reassociation the compiler applies.
  *
  * Repacked layouts, for (d, k) matrices with d % 16 == 0, k % 256 == 0: block rb = rows 16 rb ..
  * 16 rb + 15, super-block s = columns 256 s .. 256 s + 255, at kp + (rb * k / 256 + s) * SB (one
  * block contiguous over all k, like Q8P). Within, "lane r, byte b" = byte 4 r + b of a 64-byte
  * chunk: a zmm's dword lane r holds 4 consecutive values of row 16 rb + r, the u8 operand of
- * vpdpbusd once unpacked. The 4- and 6-bit data stays packed (decode is bandwidth-bound).
+ * vpdpbusd once unpacked. The 3- to 6-bit data stays packed (decode is bandwidth-bound).
+ *   Q3P, SB = 1792 bytes (28 x 64): 112 bytes per row and super-block (file: 110, +1.8%; the 6-bit
+ *     scales stay packed: as int8 they would make it 1856, +5.5%)
+ *     +0    float d[16]       d of row r as fp32 (exact)
+ *     +64   uint8 scl[8][16]  at 16 p + r: low nibble = low 4 bits of sc_2p of row r, high nibble = of sc_2p+1
+ *     +192  uint8 sch[4][16]  at 16 u + r: bits 2 v, 2 v + 1 = high 2 bits of sc_4u+v of row r
+ *     +256  per group g (columns 32 g .. 32 g + 31 = sub-blocks 2 g, 2 g + 1) 192 bytes at 256 + 192 g:
+ *       +0, +64   chunk h (sub-block 2 g + h): lane r, byte b, bits 2 t, 2 t + 1 = q2 of column
+ *                 32 g + 16 h + 4 t + b (t < 4: the 4 steps of the sub-block)
+ *       +128      8 masks of 8 bytes: bit 4 r + b of mask t (t < 8: the group's steps) = h (bit 2 of q')
+ *                 of column 32 g + 4 t + b of row r (as Q5P's masks)
+ *           (q' of step t = ((chunk >> 2 t) & 3) | mask bit << 2: AVX-512 a masked add of 4 (kmovq), NEON a
+ *           shift-insert of the expanded bit)
  *   Q4P, SB = 2368 bytes (37 x 64): 148 bytes per row and super-block (file: 144, +2.8%)
  *     +0    uint16 d[16]      fp16 d of row r (as in the file)
  *     +32   uint16 dmin[16]   fp16 dmin of row r
@@ -58,7 +77,7 @@
  *           (q of step t = low nibble | ((qh << 4 >> 2 t) & 0x30), shifts on 16-bit lanes)
  *
  * Activations: int8 xq, quantized in groups of 32 (GS = 32 for GGUF, as for Q8_0) with fp32 scales
- * xs, the same quantized row for every matrix it feeds (q / k / v may mix Q4_K, Q5_K and Q6_K). Q6_K's
+ * xs, the same quantized row for every matrix it feeds (q / k / v may mix Q3_K .. Q6_K). Q3_K's and Q6_K's
  * sub-blocks of 16 use the same groups of 32: two weight scales per activation group, combined in
  * int32 (exact; groups of 16 would need a second quantization of the same row for a fused q / k / v
  * with mixed types, and twice the float folds). Per activation row and group g, kq_act_prep:
@@ -79,11 +98,14 @@
  *           sum of (q - 32) * xq: |t_j| <= 32 * 127 * 16 = 65,024)
  *     I = sc_j0 * t_j0 + sc_j0+1 * t_j0+1                       (int32, exact, |I| < 2^24)
  *     val = val + (d * xs[g]) * (float) I                       (d: fp32 of the fp16, exact)
+ *   Q3_K: exactly Q6_K's fold with its 3-bit q and signed scales: t_j = sum over the 16 values of q' * xq
+ *     - 4 * (sum of their 16 xq) (= the sum of q * xq, |t_j| <= 4 * 128 * 16 = 8,192), I = (sc_j0 - 32) *
+ *     t_j0 + (sc_j0+1 - 32) * t_j0+1 (|I| <= 2 * 32 * 8,192 = 524,288), val = val + (d * xs[g]) * (float) I
  * The integer parts may be computed in any order (vpdpbusd: q as u8 x xq as s8; Q4_K's mins and
- * Q6_K's -32 go through the activation sums); the float part per row only depends on per-row values
- * and per-group activation values, so 16 rows vectorize across the 16 lanes of a zmm (d, dmin,
+ * Q3_K's -4 / Q6_K's -32 go through the activation sums); the float part per row only depends on per-row
+ * values and per-group activation values, so 16 rows vectorize across the 16 lanes of a zmm (d, dmin,
  * ds, dm per lane; xs, xf broadcast) with no horizontal operation. 6 float ops per 32 values for
- * Q4_K / Q5_K (ds * xs, cvt, mul, dm * xf, sub, add; ds, dm once per 16-row block and group), 4 for Q6_K.
+ * Q4_K / Q5_K (ds * xs, cvt, mul, dm * xf, sub, add; ds, dm once per 16-row block and group), 4 for Q3_K / Q6_K.
  */
 #ifndef RUNQ_KQUANTS_H
 #define RUNQ_KQUANTS_H
@@ -105,16 +127,18 @@
 #endif
 
 #define QK_K 256
+#define Q3_K_BLOCK 110
 #define Q4_K_BLOCK 144
 #define Q5_K_BLOCK 176
 #define Q6_K_BLOCK 210
 #define KQ_ROWS 16
+#define Q3P_SB 1792
 #define Q4P_SB 2368
 #define Q5P_SB 2880
 #define Q6P_SB 3392
 #define KQ_NC 4          // activation rows per generic kernel call (weights unpacked once for these)
 
-enum { GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14 }; // ggml type numbers
+enum { GGML_Q3_K = 11, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14 }; // ggml type numbers
 
 static float fp16_to_f32(uint16_t h) {
     // IEEE half -> float, exact (every half value is a float)
@@ -135,9 +159,11 @@ static inline uint16_t kq_u16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); 
 static inline uint64_t kq_u64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
 
 static inline int kq_block_bytes(int type) {
-    return type == GGML_Q4_K ? Q4_K_BLOCK : type == GGML_Q5_K ? Q5_K_BLOCK : Q6_K_BLOCK;
+    return type == GGML_Q4_K ? Q4_K_BLOCK : type == GGML_Q5_K ? Q5_K_BLOCK : type == GGML_Q3_K ? Q3_K_BLOCK : Q6_K_BLOCK;
 }
-static inline int kq_sb_bytes(int type) { return type == GGML_Q4_K ? Q4P_SB : type == GGML_Q5_K ? Q5P_SB : Q6P_SB; }
+static inline int kq_sb_bytes(int type) {
+    return type == GGML_Q4_K ? Q4P_SB : type == GGML_Q5_K ? Q5P_SB : type == GGML_Q3_K ? Q3P_SB : Q6P_SB;
+}
 static inline size_t kq_size(int type, int d, int k) { return (size_t)(d / KQ_ROWS) * (k / QK_K) * kq_sb_bytes(type); }
 
 static inline void q4k_scale_min(const uint8_t *s, int j, int *sc, int *m) {
@@ -171,10 +197,25 @@ static inline int q6k_q(const uint8_t *blk, int i) {
     return lo | hi << 4;
 }
 
+static inline int q3k_q(const uint8_t *blk, int i) {
+    // 3-bit quant q' = q + 4 (0..7) of value i (0..255) of a Q3_K block: low 2 bits from qs (+32), bit 2 =
+    // the hmask bit (set: q = q2, clear: q = q2 - 4; see the header comment)
+    int n = i / 128, p = i / 32 % 4, l = i % 32;
+    return (blk[32 + 32 * n + l] >> (2 * p) & 3) | (blk[l] >> (i / 32) & 1) << 2;
+}
+
+static inline int q3k_scale(const uint8_t *blk, int j) {
+    // 6-bit scale (0..63, before the -32) of sub-block j (0..15) of a Q3_K block (scales at +96)
+    const uint8_t *s = blk + 96;
+    return (j < 8 ? s[j] & 15 : s[j - 8] >> 4) | (s[8 + j % 4] >> (2 * (j / 4)) & 3) << 4;
+}
+
 static int kq_block_ok(int type, const uint8_t *blk) {
-    // the fp16 scales are finite (Q4_K / Q5_K: d and dmin; Q6_K: d); 0 for a corrupt block
+    // the fp16 scales are finite (Q4_K / Q5_K: d and dmin; Q3_K, Q6_K: d); 0 for a corrupt block
     if (type == GGML_Q4_K || type == GGML_Q5_K)
         return (kq_u16(blk) & 0x7c00) != 0x7c00 && (kq_u16(blk + 2) & 0x7c00) != 0x7c00;
+    if (type == GGML_Q3_K)
+        return (kq_u16(blk + 108) & 0x7c00) != 0x7c00;
     return (kq_u16(blk + 208) & 0x7c00) != 0x7c00;
 }
 
@@ -191,6 +232,14 @@ static void kq_dequant_row(int type, const uint8_t *blk, int n, float *y) {
                 float d1 = d * sc, m1 = dmin * m;
                 for (int l = 0; l < 32; l++)
                     y[32 * j + l] = d1 * (q5 ? q5k_q(b, 32 * j + l) : q4k_q(b, 32 * j + l)) - m1;
+            }
+        } else if (type == GGML_Q3_K) { // ggml: dl = d * (sc - 32), y = dl * q (both exact)
+            const uint8_t *b = blk + (size_t)s * Q3_K_BLOCK;
+            float d = fp16_to_f32(kq_u16(b + 108));
+            for (int j = 0; j < 16; j++) {
+                float dl = d * (q3k_scale(b, j) - 32);
+                for (int l = 0; l < 16; l++)
+                    y[16 * j + l] = dl * (q3k_q(b, 16 * j + l) - 4);
             }
         } else {
             const uint8_t *b = blk + (size_t)s * Q6_K_BLOCK;
@@ -209,11 +258,39 @@ static void kq_pack_blocks(int type, uint8_t *kp, const uint8_t *src, int nblk, 
     for (int rb = 0; rb < nblk; rb++)
         for (int s = 0; s < nsb; s++) {
             uint8_t *o = kp + ((size_t)rb * nsb + s) * sbb;
-            uint64_t q5m[8][8]; // Q5_K: mask t of sub-block j, over the block's 16 rows (one byte per row)
-            if (type == GGML_Q5_K) memset(q5m, 0, sizeof(q5m));
+            uint64_t q5m[8][8]; // Q5_K: mask t of sub-block j, over the block's 16 rows (one byte per row); Q3_K: of group j
+            if (type == GGML_Q5_K || type == GGML_Q3_K) memset(q5m, 0, sizeof(q5m));
             for (int r = 0; r < KQ_ROWS; r++) {
                 const uint8_t *b = src + ((size_t)(rb * KQ_ROWS + r) * nsb + s) * bb;
-                if (type == GGML_Q4_K || type == GGML_Q5_K) {
+                if (type == GGML_Q3_K) {
+                    float d = fp16_to_f32(kq_u16(b + 108));
+                    memcpy(o + 4 * r, &d, 4);
+                    int sc[16];
+                    for (int j = 0; j < 16; j++)
+                        sc[j] = q3k_scale(b, j);
+                    for (int p = 0; p < 8; p++)
+                        o[64 + 16 * p + r] = (uint8_t)((sc[2 * p] & 15) | (sc[2 * p + 1] & 15) << 4);
+                    for (int u = 0; u < 4; u++)
+                        o[192 + 16 * u + r] = (uint8_t)((sc[4 * u] >> 4) | (sc[4 * u + 1] >> 4) << 2 |
+                                                        (sc[4 * u + 2] >> 4) << 4 | (sc[4 * u + 3] >> 4) << 6);
+                    uint8_t q[QK_K]; // the q' values (q3k_q, in ggml's loop order: n, p, l)
+                    for (int n = 0; n < 2; n++)
+                        for (int p = 0; p < 4; p++)
+                            for (int l = 0; l < 32; l++)
+                                q[128 * n + 32 * p + l] = (uint8_t)((b[32 + 32 * n + l] >> (2 * p) & 3) |
+                                                                    (b[l] >> (4 * n + p) & 1) << 2);
+                    for (int g = 0; g < 8; g++) {
+                        const uint8_t *qg = q + 32 * g;
+                        for (int h = 0; h < 2; h++)
+                            for (int e = 0; e < 4; e++)
+                                o[256 + 192 * g + 64 * h + 4 * r + e] =
+                                    (uint8_t)((qg[16 * h + e] & 3) | (qg[16 * h + 4 + e] & 3) << 2 |
+                                              (qg[16 * h + 8 + e] & 3) << 4 | (qg[16 * h + 12 + e] & 3) << 6);
+                        for (int t = 0; t < 8; t++)
+                            for (int e = 0; e < 4; e++)
+                                q5m[g][t] |= (uint64_t)(qg[4 * t + e] >> 2) << (4 * r + e);
+                    }
+                } else if (type == GGML_Q4_K || type == GGML_Q5_K) {
                     int q5 = type == GGML_Q5_K;
                     memcpy(o + 2 * r, b, 2);
                     memcpy(o + 32 + 2 * r, b + 2, 2);
@@ -261,6 +338,9 @@ static void kq_pack_blocks(int type, uint8_t *kp, const uint8_t *src, int nblk, 
             if (type == GGML_Q5_K)
                 for (int j = 0; j < 8; j++)
                     memcpy(o + 320 + 320 * j + 256, q5m[j], sizeof(q5m[j]));
+            if (type == GGML_Q3_K)
+                for (int g = 0; g < 8; g++)
+                    memcpy(o + 256 + 192 * g + 128, q5m[g], sizeof(q5m[g]));
         }
 }
 
@@ -284,6 +364,17 @@ static void kq_packed_row(int type, const uint8_t *kp, int row, int k, float *y)
                     }
                     y[32 * j + w] = d1 * q - m1;
                 }
+            }
+        } else if (type == GGML_Q3_K) {
+            float d;
+            memcpy(&d, o + 4 * r, 4);
+            for (int i = 0; i < QK_K; i++) {
+                int j = i / 16, g = i / 32, h = i / 16 % 2, t = i % 16 / 4, c = i % 32 / 4, b = i % 4;
+                int sc = (o[64 + 16 * (j / 2) + r] >> (4 * (j % 2)) & 15) | (o[192 + 16 * (j / 4) + r] >> (2 * (j % 4)) & 3) << 4;
+                uint64_t mask;
+                memcpy(&mask, o + 256 + 192 * g + 128 + 8 * c, 8);
+                int q = (o[256 + 192 * g + 64 * h + 4 * r + b] >> (2 * t) & 3) | (int)(mask >> (4 * r + b) & 1) << 2;
+                y[i] = d * (sc - 32) * (q - 4);
             }
         } else {
             float d;
@@ -462,6 +553,58 @@ KQ_EXACT static void q6p_dot(float *out, size_t ldo, const uint8_t *wb, int k, i
         memcpy(out + c * ldo, val[c], sizeof(val[c]));
 }
 
+KQ_EXACT static void q3p_dot(float *out, size_t ldo, const uint8_t *wb, int k, int nc, const int8_t *xq, size_t ldx,
+                             const float *xs, size_t ldxs) { RQ_FP_EXACT
+    // q6p_dot for a Q3P block: the same fold, on q' = q + 4 (0..7) with the -4 applied in int32 and the scales
+    // sc - 32 (-32..31)
+    float val[KQ_NC][KQ_ROWS];
+    memset(val, 0, sizeof(val));
+    for (int s = 0; s < k / QK_K; s++) {
+        const uint8_t *o = wb + (size_t)s * Q3P_SB;
+        float d[KQ_ROWS];
+        memcpy(d, o, sizeof(d));
+        for (int g8 = 0; g8 < 8; g8++) {
+            int g = 8 * s + g8;
+            const uint8_t *qg = o + 256 + 192 * g8;
+            uint64_t mask[8];
+            memcpy(mask, qg + 128, sizeof(mask));
+            uint8_t w[2][KQ_ROWS][16]; // the two sub-blocks unpacked (q'), row-major
+            int32_t sc[2][KQ_ROWS];
+            for (int h = 0; h < 2; h++) {
+                int j = 2 * g8 + h;
+                for (int r = 0; r < KQ_ROWS; r++) {
+                    sc[h][r] = ((o[64 + 16 * g8 + r] >> (4 * h) & 15) | (o[192 + 16 * (j / 4) + r] >> (2 * (j % 4)) & 3) << 4) - 32;
+                    for (int t = 0; t < 4; t++)
+                        for (int b = 0; b < 4; b++)
+                            w[h][r][4 * t + b] = (uint8_t)((qg[64 * h + 4 * r + b] >> (2 * t) & 3) |
+                                                           (mask[4 * h + t] >> (4 * r + b) & 1) << 2);
+                }
+            }
+            for (int c = 0; c < nc; c++) {
+                const int8_t *x = xq + c * ldx + 32 * g;
+                float xsg = xs[c * ldxs + g];
+                int32_t xsum[2] = { 0, 0 };
+                for (int i = 0; i < 16; i++) {
+                    xsum[0] += x[i];
+                    xsum[1] += x[16 + i];
+                }
+                for (int r = 0; r < KQ_ROWS; r++) {
+                    int32_t I = 0;
+                    for (int h = 0; h < 2; h++) {
+                        int32_t t = 0;
+                        for (int i = 0; i < 16; i++)
+                            t += w[h][r][i] * x[16 * h + i];
+                        I += sc[h][r] * (t - 4 * xsum[h]);
+                    }
+                    val[c][r] = val[c][r] + (d[r] * xsg) * (float)I;
+                }
+            }
+        }
+    }
+    for (int c = 0; c < nc; c++)
+        memcpy(out + c * ldo, val[c], sizeof(val[c]));
+}
+
 static inline void kq_dot(int type, float *out, size_t ldo, const uint8_t *wb, int k, int nc, const int8_t *xq, size_t ldx,
                    const float *xs, size_t ldxs, const float *xf, size_t ldxf) {
     // one 16-row block of a K-quant matrix times nc <= KQ_NC activation rows
@@ -469,6 +612,8 @@ static inline void kq_dot(int type, float *out, size_t ldo, const uint8_t *wb, i
         q4p_dot(out, ldo, wb, k, nc, xq, ldx, xs, ldxs, xf, ldxf);
     else if (type == GGML_Q5_K)
         q5p_dot(out, ldo, wb, k, nc, xq, ldx, xs, ldxs, xf, ldxf);
+    else if (type == GGML_Q3_K)
+        q3p_dot(out, ldo, wb, k, nc, xq, ldx, xs, ldxs);
     else
         q6p_dot(out, ldo, wb, k, nc, xq, ldx, xs, ldxs);
 }

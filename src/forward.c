@@ -93,7 +93,7 @@ struct RqCtx {
     // rows (else a phase); a row block's attention split over its blocks of ATT_P positions when the pass has fewer
     // than bd_split * threads (row block, kv head) items; the small-batch kernels up to smb_max rows per weight
     // type (gemm_plan). Tuning: RUNQ_SMB, RUNQ_BD
-    int smb_max[4], smb_pf, bd_max, bd_epi, bd_split, bd_seg;
+    int smb_max[5], smb_pf, bd_max, bd_epi, bd_split, bd_seg;
     float *att_sp; size_t att_sp_n; // split attention: per (row, query head, block) partial results
     int *row_it0;       // batch_decode_worker: attention items of row blocks 0..u-1 (per kv head)
     void *probindex;    // sampler scratch (sampler.c: vocab_size candidates)
@@ -693,7 +693,7 @@ void embed_row(float *x, const QuantizedTensor *t, int token, int dim) {
         return;
     }
     if (t->b && t->type != GGML_Q8_0) {
-        // GGUF Q4_K / Q6_K: ggml's dequantization of the row's blocks (dim % 256 == 0). By the tensor's
+        // GGUF K-quants (Q3_K .. Q6_K): ggml's dequantization of the row's blocks (dim % 256 == 0). By the tensor's
         // type, not by t->kp: an untied embedding table (Qwen3-8B: Q4_K, output.weight Q6_K) is never
         // repacked (only the matmul weights are), so it has no kp and used to be read as Q8_0 blocks (NaN)
         kq_dequant_row(t->type, t->b + (size_t)token * (dim / QK_K) * kq_block_bytes(t->type), dim, x);
@@ -805,7 +805,7 @@ static inline const QuantizedTensor *ab_item(const QuantizedTensor *wa, const Qu
 // of each matrix split into work items. matvec_prep: the VNNI kernel's activation corrections for
 // x[i0 .. i0+n) (one per GS-group; nothing to do for the generic kernel), and with K-quant weights
 // (xf != NULL) the activation group sums xf of kquants.h, plus for the AVX-512 K-quant GEMV the
-// -32 * sums of 16 (c16, Q6_K); matvec_rows: rows i0..i1-1
+// -32 * sums of 16 (c16, Q6_K; Q3_K: c16 / 8); matvec_rows: rows i0..i1-1
 static inline void matvec_prep(int32_t *corr, float *xf, int32_t *c16, QuantizedTensor *x, int i0, int n) {
 #ifdef RUNQ_Q8X
     q8x_gemv_corr(corr + i0 / GS, x->q + i0, n, GS);
@@ -825,7 +825,7 @@ static inline void matvec_prep(int32_t *corr, float *xf, int32_t *c16, Quantized
 static inline void matvec_rows(float *xout, QuantizedTensor *x, const int32_t *corr, const float *xf, const int32_t *c16,
                                QuantizedTensor *w, int n, int i0, int i1) {
     // xout[i] = W (d,n) row i . x (n,) for i0 <= i < i1 (multiples of 16, as the VNNI blocks)
-    if (w->kp) { // Q4_K / Q6_K, 16-row blocks (kquants.h; AVX-512: kernels_avx512.h)
+    if (w->kp) { // K-quants, 16-row blocks (kquants.h; AVX-512: kernels_avx512.h)
 #ifdef RUNQ_KQX
         kqx_gemv_rows(w->type, xout, x->q, x->s, xf, c16, w->kp, n, i0 / KQ_ROWS, i1 / KQ_ROWS);
 #else
@@ -887,13 +887,13 @@ typedef struct { float *out; int ldo; QuantizedTensor *w; int d; } MatJob; // on
 // One batched-matmul phase of a batched pass: up to 4 GEMMs on the same nb quantized activation rows
 // (q / k / v, w1 / w3; Qwen3.5's qkv / z / alpha / beta), out[b * ldo + i] = W[i, :] . x[b, :] (W d x k; x row b at x->q + b * ldx,
 // its k / GS scales at x->s + b * ldx / GS), as work items of one phase:
-//   AVX-512 build: (32-row tile, chunk of nbi activation rows), Q8P (q8p_gemm_item) or Q4P / Q6P
+//   AVX-512 build: (32-row tile, chunk of nbi activation rows), Q8P (q8p_gemm_item) or Q3P .. Q6P
 //     (kq512_gemm_item); the items of a tile are claimed together (chunk = nchunk), so the weight
 //     tile is read (K-quants: unpacked) once per claim and reused from L1/L2
 //   generic: blocks of MB_ROWS rows (Q8_0, dot_q8_x4) or of 16 rows (K-quants, kq_dot) over all nb rows
 // Each output is computed exactly as in the decode GEMV (matvec_rows), so the batched path matches the
 // sequential one bit for bit. Activation prep (row stride k / GS, k / GS, k / 16): corr (AVX-512 Q8P),
-// xf (K-quants), c16 (AVX-512 Q6_K), computed per row when the row is quantized (act_prep_row)
+// xf (K-quants), c16 (AVX-512 / NEON Q3_K, Q6_K), computed per row when the row is quantized (act_prep_row)
 typedef struct {
     int nj; MatJob job[4];
     int it0[5];          // items of job j: it0[j] .. it0[j + 1] - 1
@@ -911,11 +911,11 @@ typedef struct {
 // over at most smb_max rows of its weight type (else the GEMM's tiles), and always in batch_decode_worker.
 // Crossover (one thread, measured in Step 10a): Q4_K / Q6_K faster than the GEMM up to ~24 rows (1.6-2.3x at
 // 1-4 rows: no tile unpacking), equal at 32, ~4% slower at 48-64; Q8_0 equal (the GEMM tile streams the
-// packed weights too). RUNQ_SMB=Q8,Q4,Q6,Q5 overrides them (tuning; 0 = never). Results never depend on it.
+// packed weights too). RUNQ_SMB=Q8,Q4,Q6,Q5,pf,Q3 overrides them (tuning; 0 = never). Results never depend on it.
 // The K-quant kernels prefetch their weights SMB_PF bytes ahead (TODO S2, 8 threads, Qwen3-8B Q4_K_M, 500
 // positions: a verify segment of 2 / 4 / 6 rows -10% / -12% / -5%, 1 and 9 rows unchanged; 1,024 / 2,048 / 8,192
 // bytes: about the same; Q8_0: none of it, within noise or up to +5% at 1-2 rows, so its kernel does not prefetch)
-enum { SMB_Q8, SMB_Q4, SMB_Q6, SMB_Q5 };
+enum { SMB_Q8, SMB_Q4, SMB_Q6, SMB_Q5, SMB_Q3 };
 #ifndef BD_MAX
 #define BD_MAX 64 // decode rows per batched pass in batch_decode_worker (if the small-batch kernels take them)
 #endif
@@ -938,11 +938,12 @@ static void env_ints(const char *name, int *v, int n) {
 }
 
 static void smb_config(RqCtx *c) {
-    // the context's small-batch / batched-decode settings: defaults, RUNQ_SMB=Q8,Q4,Q6,Q5,pf (rows per weight
-    // type; the kernels' prefetch distance in bytes), RUNQ_BD=max,epi,split,seg
-    int smb[5] = { 32, 32, 32, 32, SMB_PF };
-    env_ints("RUNQ_SMB", smb, 5);
-    memcpy(c->smb_max, smb, sizeof(c->smb_max));
+    // the context's small-batch / batched-decode settings: defaults, RUNQ_SMB=Q8,Q4,Q6,Q5,pf,Q3 (rows per weight
+    // type; the kernels' prefetch distance in bytes; Q3_K's rows are the 6th value: pf was there first), RUNQ_BD=max,epi,split,seg
+    int smb[6] = { 32, 32, 32, 32, SMB_PF, 32 };
+    env_ints("RUNQ_SMB", smb, 6);
+    memcpy(c->smb_max, smb, 4 * sizeof(int));
+    c->smb_max[SMB_Q3] = smb[5];
     c->smb_pf = smb[4];
     int bd[4] = { BD_MAX, 2, 8, BD_SEG };
     env_ints("RUNQ_BD", bd, 4);
@@ -957,7 +958,7 @@ static void smb_config(RqCtx *c) {
 
 static inline int smb_slot(int type) {
     // smb_max index of a K-quant type (the small-batch kernels have one per type)
-    return type == GGML_Q4_K ? SMB_Q4 : type == GGML_Q5_K ? SMB_Q5 : SMB_Q6;
+    return type == GGML_Q4_K ? SMB_Q4 : type == GGML_Q5_K ? SMB_Q5 : type == GGML_Q3_K ? SMB_Q3 : SMB_Q6;
 }
 
 static inline int smb_use(const RqCtx *c, const QuantizedTensor *w, int nb) {

@@ -23,7 +23,7 @@ static void rand_blocks(int type, uint8_t *b, int nblk) {
             memcpy(p, &h, 2);
             h = (uint16_t)(((rnd() % 7) + 8) << 10 | (rnd() & 0x3ff));
             memcpy(p + 2, &h, 2);
-        } else memcpy(p + 208, &h, 2);
+        } else memcpy(p + (type == GGML_Q3_K ? 108 : 208), &h, 2);
     }
 }
 
@@ -162,9 +162,10 @@ int main(void) {
     int fails = 0;
     fails += test_attn(1, 128) + test_attn(2, 128) + test_attn(1, 64) + test_attn(2, 64);
     fails += test_q8(32, 1024) + test_q8(32, 3072) + test_q8(64, 1024) + test_q8(64, 3072);
-    int types[3] = { GGML_Q4_K, GGML_Q5_K, GGML_Q6_K };
+    int types[4] = { GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q3_K };
+    static const char *tname[4] = { "Q4_K", "Q5_K", "Q6_K", "Q3_K" };
     int ks[2] = { 1024, 3072 };
-    for (int ti = 0; ti < 3; ti++)
+    for (int ti = 0; ti < 4; ti++)
         for (int ki = 0; ki < 2; ki++) {
             int type = types[ti], k = ks[ki], d = 80, nb = 13; // 5 blocks: an odd tile at the end
             int nsb = k / QK_K, ng = k / 32;
@@ -192,7 +193,7 @@ int main(void) {
             // GEMV: one activation row at a time
             for (int b = 0; b < nb; b++)
                 kqx_gemv_rows(type, got + (size_t)b * d, xq + (size_t)b * k, xs + b * ng, xf + b * ng, c16 + b * (k / 16), kp, k, 0, d / KQ_ROWS);
-            snprintf(name, sizeof name, "gemv %s k=%d", type == GGML_Q4_K ? "Q4_K" : type == GGML_Q5_K ? "Q5_K" : "Q6_K", k);
+            snprintf(name, sizeof name, "gemv %s k=%d", tname[ti], k);
             fails += cmp(name, got, ref, nb * d);
             // GEMM: all tiles, chunks of 5 rows
             memset(got, 0, sizeof(float) * nb * d);
@@ -202,7 +203,7 @@ int main(void) {
             for (int t = 0; t < ntile; t++)
                 for (int ch = 0; ch * nbi < nb; ch++)
                     kqx_gemm_item(got, d, kp, type, d, t, ch, nbi, xq, xs, k, nb, k, xf, c16, scr, &last);
-            snprintf(name, sizeof name, "gemm %s k=%d", type == GGML_Q4_K ? "Q4_K" : type == GGML_Q5_K ? "Q5_K" : "Q6_K", k);
+            snprintf(name, sizeof name, "gemm %s k=%d", tname[ti], k);
             fails += cmp(name, got, ref, nb * d);
             free(src); free(kp); free(xq); free(xs); free(xf); free(c16); free(ref); free(got); free(scr);
         }

@@ -1,5 +1,5 @@
 /* AVX-512 VNNI Q8_0 kernels for the forward passes (forward.c: GEMM for the batched prefill, GEMV for decode); further down
- * the same for the K-quants (Q4_K / Q5_K / Q6_K on the Q4P / Q5P / Q6P layouts of kquants.h) and the attention.
+ * the same for the K-quants (Q3_K / Q4_K / Q5_K / Q6_K on the Q3P / Q4P / Q5P / Q6P layouts of kquants.h) and the attention.
  *
  * Enabled when the compiler targets AVX-512 F/BW/VNNI (e.g. -march=native on Zen 4 / Ice Lake+)
  * and RUNQ_GENERIC is not defined; it then defines RUNQ_VNNI. Otherwise this header is empty and
@@ -267,34 +267,37 @@ static void q8p_gemv_rows(float *out, const int8_t *xq, const float *xs, const i
 }
 
 /* ---------------------------------------------------------------------------------------------
- * K-quants (GGUF Q4_K / Q5_K / Q6_K) on the repacked Q4P / Q5P / Q6P layouts of kquants.h: GEMV
- * (decode) and GEMM (prefill). The arithmetic is the definition in kquants.h's header comment, as the
- * generic q4p_dot / q5p_dot / q6p_dot compute it: exact int32 sums (vpdpbusd, q as u8 0..15 / 0..31 /
- * 0..63 x xq as s8),
+ * K-quants (GGUF Q3_K / Q4_K / Q5_K / Q6_K) on the repacked Q3P / Q4P / Q5P / Q6P layouts of kquants.h:
+ * GEMV (decode) and GEMM (prefill). The arithmetic is the definition in kquants.h's header comment, as the
+ * generic q3p_dot / q4p_dot / q5p_dot / q6p_dot compute it: exact int32 sums (vpdpbusd, q as u8 0..7 /
+ * 0..15 / 0..31 / 0..63 x xq as s8),
  * then per (16-row block, activation row, group of 32) the float fold with explicit-rounding
  * intrinsics (no contraction, no reassociation), groups in order:
  *   Q4_K / Q5_K: val = val + ((ds * xs) * (float) isum - dm * xf),  ds = d * sc, dm = dmin * m (exact)
  *   Q6_K: val = val + (d * xs) * (float) (sc_j0 * t_j0 + sc_j1 * t_j1),
  *         t_j = sum of q * xq over the 16 values of sub-block j - 32 * (sum of their 16 xq)
+ *   Q3_K: the same with q' (0..7), - 4 * (sum of the 16 xq) and the scales sc - 32
  * The 16 lanes of a zmm are the 16 rows of a block (d, dmin, sc, m per lane; xs, xf broadcast).
  * Activation side, per row: xf[g] (kq_act_prep, kquants.h) and c16[i] = -32 * (sum of the 16 xq
- * at 16 i) (kq512_c16): Q6_K's accumulators start there, so the -32 costs nothing per weight.
+ * at 16 i) (kq512_c16): Q6_K's accumulators start there (Q3_K's at c16 / 8, exact), so the -32 / -4
+ * costs nothing per weight.
  *
- * GEMV: one 16-row block at a time, streamed (decode is memory-bound: the 4 / 6-bit data is read
+ * GEMV: one 16-row block at a time, streamed (decode is memory-bound: the 3- to 6-bit data is read
  * once, packed, and unpacked in registers: and 0x0f / shift right 4 for the nibbles, Q5_K's high
  * bit from the masks (maskz_mov_epi8, or), Q6_K's high
- * 2 bits shifted into bits 4-5 of each byte and or'ed in).
+ * 2 bits shifted into bits 4-5 of each byte and or'ed in, Q3_K's 2-bit crumbs shifted and masked, + 4
+ * where its mask bit is set (mask_add_epi8)).
  * GEMM: work items (2-block = 32-row weight tile, chunk of activation rows), as q8p_gemm_item. Each
  * thread unpacks its weight tile once into a per-thread scratch ("KQS": per block and group of 32
  * columns 8 steps of 64 bytes of u8 q, lane r = row r, 4 consecutive columns per step, the Q8P
- * step layout; Q4_K / Q5_K: + ds, dm as fp32; Q6_K: + sc_j0, sc_j1 as int32, d as fp32) and reuses it
+ * step layout; Q4_K / Q5_K: + ds, dm as fp32; Q3_K / Q6_K: + sc_j0, sc_j1 as int32, d as fp32) and reuses it
  * for all its activation rows (consecutive items of the same tile: unpacked once); the register
- * tile then reads u8 weights as the Q8 GEMM does, with no unpacking in the inner loop.
+ * tile then reads u8 weights as the Q8 GEMM does, with no unpacking in the inner loop (Q3_K: Q6_K's tile).
  */
 #include "kquants.h"
 
 #define KQS_Q4 640 // scratch bytes per (block, group): 8 x 64 q, 64 ds, 64 dm (Q5_K: the same, u8 0..31)
-#define KQS_Q6 704 // 8 x 64 q, 64 sc_j0 (int32), 64 sc_j1, 64 d
+#define KQS_Q6 704 // 8 x 64 q, 64 sc_j0 (int32), 64 sc_j1, 64 d (Q3_K: the same, q' 0..7, sc - 32)
 // GEMM register tiles: KQ_RB blocks x KQ4_C / KQ6_C activation rows. Q4: 2 x C int32 + 2 x C
 // float accumulators; Q6: 3 x 2 x C (the two sub-block sums t_j and I are live together)
 #ifndef KQ4_C
@@ -345,6 +348,64 @@ static inline void kq6_unpack4(const uint8_t *ql, const uint8_t *qh, __m512i q[4
     q[3] = _mm512_ternarylogic_epi32(_mm512_srli_epi16(h, 2), _mm512_srli_epi16(v1, 4), m4, 0xd8);
     for (int t = 0; t < 4; t++)
         q[t] = _mm512_and_si512(q[t], _mm512_set1_epi8(0x3f));
+}
+
+static inline void kq3_unpack4(const uint8_t *ql, const uint8_t *mp, __m512i q[4]) {
+    // the 4 steps (columns 4 t .. 4 t + 3) of a Q3P sub-block as u8 q' (0..7): the low 2 bits from the chunk
+    // ql (bits 2 t, 2 t + 1: 16-bit shifts, the and keeps bytes apart), + 4 where mask t (at mp + 8 t) is set
+    const __m512i m3 = _mm512_set1_epi8(3), four = _mm512_set1_epi8(4);
+    __m512i v = _mm512_load_si512((const void *)ql);
+    __m512i l[4] = { _mm512_and_si512(v, m3), _mm512_and_si512(_mm512_srli_epi16(v, 2), m3),
+                     _mm512_and_si512(_mm512_srli_epi16(v, 4), m3), _mm512_and_si512(_mm512_srli_epi16(v, 6), m3) };
+    for (int t = 0; t < 4; t++)
+        q[t] = _mm512_mask_add_epi8(l[t], (__mmask64)kq_u64(mp + 8 * t), l[t], four);
+}
+
+static inline void kq3_scales(const uint8_t *o, int g8, __m512i *s0, __m512i *s1) {
+    // the scales sc - 32 of sub-blocks 2 g8, 2 g8 + 1 of the 16 rows as int32 (Q3P: the low nibbles at
+    // 64 + 16 g8, the high 2 bits at 192 + 16 (g8 / 2), bits 4 (g8 % 2) ..)
+    const __m512i m15 = _mm512_set1_epi32(15), m3 = _mm512_set1_epi32(3), c32 = _mm512_set1_epi32(32);
+    __m512i L = _mm512_cvtepu8_epi32(_mm_load_si128((const __m128i *)(o + 64 + 16 * g8)));
+    __m512i H = _mm512_srl_epi32(_mm512_cvtepu8_epi32(_mm_load_si128((const __m128i *)(o + 192 + 16 * (g8 / 2)))),
+                                 _mm_cvtsi32_si128(4 * (g8 & 1)));
+    *s0 = _mm512_sub_epi32(_mm512_or_si512(_mm512_and_si512(L, m15), _mm512_slli_epi32(_mm512_and_si512(H, m3), 4)), c32);
+    *s1 = _mm512_sub_epi32(_mm512_or_si512(_mm512_srli_epi32(L, 4), _mm512_slli_epi32(_mm512_and_si512(_mm512_srli_epi32(H, 2), m3), 4)),
+                           c32);
+}
+
+static void kq3_gemv_rows(float *out, const int8_t *xq, const float *xs, const int32_t *c16, const uint8_t *wp, int k,
+                          int rb0, int rb1) {
+    // out[i] = W[i, :] . x for the rows of the 16-row Q3P blocks rb0..rb1-1 (decode, no OpenMP here; c16:
+    // kq512_c16 of xq, / 8 = Q3_K's accumulator start)
+    int nsb = k / QK_K;
+    for (int rb = rb0; rb < rb1; rb++) {
+        const uint8_t *wb = wp + (size_t)rb * nsb * Q3P_SB;
+        __m512 f = _mm512_setzero_ps();
+        for (int s = 0; s < nsb; s++) {
+            const uint8_t *o = wb + (size_t)s * Q3P_SB;
+            __m512 d = _mm512_load_ps((const float *)o);
+            #pragma GCC unroll 2
+            for (int g8 = 0; g8 < 8; g8++) {
+                int g = 8 * s + g8;
+                const uint8_t *qg = o + 256 + 192 * g8;
+                __m512i sc[2], I = _mm512_setzero_si512();
+                kq3_scales(o, g8, &sc[0], &sc[1]);
+                for (int h = 0; h < 2; h++) {
+                    const int8_t *x = xq + 32 * g + 16 * h;
+                    __m512i q[4];
+                    kq3_unpack4(qg + 64 * h, qg + 128 + 32 * h, q);
+                    __m512i t0 = _mm512_set1_epi32(c16[2 * g + h] / 8), t1 = _mm512_setzero_si512();
+                    t0 = _mm512_dpbusd_epi32(t0, q[0], q8p_bcast4(x));
+                    t1 = _mm512_dpbusd_epi32(t1, q[1], q8p_bcast4(x + 4));
+                    t0 = _mm512_dpbusd_epi32(t0, q[2], q8p_bcast4(x + 8));
+                    t1 = _mm512_dpbusd_epi32(t1, q[3], q8p_bcast4(x + 12));
+                    I = _mm512_add_epi32(I, _mm512_mullo_epi32(_mm512_add_epi32(t0, t1), sc[h]));
+                }
+                f = kq6_fold(f, d, xs[g], I);
+            }
+        }
+        _mm512_storeu_ps(out + (size_t)rb * KQ_ROWS, f);
+    }
 }
 
 static void kq4_gemv_rows(float *out, const int8_t *xq, const float *xs, const float *xf, const uint8_t *wp, int k,
@@ -456,12 +517,14 @@ static void kq512_gemv_rows(int type, float *out, const int8_t *xq, const float 
         kq4_gemv_rows(out, xq, xs, xf, wp, k, rb0, rb1);
     else if (type == GGML_Q5_K)
         kq5_gemv_rows(out, xq, xs, xf, wp, k, rb0, rb1);
+    else if (type == GGML_Q3_K)
+        kq3_gemv_rows(out, xq, xs, c16, wp, k, rb0, rb1);
     else
         kq6_gemv_rows(out, xq, xs, c16, wp, k, rb0, rb1);
 }
 
 static void kq_unpack_tile(int type, uint8_t *scr, const uint8_t *wp, int nblk, int k) {
-    // nblk (<= KQ_RB) consecutive Q4P / Q5P / Q6P blocks at wp -> the KQS scratch layout (block r at
+    // nblk (<= KQ_RB) consecutive Q3P / Q4P / Q5P / Q6P blocks at wp -> the KQS scratch layout (block r at
     // scr + r * (k / 32) * KQS_Q4 / KQS_Q6)
     int nsb = k / QK_K, ng = k / 32;
     const __m512i m4 = _mm512_set1_epi8(0x0f), m16 = _mm512_set1_epi8(0x10);
@@ -498,6 +561,23 @@ static void kq_unpack_tile(int type, uint8_t *scr, const uint8_t *wp, int nblk, 
                     }
                     _mm512_store_ps((float *)(dst + 512), _mm512_mul_round_ps(d, kq512_u8ps(o + 64 + 16 * j), Q8P_RND));
                     _mm512_store_ps((float *)(dst + 576), _mm512_mul_round_ps(dmin, kq512_u8ps(o + 192 + 16 * j), Q8P_RND));
+                }
+            } else if (type == GGML_Q3_K) {
+                const uint8_t *o = wp + ((size_t)r * nsb + s) * Q3P_SB;
+                __m512 d = _mm512_load_ps((const float *)o);
+                for (int g8 = 0; g8 < 8; g8++) {
+                    uint8_t *dst = scr + ((size_t)r * ng + 8 * s + g8) * KQS_Q6;
+                    const uint8_t *qg = o + 256 + 192 * g8;
+                    __m512i sc[2];
+                    kq3_scales(o, g8, &sc[0], &sc[1]);
+                    for (int h = 0; h < 2; h++) {
+                        __m512i q[4];
+                        kq3_unpack4(qg + 64 * h, qg + 128 + 32 * h, q);
+                        for (int t = 0; t < 4; t++)
+                            _mm512_store_si512((void *)(dst + 256 * h + 64 * t), q[t]);
+                        _mm512_store_si512((void *)(dst + 512 + 64 * h), sc[h]);
+                    }
+                    _mm512_store_ps((float *)(dst + 640), d);
                 }
             } else {
                 const uint8_t *o = wp + ((size_t)r * nsb + s) * Q6P_SB;
@@ -560,9 +640,10 @@ void kq45_tile(const int RB, const int C, const uint8_t *ws, size_t bstride, int
 }
 
 static inline __attribute__((always_inline))
-void kq6_tile(const int RB, const int C, const uint8_t *ws, size_t bstride, int ng, const int8_t *x, size_t ldx,
-              const float *xs, size_t ldxs, const int32_t *c16, size_t ldc, float *out, size_t ldo) {
-    // the same for the Q6 scratch tile (c16 + c * ldc: row c's -32 * sums of 16)
+void kq6_tile(const int RB, const int C, const int DIV, const uint8_t *ws, size_t bstride, int ng, const int8_t *x,
+              size_t ldx, const float *xs, size_t ldxs, const int32_t *c16, size_t ldc, float *out, size_t ldo) {
+    // the same for the Q6 scratch tile (c16 + c * ldc: row c's -32 * sums of 16), and the Q3 one (DIV 8: the
+    // accumulators start at c16 / 8 = -4 * sums of 16; Q6_K: DIV 1)
     __m512 f[KQ_RB][8];
     for (int r = 0; r < RB; r++)
         for (int c = 0; c < C; c++)
@@ -577,7 +658,7 @@ void kq6_tile(const int RB, const int C, const uint8_t *ws, size_t bstride, int 
         for (int h = 0; h < 2; h++) {
             __m512i t[KQ_RB][8];
             for (int c = 0; c < C; c++) {
-                __m512i cv = _mm512_set1_epi32(c16[c * ldc + 2 * g + h]);
+                __m512i cv = _mm512_set1_epi32(c16[c * ldc + 2 * g + h] / DIV);
                 for (int r = 0; r < RB; r++)
                     t[r][c] = cv;
             }
@@ -612,11 +693,12 @@ void kq6_tile(const int RB, const int C, const uint8_t *ws, size_t bstride, int 
 static void kq_tile_any(int type, int rb, int c, const uint8_t *ws, size_t bstride, int ng, const int8_t *x, size_t ldx,
                         const float *xs, size_t ldxs, const float *xf, size_t ldxf, const int32_t *c16, size_t ldc,
                         float *out, size_t ldo) {
-    // dispatch to the instance with compile-time RB (1..2) and C (1..KQ4_C / KQ6_C)
+    // dispatch to the instance with compile-time RB (1..2) and C (1..KQ4_C / KQ6_C; Q3_K: Q6_K's tile)
     #define KQ_CASE(R, CC) \
         case (R) * 16 + (CC): \
-            if (type != GGML_Q6_K) { if ((CC) <= KQ4_C) kq45_tile(R, (CC) <= KQ4_C ? (CC) : 1, ws, bstride, ng, x, ldx, xs, ldxs, xf, ldxf, out, ldo); } \
-            else if ((CC) <= KQ6_C) kq6_tile(R, (CC) <= KQ6_C ? (CC) : 1, ws, bstride, ng, x, ldx, xs, ldxs, c16, ldc, out, ldo); \
+            if (type == GGML_Q6_K) { if ((CC) <= KQ6_C) kq6_tile(R, (CC) <= KQ6_C ? (CC) : 1, 1, ws, bstride, ng, x, ldx, xs, ldxs, c16, ldc, out, ldo); } \
+            else if (type == GGML_Q3_K) { if ((CC) <= KQ6_C) kq6_tile(R, (CC) <= KQ6_C ? (CC) : 1, 8, ws, bstride, ng, x, ldx, xs, ldxs, c16, ldc, out, ldo); } \
+            else if ((CC) <= KQ4_C) kq45_tile(R, (CC) <= KQ4_C ? (CC) : 1, ws, bstride, ng, x, ldx, xs, ldxs, xf, ldxf, out, ldo); \
             break;
     switch (rb * 16 + c) {
         KQ_CASE(1, 1) KQ_CASE(1, 2) KQ_CASE(1, 3) KQ_CASE(1, 4) KQ_CASE(1, 5) KQ_CASE(1, 6) KQ_CASE(1, 7) KQ_CASE(1, 8)
@@ -631,7 +713,7 @@ static void kq_tile_any(int type, int rb, int c, const uint8_t *ws, size_t bstri
 static void kq512_gemm_item(float *out, int ldo, const uint8_t *kp, int type, int d, int t, int ch, int nbi,
                             const int8_t *xq, const float *xs, int ldx, int nb, int k, const float *xf,
                             const int32_t *c16, uint8_t *scr, const void **last) {
-    // one K-quant GEMM work item, as q8p_gemm_item: 32-row tile t of W (Q4P / Q6P), activation rows
+    // one K-quant GEMM work item, as q8p_gemm_item: 32-row tile t of W (Q3P .. Q6P), activation rows
     // of chunk ch (xf + b * k / 32: kq_act_prep, c16 + b * k / 16: kq512_c16 of each row). The
     // thread's scratch scr (KQ512_SCRATCH(k) bytes) holds the tile unpacked (KQS layout); *last =
     // the tile it holds (unpacked again only for another tile: callers claim all chunks of a tile at once)
@@ -639,13 +721,14 @@ static void kq512_gemm_item(float *out, int ldo, const uint8_t *kp, int type, in
     size_t ldxs = (size_t)ldx / 32;
     int nblk = d / KQ_ROWS, rb0 = t * KQ_RB;
     int rb = nblk - rb0 < KQ_RB ? nblk - rb0 : KQ_RB;
-    size_t bstride = (size_t)ng * (type == GGML_Q6_K ? KQS_Q6 : KQS_Q4);
+    int q36 = type == GGML_Q6_K || type == GGML_Q3_K; // (the Q6 scratch layout and register tile)
+    size_t bstride = (size_t)ng * (q36 ? KQS_Q6 : KQS_Q4);
     const uint8_t *wt = kp + (size_t)rb0 * (k / QK_K) * sbb;
     if (*last != wt) {
         kq_unpack_tile(type, scr, wt, rb, k);
         *last = wt;
     }
-    int b1 = (ch + 1) * nbi < nb ? (ch + 1) * nbi : nb, C = type == GGML_Q6_K ? KQ6_C : KQ4_C;
+    int b1 = (ch + 1) * nbi < nb ? (ch + 1) * nbi : nb, C = q36 ? KQ6_C : KQ4_C;
     for (int b = ch * nbi; b < b1; b += C) {
         int c = b1 - b < C ? b1 - b : C;
         kq_tile_any(type, rb, c, scr, bstride, ng, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
@@ -834,6 +917,45 @@ void kq6_smb_block(const int C, const uint8_t *wb, int nsb, const int8_t *x, siz
         _mm512_storeu_ps(out + (size_t)c * ldo, f[c]);
 }
 
+static inline __attribute__((always_inline))
+void kq3_smb_block(const int C, const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs,
+                   const int32_t *c16, size_t ldc, float *out, size_t ldo, int pf) {
+    // one Q3P block x C activation rows, as kq6_smb_block (accumulators from c16 / 8, the scales sc - 32)
+    __m512 f[8];
+    for (int c = 0; c < C; c++)
+        f[c] = _mm512_setzero_ps();
+    for (int s = 0; s < nsb; s++) {
+        const uint8_t *o = wb + (size_t)s * Q3P_SB;
+        __m512 d = _mm512_load_ps((const float *)o);
+        for (int g8 = 0; g8 < 8; g8++) {
+            int g = 8 * s + g8;
+            const uint8_t *qg = o + 256 + 192 * g8;
+            smb_pf(o + g8 * (Q3P_SB / 8), Q3P_SB / 8, pf);
+            __m512i I[8], sc[2];
+            for (int c = 0; c < C; c++)
+                I[c] = _mm512_setzero_si512();
+            kq3_scales(o, g8, &sc[0], &sc[1]);
+            for (int h = 0; h < 2; h++) {
+                __m512i q[4];
+                kq3_unpack4(qg + 64 * h, qg + 128 + 32 * h, q);
+                for (int c = 0; c < C; c++) {
+                    const int8_t *xg = x + (size_t)c * ldx + 32 * g + 16 * h;
+                    __m512i t0 = _mm512_set1_epi32(c16[(size_t)c * ldc + 2 * g + h] / 8), t1 = _mm512_setzero_si512();
+                    t0 = _mm512_dpbusd_epi32(t0, q[0], q8p_bcast4(xg));
+                    t1 = _mm512_dpbusd_epi32(t1, q[1], q8p_bcast4(xg + 4));
+                    t0 = _mm512_dpbusd_epi32(t0, q[2], q8p_bcast4(xg + 8));
+                    t1 = _mm512_dpbusd_epi32(t1, q[3], q8p_bcast4(xg + 12));
+                    I[c] = _mm512_add_epi32(I[c], _mm512_mullo_epi32(_mm512_add_epi32(t0, t1), sc[h]));
+                }
+            }
+            for (int c = 0; c < C; c++)
+                f[c] = kq6_fold(f[c], d, xs[(size_t)c * ldxs + g], I[c]);
+        }
+    }
+    for (int c = 0; c < C; c++)
+        _mm512_storeu_ps(out + (size_t)c * ldo, f[c]);
+}
+
 // instances per row count C = 1..SMB_C (and Q8P group size)
 #define SMB_INST(NAME, BODY) \
     static void NAME##_1 BODY(1) static void NAME##_2 BODY(2) static void NAME##_3 BODY(3) static void NAME##_4 BODY(4) \
@@ -848,17 +970,21 @@ void kq6_smb_block(const int C, const uint8_t *wb, int nsb, const int8_t *x, siz
     size_t ldxf, float *out, size_t ldo, int pf) { kq5_smb_block(C, wb, nsb, x, ldx, xs, ldxs, xf, ldxf, out, ldo, pf); }
 #define SMB_KQ6(C) (const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs, const int32_t *c16, \
     size_t ldc, float *out, size_t ldo, int pf) { kq6_smb_block(C, wb, nsb, x, ldx, xs, ldxs, c16, ldc, out, ldo, pf); }
+#define SMB_KQ3(C) (const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs, const int32_t *c16, \
+    size_t ldc, float *out, size_t ldo, int pf) { kq3_smb_block(C, wb, nsb, x, ldx, xs, ldxs, c16, ldc, out, ldo, pf); }
 SMB_INST(q8p_smb64, SMB_Q8_64)
 SMB_INST(q8p_smb32, SMB_Q8_32)
 SMB_INST(kq4_smb, SMB_KQ4)
 SMB_INST(kq5_smb, SMB_KQ5)
 SMB_INST(kq6_smb, SMB_KQ6)
+SMB_INST(kq3_smb, SMB_KQ3)
 #undef SMB_INST
 #undef SMB_Q8_64
 #undef SMB_Q8_32
 #undef SMB_KQ4
 #undef SMB_KQ5
 #undef SMB_KQ6
+#undef SMB_KQ3
 
 typedef void (*SmbQ8Fn)(const uint8_t *, int, const int8_t *, size_t, const float *, size_t, const int32_t *, size_t, float *, size_t);
 typedef void (*SmbKq4Fn)(const uint8_t *, int, const int8_t *, size_t, const float *, size_t, const float *, size_t, float *, size_t, int);
@@ -868,14 +994,15 @@ static const SmbQ8Fn smb_q8_32[8] = { q8p_smb32_1, q8p_smb32_2, q8p_smb32_3, q8p
 static const SmbKq4Fn smb_kq4[8] = { kq4_smb_1, kq4_smb_2, kq4_smb_3, kq4_smb_4, kq4_smb_5, kq4_smb_6, kq4_smb_7, kq4_smb_8 };
 static const SmbKq4Fn smb_kq5[8] = { kq5_smb_1, kq5_smb_2, kq5_smb_3, kq5_smb_4, kq5_smb_5, kq5_smb_6, kq5_smb_7, kq5_smb_8 };
 static const SmbKq6Fn smb_kq6[8] = { kq6_smb_1, kq6_smb_2, kq6_smb_3, kq6_smb_4, kq6_smb_5, kq6_smb_6, kq6_smb_7, kq6_smb_8 };
+static const SmbKq6Fn smb_kq3[8] = { kq3_smb_1, kq3_smb_2, kq3_smb_3, kq3_smb_4, kq3_smb_5, kq3_smb_6, kq3_smb_7, kq3_smb_8 };
 
 static void smb512_rows(int type, float *out, size_t ldo, const int8_t *xq, size_t ldx, const float *xs, const int32_t *corr,
                         const float *xf, const int32_t *c16, int nb, const uint8_t *wp, int k, int gs, int rb0, int rb1, int pf) {
-    // the small-batch kernel over blocks rb0..rb1-1 of W (Q4P / Q5P / Q6P by type; any other type: Q8P
+    // the small-batch kernel over blocks rb0..rb1-1 of W (Q3P .. Q6P by type; any other type: Q8P
     // with group size gs) and activation rows 0..nb-1, SMB_C rows per pass over a block; pf: the K-quant
     // kernels' prefetch distance (bytes, 0: none)
     size_t ldxs = (size_t)ldx / gs;
-    if (type != GGML_Q4_K && type != GGML_Q5_K && type != GGML_Q6_K) {
+    if (type != GGML_Q3_K && type != GGML_Q4_K && type != GGML_Q5_K && type != GGML_Q6_K) {
         int ng = k / gs;
         size_t bstride = (size_t)ng * Q8P_GROUP(gs);
         const SmbQ8Fn *fn = gs == 64 ? smb_q8_64 : smb_q8_32;
@@ -897,8 +1024,9 @@ static void smb512_rows(int type, float *out, size_t ldo, const int8_t *xq, size
                                                               xs + (size_t)b * ldxs, ldxs, xf + (size_t)b * ng, ng,
                                                               out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo, pf);
             else
-                smb_kq6[c - 1](wp + (size_t)rb * bstride, nsb, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
-                               c16 + (size_t)b * n16, n16, out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo, pf);
+                (type == GGML_Q6_K ? smb_kq6 : smb_kq3)[c - 1](wp + (size_t)rb * bstride, nsb, xq + (size_t)b * ldx, ldx,
+                                                              xs + (size_t)b * ldxs, ldxs, c16 + (size_t)b * n16, n16,
+                                                              out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo, pf);
         }
 }
 

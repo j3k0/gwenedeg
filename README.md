@@ -137,8 +137,9 @@ them: rejected with a clean error; a "UD" file made only of Q4_K / Q5_K / Q6_K /
 the MoE models (`qwen3moe`, `qwen35moe`: Qwen3.5-35B-A3B and up, Qwen3.6-35B-A3B), images, Qwen3-Embedding / Reranker,
 RoPE scaling (YaRN), and Hadamard-folded GGUFs (`prism.hadamard.*` metadata: rejected). The other dense Qwen3.5 / 3.6
 sizes should load but are untested: 2B (as many value heads as key heads, like 0.8B), 9B, 27B and Qwen3.6-27B (2x / 3x
-as many value heads, like 4B; the 27B shape is covered by a synthetic test model). Files with an MTP block
-(`nextn` tensors, e.g. bartowski's) or F32 `ssm_alpha` / `ssm_beta` do not load: use Unsloth's or LM Studio's.
+as many value heads, like 4B; the 27B shape is covered by synthetic test models). Files with an MTP block
+(`nextn_predict_layers`, `nextn` tensors: e.g. bartowski's, and Unsloth's Qwen3.8-27B) are refused with a clear
+message, and F32 `ssm_alpha` / `ssm_beta` (Qwen3.8-27B's) do not load yet: use Unsloth's or LM Studio's Qwen3.5 files.
 
 ## Performance
 

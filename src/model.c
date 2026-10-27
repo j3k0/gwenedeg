@@ -608,6 +608,10 @@ static void load_model(RqModel *m, const char *path, const RqModelOpts *o, Loade
         gguf_parse(&m->gguf);
         gguf_config(&m->gguf, c, &m->rope_theta, &m->rope_dim, &m->hy);
         m->chat = gguf_chat_variant(&m->gguf);
+        if (m->hy.nextn) // (the layer pattern would count the MTP block as a main layer; tokenizer-only loads are fine)
+            load_fail(e, "GGUF %s: MTP (multi-token prediction) layers are not supported yet: %s.nextn_predict_layers = %d, "
+                      "block_count %d includes the nextn block%s", path, m->hy.on ? "qwen35" : "qwen3", m->hy.nextn,
+                      c->n_layers, m->hy.nextn > 1 ? "s" : "");
     } else {
         // checkpoint format is 256-byte header, and then the model weights
         memcpy(c, map, sizeof(Config));

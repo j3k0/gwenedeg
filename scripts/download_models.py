@@ -121,6 +121,11 @@ SETS = {
     "3.5-0.8b-q4km": ("unsloth/Qwen3.5-0.8B-GGUF", "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0", "Qwen3.5-0.8B-GGUF", [
         ("Qwen3.5-0.8B-Q4_K_M.gguf", 532517120, "sha256", "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517"),
     ]),
+    # Unsloth's Q3_K_M (TODO G3, the Q3_K kernels): Q3_K attn_q / attn_k / attn_gate / ffn_gate / ffn_up (78 tensors, as
+    # the 27B's Q3_K_M file), Q4_K / Q5_K for the rest, Q6_K token_embd (tied), Q8_0 ssm_alpha / ssm_beta
+    "3.5-0.8b-q3km": ("unsloth/Qwen3.5-0.8B-GGUF", "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0", "Qwen3.5-0.8B-GGUF", [
+        ("Qwen3.5-0.8B-Q3_K_M.gguf", 470167808, "sha256", "c49ad509cd0a3f8584c4eff50d84202336bf9475b8a724c89f4061687c1fb510"),
+    ]),
     # Qwen3.5-4B: 32 layers (24 linear / 8 attention), dim 2560, ffn 9216, 16 / 4 attention heads, 16 key heads but
     # 32 value heads in the linear layers (nv = 2 nk: the GGUF's value heads are in llama.cpp's tiled order,
     # docs/qwen35.md), tied. The HF checkpoint (bf16, 9.3 GB, with the vision tower and MTP) is the input of
@@ -152,7 +157,7 @@ DEFAULT_SETS = ["hf", "q4km", "q8gguf"]
 # names that stand for several sets
 GROUPS = {
     "family": ["q5km", "1.7b-q8", "1.7b-q4km", "1.7b-hf", "4b-q4km", "4b-q8", "4b-2507i-q4km", "8b-q4km"],
-    "qwen35": ["3.5-0.8b-hf", "3.5-0.8b-q8", "3.5-0.8b-q4km"],
+    "qwen35": ["3.5-0.8b-hf", "3.5-0.8b-q8", "3.5-0.8b-q4km", "3.5-0.8b-q3km"],
     "qwen35-4b": ["3.5-4b-q8", "3.5-4b-hf"],
 }
 CHUNK = 1 << 20

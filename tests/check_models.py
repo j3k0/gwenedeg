@@ -26,6 +26,7 @@ models  (opt-in: tests/run_tests.sh --models, make test-models) every downloaded
         template variant and its renderings, runq serve (greedy == the CLI, a constrained reply)
 """
 import argparse
+import concurrent.futures as cf
 import json
 import os
 import signal
@@ -297,6 +298,9 @@ FAMILY = [
     ("3.5-0.8b-q8", "Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf", "qwen3.5", [("3.5-0.8b-hf", "q8_hf"), ("3.5-0.8b-q8", "ref")]),
     # Unsloth's Q4_K_M: attn_qkv / ssm_out of the linear layers Q5_K (Q4_K, Q6_K, Q8_0 for the rest)
     ("3.5-0.8b-q4km", "Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf", "qwen3.5", [("3.5-0.8b-hf", "q35q4_hf"), ("3.5-0.8b-q4km", "ref")]),
+    # Unsloth's Q3_K_M (TODO G3): the Q3_K kernels on attn_q / attn_k / attn_gate / ffn_gate / ffn_up (78 tensors: the
+    # roles of the 27B's Q3_K_M file but its token_embd), Q4_K / Q5_K for the rest, Q6_K token_embd, Q8_0 alpha / beta
+    ("3.5-0.8b-q3km", "Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_M.gguf", "qwen3.5", [("3.5-0.8b-hf", "q35q3_hf"), ("3.5-0.8b-q3km", "ref")]),
     # Qwen3.5-4B Q8_0: 32 value heads on 16 key heads (llama.cpp's tiled order: value head h uses key head h % 16). Its
     # HF golden is tests/ref_qwen35.py on the HF bf16 weights (make_model_ref.py --hf: transformers' fp32 forward needs
     # ~17 GB), which matches transformers on 0.8B and on tiny models with nv = 2 / 3 nk (docs/qwen35.md)
@@ -311,15 +315,16 @@ FAMILY = [
 # at a time (the models group runs its files in turn); GWENEDEG_TEST_MEM (GiB) stands in for MemAvailable
 BIG = {"3.8-27b-q4km"}
 BIG_MARGIN = 1.5
-# dequantized rows vs gguf-py (tests/golden/dequant, tests/make_dequant_golden.py --q5), bitwise, per FAMILY tag:
+# dequantized rows vs gguf-py (tests/golden/dequant, tests/make_dequant_golden.py --q5 / --q3), bitwise, per FAMILY tag:
 # from the file's blocks and from the repacked layouts (`runq -m dequant`)
-DEQUANT = {"3.5-0.8b-q4km": "q5_k.npz"}
-# more kernel checks for the files with a new kernel type (Q5_K) or code path (4B: value heads != key heads): AVX-512 vs
+DEQUANT = {"3.5-0.8b-q4km": "q5_k.npz", "3.5-0.8b-q3km": "q3_k.npz"}
+# more kernel checks for the files with a new kernel type (Q5_K, Q3_K) or code path (4B: value heads != key heads): AVX-512 vs
 # generic logits at -b 64 (the GEMM tiles of every Q5_K matrix: 15 rows = 6 + 6 + 3; the batched DeltaNet items), and
 # the batched passes' api_test digests (--digest-small) of both builds
-EXTRA_KERNELS = {"3.5-0.8b-q4km": [("en", 64)], "0.6b-q5km": [("en", 64)], "3.5-4b-q8": [("en", 64)]}
+EXTRA_KERNELS = {"3.5-0.8b-q4km": [("en", 64)], "0.6b-q5km": [("en", 64)], "3.5-4b-q8": [("en", 64)], "3.5-0.8b-q3km": [("en", 64)]}
 Q35_TAG = "3.5-0.8b-q8"
 Q35_Q4_TAG = "3.5-0.8b-q4km"    # in the q35 group too, if its file is next to the Q8_0 one (~20 s)
+Q35_Q3_TAG = "3.5-0.8b-q3km"    # the same (Q3_K), lean: its weights' checks (render, greedy, api, server: --models)
 # chats on Qwen3.5 (check.py's chat_case): -r 1, the history drops turn 1's reasoning (and its "<think>\n"): the cache
 # goes back to the checkpoint at turn 1's assistant header; the generic build too; -r 0 with a system prompt (no
 # rollback); context full: the oldest turns dropped (back to a checkpoint or 0)
@@ -352,6 +357,11 @@ TH = {
     # pos0 0.9855-0.9957, top-1 14/15, 25/25, 11/15, 7/7, pooled 0.9946); vs its own dequantized-weights reference
     # (the "ref" goldens) runq is at cos 0.9999, top-1 62/62. Bounds ~2x the error
     "q35q4_hf": dict(cos_mean=0.985, cos_pos=0.93, cos_pos0=0.95, top1=0.6, cos_all=0.985),
+    # Qwen3.5-0.8B Unsloth Q3_K_M vs HF fp32 (TODO G3): ~3.5x the Q4_K_M file's error (measured: cos means 0.9701 /
+    # 0.9864 / 0.9815 / 0.9822 (chat, code, en, long2), min 0.8577 (chat), pos0 0.9379-0.9918, top-1 12/15, 24/25, 11/15,
+    # 7/7, pooled 0.98089); vs its own dequantized-weights reference runq is at pooled cos 0.99984, top-1 62/62 (the
+    # Q4_K_M file: 0.99986), i.e. all of it is the 3-bit weights' own error. Bounds ~2x the error
+    "q35q3_hf": dict(cos_mean=0.94, cos_pos=0.72, cos_pos0=0.87, top1=0.6, cos_all=0.96),
 }
 MODEL_THREADS = 8
 MODEL_PROMPTS = ["en", "code", "chat"]
@@ -449,8 +459,9 @@ def greedy_text(stdout):
     return stdout.decode(errors="replace").rstrip("\n")
 
 
-def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", path=None):
-    """the checks of every downloaded FAMILY file (tags: only those; path: the file of the one tag)"""
+def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", path=None, lean=False):
+    """the checks of every downloaded FAMILY file (tags: only those; path: the file of the one tag; lean: the weights'
+    checks only, without render / greedy / api / server, whose code paths another file of the run covers)"""
     gdir = os.path.join(GOLDEN, "models")
     fam = [x for x in FAMILY if tags is None or x[0] in tags]
     where = lambda f: path or os.path.join(ROOT, "models", f)
@@ -474,21 +485,24 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
                 logits_run(runq, model, texts[name], path, chunk, threads)
             return path
         # template variant and renderings (tokenizer only)
-        render_cases(a.runq, model, variant, res, f"{prefix}/{tag}/render")
+        if not lean:
+            render_cases(a.runq, model, variant, res, f"{prefix}/{tag}/render")
         # dequantization vs gguf-py
         if tag in DEQUANT:
             dequant_check(a.runq, model, DEQUANT[tag], res, f"{prefix}/{tag}/dequant")
         # greedy golden
         gpath = os.path.join(gdir, "greedy", f"{tag}.txt")
-        p = run([a.runq, model] + GREEDY, nd)
-        txt = greedy_text(p.stdout)
-        if update:
-            os.makedirs(os.path.dirname(gpath), exist_ok=True)
-            with open(gpath, "w", encoding="utf-8") as fh:
-                fh.write(txt + "\n")
         want = open(gpath, encoding="utf-8").read().rstrip("\n") if os.path.exists(gpath) else None
-        res.report(p.returncode == 0 and txt == want, f"{prefix}/{tag}/greedy", repr(txt[-120:]) +
-                   ("" if txt == want else f"  <- golden {want!r}" if want is not None else "  <- no golden (--update-models)"))
+        if not lean:
+            p = run([a.runq, model] + GREEDY, nd)
+            txt = greedy_text(p.stdout)
+            if update:
+                os.makedirs(os.path.dirname(gpath), exist_ok=True)
+                with open(gpath, "w", encoding="utf-8") as fh:
+                    fh.write(txt + "\n")
+                want = txt
+            res.report(p.returncode == 0 and txt == want, f"{prefix}/{tag}/greedy", repr(txt[-120:]) +
+                       ("" if txt == want else f"  <- golden {want!r}" if want is not None else "  <- no golden (--update-models)"))
         # logits vs the goldens
         for sub, kind in goldens:
             th = TH[kind]
@@ -548,14 +562,14 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
             # (its batched decode of up to 17 sequences, each with its recurrent state and checkpoints, would need
             # ~22.4 GiB of RSS on the 27B: run by hand, docs/qwen38-speculative.md)
             print(f"      {tag}: api_test skipped (memory)")
-        elif a.api_test:
+        elif a.api_test and not lean:
             p = run([a.api_test, model], nd)
             lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
             bad = [l[5:].split("  ")[0] for l in lines if l.startswith("FAIL ")]
             res.report(p.returncode == 0 and lines and not bad, f"{prefix}/{tag}/api",
                        f"api_test (batched decode rows == alone, mixed passes, ...): {len(lines) - len(bad)}/{len(lines)} passed"
                        + (f"; failed: {', '.join(bad)}" if bad else ""))
-        for ok, name, det in server_smoke(a.runq, model, variant, want, None):
+        for ok, name, det in server_smoke(a.runq, model, variant, want, None) if not lean else ():
             res.report(ok, f"{prefix}/{tag}/server/{name}", det)
         for fn in os.listdir(d):
             os.remove(os.path.join(d, fn))
@@ -896,11 +910,14 @@ def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
     a2 = argparse.Namespace(**{**vars(a), "model": a.q35, "vocab_model": a.q35})
     vocab = load_vocab(a.q35)
     d = os.path.join(GOLDEN, "greedy")
-    rec, rec4 = Recorded(), Recorded()
+    rec, rec4, rec3 = Recorded(), Recorded(), Recorded()
     t = os.path.join(tmp, "q35")
     os.makedirs(os.path.join(t, "q4"), exist_ok=True)
+    os.makedirs(os.path.join(t, "q3"), exist_ok=True)
     q4 = os.path.join(os.path.dirname(a.q35), "Qwen3.5-0.8B-Q4_K_M.gguf")
     q4 = q4 if os.path.exists(q4) else None
+    q3 = os.path.join(os.path.dirname(a.q35), "Qwen3.5-0.8B-Q3_K_M.gguf")
+    q3 = q3 if os.path.exists(q3) else None
     try:
         sd, serr = q35_synth_build(a), None
     except RuntimeError as e:
@@ -913,16 +930,21 @@ def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
          for fn in ("synth-tok-qwen3.8.gguf", "synth-tok-qwen3.8-hf.gguf")] + \
         ([ex.submit(q35_two_run, a, sd)] if a.api_test else []) if sd else []
     synth.append(ex.submit(q35_serve_slots, a))
-    return {"a": a2, "tok_test": tok_test, "synth": synth, "synth_err": serr,
+    # the Q3_K_M file (lean) on a worker of its own from the start: on mx, after the other two, it made the suite's
+    # tail (that chain) ~35 s longer; next to them the suite took as long as without it (185.4 / 186.5 s vs 181.0 /
+    # 187.1 s, interleaved, load ~25)
+    q3x = cf.ThreadPoolExecutor(max_workers=1) if q3 else None
+    return {"a": a2, "tok_test": tok_test, "synth": synth, "synth_err": serr, "q3x": q3x,
             "chats": [ex.submit(chat_case, a2, tmp, vocab, d, *c) for c in Q35_CHAT_CASES],
             "rec": rec, "models": [mx.submit(test_models, a, rec, t, texts, False, {Q35_TAG}, "q35", a.q35)] + (
-                [mx.submit(test_models, a, rec4, os.path.join(t, "q4"), texts, False, {Q35_Q4_TAG}, "q35", q4)] if q4 else []),
-            "rec4": rec4}
+                [mx.submit(test_models, a, rec4, os.path.join(t, "q4"), texts, False, {Q35_Q4_TAG}, "q35", q4)] if q4 else []) + (
+                [q3x.submit(test_models, a, rec3, os.path.join(t, "q3"), texts, False, {Q35_Q3_TAG}, "q35", q3, True)] if q3 else []),
+            "rec4": rec4, "rec3": rec3}
 
 
 def test_q35(a, res, tmp, texts, S):
     if S is None:
-        print("      skipped: no Qwen3.5-0.8B Q8_0 GGUF (--q35; scripts/download_models.py 3.5-0.8b-q8, 3.5-0.8b-q4km)")
+        print("      skipped: no Qwen3.5-0.8B Q8_0 GGUF (--q35; scripts/download_models.py 3.5-0.8b-q8, 3.5-0.8b-q4km, 3.5-0.8b-q3km)")
         return
     S["tok_test"](S["a"], res, "q35/tokenizer", "tokenizer_qwen35.json")
     for f in S["chats"]:
@@ -935,5 +957,7 @@ def test_q35(a, res, tmp, texts, S):
             res.report(ok, n, detail)
     for f in S["models"]:
         f.result()
-    for ok, n, detail, xfail in S["rec"].reports + S["rec4"].reports:
+    if S["q3x"]:
+        S["q3x"].shutdown()
+    for ok, n, detail, xfail in S["rec"].reports + S["rec4"].reports + S["rec3"].reports:
         res.report(ok, n, detail, xfail)

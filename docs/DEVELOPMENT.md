@@ -99,7 +99,7 @@ conversation goes.
   and an AVX-512 attention (shared by decode and prefill) on a tiled KV cache
   (`src/kernels_avx512.h`, compile-time selection; `-DRUNQ_GENERIC` / `make generic` or a CPU
   without AVX-512 gives the generic C kernels, bit-identical results);
-  NEON kernels for Q8_0, Q4_K / Q6_K and the attention (f32 / bf16 / f16 KV cache) on AArch64 with
+  NEON kernels for Q8_0, Q3_K .. Q6_K and the attention (f32 / bf16 / f16 KV cache) on AArch64 with
   the dot product extension (`src/kernels_neon.h`; tested on macOS only), bit-identical to the generic ones
   (`make kq-neon-test`);
   RoPE cos/sin once per position;
@@ -142,10 +142,10 @@ conversation goes.
   batched decode of several sequences (Step 10a): small-batch AVX-512 kernels, a decode-rows worker,
   batched sampling, bit-identical to decoding each sequence alone; continuous batching in `runq serve`
   (Step 10b).
-- `src/kquants.h`: the Q4_K / Q5_K / Q6_K block formats, their dequantization, the repacked layouts (Q4P, Q5P,
-  Q6P) and the generic kernels; the arithmetic of a K-quant matmul output is defined there.
+- `src/kquants.h`: the Q3_K / Q4_K / Q5_K / Q6_K block formats, their dequantization, the repacked layouts (Q3P,
+  Q4P, Q5P, Q6P) and the generic kernels; the arithmetic of a K-quant matmul output is defined there.
 - `src/kernels_avx512.h`: the AVX-512 VNNI Q8_0 GEMM / GEMV (group size 64 or 32) and the weight
-  repacking, the Q4_K / Q5_K / Q6_K GEMV / GEMM / small-batch kernels on the Q4P / Q5P / Q6P layouts, and the fp32 attention with the KV
+  repacking, the Q3_K / Q4_K / Q5_K / Q6_K GEMV / GEMM / small-batch kernels on the Q3P .. Q6P layouts, and the fp32 attention with the KV
   cache layouts (fp32 / bf16 / f16; layouts, arithmetic and bit-identity argument in its comments).
 - `src/threads.h`: the thread pool and the phase synchronization (design and measurements in its
   header comment; OpenMP's parallel region instead with `-DRUNQ_NO_POOL` and on Windows).
@@ -198,7 +198,7 @@ vs the f32 cache +8-10% / +17-22% / +23-29% after 451 / 1,500 / 3,000-token prom
 
 ## Platform notes and test status
 
-- Q8_0 (.bin or GGUF) and Q4_K_M / Q5_K_M GGUF (any mix of Q8_0 / Q4_K / Q5_K / Q6_K matrices). Other GGUF types
+- Q8_0 (.bin or GGUF) and Q3_K_M / Q4_K_M / Q5_K_M GGUF (any mix of Q8_0 / Q3_K / Q4_K / Q5_K / Q6_K matrices). Other GGUF types
   (F16, IQ*, Q4_0, ...) are rejected with a clean error. Without AVX-512 VNNI (or `make generic`)
   every format runs on the generic C kernels, with the same results; for Q4_K_M they are ~10x
   slower in prefill and ~3-4x in decode than the AVX-512 ones. On AArch64 (with `sdot`) every
@@ -325,5 +325,6 @@ lists open work only; the full log is in git: `git show b3e48a3:TODO.md`. The st
 | 12b | Qwen3.5's recurrence in blocks of 32 v columns: prefill 0.64x -> 0.82x of Qwen3-0.6B's | `902b66b` |
 | 13 | Q5_K (Unsloth's Qwen3.5-0.8B Q4_K_M, Qwen3 Q5_K_M files): Q5P layout, generic / AVX-512 / NEON kernels | `fc7fca6` |
 | 14 | Qwen3.5-4B: more value heads than key heads (llama.cpp's tiled order, the q / k conv per key head), synthetic r = 2 / 3 models | `e73e0e8` |
+| G3 (Q3_K) | Q3_K (Unsloth's Qwen3.5-0.8B Q3_K_M; for the 27B's Q3_K_M file): Q3P layout, Q6_K's fold on 3-bit values, generic / AVX-512 / NEON kernels | `2f7b8f3` |
 
 The macOS / NEON port (`67d7296` onwards) was developed on a separate branch and merged after Step 7b.

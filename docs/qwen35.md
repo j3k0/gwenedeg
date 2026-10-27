@@ -50,6 +50,26 @@ interleaved with the Q8_0 file):
   `attn_output`, half of `ffn_down` and 2 `attn_v`; Q6_K: the other `ffn_down`, 4 `attn_v` and `token_embd`; Q8_0:
   `ssm_alpha` / `ssm_beta`.
 
+Q3_K_M (Unsloth, 470 MB; Q3_K support added 2026-10-27, TODO G3: the 27B's Q3_K_M file uses the same 3-bit roles):
+
+- Tensor types: Q3_K (78) `attn_q` / `attn_k` (the 6 attention layers), `attn_gate` (18 linear layers), every
+  `ffn_gate` / `ffn_up`; Q4_K `attn_qkv`, `ssm_out`, `attn_output`, most `attn_v` / `ffn_down`; Q5_K 3 of those;
+  Q6_K the tied `token_embd`; Q8_0 `ssm_alpha` / `ssm_beta`.
+- Logits vs HF fp32 (`3.5-0.8b-hf`, 62 positions): cos means 0.9701 / 0.9864 / 0.9815 / 0.9822 (chat, code, en, long2),
+  min 0.8577 (chat), position 0 0.9379-0.9918, pooled 0.98089, top-1 54/62: ~3.5x the Q4_K_M file's 1 - cos (0.9946,
+  57/62). All of it is the 3-bit weights': vs the file's dequantized-weights reference (`3.5-0.8b-q3km`) runq is at
+  pooled cos 0.99984, top-1 62/62 (the Q4_K_M file: 0.99986). Greedy chat answers as the Q4_K_M file does.
+- Bit-identical: `-m dequant` of all 78 Q3_K tensors (236,544 rows, from the blocks and from the repacked layout) ==
+  gguf-py; `-b 1 / 7 / 64 / 512`, 8 vs 3 threads, AVX-512 vs generic (`-b 1 / 7 / 64`, `api_test --digest-small`), a
+  batched decode row vs the sequence alone; NEON vs generic on random Q3_K blocks at k = 1,024 / 3,072
+  (`make kq-neon-test` under clang + qemu-user).
+- Speed (prefill 448 / 1,492 tokens, decode short / after 1,500 tokens, tok/s; `scripts/bench_models.py -t 8 -r 3`,
+  interleaved with the Q4_K_M file, load 3-5): Q3_K_M 1,409 / 1,322, 211.5 / 208.9; Q4_K_M 1,443 / 1,355, 206.0 / 191.8;
+  peak RSS 601 vs 663 MB. Small gains on this file: its matrices read 459 MB per token vs 521, the Q3_K ones only 104
+  (the tied 248k x 1,024 Q6_K classifier is 209). The Q3_K GEMV runs as fast per weight as Q4_K's on one thread (a
+  scratch benchmark at the 27B's `ffn_gate` shape, 17,408 x 5,120: 1.88 vs 1.89 ms; 8 threads 0.29 vs 0.49 ms), so on
+  the 27B the 3-bit matrices are read at memory speed as the 4-bit ones are.
+
 Qwen3.5-4B Q8_0 (Unsloth, 4.48 GB; Step 14, 2026-10-27):
 
 - Logits vs the HF-weights reference (`tests/golden/models/3.5-4b-hf`: **`tests/ref_qwen35.py` on HF's bf16
@@ -141,7 +161,8 @@ Value transforms by llama.cpp's converter, checked bit-exactly (`maxabs 0`) on l
 Tensor types: the Unsloth **Q8_0** file is Q8_0 + F32 only, so runq's kernels cover it. The Unsloth **Q4_K_M**
 uses Q4_K / Q6_K, plus **Q5_K** for `attn_qkv` and `ssm_out` of every linear layer (36 tensors), and Q8_0 for
 `ssm_alpha` / `ssm_beta`. Q5_K is supported since Step 13 (`src/kquants.h`: the Q5P layout, and the Q5_K arithmetic
-= Q4_K's fold on 5-bit values); the Q8_0 file came first. Qwen3.8-27B's Q4_K_M has `ssm_alpha` / `ssm_beta` as **F32**
+= Q4_K's fold on 5-bit values); the Q8_0 file came first. Q3_K (the **Q3_K_M** file, TODO G3) since 2026-10-27: the Q3P
+layout, Q6_K's fold on 3-bit values. Qwen3.8-27B's Q4_K_M has `ssm_alpha` / `ssm_beta` as **F32**
 matrices: accepted for those two only, applied in fp32 to the fp32 activations with a fixed summation order (TODO S6:
 [qwen38-speculative.md](qwen38-speculative.md#loader-the-mtp-block-and-the-f32-matrices)), and an MTP block after its
 64 layers (`nextn_predict_layers` 1), validated but not loaded.

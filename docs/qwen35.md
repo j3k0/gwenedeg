@@ -56,7 +56,7 @@ out  = W_out o                     (1024 x 2048)
 as in Qwen3. **Partial RoPE**: only the first 64 dims of each head rotate (NeoX pairs `(j, j + 32)`,
 theta 1e7), and dims 64..255 pass through. Output: `W_o (attn * sigmoid(gate))`. The config declares
 MRoPE (sections 11 / 11 / 10, interleaved). For text, the three position ids are equal, so it reduces to the
-plain partial RoPE above. Images would need the 3-D positions, which are out of scope.
+plain partial RoPE above. Images would need the 3-D positions, which are out of scope for the project ([IDEAS.md](../IDEAS.md#images-qwen35-vision)).
 
 **Not part of the text model:** the vision tower (153 tensors) and the MTP head (15 tensors, `mtp.*`;
 speculative decoding, see IDEAS.md). The Unsloth GGUFs contain neither: 24 blocks, no `nextn` tensors.

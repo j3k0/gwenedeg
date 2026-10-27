@@ -77,3 +77,21 @@ The `qwen3moe` architecture (e.g. Qwen3-30B-A3B) adds a router and expert FFNs. 
 experts' weights, which suits a memory-bound CPU engine. Batched passes would group rows by expert, and each row's
 result must stay independent of the grouping (the expert matmuls per row as now). The files are large (~18 GB at
 Q4_K_M for 30B-A3B), and the GGUF loader, the weight repacking and the tests would all grow.
+
+## Images (Qwen3.5 vision)
+
+Out of scope for the project (TODO.md), noted in case it is wanted. The Qwen3.5 / 3.6 models are multimodal. In the
+GGUF ecosystem the vision part is a separate **mmproj** file (0.19 GB for 0.8B to 0.93 GB for 27B; architecture
+`clip`, projector `qwen3vl_merger`); the text GGUF is unchanged. It holds a ViT (depth 12-27, patch 16, temporal patch
+2, learned position embedding interpolated + 2-D RoPE, gelu-tanh MLP) and a 2x2 patch merger to the text width.
+The merged patch embeddings replace the `<|image_pad|>` tokens (the template wraps each image in
+`<|vision_start|><|image_pad|><|vision_end|>`; the processor expands the pad to (H/32) x (W/32) tokens).
+
+Positions are 3-D (interleaved MRoPE, sections 11 / 11 / 10): an image token i at `t = p0, x = p0 + i % nx,
+y = p0 + i / nx`, and the image advances the position by `max(nx, ny)`; text has t = h = w, which is today's plain
+partial RoPE. Work: an image decoder + resize / normalize; the ViT + merger forward (its own kernels: patch conv as a
+matmul, bidirectional attention, 2-D RoPE, LayerNorm with bias, gelu); a position counter per sequence apart from
+the index (through `rope_row`, the KV cache, the checkpoints and the sequence API); embeddings as input in the batch
+API; the server's OpenAI image content parts; the template's image items; HF goldens with images. Several weeks.
+Notes: `docs/qwen35.md` (the text model only), llama.cpp's `mtmd` / `clip` and `conversion/qwen3vl.py` as the
+reference for the layout.

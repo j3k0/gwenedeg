@@ -93,9 +93,27 @@ Qwen3.5-0.8B Q8_0 runs and is tested (`make test`'s `q35` group); design, result
 - [ ] **Q5_K, for the Unsloth Q4_K_M** (`Qwen3.5-0.8B-Q4_K_M.gguf`: `attn_qkv` and `ssm_out` of the 18 linear layers
   are Q5_K, rejected today): the "More GGUF types" item below, Q5_K first. Done when the file passes vs a
   `make_model_ref.py` golden (`3.5-0.8b-q4km`) and the bitwise groups (a `FAMILY` entry in `tests/check_models.py`).
-- [ ] **The other sizes**: Qwen3.5-2B / 4B / 9B have `num_v_heads != num_k_heads` (rejected at load): the converter
-  reorders the value heads, check against HF (`tests/ref_qwen35.py` asserts equal counts too); MoE models
-  (Qwen3.6-35B-A3B: these layers plus expert routing); images (MRoPE's 3-D positions, the vision tower).
+- [ ] **The other sizes**: the text models of Qwen3.5 / 3.6 are dense or MoE; **images are out of scope for this
+  project** (ideas: [IDEAS.md](IDEAS.md#images-qwen35-vision)).
+  - Qwen3.5-0.8B and 2B have as many value heads as key heads and should load (2B: untested). 4B / 9B / 27B have
+    `num_v_heads` = 2 x `num_k_heads` (rejected at load). llama.cpp's converter reorders the value heads from
+    HF's grouped order to a tiled one in every GGUF (the v rows of `attn_qkv`, `attn_gate`, `ssm_alpha` / `ssm_beta`
+    / `ssm_a` / `ssm_dt`, the v channels of `ssm_conv1d`, the input columns of `ssm_out`; not the q / k rows nor
+    `ssm_norm`): GGUF value head h uses q / k head `h % nk` (HF: `h // r`). In `dn_head` that is the q / k channel
+    offset `(h % nk) * dk`, but the q / k conv state then advances once per **key** head, not per value head (two
+    value heads would shift the same channels: wrong, and a race): a per-(row, key head) phase for the q / k conv +
+    SiLU + l2norm, and `dn_copy_head` likewise. `tests/ref_qwen35.py` takes `h % nk` on GGUF weights and `h // r`
+    on HF weights. Reject files with `prism.hadamard.*` keys. Test model: unsloth `Qwen3.5-4B-Q8_0.gguf`
+    (4.48 GB, Q8_0 + F32, tied embedding, no MTP). Its HF fp32 reference (16.8 GB) does not fit next to other work:
+    run `ref_qwen35.py` on the HF weights layer by layer (~4 GB), and test the reorder end to end on a tiny
+    random-init `qwen3_5` model converted with llama.cpp's converter.
+  - MoE (`qwen35moe`, Qwen3.6-35B-A3B and a tiny test model): router `ffn_gate_inp` (F32), experts
+    `ffn_{gate,up,down}_exps` (3-D tensors), a shared expert `ffn_*_shexp` with its sigmoid gate
+    `ffn_gate_inp_shexp`; softmax, top-8, always renormalized (as `qwen3moe`, which has no shared expert). The 35B's
+    Q4_K_M file is 22 GB: runq copies and repacks all weights into RAM today, so the experts (19.5 GB) would be read
+    in place from the mmap'd file, and `ffn_down_exps` needs Q5_K. Estimate: ~2.6 GB read per token, 30-40 tok/s
+    with everything cached, a few tok/s on the 30 GB dev box. Reference: a numpy forward that dequantizes only the
+    routed experts (HF's 67 GB bf16 is out of reach). Order: Q5_K, 4B Q8_0, a tiny MoE, then the 35B.
 - [ ] **Checkpoints, measured**: `RQ_SEQ_CK` = 2 per sequence (18.9 MB each) at the prompt's assistant header
   (docs/qwen35.md). Not measured on real traffic: how often `runq serve`'s requests roll back further (a
   re-prefill of the whole conversation), and whether a checkpoint at the end of each reply would pay off.

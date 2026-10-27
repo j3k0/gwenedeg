@@ -101,12 +101,13 @@ the `q35` group ([tests/README.md](../tests/README.md)).
 Method: Qwen3.8-27B through an OpenAI-compatible inference API (HTTP 429 above ~4 parallel requests; the key file is
 git-ignored); each answer teacher-forced through Qwen3.5-0.8B Q8_0 with `runq -m logits`, with the exact 3.8 prompt
 rendering (prompt lengths equal the API's). 30 prompts in 6 kinds; answers up to 400 tokens, 500 with thinking (the
-start of the reasoning only). Scripts and raw data: `logs/specmeas-2026-10-27/` (git-ignored; TODO S0 keeps them).
+start of the reasoning only). Tool: `scripts/spec_accept.py` (below); raw data: `logs/specmeas-2026-10-27/`
+(git-ignored).
 
 | | top-1 match | tokens per pass, k = 3 (loop simulated) | est. tok/s (best k) |
 |---|---|---|---|
 | thinking off, temperature 0 | 83% | 2.97 | ~17.7 (k = 3) |
-| thinking off, temperature 1 | 80% | 2.81 | ~16.7 |
+| thinking off, temperature 1 | 80% | 2.81 | ~16.8 |
 | thinking on, temperature 0 | 70% | 2.38 | ~14.2 |
 | thinking on, temperature 1 | 65% | 2.18 | ~13.0 |
 
@@ -115,6 +116,58 @@ k: 3 for chat and summaries (~15-16 tok/s), 6 for code and math (~21-23). Temper
 sampled output (the rule kept; a lower bound for rejection sampling). The tok/s are a **cost model**: a 27B decode
 step ~120 ms (16.8 GB at ~140 GB/s); a verify pass of k + 1 rows ~1.03-1.9x one step for k = 1-8 (interpolated from
 8 batched rows ~1.8-2x one row on the 4B / 8B); a 0.8B step ~6 ms, k + 1 draft steps per pass.
+
+### Rerunning it: `scripts/spec_accept.py`
+
+```sh
+P=".venv/bin/python -I scripts/spec_accept.py"; L=logs/specmeas-2026-10-27
+$P gen $L/out_think_t0.json --think --max 500 --key-file hetzner.key   # 30 requests, 2 at a time; --temp 1: seeded
+$P measure $L/out_think_t0.json models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf   # -> $L/meas_<draft>_<gen>.json
+$P report --by-kind $L/meas_Qwen3.5-0.8B-Q8_0_out_*.json [--draft-ms 6] [--tau 0.4,0.5 --kmax 6,8]
+```
+
+`gen` defaults to the run above (endpoint, model `Qwen3.8-27B`, 2 parallel requests, max 400 tokens, `--set base`
+the 30 prompts; `--set long` 3 prompts that reason at length; `--top-logprobs N` for TODO S10). `measure` renders
+Qwen3.8's template itself (thinking on: the `xhigh` effort line, `--effort`; `--template tmpl_38.jinja` checks it
+against the model's own template with jinja2), checks the prompt length against the API's and saves per answer token
+the target id, the draft's argmax, its top-1 probability and the target token's probability (~0.5 s per answer at 8
+threads; the logits files, ~1 MB per position, go to `--tmp`). `report` simulates the loop and applies the cost
+model. Reproduction (2026-10-27, measure rerun with the 0.8B Q8_0): every per-answer top-1 of the original logs is
+identical (120 answers), so are the table's top-1 and tokens per pass (all k, all kinds). The original tok/s were
+worked out by hand from the ranges above; the script's default verify factors (k = 1..8: 1.03, 1.12, 1.20, 1.35,
+1.47, 1.60, 1.75, 1.90) reproduce them: 17.7 / 16.8 / 14.2 / 13.0 at k = 3 (16.7 before: 2.81 rounded / 168 ms),
+chat / summaries 14.9 / 15.7 at k = 3, code 21.1 and math 23.5 at k = 6. They are a guess until TODO S2 measures
+the verify pass.
+
+### Q4_K_M draft, long reasoning, adaptive draft length (2026-10-27)
+
+The 0.8B decode step (`scripts/bench_models.py -t 8 -r 3`, under the bench lock, two runs, load 12-16 from other
+jobs): Q8_0 134-153 tok/s short, 134-144 after 1,500 tokens (6.5-7.5 ms); Q4_K_M 186-210 / 193-200 (4.8-5.4 ms),
+1.34-1.50x faster; peak RSS 963 / 663 MB. Below: 7.0 ms vs 5.1 ms per draft step, the other parameters as above.
+"Long": 3 new prompts (`--set long`: probability, an LRU cache in C, a logic puzzle; thinking on, up to 1,500
+tokens, 3,522 answer tokens). Adaptive: stop drafting at the first position where the draft's top-1 probability <
+tau, at most k_max (it changes the guesses, never the output); the teacher-forced probabilities are exact up to the
+first wrong guess, after it they only decide how many wasted guesses are paid for.
+
+| | Q8_0: top-1, k = 3, tok/s | Q4_K_M: top-1, k = 3, tok/s | adaptive, tau 0.5, k_max 8: Q8_0 / Q4_K_M |
+|---|---|---|---|
+| thinking off, temperature 0 | 83%, 2.97, 17.3 | 82%, 2.94, 17.9 | 18.4 / 18.9 |
+| thinking off, temperature 1 | 80%, 2.81, 16.4 | 79%, 2.79, 17.0 | 17.3 / 18.0 |
+| thinking on, temperature 0 | 70%, 2.38, 13.8 | 70%, 2.38, 14.5 | 14.7 / 15.1 |
+| thinking on, temperature 1 | 65%, 2.18, 12.7 | 65%, 2.18, 13.3 | 13.7 / 14.1 |
+| thinking on, long (3 prompts) | 70%, 2.38, 13.8 | 69%, 2.35, 14.3 | 14.6 / 15.1 |
+
+- **Q4_K_M as the draft:** the same acceptance (top-1 within a point, tokens per pass within 0.03), ~+4% tok/s from
+  the faster step, 300 MB less RAM. Use it.
+- **Long reasoning** accepts like the first 500 tokens (70%, 2.38 per pass); deeper into the reasoning it does not get
+  worse (code: 41% in the first 500 tokens, 77% after; math 80% / 94%).
+- **Adaptive length: +5-6%** over the best fixed k (3) with one setting (tau 0.4-0.5, k_max 6-8) in every row:
+  thinking off, more tokens per pass for about the same guesses (Q4_K_M: 3.49 per pass for 3.5 guesses, k = 3: 2.94
+  for 3); thinking on, the same tokens per pass with fewer guesses (2.42 for 2.1). Per kind (Q4_K_M, best tau /
+  k_max per kind): thinking off code +10%, math +8%, extraction +11% (tau 0.6, k_max 12: long runs of confident
+  guesses), chat and summaries +0-2%; thinking on +7-15% for code, math and extraction, +2-6% for the rest. With a
+  linear verify cost (1.03 + 0.124 (k - 1)) the gain is +8-11%: fixed k pays for long passes where they fail.
+  Worth it: a loop option (TODO S1).
 
 ## Decisions
 

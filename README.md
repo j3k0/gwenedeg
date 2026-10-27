@@ -99,12 +99,12 @@ Measured on the 16-vCPU AMD EPYC Genoa VM (shared, noisy: best of 2, interleaved
 | Qwen3-4B-Instruct-2507 Q4_K_M | 2.8 GB | 284 / 401 | 56 / 56 | 173 / 237 | 11.86 |
 | Qwen3-4B-Thinking-2507 Q4_K_M | 2.8 GB | 280 / 375 | 51 / 58 | 179 / 233 | 13.61 |
 | Qwen3-8B Q4_K_M | 4.9 GB | 158 / 219 | 30 / 30 | 91 / 119 | 11.53 |
-| Qwen3.5-0.8B Q8_0 (\*) | 0.96 GB | 1,117 / 1,580 | 141 / 182 | | 18.86 (512-token windows: 22.729, HF 22.728) |
+| Qwen3.5-0.8B Q8_0 (\*) | 0.96 GB | 1,506 / 2,039 | 141 / 182 | | 18.86 (512-token windows: 22.729, HF 22.728) |
 
-(\*) Another session (2026-10-26, `scripts/bench_models.py`, 448 tokens; Qwen3-0.6B Q8_0 alongside: 1,817 / 2,494 and
-209 / 230). Its decode barely slows down with the context (160 / 174 tok/s after 1,500 tokens): only 6 of its 24
-layers have a KV cache, at 12 KB per token. Prefill is ~0.6x the 0.6B's: the linear attention's recurrence is not
-tuned yet (docs/qwen35.md, Performance).
+(\*) Another session: prefill 2026-10-27 (`scripts/bench_models.py`, 451 tokens; Qwen3-0.6B Q8_0 alongside: 1,832 /
+2,511), decode 2026-10-26 (0.6B alongside: 209 / 230). Its decode barely slows down with the context (160 / 174 tok/s
+after 1,500 tokens): only 6 of its 24 layers have a KV cache, at 12 KB per token. Prefill is ~0.8x the 0.6B's (it was
+~0.64x before the linear attention's recurrence was blocked and tuned, docs/qwen35.md, Performance).
 
 Decode is memory-bound and moves with the machine's load (8B ranged 12-30 tok/s); startup takes 0.1-0.2 s
 up to 1.7B, ~0.5 s for 4B and ~1 s for 8B. Q4_K_M is the better trade at 4B / 8B (decode ~1.6x Q8_0 at

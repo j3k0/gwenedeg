@@ -231,7 +231,8 @@ has three kinds of objects:
 The forward passes are `rq_decode` (one token), `rq_prefill` (a sequence's tokens in chunks) and
 `rq_forward_batch` (one pass over rows of several sequences, each at its own position: prefill chunks
 next to decode rows). On top of them sit `rq_sample` / `rq_sample_batch` (temperature, top-p, an optional
-token mask), `rq_generate` (the chat loop with per-token callbacks), `rq_tokenize`, `rq_detok_push`
+token mask), `rq_generate` (the chat loop with per-token callbacks; built on `rq_gen_start` / `rq_gen_step`, one
+token at a time, for loops that feed the tokens themselves, e.g. speculative decoding), `rq_tokenize`, `rq_detok_push`
 (incremental, UTF-8 safe) and `rq_chat_render`. Errors come back as `RQ_ERR_*` codes and messages; the
 library never prints or exits.
 

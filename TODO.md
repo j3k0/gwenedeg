@@ -38,20 +38,18 @@ Preparation (no output changes; `make test` and `tests/compare_bins.sh` byte-ide
   cache (`posix_fadvise(POSIX_FADV_DONTNEED)`; the loader `pread`s). (d) Record load peak RSS for the 8B Q4_K_M and
   the 4B Q8_0 as the baseline (tests/README or BENCHMARKS). Done when the estimates are within ~5% of the measured
   RSS and outputs are unchanged.
-- [ ] **P5. Sampling as a reusable step, then top-k.** Factor `rq_generate`'s per-token body (sample with the
-  sequence's RNG, the stop / limit checks, the `on_logits` hook) into one function that the speculative loop calls
-  too, so its RNG pattern (one draw per prefilled token but the last, one per emitted token) is shared by
-  construction, not copied; expose a logits-hash hook in `src/runq.h` for the equivalence tests. Then top-k and the
-  per-model defaults from `general.sampling.*` (Qwen3.8: 1.0 / 0.95 / 20; the older item "Top-k sampling and
-  per-model sampling defaults" is folded in here), with the sampler's exact-order rules. Done when the refactor is
-  byte-identical (compare_bins) and top-k matches a numpy reference of the sampler on recorded logits.
+- [ ] **P5. Top-k and the per-model sampling defaults.** (The step part is done: `rq_gen_start` / `rq_gen_step` in
+  `src/runq.h`, which `rq_generate` is built on.) Top-k and the per-model defaults from `general.sampling.*`
+  (Qwen3.8: 1.0 / 0.95 / 20; the older item "Top-k sampling and per-model sampling defaults" is folded in here), with
+  the sampler's exact-order rules. Done when top-k matches a numpy reference of the sampler on recorded logits.
 
 Steps:
 
 - [ ] **S1. The speculative loop on Qwen3** (no recurrent state). Target Qwen3-1.7B, draft Qwen3-0.6B.
   `rq_generate_spec(ctx_t, seq_t, ctx_d, seq_d, tokens, n, cfg, max_new, k, cb, st)`: draft k tokens greedily on
-  `seq_d`, verify `[last, d1..dk]` as one segment on `seq_t` (`RQ_LOGITS_ALL`), sample the rows in order with P5's
-  step, accept while sample == draft (the first mismatch's sample is the next token), truncate both sequences.
+  `seq_d`, verify `[last, d1..dk]` as one segment on `seq_t` (`RQ_LOGITS_ALL`), sample the rows in order with
+  `rq_gen_step` (`src/runq.h`; `api_test`'s `generate_step` runs this loop with an oracle draft), accept while
+  sample == draft (the first mismatch's sample is the next token), truncate both sequences.
   Adaptive length as an option: stop drafting at the first guess whose draft top-1 probability < tau, at most k
   (measured +5-6% est. tok/s at tau 0.4-0.5, k 6-8; docs/qwen38-speculative.md). Refuse a draft whose vocabulary or
   token bytes (hash) differ. CLI `-D draft.gguf -K k` (and the tau); stats in `[timing]`. Done

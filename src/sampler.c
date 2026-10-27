@@ -181,6 +181,7 @@ unsigned int random_u32(unsigned long long *state) {
 float random_f32(unsigned long long *state) { // random float32 in [0,1)
     return (random_u32(state) >> 8) / 16777216.0f;
 }
+float rq_rng_f32(unsigned long long *state) { return random_f32(state); }
 
 // (not inlined: as a function of its own, taking the configuration through a pointer, its code is
 // the same as before the API; e.g. the temperature division stays a division per value, which

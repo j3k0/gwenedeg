@@ -118,7 +118,13 @@ int rq_seq_common_prefix(const RqSeq *s, const int *tokens, int n); // longest c
 // length, as rq_seq_truncate: src's longest checkpoint <= n, else 0 (rq_seq_len(dst) tells)
 int rq_seq_copy(RqSeq *dst, const RqSeq *src, int n);
 void rq_seq_seed(RqSeq *s, unsigned long long seed);
-unsigned long long *rq_seq_rng(RqSeq *s);      // the sampling RNG state (xorshift)
+// the sampling RNG state (xorshift), read / write: a copy of it predicts the sequence's next draws without
+// consuming them (rq_rng_f32 on the copy); e.g. sampling another model's logits with this sequence's next draw
+// (TODO S10): save that sequence's state, put this one's copy there, rq_sample, restore
+unsigned long long *rq_seq_rng(RqSeq *s);
+// the next uniform draw in [0, 1) of an RNG state, advancing it: rq_sample's coin (one per sampled token at
+// temperature > 0)
+float rq_rng_f32(unsigned long long *state);
 
 // ---------------------------------------------------------------------------------- compute context
 typedef struct RqCtx RqCtx;
@@ -252,10 +258,12 @@ int rq_chat_check(const RqModel *m, int thinking, char *err, size_t errlen);
 
 // --------------------------------------------------------------------------------------- generation
 // Prefill tokens at the sequence's next positions, then sample and decode until an end token (not
-// fed), max_new tokens (> 0) or a full context, as the CLI's chat does. With temperature > 0 the RNG
-// draws once per prefilled token but the last, then once per sampled token. The callbacks (any may be
-// NULL): on_logits before each sample (pos = the position of the token that produced them), on_token
-// for each sampled token that is not an end token (return nonzero to stop: it is not fed then)
+// fed), max_new tokens (> 0) or a full context, as the CLI's chat does. The RNG pattern (temperature
+// != 0): one draw per prefilled token but the last (rq_gen_start), then one per sampled token (rq_gen_step:
+// every token sampled, fed or not: the end token, a token on_token refused or that found no room too). The
+// callbacks (any may be NULL): on_logits before each sample (pos = the position of the token that produced
+// them; the hook for equivalence tests: rq_logits_hash of each), on_token for each sampled token that is
+// not an end token (return nonzero to stop: it is not fed then)
 enum { RQ_STOP_END = 0, RQ_STOP_LIMIT = 1, RQ_STOP_CONTEXT = 2, RQ_STOP_CALLBACK = 3 };
 typedef struct {
     int (*on_token)(void *user, int token);
@@ -269,6 +277,43 @@ typedef struct {
 } RqGenStats;
 int rq_generate(RqCtx *c, RqSeq *s, const int *tokens, int n, const RqSampling *cfg, int max_new,
                 const RqCallbacks *cb, RqGenStats *st);
+
+// rq_generate's loop one token at a time, for a loop that feeds the tokens itself, e.g. a speculative one: it
+// verifies [last, d1..dk] in one pass (RQ_LOGITS_ALL) and steps through the rows in order while the sampled
+// token equals the guess. rq_generate is built on these two calls, so such a loop gets its tokens, RNG draws
+// and callbacks by construction:
+//   rq_prefill(c, s, tokens, n, RQ_LOGITS_LAST, NULL, &logits);   // (or any chunking: the same bits)
+//   RqGen g;
+//   rq_gen_start(&g, s, cfg, max_new, cb, n);
+//   for (int pos = rq_seq_len(s) - 1;; pos++) {
+//       int r = rq_gen_step(&g, c, pos, logits);   // logits: those of the token at pos
+//       if (r < 0) error; if (r == RQ_GEN_DONE) break;
+//       rq_decode(c, s, g.token, r == RQ_GEN_LAST ? NULL : &logits);   // feed it at pos + 1
+//       if (r == RQ_GEN_LAST) break;
+//   }
+// rq_gen_step: on_logits(pos), rq_sample (one draw at temperature > 0), then the checks in this order: an end
+// token (RQ_GEN_DONE, stop RQ_STOP_END), on_token asks to stop (DONE, RQ_STOP_CALLBACK), no room for the token
+// at pos + 1 (DONE, RQ_STOP_CONTEXT), the max_new-th token (RQ_GEN_LAST: feed it, its logits are not needed;
+// stop RQ_STOP_LIMIT); else RQ_GEN_NEXT: feed g.token, then step on its logits. A token is not fed after
+// RQ_GEN_DONE. Errors (< 0): those of rq_sample. The sequence's length is not read (pos is), so the rows of a
+// verify pass that are already in the cache can be stepped through; the callbacks see what rq_generate's would
+enum { RQ_GEN_DONE = 0, RQ_GEN_NEXT = 1, RQ_GEN_LAST = 2 };
+typedef struct {
+    RqSeq *s;
+    const RqSampling *cfg;
+    const RqCallbacks *cb;
+    int max_new;  // as rq_generate's (0: no limit)
+    int n_gen;    // tokens returned to feed so far (RQ_GEN_NEXT / LAST)
+    int token;    // the last sampled token
+    int stop;     // RQ_STOP_* once done, else -1
+} RqGen;
+// the state for a reply after n prompt tokens were prefilled: RNG draws for them (n - 1 at temperature != 0)
+void rq_gen_start(RqGen *g, RqSeq *s, const RqSampling *cfg, int max_new, const RqCallbacks *cb, int n);
+int rq_gen_step(RqGen *g, RqCtx *c, int pos, float *logits);
+
+// a hash of a logits vector's bits (FNV-1a over the bytes; n floats): equal vectors, equal hashes. For tests
+// comparing generation paths through on_logits (e.g. speculative == plain decoding)
+unsigned long long rq_logits_hash(const float *logits, int n);
 
 // ----------------------------------------------------------------------------------------- test hooks
 // rows r0..r0+nr-1 of the matrix `name` (llama.cpp tensor name; GGUF only) dequantized from the file's

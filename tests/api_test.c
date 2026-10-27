@@ -151,6 +151,82 @@ static int on_tok(void *u, int t) {
     return 0;
 }
 
+// rq_generate's callbacks recorded: each sampled logits vector (position, rq_logits_hash) and each reported
+// token with the RNG state right after its draw
+#define GR_MAX 64
+typedef struct {
+    RqSeq *s;
+    int n, nl, tok[GR_MAX], pos[GR_MAX];
+    unsigned long long rng[GR_MAX], lh[GR_MAX];
+} GenRec;
+
+static void gr_logits(void *u, int pos, const float *lg) {
+    GenRec *r = u;
+    if (r->nl < GR_MAX) {
+        r->pos[r->nl] = pos;
+        r->lh[r->nl++] = rq_logits_hash(lg, V);
+    }
+}
+
+static int gr_token(void *u, int t) {
+    GenRec *r = u;
+    if (r->n < GR_MAX) {
+        r->rng[r->n] = *rq_seq_rng(r->s);
+        r->tok[r->n++] = t;
+    }
+    return 0;
+}
+
+static int gr_same(const GenRec *a, const GenRec *b) {
+    return a->n == b->n && a->nl == b->nl && !memcmp(a->tok, b->tok, a->n * sizeof(int)) &&
+           !memcmp(a->rng, b->rng, a->n * sizeof(a->rng[0])) && !memcmp(a->pos, b->pos, a->nl * sizeof(int)) &&
+           !memcmp(a->lh, b->lh, a->nl * sizeof(a->lh[0]));
+}
+
+static int gen_verify_loop(RqCtx *c, RqSeq *s, const int *p, int np, const RqSampling *cfg, int max_new,
+                           const RqCallbacks *cb, const GenRec *ref, RqGen *g) {
+    // TODO S1's loop with an oracle draft: the reply's tokens as guesses (ref), every 4th one wrong, k = 3: feed
+    // [t, d1, d2, d3] in one pass (all rows' logits), rq_gen_step through the rows while the sample equals the
+    // guess; at the first mismatch (or the end) the sequence is cut after the stepped row (Qwen3.5: back to the
+    // checkpoint taken at the pass's start, then the accepted rows prefilled again) and the sample is the next t
+    enum { K = 3 };
+    float *out = malloc((size_t)(K + 1) * V * sizeof(float)), *lg;
+    int e = rq_prefill(c, s, p, np, RQ_LOGITS_LAST, NULL, &lg);
+    if (e != RQ_OK) { free(out); return e; }
+    rq_gen_start(g, s, cfg, max_new, cb, np);
+    int r = rq_gen_step(g, c, rq_seq_len(s) - 1, lg), done = 0;
+    while (r > 0 && !done) {
+        int pos = rq_seq_len(s) - 1, seg[K + 1], idx = g->n_gen; // (the next token is the reply's token idx)
+        seg[0] = g->token;
+        if (r == RQ_GEN_LAST) { e = rq_decode(c, s, seg[0], NULL); break; }
+        for (int j = 1; j <= K; j++) {
+            int i = idx + j - 1;
+            seg[j] = i < ref->n ? ref->tok[i] : 1000 + j;
+            if (i % 4 == 2) seg[j] = (seg[j] + 1) % V; // a wrong guess
+        }
+        if ((e = rq_seq_checkpoint_at(s, pos + 1)) != RQ_OK) break;
+        if ((e = rq_prefill(c, s, seg, K + 1, RQ_LOGITS_ALL, out, NULL)) != RQ_OK) break;
+        int j = 0, keep = 0;
+        for (; j <= K; j++) { // row j: the logits of seg[j], at pos + 1 + j
+            r = rq_gen_step(g, c, pos + 1 + j, out + (size_t)j * V);
+            if (r < 0 || r == RQ_GEN_DONE) { keep = j + 1; done = 1; break; }
+            if (j < K && g->token == seg[j + 1]) { // accepted (already fed)
+                if (r == RQ_GEN_LAST) { keep = j + 2; done = 1; break; }
+                continue;
+            }
+            keep = j + 1; // rejected: g->token is the next t (RQ_GEN_LAST: fed alone below)
+            break;
+        }
+        if (r < 0) { e = r; break; }
+        if ((e = rq_seq_truncate(s, pos + 1 + keep)) != RQ_OK) break;
+        int L = rq_seq_len(s);
+        if (L < pos + 1 + keep && (e = rq_prefill(c, s, seg + (L - pos - 1), pos + 1 + keep - L, RQ_LOGITS_NONE, NULL, NULL)) != RQ_OK)
+            break;
+    }
+    free(out);
+    return e != RQ_OK ? e : r < 0 ? r : RQ_OK;
+}
+
 static void batch_tests(RqCtx *c, RqTokens A, RqTokens B, RqTokens C, const float *refB, int only_digest);
 static int two_main(int argc, char **argv);
 
@@ -375,6 +451,85 @@ int main(int argc, char **argv) {
         rq_tokens_free(&r);
         rq_seq_free(s1);
         rq_seq_free(s2);
+    }
+
+    // 4b. the generation step (rq_gen_start / rq_gen_step) == rq_generate: a hand loop on it; the RNG pattern
+    // written out (n - 1 draws after the prompt, rq_sample per token, rq_rng_f32 on a copy = the next draw); a
+    // verify-pass loop (TODO S1's shape, an oracle draft with wrong guesses). Equal: the tokens, the RNG state
+    // after each sample, each sampled logits vector's position and hash, the stop, the cache's tokens and the
+    // logits of one more decode step. Greedy, seeded top-p and the full distribution; limits 40 and 9
+    {
+        RqTokens p = { 0 };
+        rq_chat_user(M, "Name three colours.", 0, &p);
+        RqSampling cf[4] = { { 0, 0.9f, NULL }, { 0.8f, 0.9f, NULL }, { 1.0f, 1.0f, NULL }, { 0.7f, 0.8f, NULL } };
+        int lim[4] = { 40, 40, 9, 9 }, ok = 1, peek_ok = 1;
+        char dd[192] = "";
+        for (int k = 0; k < 4; k++) {
+            RqSeq *s[4];
+            GenRec rec[4];
+            RqGen g[4];
+            int stop[4], ng[4];
+            unsigned long long hnext[4];
+            for (int i = 0; i < 4; i++) {
+                s[i] = seq_new(0);
+                rq_seq_seed(s[i], 42 + k);
+                memset(&rec[i], 0, sizeof(rec[i]));
+                rec[i].s = s[i];
+            }
+            RqCallbacks cb[4];
+            for (int i = 0; i < 4; i++) cb[i] = (RqCallbacks) { gr_token, gr_logits, &rec[i] };
+            // 0: rq_generate
+            RqGenStats st;
+            int e = rq_generate(c, s[0], p.v, p.n, &cf[k], lim[k], &cb[0], &st);
+            stop[0] = st.stop, ng[0] = st.n_gen;
+            // 1: a hand loop on the step
+            float *lg;
+            if (e == RQ_OK) e = rq_prefill(c, s[1], p.v, p.n, RQ_LOGITS_LAST, NULL, &lg);
+            if (e == RQ_OK) rq_gen_start(&g[1], s[1], &cf[k], lim[k], &cb[1], p.n);
+            for (int pos = rq_seq_len(s[1]) - 1, r; e == RQ_OK; pos++) {
+                if ((r = rq_gen_step(&g[1], c, pos, lg)) <= 0) { e = r < 0 ? r : RQ_OK; break; }
+                e = rq_decode(c, s[1], g[1].token, r == RQ_GEN_LAST ? NULL : &lg);
+                if (r == RQ_GEN_LAST) break;
+            }
+            stop[1] = g[1].stop, ng[1] = g[1].n_gen;
+            // 2: the pattern written out with rq_sample (no step function)
+            if (e == RQ_OK) e = rq_prefill(c, s[2], p.v, p.n, RQ_LOGITS_LAST, NULL, &lg);
+            if (cf[k].temperature != 0)
+                for (int i = 0; i < p.n - 1; i++) rq_rng_f32(rq_seq_rng(s[2]));
+            stop[2] = -1, ng[2] = 0;
+            while (e == RQ_OK) {
+                gr_logits(&rec[2], rq_seq_len(s[2]) - 1, lg);
+                unsigned long long cp = *rq_seq_rng(s[2]);
+                float u = rq_rng_f32(&cp); // (the next draw, peeked)
+                int t = rq_sample(c, s[2], lg, &cf[k]);
+                peek_ok &= cf[k].temperature == 0 ? cp != *rq_seq_rng(s[2]) || u < 0 : cp == *rq_seq_rng(s[2]);
+                if (t < 0) { e = t; break; }
+                if (rq_is_end_token(M, t)) { stop[2] = RQ_STOP_END; break; }
+                gr_token(&rec[2], t);
+                int last = ++ng[2] >= lim[k];
+                e = rq_decode(c, s[2], t, last ? NULL : &lg);
+                if (last) { stop[2] = RQ_STOP_LIMIT; break; }
+            }
+            // 3: the verify-pass loop
+            if (e == RQ_OK) e = gen_verify_loop(c, s[3], p.v, p.n, &cf[k], lim[k], &cb[3], &rec[0], &g[3]);
+            stop[3] = g[3].stop, ng[3] = g[3].n_gen;
+            for (int i = 0; i < 4 && e == RQ_OK; i++) { // the caches: one more decode step
+                if ((e = rq_decode(c, s[i], 1000, &lg)) == RQ_OK) hnext[i] = rq_logits_hash(lg, V);
+            }
+            int okk = e == RQ_OK;
+            for (int i = 1; i < 4 && okk; i++)
+                okk &= gr_same(&rec[0], &rec[i]) && *rq_seq_rng(s[0]) == *rq_seq_rng(s[i]) && stop[i] == stop[0] &&
+                        ng[i] == ng[0] && rq_seq_len(s[i]) == rq_seq_len(s[0]) && hnext[i] == hnext[0] &&
+                        !memcmp(rq_seq_tokens(s[i]), rq_seq_tokens(s[0]), rq_seq_len(s[0]) * sizeof(int));
+            okk &= rec[0].n == ng[0] && rec[0].nl == ng[0] + (stop[0] == RQ_STOP_END);
+            ok &= okk;
+            size_t dl = strlen(dd);
+            snprintf(dd + dl, sizeof(dd) - dl, "%s%s %d tok stop %d%s", k ? "; " : "", k == 0 ? "greedy" : "seeded", ng[0], stop[0],
+                     okk ? "" : " DIFFER");
+            for (int i = 0; i < 4; i++) rq_seq_free(s[i]);
+        }
+        report(ok && peek_ok, "generate_step", dd);
+        rq_tokens_free(&p);
     }
 
     // 5. errors: context full (nothing prefilled), bad token, a sequence twice in one pass, logits rows

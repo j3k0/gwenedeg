@@ -184,8 +184,13 @@ first wrong guess, after it they only decide how many wasted guesses are paid fo
 Batched passes are bit-identical to sequential ones (the repo's invariant), so a verify row's logits equal plain
 decoding's at that position, and exact-match acceptance reproduces plain decoding by construction, provided the
 loop draws from the target sequence's RNG exactly as `rq_generate` does (one draw per prefilled token but the last,
-then one per emitted token) and rolls the target back exactly (KV: truncate; DeltaNet: a checkpoint per verified
-row). The draft's state never affects the output, only the acceptance rate.
+then one per sampled token) and rolls the target back exactly (KV: truncate; DeltaNet: a checkpoint per verified
+row). The draft's state never affects the output, only the acceptance rate. The first part is shared by
+construction: `rq_generate` is `rq_gen_start` + `rq_gen_step` per token (`src/runq.h`: sample, the stop / limit
+checks, `on_logits`), which the speculative loop calls for each verified row with the row's position; `api_test`'s
+`generate_step` runs that loop with an oracle draft (wrong guesses included) and checks tokens, RNG states and
+logits hashes against `rq_generate`. `rq_seq_rng` + `rq_rng_f32` on a copy give the next uniform draw without
+consuming it (S10).
 
 ## Not now
 

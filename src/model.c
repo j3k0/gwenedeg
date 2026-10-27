@@ -113,14 +113,15 @@ static void bin_map_weights(RqModel *m, const char *path, LoadErr *e) {
 // ---------------------------------------------------------------------------- GGUF weights
 
 static void gguf_matrix(const Gguf *g, QuantizedTensor *res, const char *name, int d, int k, int f32) {
-    // one matrix (d, k): Q8_0, Q4_K, Q5_K or Q6_K (dispatch per tensor: Q4_K_M mixes them within a role), or F32 if
+    // one matrix (d, k): Q8_0, Q3_K, Q4_K, Q5_K or Q6_K (dispatch per tensor: Q4_K_M mixes them within a role), or F32 if
     // f32 (only where forward.c's fp32 path takes it: ssm_alpha / ssm_beta), its data in the mapping (q / s / p /
     // kp / f are set by prepare_weights)
     const GgufTensor *t = gguf_tensor(g, name);
     uint32_t type = t ? t->type : GGML_Q8_0; // (missing: gguf_weight reports it)
-    if (type != GGML_Q8_0 && type != GGML_Q4_K && type != GGML_Q5_K && type != GGML_Q6_K && !(f32 && type == GGML_F32)) {
+    if (type != GGML_Q8_0 && type != GGML_Q3_K && type != GGML_Q4_K && type != GGML_Q5_K && type != GGML_Q6_K &&
+        !(f32 && type == GGML_F32)) {
         char msg[160];
-        snprintf(msg, sizeof(msg), "tensor %%s has ggml type %u, need Q8_0 (8), Q4_K (12), Q5_K (13)%s or Q6_K (14)", type,
+        snprintf(msg, sizeof(msg), "tensor %%s has ggml type %u, need Q8_0 (8), Q3_K (11), Q4_K (12), Q5_K (13)%s or Q6_K (14)", type,
                  f32 ? ", F32 (0)" : "");
         gguf_fail(g, msg, name);
     }
@@ -369,7 +370,7 @@ static size_t prep_bytes(const QuantizedTensor *t, int d, int k, int pack) {
     size_t sz = (size_t)d * k + (size_t)d * (k / GS) * sizeof(float); // (generic kernels on GGUF Q8_0: q / s arrays)
     if (t->type == GGML_F32) // (the rows as in the file)
         sz = (size_t)d * k * sizeof(float);
-    else if (t->type != GGML_Q8_0) // Q4_K / Q5_K / Q6_K (GGUF; d % 16 == 0, k % 256 == 0 checked)
+    else if (t->type != GGML_Q8_0) // Q3_K .. Q6_K (GGUF; d % 16 == 0, k % 256 == 0 checked)
         sz = kq_size(t->type, d, k);
 #ifdef RUNQ_Q8X
     else if (pack)
@@ -452,7 +453,7 @@ static void prepare_worker(void *arg, int tid, int nt) {
             prep_item_done(P, jj);
             continue;
         }
-        if (t->kp) { // Q4_K / Q5_K / Q6_K: blocks of nr rows (k / 256 each) -> Q4P / Q5P / Q6P
+        if (t->kp) { // Q3_K .. Q6_K: blocks of nr rows (k / 256 each) -> Q3P / Q4P / Q5P / Q6P
             size_t rowb = (size_t)(k / QK_K) * kq_block_bytes(t->type);
             read_at(fd, P->base, bb, nr * rowb, t->b + r0 * rowb);
             for (size_t i = 0; i < nr * (k / QK_K); i++)
@@ -491,7 +492,7 @@ static int prepare_weights(RqModel *m, int fd, int drop, LoadErr *e, char *warni
     //   generic kernels on a GGUF file: its Q8_0 blocks (fp16 scale + 32 int8) into the q / s
     //     arrays the .bin format has (fp16 -> fp32 is exact)
     //   generic kernels on a .bin file: nothing to do, q / s are the mapping
-    //   GGUF Q4_K / Q5_K / Q6_K tensors (any build): repacked into the Q4P / Q5P / Q6P layouts of kquants.h
+    //   GGUF Q3_K / Q4_K / Q5_K / Q6_K tensors (any build): repacked into the Q3P / Q4P / Q5P / Q6P layouts of kquants.h
     // The source rows are read with pread (read_at), not through the mapping: only the norms and
     // the token embedding rows looked up later (the classifier is shared with them) are ever
     // mapped. The destination is pre-faulted in parallel (MADV_POPULATE_WRITE, 2 MB per call).
@@ -1047,7 +1048,7 @@ void rq_model_info(const RqModel *m, RqModelInfo *info) {
 int rq_dequant_rows(const RqModel *m, const char *name, size_t nlen, long r0, long nr, float **rows, float **packed,
                     int *ncols, int *npacked, char *err, size_t errlen) {
     // rows of the matrix `name` dequantized from the file's blocks (embed_row: ggml's expressions) and,
-    // for Q4_K / Q6_K, also from the repacked weights (kq_packed_row, the same expressions: checks the
+    // for the K-quants, also from the repacked weights (kq_packed_row, the same expressions: checks the
     // repacking)
     const Config *p = &m->config;
     const TransformerWeights *w = &m->weights;

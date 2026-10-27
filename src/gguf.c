@@ -228,7 +228,7 @@ const uint8_t *gguf_weight(const Gguf *g, const char *name, uint32_t type, uint6
 void gguf_config(const Gguf *g, Config *c, float *rope_theta, int *rope_dim, Hybrid *hy) {
     // the hyperparameters from the metadata (llama.cpp's qwen3 / qwen35 keys), checked against what this
     // engine implements: Qwen3 (any RoPE theta: 1e6, the 2507 models 5e6; no RoPE scaling) with RMSNorm
-    // eps 1e-6 (the constant in rmsnorm); Q8_0 / Q4_K / Q5_K / Q6_K weights (gguf_matrices). Qwen3.5 (qwen35, the
+    // eps 1e-6 (the constant in rmsnorm); Q8_0 / Q3_K / Q4_K / Q5_K / Q6_K weights (gguf_matrices). Qwen3.5 (qwen35, the
     // hybrid layers: docs/qwen35.md): also the linear-attention shapes (ssm.*), the attention layer interval
     // and the partial RoPE (rope.dimension_count); value heads a multiple of the key heads (4B / 9B / 27B: twice
     // or three times as many), in the order llama.cpp's converter writes them (tiled: value head h uses key head

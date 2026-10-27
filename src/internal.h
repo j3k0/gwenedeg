@@ -34,7 +34,7 @@
 #include "kernels_avx512.h"
 // NEON K-quant kernels (AArch64 with the dot product extension; defines RUNQ_NEON, RUNQ_KQX)
 #include "kernels_neon.h"
-// K-quants (GGUF Q4_K / Q5_K / Q6_K): block formats, repacked layouts, arithmetic, generic kernels
+// K-quants (GGUF Q3_K / Q4_K / Q5_K / Q6_K): block formats, repacked layouts, arithmetic, generic kernels
 #include "kquants.h"
 // phase synchronization and the parallel region of a decode step / prefill chunk
 #include "threads.h"
@@ -99,10 +99,10 @@ typedef struct {
     uint8_t *p;   // weights only: the same matrix repacked for the SIMD Q8_0 kernels (Q8P layout,
                   // kernels_avx512.h; Q8N on AArch64, kernels_neon.h), or NULL (generic kernels on q / s)
     const uint8_t *b; // GGUF weights: the blocks in the file mapping (Q8_0: per 32 values an fp16
-                  // scale + 32 int8, Q8_0_BLOCK bytes; Q4_K / Q5_K / Q6_K: kquants.h), converted at load
+                  // scale + 32 int8, Q8_0_BLOCK bytes; Q3_K .. Q6_K: kquants.h), converted at load
                   // (prepare_weights); or NULL
-    int type;     // weights: ggml type, GGML_Q8_0 (also the .bin's group-64 Q8), GGML_Q4_K / Q5_K / Q6_K, GGML_F32
-    uint8_t *kp;  // K-quant weights: repacked (Q4P / Q5P / Q6P layout, kquants.h), else NULL
+    int type;     // weights: ggml type, GGML_Q8_0 (also the .bin's group-64 Q8), GGML_Q3_K / Q4_K / Q5_K / Q6_K, GGML_F32
+    uint8_t *kp;  // K-quant weights: repacked (Q3P / Q4P / Q5P / Q6P layout, kquants.h), else NULL
     float *f;     // F32 weights (ssm_alpha / ssm_beta only: Qwen3.8-27B's): the rows copied at load (prepare_weights),
                   // applied to the fp32 activations (forward.c, f32_rows), else NULL
 } QuantizedTensor;
@@ -112,7 +112,7 @@ typedef struct {
 // nextn.enorm / hnorm / shared_head_norm (dim); it shares token_embd and output with the main model. Validated at load
 // (names, shapes, types: the file is untrusted) from the tensor directory only: nothing of it is read, converted or
 // counted in the memory estimate; the forward passes never use it (for the MTP drafter, TODO S9). The matrices are
-// as gguf_matrices maps them (b, type in the mapping; Q8_0 / Q4_K / Q5_K / Q6_K), the norms point into the mapping
+// as gguf_matrices maps them (b, type in the mapping; Q8_0 / Q3_K .. Q6_K), the norms point into the mapping
 typedef struct {
     int layer;                  // blk.<layer>: the block's index in the file (= Config.n_layers), -1 if none
     QuantizedTensor wq, wk, wv, wo, w1, w2, w3; // attn_q ([q | gate] per head), attn_k / v, attn_output, ffn_gate / down / up
@@ -172,7 +172,7 @@ typedef struct { jmp_buf jb; char *msg; size_t len; } LoadErr;
 RQ_NORETURN void load_fail(LoadErr *e, const char *fmt, ...);
 
 // GGUF files (llama.cpp's format, versions 2 and 3), read directly: hyperparameters and tokenizer
-// from the metadata, Q8_0 / Q4_K / Q5_K / Q6_K / F32 tensors from the mapped file (layout: gguf.c)
+// from the metadata, Q8_0 / Q3_K / Q4_K / Q5_K / Q6_K / F32 tensors from the mapped file (layout: gguf.c)
 #define GGUF_MAGIC 0x46554747u // "GGUF"
 enum { GV_U8, GV_I8, GV_U16, GV_I16, GV_U32, GV_I32, GV_F32, GV_BOOL, GV_STR, GV_ARR, GV_U64, GV_I64, GV_F64, GV_N };
 enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q8_0 = 8 }; // tensor types (ggml numbering) used here
@@ -220,7 +220,7 @@ struct RqModel {
     int has_weights, has_tok, is_gguf;
     int gs_counted;             // counted in model.c's gs_models (one group size per process)
     char warning[256];          // a load-time warning for the caller to show ("" if none)
-    int kq;                     // K-quant weights (Q4_K / Q5_K / Q6_K): the activation sums xf are needed
+    int kq;                     // K-quant weights (Q3_K .. Q6_K): the activation sums xf are needed
     // derived shape parameters of the forward passes (checked at load)
     int kv_dim, all_heads_dim, kv_mul;
     int xs;                     // row stride of the batched xb / xq rows: max(dim, all_heads_dim)

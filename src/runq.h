@@ -70,7 +70,7 @@ typedef struct {
                         // if the file is >= 1/4 of the RAM, 1 = dropped, -1 = kept
 } RqModelOpts;
 
-// A qwen3.c .bin (with its .tokenizer / .template* side files) or a GGUF file (Q8_0, Q4_K_M), by
+// A qwen3.c .bin (with its .tokenizer / .template* side files) or a GGUF file (Q8_0, Q3_K_M .. Q5_K_M), by
 // magic. NULL on failure, with the reason in err (e.g. "GGUF <path>: tensor ... not found"; a model whose
 // estimate does not fit: "... needs ~N GiB ...", RqModelOpts.mem)
 RqModel *rq_model_load(const char *path, const RqModelOpts *opts, char *err, size_t errlen);
@@ -443,7 +443,7 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
 
 // ----------------------------------------------------------------------------------------- test hooks
 // rows r0..r0+nr-1 of the matrix `name` (llama.cpp tensor name; GGUF only) dequantized from the file's
-// blocks into rows (nr x *ncols), and for Q4_K / Q6_K also from the repacked layout into packed (if
+// blocks into rows (nr x *ncols), and for the K-quants also from the repacked layout into packed (if
 // not NULL; *npacked = 1). rows / packed: malloc'd by the call
 int rq_dequant_rows(const RqModel *m, const char *name, size_t name_len, long r0, long nr, float **rows,
                     float **packed, int *ncols, int *npacked, char *err, size_t errlen);

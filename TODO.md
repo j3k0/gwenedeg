@@ -127,12 +127,18 @@ more than its new tokens plus the last reply.
   `ffn_gate` / `ffn_up`, `attn_gate`, attention q / k and `token_embd`; 4-bit DeltaNet `attn_qkv` / `ssm_out`, attention
   v / output, `ffn_down`; Q6_K `output`): ~12.4 GiB of weights in RAM vs 15.3, so a 96k session + draft + speculation
   needs ~21.9 GiB (~2 GiB spare); decode reads ~13.0 GB per token instead of ~16.1 (est. ~+20% at short context,
-  ~+10-15% at 90k); prefill unchanged (attention-bound). Needs Q3_K in runq (as Q5_K was done: one arithmetic
-  definition, generic / AVX-512 / NEON and small-batch kernels, the embedding-row lookup, `-m dequant` bitwise vs
-  gguf-py, a small Q3_K_M test file, compare_bins), then a **quality gate** vs Q4_K_M before it becomes the agentic
-  file: teacher-forced top-1 vs the API's model on the saved answers (Q4_K_M: 716/720 thinking off, 579/588 on), KL
-  between the two files on recorded pi sessions, draft acceptance, perplexity. Q4_K_M stays the reference. Not
-  Q3_K_S (nearly all 3-bit for 1.2 GiB more), nor the UD / IQ files (codebook formats: new kernels), nor 2-bit.
+  ~+10-15% at 90k); prefill unchanged (attention-bound). Q3_K in runq: **done** (`2f7b8f3`, 2026-10-27: the Q3P
+  layout, +1.8% over the file's blocks; Q6_K's fold on 3-bit values; generic / AVX-512 / NEON / small-batch kernels;
+  the embedding-row lookup; `-m dequant` == gguf-py bitwise on all 78 Q3_K tensors of Unsloth's Qwen3.5-0.8B Q3_K_M,
+  which is in the q35 group: vs HF fp32 pooled cos 0.981, top-1 54/62 (its Q4_K_M 0.9946, 57/62), vs its
+  dequantized-weights reference 0.99984, every bitwise check; compare_bins vs 5d93873 identical but the usage line).
+  From the 27B file's header: 12.39 GiB of repacked weights vs 15.32 for Q4_K_M (Q3_K 5.71 GiB, Q4_K 5.31, Q6_K 0.98,
+  Q5_K 0.30; token_embd read from the mapping: no test file has a Q3_K token_embd, its rows go through kq_dequant_row,
+  the code `-m dequant` checks; the 27B's models-group entry will cover it). Open: the **quality gate** vs Q4_K_M before
+  it becomes the agentic file: teacher-forced top-1 vs the API's model on the saved answers (Q4_K_M: 716/720 thinking
+  off, 579/588 on), KL between the two files on recorded pi sessions, draft acceptance, perplexity. Q4_K_M stays the
+  reference. Not Q3_K_S (nearly all 3-bit for 1.2 GiB more), nor the UD / IQ files (codebook formats: new kernels),
+  nor 2-bit.
   Second lever, optional after Q3_K_M (from `IDEAS.md`, "int8 (or 8-bit float) KV cache"):
   - An 8-bit KV cache: V first (its bf16 rounding was harmless), then K, which needs per-tile scales: |K| reaches
     ~500 and bf16 K alone already cost +4.4% KL against HF fp32. Each variant judged by the KL measurement of the 16-bit
@@ -264,7 +270,8 @@ Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M (Qwen3.8-27B Q4_K_M, the same
 
 - [ ] **More GGUF types**: Q4_0 / Q4_1, Q2_K (the Unsloth "UD" files of the small bit widths), IQ4_XS, F16 / BF16
   weights. Each needs its block format, a repacked layout and generic, AVX-512 and NEON kernels that follow one
-  arithmetic definition, as in `src/kquants.h` (Q5_K, done, is the template: a new bit plane on Q4_K's fold). Tests:
+  arithmetic definition, as in `src/kquants.h` (Q5_K and Q3_K, done, are the templates: a new bit plane on Q4_K's
+  fold, resp. 3-bit values with a bit plane on Q6_K's). Tests:
   dequantization bitwise against gguf-py (`-m dequant`, `tests/make_dequant_golden.py`), logits against the file's
   dequantized-weights reference (`tests/make_model_ref.py`), and the bitwise groups. Q6_K-only files should already
   load, but are untested.

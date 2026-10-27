@@ -659,7 +659,9 @@ static void kq512_gemm_item(float *out, int ldo, const uint8_t *kp, int type, in
  * rb0..rb1-1 and all nb activation rows. Like the GEMV, each thread streams its blocks once, the
  * 4 / 6-bit data unpacked in registers (no scratch tile: the GEMM's per-tile unpacking costs as much
  * as the arithmetic at a few rows); each unpacked group is used for up to SMB_C activation rows
- * (more rows: the block again from L1 for the next SMB_C). The integer sums are exact and the folds
+ * (more rows: the block again from L1 for the next SMB_C). The K-quant kernels prefetch their weights pf bytes
+ * ahead (forward.c SMB_PF: at 2-6 rows the hardware prefetchers alone leave the loads waiting on memory while
+ * the arithmetic runs; a prefetch changes no result). The integer sums are exact and the folds
  * the same functions in the same order per (block, row, group) as the GEMV / GEMM / generic kernels,
  * so every row's result is bit-identical to them, whatever rows it is batched with.
  * Activation side per row b: xq + b * ldx, xs + b * ldx / gs; Q8P corr + b * k / gs; K-quants xf +
@@ -671,6 +673,13 @@ static void kq512_gemm_item(float *out, int ldo, const uint8_t *kp, int type, in
 #if SMB_C < 1 || SMB_C > 8
 #error "SMB_C must be in 1..8"
 #endif
+
+static inline __attribute__((always_inline)) void smb_pf(const uint8_t *p, int bytes, int pf) {
+    // prefetch the lines of [p + pf, p + pf + bytes) (pf 0: none; past the matrix: harmless, a prefetch never faults)
+    if (pf)
+        for (int i = 0; i < bytes; i += 64)
+            _mm_prefetch((const char *)p + pf + i, _MM_HINT_T0);
+}
 
 static inline __attribute__((always_inline))
 void q8p_smb_block(const int C, const int GSZ, const uint8_t *wb, int ng, const int8_t *x, size_t ldx, const float *xs,
@@ -708,7 +717,7 @@ void q8p_smb_block(const int C, const int GSZ, const uint8_t *wb, int ng, const 
 
 static inline __attribute__((always_inline))
 void kq4_smb_block(const int C, const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs,
-                   const float *xf, size_t ldxf, float *out, size_t ldo) {
+                   const float *xf, size_t ldxf, float *out, size_t ldo, int pf) {
     // one Q4P block (wb: its nsb super-blocks) x C activation rows: per group the 8 steps unpacked once
     const __m512i m4 = _mm512_set1_epi8(0x0f);
     __m512 f[8];
@@ -721,6 +730,7 @@ void kq4_smb_block(const int C, const uint8_t *wb, int nsb, const int8_t *x, siz
         for (int j = 0; j < 8; j++) {
             int g = 8 * s + j;
             const uint8_t *qs = o + 320 + 256 * j;
+            smb_pf(o + j * (Q4P_SB / 8), Q4P_SB / 8, pf);
             __m512i w[8];
             for (int cc = 0; cc < 4; cc++) {
                 __m512i v = _mm512_load_si512((const void *)(qs + 64 * cc));
@@ -746,7 +756,7 @@ void kq4_smb_block(const int C, const uint8_t *wb, int nsb, const int8_t *x, siz
 
 static inline __attribute__((always_inline))
 void kq5_smb_block(const int C, const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs,
-                   const float *xf, size_t ldxf, float *out, size_t ldo) {
+                   const float *xf, size_t ldxf, float *out, size_t ldo, int pf) {
     // one Q5P block (wb: its nsb super-blocks) x C activation rows, as kq4_smb_block with the masks
     const __m512i m4 = _mm512_set1_epi8(0x0f), m16 = _mm512_set1_epi8(0x10);
     __m512 f[8];
@@ -759,6 +769,7 @@ void kq5_smb_block(const int C, const uint8_t *wb, int nsb, const int8_t *x, siz
         for (int j = 0; j < 8; j++) {
             int g = 8 * s + j;
             const uint8_t *qs = o + 320 + 320 * j, *mp = qs + 256;
+            smb_pf(o + j * (Q5P_SB / 8), Q5P_SB / 8, pf);
             __m512i w[8];
             for (int cc = 0; cc < 4; cc++) {
                 __m512i v = _mm512_load_si512((const void *)(qs + 64 * cc));
@@ -786,7 +797,7 @@ void kq5_smb_block(const int C, const uint8_t *wb, int nsb, const int8_t *x, siz
 
 static inline __attribute__((always_inline))
 void kq6_smb_block(const int C, const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs,
-                   const int32_t *c16, size_t ldc, float *out, size_t ldo) {
+                   const int32_t *c16, size_t ldc, float *out, size_t ldo, int pf) {
     // one Q6P block x C activation rows: per sub-block the 4 steps unpacked once
     __m512 f[8];
     for (int c = 0; c < C; c++)
@@ -796,6 +807,7 @@ void kq6_smb_block(const int C, const uint8_t *wb, int nsb, const int8_t *x, siz
         __m512 d = _mm512_load_ps((const float *)o);
         for (int g8 = 0; g8 < 8; g8++) {
             int g = 8 * s + g8;
+            smb_pf(o + g8 * (Q6P_SB / 8), Q6P_SB / 8, pf);
             __m512i I[8];
             for (int c = 0; c < C; c++)
                 I[c] = _mm512_setzero_si512();
@@ -831,11 +843,11 @@ void kq6_smb_block(const int C, const uint8_t *wb, int nsb, const int8_t *x, siz
 #define SMB_Q8_32(C) (const uint8_t *wb, int ng, const int8_t *x, size_t ldx, const float *xs, size_t ldxs, const int32_t *corr, \
     size_t ldc, float *out, size_t ldo) { q8p_smb_block(C, 32, wb, ng, x, ldx, xs, ldxs, corr, ldc, out, ldo); }
 #define SMB_KQ4(C) (const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs, const float *xf, \
-    size_t ldxf, float *out, size_t ldo) { kq4_smb_block(C, wb, nsb, x, ldx, xs, ldxs, xf, ldxf, out, ldo); }
+    size_t ldxf, float *out, size_t ldo, int pf) { kq4_smb_block(C, wb, nsb, x, ldx, xs, ldxs, xf, ldxf, out, ldo, pf); }
 #define SMB_KQ5(C) (const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs, const float *xf, \
-    size_t ldxf, float *out, size_t ldo) { kq5_smb_block(C, wb, nsb, x, ldx, xs, ldxs, xf, ldxf, out, ldo); }
+    size_t ldxf, float *out, size_t ldo, int pf) { kq5_smb_block(C, wb, nsb, x, ldx, xs, ldxs, xf, ldxf, out, ldo, pf); }
 #define SMB_KQ6(C) (const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs, const int32_t *c16, \
-    size_t ldc, float *out, size_t ldo) { kq6_smb_block(C, wb, nsb, x, ldx, xs, ldxs, c16, ldc, out, ldo); }
+    size_t ldc, float *out, size_t ldo, int pf) { kq6_smb_block(C, wb, nsb, x, ldx, xs, ldxs, c16, ldc, out, ldo, pf); }
 SMB_INST(q8p_smb64, SMB_Q8_64)
 SMB_INST(q8p_smb32, SMB_Q8_32)
 SMB_INST(kq4_smb, SMB_KQ4)
@@ -849,8 +861,8 @@ SMB_INST(kq6_smb, SMB_KQ6)
 #undef SMB_KQ6
 
 typedef void (*SmbQ8Fn)(const uint8_t *, int, const int8_t *, size_t, const float *, size_t, const int32_t *, size_t, float *, size_t);
-typedef void (*SmbKq4Fn)(const uint8_t *, int, const int8_t *, size_t, const float *, size_t, const float *, size_t, float *, size_t);
-typedef void (*SmbKq6Fn)(const uint8_t *, int, const int8_t *, size_t, const float *, size_t, const int32_t *, size_t, float *, size_t);
+typedef void (*SmbKq4Fn)(const uint8_t *, int, const int8_t *, size_t, const float *, size_t, const float *, size_t, float *, size_t, int);
+typedef void (*SmbKq6Fn)(const uint8_t *, int, const int8_t *, size_t, const float *, size_t, const int32_t *, size_t, float *, size_t, int);
 static const SmbQ8Fn smb_q8_64[8] = { q8p_smb64_1, q8p_smb64_2, q8p_smb64_3, q8p_smb64_4, q8p_smb64_5, q8p_smb64_6, q8p_smb64_7, q8p_smb64_8 };
 static const SmbQ8Fn smb_q8_32[8] = { q8p_smb32_1, q8p_smb32_2, q8p_smb32_3, q8p_smb32_4, q8p_smb32_5, q8p_smb32_6, q8p_smb32_7, q8p_smb32_8 };
 static const SmbKq4Fn smb_kq4[8] = { kq4_smb_1, kq4_smb_2, kq4_smb_3, kq4_smb_4, kq4_smb_5, kq4_smb_6, kq4_smb_7, kq4_smb_8 };
@@ -858,9 +870,10 @@ static const SmbKq4Fn smb_kq5[8] = { kq5_smb_1, kq5_smb_2, kq5_smb_3, kq5_smb_4,
 static const SmbKq6Fn smb_kq6[8] = { kq6_smb_1, kq6_smb_2, kq6_smb_3, kq6_smb_4, kq6_smb_5, kq6_smb_6, kq6_smb_7, kq6_smb_8 };
 
 static void smb512_rows(int type, float *out, size_t ldo, const int8_t *xq, size_t ldx, const float *xs, const int32_t *corr,
-                        const float *xf, const int32_t *c16, int nb, const uint8_t *wp, int k, int gs, int rb0, int rb1) {
+                        const float *xf, const int32_t *c16, int nb, const uint8_t *wp, int k, int gs, int rb0, int rb1, int pf) {
     // the small-batch kernel over blocks rb0..rb1-1 of W (Q4P / Q5P / Q6P by type; any other type: Q8P
-    // with group size gs) and activation rows 0..nb-1, SMB_C rows per pass over a block
+    // with group size gs) and activation rows 0..nb-1, SMB_C rows per pass over a block; pf: the K-quant
+    // kernels' prefetch distance (bytes, 0: none)
     size_t ldxs = (size_t)ldx / gs;
     if (type != GGML_Q4_K && type != GGML_Q5_K && type != GGML_Q6_K) {
         int ng = k / gs;
@@ -882,10 +895,10 @@ static void smb512_rows(int type, float *out, size_t ldo, const int8_t *xq, size
             if (type == GGML_Q4_K || type == GGML_Q5_K)
                 (type == GGML_Q4_K ? smb_kq4 : smb_kq5)[c - 1](wp + (size_t)rb * bstride, nsb, xq + (size_t)b * ldx, ldx,
                                                               xs + (size_t)b * ldxs, ldxs, xf + (size_t)b * ng, ng,
-                                                              out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo);
+                                                              out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo, pf);
             else
                 smb_kq6[c - 1](wp + (size_t)rb * bstride, nsb, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
-                               c16 + (size_t)b * n16, n16, out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo);
+                               c16 + (size_t)b * n16, n16, out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo, pf);
         }
 }
 

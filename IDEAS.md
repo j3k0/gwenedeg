@@ -14,11 +14,10 @@ Draft the next few tokens by finding the last n-gram of the sequence earlier in 
 draft model), then verify them in one pass: the sequence's last token plus the k drafted tokens as one segment of
 k + 1 rows, with logits for every row. Accept drafts while they equal the token sampled at their position.
 
-- Why: decode is memory-bound, so a pass over a few rows costs much less than that many single-row steps. Rough
-  figures from the batched-decode measurements (0.6B Q4_K_M, 8 threads, 500 positions): 4 decode rows of
-  different sequences take ~1.9x one row (7.8 vs 4.2 ms). Rows of one sequence share its KV cache, so should be
-  cheaper still. Measure first: a multi-row segment takes the prefill path (9 phases per layer, not the decode
-  path's 4).
+- Why: decode is memory-bound, so a pass over a few rows costs much less than that many single-row steps. Measured
+  (TODO S2, docs/qwen38-speculative.md "Verify-pass cost"; 8 threads, 500 / 2,000 positions): a segment of 4 rows
+  of one sequence costs 1.21-1.24x a decode step on Qwen3-1.7B Q8_0, 1.28-1.34x on Qwen3-8B Q4_K_M, 1.42-1.64x on
+  the 0.6B (its attention weighs more per row).
 - Exactness for free: the verification rows' logits are bit-identical to plain decoding (batched == sequential).
   If every position is sampled with the sequence's own RNG in order, and the pass stops at the first mismatch,
   then greedy and seeded outputs equal non-speculative decoding exactly. The price is a lower acceptance rate than

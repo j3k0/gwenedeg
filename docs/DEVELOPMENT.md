@@ -277,6 +277,12 @@ Threads
   - the norms as a phase epilogue for more than 2 rows: within noise at 4, ~10% slower at 8 and 16.
   - q / k / v items of 32 / 64 / 128 weight rows were within noise. Above 64 rows per pass, the prefill path's
     GEMM is the faster one: ~10% at 96-256 rows, equal at 48-64.
+- Verify segments (TODO S2, docs/qwen38-speculative.md "Verify-pass cost"): segments of up to 16 rows of one
+  sequence take the decode-rows worker (attention per row block of the segment); measured and not kept:
+  - more rows there: 24-32 rows of one sequence within noise / up to 3% slower than the prefill path;
+  - the small-batch kernels' weight prefetch for Q8_0 too (4,096 / 8,192 bytes): within noise, up to +5% at 1-2
+    rows (kept for the K-quants: -10 to -12% at 2-4 rows on the 8B Q4_K_M; 1,024 / 2,048 / 8,192 bytes about the
+    same as 4,096).
 
 Sampling and the KV cache type
 - At `-t > 0`, the sampler's remaining cost is the temperature scale and the softmax over the vocabulary (~80-110

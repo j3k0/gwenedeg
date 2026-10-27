@@ -154,6 +154,34 @@ static int bd_batch(RqCtx *c, RqSeq **sq, RqSeq *base, int lo, int span, int n, 
     return ok;
 }
 
+// Verify segments (TODO S2: a speculative verify pass, the k + 1 rows of one sequence with every row's logits, takes
+// the decode-rows path of rq_forward_batch): sequence base's first P positions, then the r tokens T[0..r-1] in one
+// segment; references: the same tokens decoded one by one (rq_decode), then T[r] after them
+#define VF_MAX 10
+static void vf_refs(RqCtx *c, RqSeq *base, int P, const int *T, int r, uint64_t *h) {
+    int e;
+    RqSeq *s = seq_new(0);
+    if ((e = seq_from(c, s, base, P)) != RQ_OK) die("seq_from", e);
+    for (int j = 0; j <= r; j++) {
+        float *lg;
+        if ((e = rq_decode(c, s, T[j], &lg)) != RQ_OK) die("rq_decode", e);
+        h[j] = hash_f(lg, V);
+    }
+    rq_seq_free(s);
+}
+
+static int vf_rollback(RqCtx *c, RqSeq *s, int P, const int *T, int r, const uint64_t *h) {
+    // after the pass (s at P + r, a checkpoint per row: rq_seq_checkpoint_rows), from the last row back to the first:
+    // truncated after row j, exactly (Qwen3.5: onto row j's checkpoint), the next token's logits == the references
+    int ok = 1;
+    for (int j = r - 1; j >= 0 && ok; j--) {
+        float *lg;
+        ok &= rq_seq_keep(s, P + 1 + j) == P + 1 + j && rq_seq_truncate(s, P + 1 + j) == RQ_OK && rq_seq_len(s) == P + 1 + j;
+        ok &= ok && rq_decode(c, s, T[j + 1], &lg) == RQ_OK && hash_f(lg, V) == h[j + 1];
+    }
+    return ok;
+}
+
 static int on_tok(void *u, int t) {
     RqTokens *r = u;
     rq_tokens_push(r, &t, 1);
@@ -907,6 +935,98 @@ static void batch_tests(RqCtx *c, RqTokens A, RqTokens B, RqTokens C, const floa
         if (!only_digest) report(okm, nlr ? "batch_mixed" : "batch_mixed_short",
                                  "a 20-row prefill chunk + 5 decode rows; a 2-row chunk + 2 decode rows");
         rq_seq_free(p);
+    }
+    // verify segments: (a) 4 rows (k = 3) of one sequence at position 20, all rows' logits, and the same with the
+    // last row's only; (b) 9 rows (k = 8) at 250..258, across the first attention block (lng); (c) one pass with the
+    // 4-row segment and 2 short decode rows; (d) one with a 6-row segment at 252..257 and a decode row at 257 (lng:
+    // few attention items, so the long rows' attention is split over its blocks, in the prefill path the single
+    // row's); each row == its sequence decoded token by token, and with a checkpoint per row (rq_seq_checkpoint_rows) each row's state is reachable by
+    // rq_seq_truncate and continues exactly. On the default context (batch_decode_worker: segments of at most
+    // bd_seg rows) and on one made with RUNQ_BD=64,2,8,1 (the prefill path for any segment of more than one row, as
+    // before TODO S2). DIGEST lines: batch_verify (a), _long (b), _mixed (c), _mixed_long (d); + _prefill
+    {
+        static const int vp[3] = { 20, 250, 252 }, vr[3] = { 4, 9, 6 };
+        static const char *vn[2] = { "", "_prefill" };
+        int vt[3][VF_MAX + 1], tok2[2], e1;
+        uint64_t vh[3][VF_MAX + 1];
+        RqSeq *vs[3] = { seq_new(0), seq_new(0), seq_new(0) };
+        char *old = getenv("RUNQ_BD") ? strdup(getenv("RUNQ_BD")) : NULL;
+        setenv("RUNQ_BD", "64,2,8,1", 1);
+        RqCtx *cp = rq_ctx_new(M, rq_ctx_max_batch(c), 0, &e1), *cv[2] = { c, cp };
+        if (old) setenv("RUNQ_BD", old, 1); else unsetenv("RUNQ_BD");
+        free(old);
+        if (!cp) die("rq_ctx_new", e1);
+        for (int q = 0; q < 3; q++) {
+            for (int j = 0; j <= vr[q]; j++) vt[q][j] = tk(40 + 10 * q + j, 0);
+            if (!only_digest && (q == 0 || lng)) vf_refs(c, q ? bl : bs, vp[q], vt[q], vr[q], vh[q]);
+        }
+        for (int x = 0; x < 2; x++) {
+            RqCtx *cx = cv[x];
+            int okv = 1, okm = 1;
+            for (int q = 0; q < 2; q++) { // (a), (b)
+                uint64_t dg = 0;
+                if (q && !lng) continue;
+                RqSeq *v = vs[q];
+                okv &= seq_from(cx, v, q ? bl : bs, vp[q]) == RQ_OK && rq_seq_set_checkpoints(v, vr[q] + 1) == RQ_OK &&
+                       rq_seq_checkpoint_rows(v, vp[q], vr[q]) == RQ_OK;
+                RqSegment sv = { v, vt[q], vr[q], RQ_LOGITS_ALL };
+                okv &= rq_forward_batch(cx, &sv, 1, out, NULL) == RQ_OK && rq_seq_len(v) == vp[q] + vr[q];
+                for (int j = 0; j < vr[q] && okv; j++) {
+                    uint64_t h = hash_f(out + (size_t)j * V, V);
+                    dg = dg * 31 + h;
+                    okv &= only_digest || h == vh[q][j];
+                }
+                if (!only_digest) okv &= vf_rollback(cx, v, vp[q], vt[q], vr[q], vh[q]);
+                if (q == 0) { // the last row's logits only (into the context's buffer)
+                    float *lg;
+                    sv.logits = RQ_LOGITS_LAST;
+                    okv &= seq_from(cx, v, bs, vp[0]) == RQ_OK && rq_forward_batch(cx, &sv, 1, NULL, &lg) == RQ_OK;
+                    okv &= okv && (only_digest || hash_f(lg, V) == vh[0][vr[0] - 1]);
+                }
+                printf("DIGEST batch_verify%s%s %016llx\n", q ? "_long" : "", vn[x], (unsigned long long)dg);
+                digest = digest * 31 + dg;
+            }
+            for (int ml = 0; ml <= lng; ml++) { // (c): rows [vs[0]: 4] [sq[2]: 1] [sq[1]: 1]; (d): [vs[2]: 6] [sq[3]: 1 at 257]
+                RqSegment sm[4];
+                int nsm = 0, row = 0, q = 2 * ml;
+                uint64_t dm = 0;
+                okm &= seq_from(cx, vs[q], q ? bl : bs, vp[q]) == RQ_OK && rq_seq_set_checkpoints(vs[q], vr[q] + 1) == RQ_OK &&
+                       rq_seq_checkpoint_rows(vs[q], vp[q], vr[q]) == RQ_OK;
+                sm[nsm++] = (RqSegment) { vs[q], vt[q], vr[q], RQ_LOGITS_ALL };
+                for (int i = 0; i < 2 - ml; i++) { // (sq[3] of the long set, or sq[2] and sq[1] of the short one)
+                    int k = ml ? 3 : 2 - i;
+                    okm &= seq_from(cx, sq[k], ml ? bl : bs, ml ? plen(k, 248, 12) : plen(k, 8, 25)) == RQ_OK;
+                    tok2[i] = tk(k, 0);
+                    sm[nsm++] = (RqSegment) { sq[k], &tok2[i], 1, RQ_LOGITS_LAST };
+                }
+                okm &= rq_forward_batch(cx, sm, nsm, out, NULL) == RQ_OK;
+                for (int i = 0; i < nsm && okm; i++)
+                    for (int j = 0; j < sm[i].n; j++, row++) {
+                        uint64_t h = hash_f(out + (size_t)row * V, V);
+                        dm = dm * 31 + h;
+                        if (only_digest) continue;
+                        okm &= i == 0 ? h == vh[q][j] : sm[i].seq == sq[3] ? h == hl[3][0] : h == hs[sm[i].seq == sq[1] ? 1 : 2][0];
+                    }
+                if (!only_digest) okm &= vf_rollback(cx, vs[q], vp[q], vt[q], vr[q], vh[q]);
+                printf("DIGEST batch_verify_mixed%s%s %016llx\n", ml ? "_long" : "", vn[x], (unsigned long long)dm);
+                digest = digest * 31 + dm;
+            }
+            if (!only_digest) {
+                char nm[64];
+                snprintf(nm, sizeof(nm), "batch_verify%s", vn[x]);
+                snprintf(d, sizeof(d), "%s: a verify segment of 4 rows at 20 (all / the last row's logits)%s == decoded one by "
+                         "one, each row's checkpoint continues exactly", x ? "prefill path" : "decode-rows path",
+                         lng ? ", 9 rows at 250..258" : "");
+                report(okv, nm, d);
+                snprintf(nm, sizeof(nm), "batch_verify_mixed%s", vn[x]);
+                snprintf(d, sizeof(d), "%s: a verify segment of 4 rows + 2 decode rows in one pass%s == each alone, the "
+                         "checkpoints too", x ? "prefill path" : "decode-rows path", lng ? "; 6 rows at 252..257 + a decode row "
+                         "at 257 (split attention)" : "");
+                report(okm, nm, d);
+            }
+        }
+        rq_ctx_free(cp);
+        for (int q = 0; q < 3; q++) rq_seq_free(vs[q]);
     }
     printf("DIGEST all%s %016llx\n", small ? "_small" : "", (unsigned long long)digest);
 

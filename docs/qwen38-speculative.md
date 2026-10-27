@@ -116,16 +116,18 @@ start of the reasoning only). Tool: `scripts/spec_accept.py` (below); raw data: 
 
 | | top-1 match | tokens per pass, k = 3 (loop simulated) | est. tok/s (best k) |
 |---|---|---|---|
-| thinking off, temperature 0 | 83% | 2.97 | ~17.7 (k = 3) |
-| thinking off, temperature 1 | 80% | 2.81 | ~16.8 |
-| thinking on, temperature 0 | 70% | 2.38 | ~14.2 |
-| thinking on, temperature 1 | 65% | 2.18 | ~13.0 |
+| thinking off, temperature 0 | 83% | 2.97 | ~17.1 (k = 3) |
+| thinking off, temperature 1 | 80% | 2.81 | ~16.2 (k = 3) |
+| thinking on, temperature 0 | 70% | 2.38 | ~13.7 (k = 3) |
+| thinking on, temperature 1 | 65% | 2.18 | ~12.6 (k = 3) |
 
 By kind (thinking off, temperature 0): chat 71%, summaries 73%, code / edits 88-89%, math 92%, extraction 93%. Best
-k: 3 for chat and summaries (~15-16 tok/s), 6 for code and math (~21-23). Temperature 1 is an exact match against one
-sampled output (the rule kept; a lower bound for rejection sampling). The tok/s are a **cost model**: a 27B decode
-step ~120 ms (16.8 GB at ~140 GB/s); a verify pass of k + 1 rows ~1.03-1.9x one step for k = 1-8 (interpolated from
-8 batched rows ~1.8-2x one row on the 4B / 8B); a 0.8B step ~6 ms, k + 1 draft steps per pass.
+k: 3 for chat and summaries (~14.4 / 15.2 tok/s), 4-5 for code, math and extraction (~19-21.5). Temperature 1 is an
+exact match against one sampled output (the rule kept; a lower bound for rejection sampling). The tok/s are a **cost
+model**: a 27B decode step ~120 ms (16.8 GB at ~140 GB/s); a verify pass of k + 1 rows 1.14-2.52x one step for k =
+1-8 (measured on Qwen3-8B Q4_K_M, the 27B's proxy: [Verify-pass cost](#verify-pass-cost-todo-s2-measured-2026-10-27));
+a 0.8B step ~6 ms, k + 1 draft steps per pass. (With the verify factors guessed before S2, 1.03-1.9x, the same
+data gave ~17.7 / 16.8 / 14.2 / 13.0 tok/s, best k 6 for code and math at ~21-23.)
 
 ### Rerunning it: `scripts/spec_accept.py`
 
@@ -144,10 +146,10 @@ the target id, the draft's argmax, its top-1 probability and the target token's 
 threads; the logits files, ~1 MB per position, go to `--tmp`). `report` simulates the loop and applies the cost
 model. Reproduction (2026-10-27, measure rerun with the 0.8B Q8_0): every per-answer top-1 of the original logs is
 identical (120 answers), so are the table's top-1 and tokens per pass (all k, all kinds). The original tok/s were
-worked out by hand from the ranges above; the script's default verify factors (k = 1..8: 1.03, 1.12, 1.20, 1.35,
-1.47, 1.60, 1.75, 1.90) reproduce them: 17.7 / 16.8 / 14.2 / 13.0 at k = 3 (16.7 before: 2.81 rounded / 168 ms),
-chat / summaries 14.9 / 15.7 at k = 3, code 21.1 and math 23.5 at k = 6. They are a guess until TODO S2 measures
-the verify pass.
+worked out by hand from guessed verify factors (k = 1..8: 1.03, 1.12, 1.20, 1.35, 1.47, 1.60, 1.75, 1.90; `--verify`
+with them reproduces 17.7 / 16.8 / 14.2 / 13.0 at k = 3, chat / summaries 14.9 / 15.7, code 21.1 and math 23.5 at
+k = 6). The script's defaults are now the measured factors (TODO S2: 1.14, 1.16, 1.25, 1.41, 1.62, 1.83, 2.15,
+2.52), which give the table above.
 
 ### Q4_K_M draft, long reasoning, adaptive draft length (2026-10-27)
 
@@ -159,25 +161,106 @@ tokens, 3,522 answer tokens). Adaptive: stop drafting at the first position wher
 tau, at most k_max (it changes the guesses, never the output); the teacher-forced probabilities are exact up to the
 first wrong guess, after it they only decide how many wasted guesses are paid for.
 
-| | Q8_0: top-1, k = 3, tok/s | Q4_K_M: top-1, k = 3, tok/s | adaptive, tau 0.5, k_max 8: Q8_0 / Q4_K_M |
+| | Q8_0: top-1, k = 3, tok/s | Q4_K_M: top-1, k = 3, tok/s | adaptive, tau 0.4, k_max 4: Q8_0 / Q4_K_M |
 |---|---|---|---|
-| thinking off, temperature 0 | 83%, 2.97, 17.3 | 82%, 2.94, 17.9 | 18.4 / 18.9 |
-| thinking off, temperature 1 | 80%, 2.81, 16.4 | 79%, 2.79, 17.0 | 17.3 / 18.0 |
-| thinking on, temperature 0 | 70%, 2.38, 13.8 | 70%, 2.38, 14.5 | 14.7 / 15.1 |
-| thinking on, temperature 1 | 65%, 2.18, 12.7 | 65%, 2.18, 13.3 | 13.7 / 14.1 |
-| thinking on, long (3 prompts) | 70%, 2.38, 13.8 | 69%, 2.35, 14.3 | 14.6 / 15.1 |
+| thinking off, temperature 0 | 83%, 2.97, 16.7 | 82%, 2.94, 17.3 | 17.2 / 17.7 |
+| thinking off, temperature 1 | 80%, 2.81, 15.8 | 79%, 2.79, 16.4 | 16.3 / 16.8 |
+| thinking on, temperature 0 | 70%, 2.38, 13.4 | 70%, 2.38, 13.9 | 14.0 / 14.5 |
+| thinking on, temperature 1 | 65%, 2.18, 12.3 | 65%, 2.18, 12.8 | 13.1 / 13.5 |
+| thinking on, long (3 prompts) | 70%, 2.38, 13.4 | 69%, 2.35, 13.8 | 14.1 / 14.5 |
+
+(tok/s with the measured verify factors of TODO S2; with the guessed ones of before, k = 3: Q8_0 17.3 / 16.4 / 13.8 /
+12.7 / 13.8, Q4_K_M 17.9 / 17.0 / 14.5 / 13.3 / 14.3, adaptive tau 0.5, k_max 8: Q4_K_M 18.9 / 18.0 / 15.1 / 14.1 /
+15.1.)
 
 - **Q4_K_M as the draft:** the same acceptance (top-1 within a point, tokens per pass within 0.03), ~+4% tok/s from
   the faster step, 300 MB less RAM. Use it.
 - **Long reasoning** accepts like the first 500 tokens (70%, 2.38 per pass); deeper into the reasoning it does not get
   worse (code: 41% in the first 500 tokens, 77% after; math 80% / 94%).
-- **Adaptive length: +5-6%** over the best fixed k (3) with one setting (tau 0.4-0.5, k_max 6-8) in every row:
-  thinking off, more tokens per pass for about the same guesses (Q4_K_M: 3.49 per pass for 3.5 guesses, k = 3: 2.94
-  for 3); thinking on, the same tokens per pass with fewer guesses (2.42 for 2.1). Per kind (Q4_K_M, best tau /
-  k_max per kind): thinking off code +10%, math +8%, extraction +11% (tau 0.6, k_max 12: long runs of confident
-  guesses), chat and summaries +0-2%; thinking on +7-15% for code, math and extraction, +2-6% for the rest. With a
-  linear verify cost (1.03 + 0.124 (k - 1)) the gain is +8-11%: fixed k pays for long passes where they fail.
-  Worth it: a loop option (TODO S1).
+- **Adaptive length: +3-5%** over the best fixed k (3) with one setting (tau 0.3-0.4, k_max 4) in every row (Q4_K_M:
+  +2.6% / +2.7% thinking off, +4.1% / +5.0% / +5.3% thinking on): thinking off, more tokens per pass for about the
+  same guesses (3.10 per pass for 2.9 guesses at tau 0.4, k = 3: 2.94 for 3); thinking on, the same tokens per pass
+  with fewer guesses (2.35 for 2.1). Per kind (Q4_K_M, best tau / k_max per kind): thinking off +1-5% (math tau 0.6,
+  k_max 6 +3.5%, extraction tau 0.5, k_max 6 +4.6%; summaries -3%: k = 3 is better), thinking on +2-6%. The
+  measured verify cost rises steeply past 5 rows (the K-quant kernels become compute-bound, below), so long passes
+  that fail cost more and a cap of 4 is best; with the guessed, nearly linear costs it was +5-6% at tau 0.4-0.5,
+  k_max 6-8. Still worth it: a loop option (TODO S1).
+
+## Verify-pass cost (TODO S2, measured 2026-10-27)
+
+A verify pass is one segment of k + 1 rows of one sequence with every row's logits (`RQ_LOGITS_ALL`). f(r) = the
+median time of such a segment of r rows / the median decode step (`rq_decode`) of the same sequence, at 500 and
+2,000 positions of context. Tool: `build/bench_verify` (`make bench-verify`, tests/bench_verify.c): each rep runs
+every configuration once in turn (dec, the segments of r = 1..9 rows, r decode rows of r different sequences),
+truncating back after each pass; `-A "ENV=..."` runs a second context with other settings in the same process,
+paired pass by pass. 8 threads, f16 KV, 21 reps (31 for the second 8B run), under the bench lock, load 2-8 from other
+jobs. "Before" is the paired context with `RUNQ_BD=64,2,8,1 RUNQ_SMB=32,32,32,32,0`: the routing and kernels of
+`848cf01` (a first run of the `848cf01` build itself, load 3-10, gave the same picture). Decode step (ms, median):
+1.7B Q8_0 14.2 / 17.2 (500 / 2,000), Qwen3.5-4B Q8_0 34.6 / 34.0, 8B Q4_K_M 33.5 / 35.4, 0.6B Q8_0 5.3 / 6.4, Qwen3.5-0.8B
+Q8_0 8.4 / 8.4.
+
+| model, positions | f(2) | f(3) | f(4) | f(5) | f(6) | f(7) | f(8) | f(9) |
+|---|---|---|---|---|---|---|---|---|
+| Qwen3-1.7B Q8_0, 500: before | 1.20 | 1.26 | 1.34 | 1.41 | 1.46 | 1.53 | 1.62 | 1.84 |
+| after | 1.07 | 1.13 | **1.24** | 1.30 | 1.34 | 1.44 | 1.52 | 1.68 |
+| 2,000: before | 1.12 | 1.18 | 1.28 | 1.36 | 1.40 | 1.56 | 1.68 | 1.82 |
+| after | 1.05 | 1.11 | **1.21** | 1.31 | 1.39 | 1.58 | 1.62 | 1.79 |
+| Qwen3.5-4B Q8_0, 500: before | 1.14 | 1.26 | 1.29 | 1.40 | 1.53 | 1.57 | 1.66 | 1.78 |
+| after | 1.07 | 1.12 | **1.20** | 1.29 | 1.38 | 1.54 | 1.59 | 1.70 |
+| 2,000: before | 1.23 | 1.34 | 1.43 | 1.52 | 1.60 | 1.80 | 1.78 | 1.93 |
+| after | 1.11 | 1.23 | **1.29** | 1.36 | 1.45 | 1.54 | 1.62 | 1.82 |
+| Qwen3-8B Q4_K_M, 500: before | 1.31 | 1.41 | 1.49 | 1.62 | 1.74 | 1.90 | 2.19 | 2.58 |
+| after | 1.14 | 1.17 | **1.28** | 1.43 | 1.61 | 1.83 | 2.14 | 2.51 |
+| 2,000: before | 1.28 | 1.45 | 1.58 | 1.72 | 1.90 | 2.12 | 2.46 | 2.85 |
+| after | 1.14 | 1.22 | **1.34** | 1.55 | 1.83 | 2.10 | 2.43 | 2.85 |
+| Qwen3-0.6B Q8_0, 500: before | 1.22 | 1.31 | 1.48 | 1.59 | 1.71 | 1.81 | 1.96 | 2.19 |
+| after | 1.18 | 1.29 | 1.42 | 1.55 | 1.69 | 1.86 | 1.95 | 2.19 |
+| 2,000: before | 1.20 | 1.37 | 1.64 | 1.85 | 2.04 | 2.29 | 2.55 | 2.81 |
+| after | 1.18 | 1.38 | 1.64 | 1.92 | 2.10 | 2.41 | 2.52 | 2.75 |
+| Qwen3.5-0.8B Q8_0, 500: before | 1.15 | 1.23 | 1.34 | 1.45 | 1.61 | 1.66 | 1.69 | 1.80 |
+| after | 1.05 | 1.17 | 1.23 | 1.34 | 1.43 | 1.50 | 1.55 | 1.68 |
+| 2,000: before | 1.36 | 1.53 | 1.64 | 1.80 | 1.96 | 2.01 | 2.06 | 2.21 |
+| after | 1.12 | 1.23 | 1.32 | 1.44 | 1.49 | 1.66 | 1.71 | 1.85 |
+
+- **Before:** a segment of 2-9 rows took the prefill path (9-10 phases per layer). It was not slower than the same
+  number of decode rows of different sequences (the rows path: within 5% at 500 positions, faster at 2,000, where
+  the rows of one sequence read its K / V once per row block), but 4 rows cost 1.28-1.43x a step on the 1.7B and
+  4B, 1.49-1.58x on the 8B Q4_K_M. Profile (`-DRUNQ_PROFILE`, 1.7B, 4 rows, 500 positions): the GEMMs' extra
+  arithmetic ~3 ms, the per-row phases (norms, SwiGLU, RoPE) ~1.1 ms of phases of their own.
+- **Change 1, the route:** segments of at most `bd_seg` rows (16; `RUNQ_BD=max,epi,split,seg`) take the decode-rows
+  worker, with attention items per (row block of the segment, kv head[, block of 256 positions]) and the DeltaNet
+  recurrence over each segment's rows in order (`dn_rec_run`, as prefill): 4 phases per layer instead of 9-10.
+  Paired, less time per pass: Qwen3 Q8_0 mostly 0-7% (the 1.7B; the 0.6B at 2,000 positions, bound by its
+  attention there, -4% to +5%), Qwen3.5 2-14%, the 0.8B at 2,000 positions 18-24% (the prefill path's 5 phases per
+  linear layer), the 8B Q4_K_M 1-4%. Longer segments: still 1-4% at 8-16 rows, within noise or up to 3% slower at
+  24-32 (hence 16).
+- **Change 2, prefetch in the K-quant small-batch kernels** (`SMB_PF` 4,096 bytes ahead; `RUNQ_SMB=...,pf`): at 2-5
+  rows the hardware prefetchers leave the kernels waiting on memory between their arithmetic. The prefetch alone,
+  paired (8B Q4_K_M, 500 positions): -10 / -12 / -5 / -1% at 2 / 4 / 6 / 9 rows, 0 at 1, the same for decode rows
+  of different sequences; 1,024-8,192 bytes about the same. Both changes on the 8B: -11 to -17% at 2-5 rows, -8% at
+  6, 0-4% at 7-9. Q8_0: nothing gained (within noise, up to +5% at 1-2 rows), so its kernel does not prefetch.
+- **Past 4-5 rows the K-quant kernels are compute-bound:** on the 8B, rows 6-9 cost ~10 ms each (~1/3 of a step;
+  the passes' times are the same in every run, ~34 multiply-adds per cycle and thread vs ~43 for Q8_0), so f rises
+  by ~0.3 per row there, ~0.1 below. Faster K-quant folds would be the next lever for k >= 4.
+- **Exactness:** every row's logits are bitwise those of decoding the tokens one by one, on both routes, both builds
+  and any thread count (`api_test`: `batch_verify` / `batch_verify_mixed` and their `_prefill` twins, with a
+  checkpoint per row on the hybrid models; the same digests with the `848cf01` library); `tests/compare_bins.sh`
+  against `848cf01`: 799 jobs identical.
+- **Checkpoints per row** (`bench_verify -c`, a first look for TODO S3, 500 positions): 0.8B 4 / 9 rows +1.2 / +2.9
+  ms (~0.3 ms per 18.9 MB checkpoint), 4B +1.7 / +7.6 ms (~0.4-0.8 ms per row).
+
+**The 27B Q4_K_M, extrapolated:** verify(k) = f(k + 1) of the 8B Q4_K_M at 500 positions, the mean of two runs:
+**1.14, 1.16, 1.25, 1.41, 1.62, 1.83, 2.15, 2.52** for k = 1..8 (`scripts/spec_accept.py`'s defaults now). Why the
+8B: its weights are Q4_K and Q6_K like most of the 27B's (Q4_K 11.4 GB, Q6_K 4.5, Q5_K 1.0, the same kernels: Q5_K
+is Q4_K's plus a bit plane), so the bytes per multiply-add, i.e. the ratio of a row's arithmetic to the memory-bound
+step, are about the same (0.61 bytes per weight in both files); both scale with the model, so f(r) carries over (the 8B's
+33 ms step : ~10 ms per compute-bound row ~ the 27B's ~120 ms : ~35 ms). 500 positions, because the 27B's KV cache
+is much smaller per weight byte (64 KiB per position for 16.8 GB of weights, the 8B 144 KiB for 4.7 GB: its 500
+positions are the 27B's ~4,000). The hybrid layers add little per row: the Qwen3.5-4B's f(r) is at or below the dense
+1.7B's at the same Q8_0 (the recurrence per extra row is ~150 M multiply-adds for the 27B, against ~27 G in its
+matmuls). Not included: the checkpoint copies per row (TODO S3: ~150 MiB each, estimated ~2-4 ms, 2-3% of a step).
+Against the guess (1.03-1.90) verify is +0-4% at k = 1-3 and +19-33% at k = 6-8: the best fixed k stays 3, the
+estimates drop by 3-4% (table above: ~13-17 tok/s with the Q4_K_M draft, ~13.5-17.7 adaptive).
 
 ## Decisions
 

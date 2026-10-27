@@ -45,6 +45,10 @@ SETS = {
     "q4km": ("unsloth/Qwen3-0.6B-GGUF", "50968a4468ef4233ed78cd7c3de230dd1d61a56b", "Qwen3-0.6B-GGUF", [
         ("Qwen3-0.6B-Q4_K_M.gguf", 396705472, "sha256", "ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a"),
     ]),
+    # Q5_K_M GGUF of the same repo (Q5_K + Q6_K tensors): the Q5_K kernels on a plain Qwen3 file (tests/check_models.py, models group)
+    "q5km": ("unsloth/Qwen3-0.6B-GGUF", "50968a4468ef4233ed78cd7c3de230dd1d61a56b", "Qwen3-0.6B-GGUF", [
+        ("Qwen3-0.6B-Q5_K_M.gguf", 444415680, "sha256", "03c6e2127d155b89c21a512954010486b1e00e1a9eebdfad650d03b53ab4c74a"),
+    ]),
     # Q8_0 GGUF from the same repo: runq loads it directly (no export step); also used by the tests
     # and for comparisons with GGUF-based engines.
     "q8gguf": ("unsloth/Qwen3-0.6B-GGUF", "50968a4468ef4233ed78cd7c3de230dd1d61a56b", "Qwen3-0.6B-GGUF", [
@@ -113,7 +117,7 @@ SETS = {
     "3.5-0.8b-q8": ("unsloth/Qwen3.5-0.8B-GGUF", "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0", "Qwen3.5-0.8B-GGUF", [
         ("Qwen3.5-0.8B-Q8_0.gguf", 811843840, "sha256", "0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c"),
     ]),
-    # (Q4_K / Q6_K, plus Q5_K for attn_qkv and ssm_out: needs Q5_K support)
+    # Unsloth's Q4_K_M: Q4_K / Q6_K, plus Q5_K for attn_qkv and ssm_out of the linear layers, Q8_0 ssm_alpha / ssm_beta
     "3.5-0.8b-q4km": ("unsloth/Qwen3.5-0.8B-GGUF", "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0", "Qwen3.5-0.8B-GGUF", [
         ("Qwen3.5-0.8B-Q4_K_M.gguf", 532517120, "sha256", "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517"),
     ]),
@@ -121,7 +125,7 @@ SETS = {
 DEFAULT_SETS = ["hf", "q4km", "q8gguf"]
 # names that stand for several sets
 GROUPS = {
-    "family": ["1.7b-q8", "1.7b-q4km", "1.7b-hf", "4b-q4km", "4b-q8", "4b-2507i-q4km", "8b-q4km"],
+    "family": ["q5km", "1.7b-q8", "1.7b-q4km", "1.7b-hf", "4b-q4km", "4b-q8", "4b-2507i-q4km", "8b-q4km"],
     "qwen35": ["3.5-0.8b-hf", "3.5-0.8b-q8", "3.5-0.8b-q4km"],
 }
 CHUNK = 1 << 20

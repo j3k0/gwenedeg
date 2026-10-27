@@ -4,10 +4,10 @@ GgufFile(path): the metadata (raw byte spans and decoded scalars / strings / arr
 a GGUF v2 / v3 file (layout: src/gguf.c), the tensor data as numpy views of a memory map.
 write_gguf(path, kvs, tensors): a GGUF v3 file from (key, raw value bytes) pairs (raw_kv / copied spans)
 and (name, ne, ggml type, data bytes) tuples.
-dequant(type, data, nrows, ncols): Q8_0 / Q4_K / Q6_K / F32 rows to float32 with ggml's expressions
-(dequantize_row_q8_0 / _q4_K / _q6_K: the same float32 operations as gguf-py, bit for bit; checked against
-tests/golden/dequant). Used by tests/make_synth.py (the synthetic models), tests/ref_forward.py (the numpy
-reference forward pass) and tests/check_models.py.
+dequant(type, data, nrows, ncols): Q8_0 / Q4_K / Q5_K / Q6_K / F32 rows to float32 with ggml's expressions
+(dequantize_row_q8_0 / _q4_K / _q5_K / _q6_K: the same float32 operations as gguf-py, bit for bit; checked
+against tests/golden/dequant). Used by tests/make_synth.py (the synthetic models), tests/ref_forward.py (the
+numpy reference forward pass) and tests/check_models.py.
 """
 import struct
 
@@ -16,9 +16,9 @@ import numpy as np
 GV_U8, GV_I8, GV_U16, GV_I16, GV_U32, GV_I32, GV_F32, GV_BOOL, GV_STR, GV_ARR, GV_U64, GV_I64, GV_F64 = range(13)
 _SCALAR = {GV_U8: "<B", GV_I8: "<b", GV_U16: "<H", GV_I16: "<h", GV_U32: "<I", GV_I32: "<i", GV_F32: "<f",
            GV_BOOL: "<?", GV_U64: "<Q", GV_I64: "<q", GV_F64: "<d"}
-F32, F16, Q8_0, Q4_K, Q6_K = 0, 1, 8, 12, 14
-BLOCK = {F32: (1, 4), F16: (1, 2), Q8_0: (32, 34), Q4_K: (256, 144), Q6_K: (256, 210)}  # values, bytes
-TYPE_NAME = {F32: "F32", F16: "F16", Q8_0: "Q8_0", Q4_K: "Q4_K", Q6_K: "Q6_K"}
+F32, F16, Q8_0, Q4_K, Q5_K, Q6_K = 0, 1, 8, 12, 13, 14
+BLOCK = {F32: (1, 4), F16: (1, 2), Q8_0: (32, 34), Q4_K: (256, 144), Q5_K: (256, 176), Q6_K: (256, 210)}  # values, bytes
+TYPE_NAME = {F32: "F32", F16: "F16", Q8_0: "Q8_0", Q4_K: "Q4_K", Q5_K: "Q5_K", Q6_K: "Q6_K"}
 
 
 def row_bytes(t, ncols):
@@ -154,6 +154,22 @@ def _f16(u8pair):
     return u8pair.copy().view(np.float16).astype(np.float32)
 
 
+def _q4k_scale_min(s):
+    """the 6-bit scales / mins of the 8 sub-blocks from the 12 packed bytes (ggml's get_scale_min_k4) ->
+    (sc, mn), each (nb, 8) int32; Q4_K and Q5_K share them"""
+    nb = s.shape[0]
+    sc = np.empty((nb, 8), np.int32)
+    mn = np.empty((nb, 8), np.int32)
+    for j in range(8):
+        if j < 4:
+            sc[:, j] = s[:, j] & 63
+            mn[:, j] = s[:, j + 4] & 63
+        else:
+            sc[:, j] = (s[:, j + 4] & 0xF) | ((s[:, j - 4] >> 6) << 4)
+            mn[:, j] = (s[:, j + 4] >> 4) | ((s[:, j] >> 6) << 4)
+    return sc, mn
+
+
 def dequant(typ, data, nrows, ncols):
     """rows of a tensor (uint8 (nrows, row bytes)) -> float32 (nrows, ncols), ggml's expressions"""
     data = np.ascontiguousarray(data, dtype=np.uint8)
@@ -171,17 +187,8 @@ def dequant(typ, data, nrows, ncols):
         nb = blk.shape[0]
         d = _f16(blk[:, 0:2]).reshape(-1, 1)
         dmin = _f16(blk[:, 2:4]).reshape(-1, 1)
-        s = blk[:, 4:16].astype(np.int32)
+        sc, mn = _q4k_scale_min(blk[:, 4:16].astype(np.int32))
         qs = blk[:, 16:].reshape(nb, 4, 32)
-        sc = np.empty((nb, 8), np.int32)
-        mn = np.empty((nb, 8), np.int32)
-        for j in range(8):  # get_scale_min_k4
-            if j < 4:
-                sc[:, j] = s[:, j] & 63
-                mn[:, j] = s[:, j + 4] & 63
-            else:
-                sc[:, j] = (s[:, j + 4] & 0xF) | ((s[:, j - 4] >> 6) << 4)
-                mn[:, j] = (s[:, j + 4] >> 4) | ((s[:, j] >> 6) << 4)
         d_sc = (d * sc.astype(np.float32))  # (nb, 8): d1 = d * sc (float32 products)
         m_mn = (dmin * mn.astype(np.float32))
         out = np.empty((nb, 8, 32), np.float32)
@@ -190,6 +197,22 @@ def dequant(typ, data, nrows, ncols):
         for g in range(4):  # 64 values per step: low nibbles (scale 2g), then high (2g + 1)
             out[:, 2 * g] = d_sc[:, 2 * g:2 * g + 1] * lo[:, g] - m_mn[:, 2 * g:2 * g + 1]
             out[:, 2 * g + 1] = d_sc[:, 2 * g + 1:2 * g + 2] * hi[:, g] - m_mn[:, 2 * g + 1:2 * g + 2]
+        return out.reshape(nrows, ncols)
+    if typ == Q5_K:
+        blk = data.reshape(-1, 176)
+        nb = blk.shape[0]
+        d = _f16(blk[:, 0:2]).reshape(-1, 1)
+        dmin = _f16(blk[:, 2:4]).reshape(-1, 1)
+        sc, mn = _q4k_scale_min(blk[:, 4:16].astype(np.int32))
+        qh = blk[:, 16:48]
+        qs = blk[:, 48:176]
+        d_sc = (d * sc.astype(np.float32))
+        m_mn = (dmin * mn.astype(np.float32))
+        # 5 bits per value: the nibbles (as Q4_K) and bit 4 = bit j of qh[l] for value 32 j + l
+        lo = ((qs.reshape(nb, 4, 1, 32) >> np.array([0, 4], dtype=np.uint8).reshape(1, 1, 2, 1)) & 0x0F).reshape(nb, 8, 32)
+        hi = (qh.reshape(nb, 1, 32) >> np.arange(8, dtype=np.uint8).reshape(1, 8, 1)) & 1
+        q = (lo | (hi << np.uint8(4))).astype(np.float32)
+        out = d_sc.reshape(nb, 8, 1) * q - m_mn.reshape(nb, 8, 1)
         return out.reshape(nrows, ncols)
     if typ == Q6_K:
         blk = data.reshape(-1, 210)

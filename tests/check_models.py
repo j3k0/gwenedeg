@@ -241,9 +241,34 @@ def test_synth(a, res, S, texts):
 
 # ------------------------------------------------------------------------------------------ models (slow)
 
+def dequant_check(runq, model, golden, res, prefix):
+    """runq -m dequant of the golden's rows (blocks and repacked layout) == gguf-py's float32, bitwise"""
+    g = np.load(os.path.join(GOLDEN, "dequant", golden))
+    for i, name in enumerate(g["names"]):
+        name, rows, r0 = str(name), g[f"rows{i}"], int(g["row0"][i])
+        d = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"dequant-{os.getpid()}-{i}.bin")
+        p = run([runq, model, "-c", "64", "-m", "dequant", "-i", f"{name}:{r0}:{rows.shape[0]}", "-o", d], 2)
+        what = f"{str(g[f'type{i}'])} rows {r0}..{r0 + rows.shape[0] - 1} x {rows.shape[1]}"
+        if p.returncode != 0:
+            res.report(False, f"{prefix}/{name}", f"runq -m dequant failed: {p.stderr.decode(errors='replace')[-300:]}")
+            continue
+        h = np.fromfile(d, dtype=np.int32, count=3)
+        got = np.fromfile(d, dtype=np.float32, offset=12).reshape(1 + int(h[2]), int(h[0]), int(h[1]))
+        os.remove(d)
+        ok = got.shape[1:] == rows.shape and got.shape[0] == 2
+        detail = []
+        for j, src in enumerate(["blocks", "repacked"][:got.shape[0]]):
+            same_ = ok and np.array_equal(got[j].view(np.uint32), rows.view(np.uint32))
+            ok &= same_
+            detail.append(f"{src} " + ("bit-identical" if same_ else "DIFFER"))
+        res.report(ok, f"{prefix}/{name}", f"{what}: " + ", ".join(detail) + " (gguf-py)")
+
+
 # tag, file, chat template variant, golden subdirectories (tests/golden/models/<sub>: hf = HF fp32, else the
 # dequantized-weights reference of this file), thresholds per golden
 FAMILY = [
+    # Qwen3-0.6B Q5_K_M (Q5_K 168 tensors, Q6_K 29): the Q5_K kernels on a Qwen3 file (k = 1024 and 3072)
+    ("0.6b-q5km", "Qwen3-0.6B-GGUF/Qwen3-0.6B-Q5_K_M.gguf", "qwen3", [("0.6b-q5km", "ref")]),
     ("1.7b-q8", "Qwen3-1.7B-GGUF/Qwen3-1.7B-Q8_0.gguf", "qwen3", [("1.7b-hf", "q8_hf"), ("1.7b-q8", "ref")]),
     ("1.7b-q4km", "Qwen3-1.7B-GGUF/Qwen3-1.7B-Q4_K_M.gguf", "qwen3", [("1.7b-hf", "q4_hf"), ("1.7b-q4km", "ref")]),
     ("4b-q8", "Qwen3-4B-GGUF/Qwen3-4B-Q8_0.gguf", "qwen3", [("4b-q8", "ref")]),
@@ -253,8 +278,17 @@ FAMILY = [
     ("8b-q4km", "Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf", "qwen3", [("8b-q4km", "ref")]),
     # Qwen3.5 (hybrid: Gated DeltaNet + gated attention; goldens made with transformers 5.21, docs/qwen35.md)
     ("3.5-0.8b-q8", "Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf", "qwen3.5", [("3.5-0.8b-hf", "q8_hf"), ("3.5-0.8b-q8", "ref")]),
+    # Unsloth's Q4_K_M: attn_qkv / ssm_out of the linear layers Q5_K (Q4_K, Q6_K, Q8_0 for the rest)
+    ("3.5-0.8b-q4km", "Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf", "qwen3.5", [("3.5-0.8b-hf", "q35q4_hf"), ("3.5-0.8b-q4km", "ref")]),
 ]
+# dequantized rows vs gguf-py (tests/golden/dequant, tests/make_dequant_golden.py --q5), bitwise, per FAMILY tag:
+# from the file's blocks and from the repacked layouts (`runq -m dequant`)
+DEQUANT = {"3.5-0.8b-q4km": "q5_k.npz"}
+# more kernel checks for the files with a new kernel type (Q5_K): AVX-512 vs generic logits at -b 64 (the GEMM tiles of
+# every Q5_K matrix: 15 rows = 6 + 6 + 3), and the batched passes' api_test digests (--digest-small) of both builds
+EXTRA_KERNELS = {"3.5-0.8b-q4km": [("en", 64)], "0.6b-q5km": [("en", 64)]}
 Q35_TAG = "3.5-0.8b-q8"
+Q35_Q4_TAG = "3.5-0.8b-q4km"    # in the q35 group too, if its file is next to the Q8_0 one (~20 s)
 # chats on Qwen3.5 (check.py's chat_case): -r 1, the history drops turn 1's reasoning (and its "<think>\n"): the cache
 # goes back to the checkpoint at turn 1's assistant header; the generic build too; -r 0 with a system prompt (no
 # rollback); context full: the oldest turns dropped (back to a checkpoint or 0)
@@ -282,6 +316,11 @@ TH = {
     "ref": dict(cos_mean=0.995, cos_pos=0.97, cos_pos0=0.98, top1=0.75, cos_all=0.997),
     "q8_hf": dict(cos_mean=0.995, cos_pos=0.98, cos_pos0=0.95, top1=0.75, cos_all=0.997),
     "q4_hf": dict(cos_mean=0.85, cos_pos=-1.0, cos_pos0=0.90, top1=0.75, cos_all=0.95),
+    # Qwen3.5-0.8B Unsloth Q4_K_M vs HF fp32 (Step 13): the 4-bit weights' own error is much smaller than the Qwen3
+    # Q4_K_M files' (measured: cos means 0.9924 / 0.9959 / 0.9958 / 0.9925 (chat, code, en, long2), min 0.9677,
+    # pos0 0.9855-0.9957, top-1 14/15, 25/25, 11/15, 7/7, pooled 0.9946); vs its own dequantized-weights reference
+    # (the "ref" goldens) runq is at cos 0.9999, top-1 62/62. Bounds ~2x the error
+    "q35q4_hf": dict(cos_mean=0.985, cos_pos=0.93, cos_pos0=0.95, top1=0.6, cos_all=0.985),
 }
 MODEL_THREADS = 8
 MODEL_PROMPTS = ["en", "code", "chat"]
@@ -385,6 +424,9 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
             return path
         # template variant and renderings (tokenizer only)
         render_cases(a.runq, model, variant, res, f"{prefix}/{tag}/render")
+        # dequantization vs gguf-py
+        if tag in DEQUANT:
+            dequant_check(a.runq, model, DEQUANT[tag], res, f"{prefix}/{tag}/dequant")
         # greedy golden
         gpath = os.path.join(gdir, "greedy", f"{tag}.txt")
         p = run([a.runq, model] + GREEDY, nd)
@@ -439,9 +481,18 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
         ok, det = same(lf("all", 64), lf("all", 64, 3))
         res.report(ok, f"{prefix}/{tag}/threads/all_b64", f"{nd} vs 3 threads: {det}")
         if a.generic:
-            for n, c in (("en", 1), ("en", 7)):
+            for n, c in (("en", 1), ("en", 7)) + tuple(EXTRA_KERNELS.get(tag, ())):
                 ok, det = same(lf(n, c), lf(n, c, 4, a.generic, "_gen"))
                 res.report(ok, f"{prefix}/{tag}/kernels/{n}_b{c}", f"AVX-512 vs generic: {det}")
+            gen_api = (a.api_test or "") + "-generic"
+            if tag in EXTRA_KERNELS and a.api_test and os.path.exists(gen_api):
+                dg = []
+                for exe in (a.api_test, gen_api):
+                    q = run([exe, model, "--digest-small"], 4)
+                    dg.append(dict(l.split()[1:3] for l in q.stdout.decode(errors="replace").splitlines() if l.startswith("DIGEST ")))
+                diff = [k for k in dg[0] if dg[1].get(k) != dg[0][k]]
+                res.report(len(dg[0]) >= 1 and not diff and set(dg[0]) == set(dg[1]), f"{prefix}/{tag}/api_digest_generic",
+                           f"{len(dg[0])} batched passes (batched decode rows, ...): AVX-512 == generic" + (f"; differ: {diff}" if diff else ""))
         if a.api_test:
             p = run([a.api_test, model], nd)
             lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
@@ -475,21 +526,26 @@ def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
     a2 = argparse.Namespace(**{**vars(a), "model": a.q35, "vocab_model": a.q35})
     vocab = load_vocab(a.q35)
     d = os.path.join(GOLDEN, "greedy")
-    rec = Recorded()
+    rec, rec4 = Recorded(), Recorded()
     t = os.path.join(tmp, "q35")
-    os.makedirs(t, exist_ok=True)
+    os.makedirs(os.path.join(t, "q4"), exist_ok=True)
+    q4 = os.path.join(os.path.dirname(a.q35), "Qwen3.5-0.8B-Q4_K_M.gguf")
+    q4 = q4 if os.path.exists(q4) else None
     return {"a": a2, "tok_test": tok_test, "chats": [ex.submit(chat_case, a2, tmp, vocab, d, *c) for c in Q35_CHAT_CASES],
-            "rec": rec, "models": mx.submit(test_models, a, rec, t, texts, False, {Q35_TAG}, "q35", a.q35)}
+            "rec": rec, "models": [mx.submit(test_models, a, rec, t, texts, False, {Q35_TAG}, "q35", a.q35)] + (
+                [mx.submit(test_models, a, rec4, os.path.join(t, "q4"), texts, False, {Q35_Q4_TAG}, "q35", q4)] if q4 else []),
+            "rec4": rec4}
 
 
 def test_q35(a, res, tmp, texts, S):
     if S is None:
-        print("      skipped: no Qwen3.5-0.8B Q8_0 GGUF (--q35; scripts/download_models.py 3.5-0.8b-q8)")
+        print("      skipped: no Qwen3.5-0.8B Q8_0 GGUF (--q35; scripts/download_models.py 3.5-0.8b-q8, 3.5-0.8b-q4km)")
         return
     S["tok_test"](S["a"], res, "q35/tokenizer", "tokenizer_qwen35.json")
     for f in S["chats"]:
         for ok, n, detail in f.result():
             res.report(ok, n.replace("chat/", "q35/chat/"), detail)
-    S["models"].result()
-    for ok, n, detail, xfail in S["rec"].reports:
+    for f in S["models"]:
+        f.result()
+    for ok, n, detail, xfail in S["rec"].reports + S["rec4"].reports:
         res.report(ok, n, detail, xfail)

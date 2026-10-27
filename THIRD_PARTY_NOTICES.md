@@ -19,9 +19,9 @@ weights are included.
 
 - Source: https://github.com/ggml-org/llama.cpp (ggml).
 - Used for: the GGUF file format (`src/gguf.c`, `tests/ggufmini.py`), the ggml tensor type numbers and
-  llama.cpp's tensor and metadata names, and the Q8_0 / Q4_K / Q6_K block formats with their
+  llama.cpp's tensor and metadata names, and the Q8_0 / Q4_K / Q5_K / Q6_K block formats with their
   dequantization expressions (`src/kquants.h`: `get_scale_min_k4`'s unpacking of the 6-bit scales,
-  `dequantize_row_q4_K` / `_q6_K`). These are reimplemented to be bit-compatible; no ggml source
+  `dequantize_row_q4_K` / `_q5_K` / `_q6_K`). These are reimplemented to be bit-compatible; no ggml source
   file is included.
 - License: MIT.
 

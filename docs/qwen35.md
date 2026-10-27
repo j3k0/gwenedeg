@@ -1,10 +1,10 @@
 # Qwen3.5: design notes
 
-Status (2026-10-26): **Qwen3.5-0.8B Q8_0 is supported** (GGUF `general.architecture == qwen35`): loader, the
+Status (2026-10-27): **Qwen3.5-0.8B Q8_0 and Unsloth's Q4_K_M are supported** (GGUF `general.architecture == qwen35`): loader, the
 `qwen35` pre-tokenizer, the chat template variant, the hybrid forward pass in every path (decode, batched prefill,
 batched decode rows) with the bitwise invariants, recurrent-state checkpoints for truncate / copy, the CLI chat and
 `runq serve`, and the tests (`tests/check_models.py` group `q35` in `make test`, the file in the `models` group).
-Open: Q5_K for the Unsloth Q4_K_M file, the recurrence's speed, the bigger Qwen3.5 / 3.6 models ([TODO.md](../TODO.md)).
+Open: the recurrence's speed, the bigger Qwen3.5 / 3.6 models ([TODO.md](../TODO.md)).
 This file records what Qwen3.5 is, what was verified, and the design. Test model: **Qwen3.5-0.8B**: the same layer
 types as the larger Qwen3.5 / 3.6 models, with a dense FFN instead of MoE.
 
@@ -23,6 +23,27 @@ Results (2026-10-26, 16-vCPU dev box):
   Performance below.
 - Tokenizer: `tests/golden/tokenizer_qwen35.json` (90 cases, 23 of them pre-tokenized differently from Qwen3's
   regex) and `fuzz_tokenizer.py` (5,000 random strings + the repo's text, 1.4 M tokens): equal to HF.
+
+Q4_K_M (Unsloth, 533 MB; Q5_K support added 2026-10-27, Step 13; measured on the same box, load 5-7, 8 threads, best of 3,
+interleaved with the Q8_0 file):
+
+- Logits vs HF fp32 (`3.5-0.8b-hf`, 62 positions): cos means 0.9924 / 0.9959 / 0.9958 / 0.9925 (chat, code, en, long2),
+  min 0.9677, position 0 0.9855-0.9957, pooled 0.9946, top-1 57/62. That is the 4-bit weights' own error (Qwen3-0.6B
+  Q4_K_M: pooled 0.984, top-1 68/84; its Q8_0: 0.9994): vs the file's dequantized-weights reference (`3.5-0.8b-q4km`,
+  `make_model_ref.py`) runq is at pooled cos 0.99986, every position's cos >= 0.9996 except chat's (0.9990), top-1 62/62,
+  the same distance as the Q8_0 file from its reference (0.99986). So the int8 activations and kernels add nothing
+  visible; the rest is quantization.
+- Bit-identical, as the Q8_0 file: `-b 1 / 7 / 64 / 512`, 8 vs 3 threads, AVX-512 vs generic (`-b 1 / 7 / 64`; the
+  batched passes of `api_test --digest-small` too), a batched decode row vs the sequence alone; the NEON kernels vs the
+  generic ones on random Q5_K blocks (`make kq-neon-test`, run under clang + qemu-user: the same for all three types).
+- Speed (prefill 448 / 1,492 tokens, decode short / after 1,500 tokens, tok/s; `scripts/bench_models.py -t 8 -r 3`):
+  Q8_0 1,210 / 1,167, 148 / 139; Q4_K_M 1,065 / 1,039, 188 / 189. Decode 1.27x (the 18 linear layers' `attn_qkv` and
+  `ssm_out` are Q5_K: ~5.5 bits; the FFN, `attn_gate` Q4_K; the tied 248k x 1,024 classifier Q6_K; 0.53 GB read per
+  token vs 0.81), prefill 0.88x (more arithmetic per weight, as for Qwen3). Peak RSS 662 MB vs 963 MB.
+- Where the Q5_K tensors are (36): `blk.N.attn_qkv.weight` (6,144 x 1,024) and `blk.N.ssm_out.weight` (1,024 x 2,048) of
+  the 18 linear layers; Q4_K: all `ffn_gate` / `ffn_up`, `attn_gate`, the full-attention `attn_q` / `attn_k` /
+  `attn_output`, half of `ffn_down` and 2 `attn_v`; Q6_K: the other `ffn_down`, 4 `attn_v` and `token_embd`; Q8_0:
+  `ssm_alpha` / `ssm_beta`.
 
 Tools: `models/Qwen3.5-0.8B` (HF safetensors, bf16, with the tokenizer files) and `models/Qwen3.5-0.8B-GGUF`
 (Unsloth `Q8_0`, 812 MB, and `Q4_K_M`, 533 MB): `scripts/download_models.py qwen35`. `tests/ref_qwen35.py`: a numpy
@@ -87,7 +108,8 @@ Value transforms by llama.cpp's converter, checked bit-exactly (`maxabs 0`) on l
 
 Tensor types: the Unsloth **Q8_0** file is Q8_0 + F32 only, so runq's kernels cover it. The Unsloth **Q4_K_M**
 uses Q4_K / Q6_K, plus **Q5_K** for `attn_qkv` and `ssm_out` of every linear layer (36 tensors), and Q8_0 for
-`ssm_alpha` / `ssm_beta`. It needs Q5_K, which is the TODO item "More GGUF types". **Q8_0 comes first.**
+`ssm_alpha` / `ssm_beta`. Q5_K is supported since Step 13 (`src/kquants.h`: the Q5P layout, and the Q5_K arithmetic
+= Q4_K's fold on 5-bit values); the Q8_0 file came first.
 
 ## Design decisions
 
@@ -197,7 +219,9 @@ the conv / l2norm and the gated norm as phases of their own; the decay folded in
 .venv/bin/python tests/fuzz_tokenizer.py --model models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf --hf-dir models/Qwen3.5-0.8B
 .venv-hf5/bin/python scripts/ppl.py bench/ppl_beagle_ch1.txt --hf --hf-dir models/Qwen3.5-0.8B --no-full \
     --runq-model models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf
-tests/run_tests.sh --only q35                                     # the q35 group alone (~45 s)
+.venv-hf5/bin/python tests/make_model_ref.py 3.5-0.8b-q4km models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf
+python3 tests/make_dequant_golden.py --q5                         # golden/dequant/q5_k.npz (needs gguf)
+tests/run_tests.sh --only q35                                     # the q35 group alone (~45 s, ~85 s with the Q4_K_M file)
 ```
 
 Re-creating `.venv-hf5`: `python3 -m venv .venv-hf5 && .venv-hf5/bin/pip install torch==2.7.0 --index-url

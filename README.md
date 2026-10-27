@@ -6,8 +6,8 @@ called `runq`**, as in qwen3.c, the project it grew from. The library keeps the 
 `rq_` prefix).
 
 - **Models**: Qwen3-0.6B, 1.7B, 4B and 8B, plus Qwen3-4B-Instruct-2507 / Thinking-2507, and Qwen3.5-0.8B (the
-  hybrid architecture: Gated DeltaNet linear attention + gated attention; Q8_0). It loads GGUF **Q8_0** and
-  **Q4_K_M** files directly (weights, tokenizer and hyperparameters come from the file; chat templates are built
+  hybrid architecture: Gated DeltaNet linear attention + gated attention; Q8_0 and Q4_K_M). It loads GGUF
+  **Q8_0**, **Q4_K_M** and **Q5_K_M** files directly (weights, tokenizer and hyperparameters come from the file; chat templates are built
   in), and also qwen3.c's Q8_0 `.bin` export.
 - **Kernels**: AVX-512 VNNI on x86-64, NEON (dot product) on AArch64 / Apple Silicon, and generic C
   everywhere else. The SIMD kernels give bit-identical results to the generic ones.
@@ -76,12 +76,14 @@ prefill and decode speed. Details: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 |---|---|---|---|
 | `q8gguf` | `Qwen3-0.6B-Q8_0.gguf` (unsloth) | 639 MB | closest to the fp32 model, best for prompt-heavy work |
 | `q4km` | `Qwen3-0.6B-Q4_K_M.gguf` (unsloth) | 397 MB | ~1.5x faster decode, ~40% less RAM, +4.9% perplexity |
+| `q5km` | `Qwen3-0.6B-Q5_K_M.gguf` (unsloth) | 444 MB | between the two: 1-cos vs HF 5.4e-3 (Q8_0 6.3e-4, Q4_K_M 1.6e-2) |
 | `1.7b-q8`, `1.7b-q4km` | `Qwen3-1.7B-Q8_0.gguf`, `-Q4_K_M.gguf` | 1,834 / 1,107 MB | 1.7B Q8_0: the smallest good LiteLLM judge |
 | `4b-q8`, `4b-q4km` | `Qwen3-4B-Q8_0.gguf`, `-Q4_K_M.gguf` | 4,280 / 2,497 MB | |
 | `4b-2507i-q4km` | `Qwen3-4B-Instruct-2507-Q4_K_M.gguf` | 2,497 MB | the best 4B for chat (never thinks) |
 | `4b-2507t-q4km` | `Qwen3-4B-Thinking-2507-Q4_K_M.gguf` | 2,497 MB | always thinks |
 | `8b-q4km` | `Qwen3-8B-Q4_K_M.gguf` | 5,028 MB | quality over speed |
 | `3.5-0.8b-q8` | `Qwen3.5-0.8B-Q8_0.gguf` (unsloth) | 812 MB | Qwen3.5: hybrid layers, 248k vocabulary, thinking off by default ([docs/qwen35.md](docs/qwen35.md)) |
+| `3.5-0.8b-q4km` | `Qwen3.5-0.8B-Q4_K_M.gguf` (unsloth) | 533 MB | Q4_K / Q5_K / Q6_K / Q8_0 mix: decode ~1.27x the Q8_0 file (188 vs 148 tok/s), prefill ~0.88x, peak RSS 662 vs 963 MB; vs HF fp32 pooled cos 0.9946, top-1 57/62 |
 | `hf`, `1.7b-hf`, `3.5-0.8b-hf` | `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-1.7B`, `Qwen/Qwen3.5-0.8B` (bf16 safetensors) | 1.5 / 4.1 / 1.8 GB | for the `.bin` export and the test goldens |
 
 Measured on the 16-vCPU AMD EPYC Genoa VM (shared, noisy: best of 2, interleaved, 2026-10-26; prefill of
@@ -126,8 +128,8 @@ The tests use it, and it is the format for comparing with upstream: `scripts/dow
 scripts/setup_venv.sh && scripts/export_q8.sh` (a `.venv` with CPU torch) gives `models/Qwen3-0.6B-q8.bin`.
 `make models` does the same.
 
-Not supported: other GGUF types (Q5_K_M, Q4_0, IQ*, F16, the Unsloth "UD" files: rejected with a clean
-error; so is Unsloth's Qwen3.5-0.8B Q4_K_M, which has Q5_K tensors), Qwen3-14B and larger (untested), Qwen3.5 sizes
+Not supported: other GGUF types (Q4_0, Q4_1, IQ*, F16 / BF16, Q2_K / Q3_K, and the Unsloth "UD" files that use
+them: rejected with a clean error; a "UD" file made only of Q4_K / Q5_K / Q6_K / Q8_0 loads), Qwen3-14B and larger (untested), Qwen3.5 sizes
 other than 0.8B (rejected), the MoE models (`qwen3moe`, Qwen3.6), images, Qwen3-Embedding / Reranker, and RoPE
 scaling (YaRN).
 
@@ -276,10 +278,10 @@ make test-models                          # optional: every downloaded bigger mo
 ```
 
 `make test` runs 481 checks in ~28-36 s on the 16-vCPU VM, 613 in ~45 s with the Qwen3.5-0.8B Q8_0 file
-(`scripts/download_models.py 3.5-0.8b-q8`). It needs numpy (from `.venv` or the system `python3`) and the 0.6B
+(`scripts/download_models.py 3.5-0.8b-q8`), 655 with its Q4_K_M file too (`3.5-0.8b-q4km`; ~80 s at load 10-17). It needs numpy (from `.venv` or the system `python3`) and the 0.6B
 `.bin`; the GGUF groups are skipped if their files are missing. It covers:
 tokenizer ids against HF; logits against HF fp32 (cosine, top-1 / top-5); batched against sequential,
-thread-count and generic-against-SIMD bit-identity; Q4_K_M dequantization against gguf-py; the KV cache
+thread-count and generic-against-SIMD bit-identity; Q4_K_M and Q5_K dequantization against gguf-py; the KV cache
 types; greedy-output goldens; chat-template rendering against HF's `apply_chat_template`; the library
 API; the server over HTTP; synthetic GGUF models with the bigger models' shapes; and Qwen3.5-0.8B (its tokenizer,
 logits against HF fp32, the same invariants, chats that roll back to a state checkpoint). Golden references
@@ -293,11 +295,11 @@ mynah-slm, an optional reference engine for comparison (not part of this reposit
 ## Limitations
 
 - Qwen3 dense models and Qwen3.5-0.8B (`general.architecture` qwen3 / qwen35, gpt2 tokenizer with the qwen2 /
-  qwen35 pre-tokenizer). GGUF Q8_0 / Q4_K_M (any mix of Q8_0, Q4_K and Q6_K tensors) and qwen3.c's `.bin`. No other
+  qwen35 pre-tokenizer). GGUF Q8_0 / Q4_K_M / Q5_K_M (any mix of Q8_0, Q4_K, Q5_K and Q6_K tensors) and qwen3.c's `.bin`. No other
   quantization types, no MoE, no RoPE scaling, no images, no Jinja interpreter (the templates are built in).
 - Fast paths: x86-64 with AVX-512 VNNI (selected at compile time with `-march=native`) and AArch64 with
   the dot-product extension. Other CPUs, including x86 without AVX-512 VNNI, use the generic C kernels:
-  the same results, but for Q4_K_M ~10x slower prefill and ~3-4x slower decode.
+  the same results, but for Q4_K_M / Q5_K_M ~10x slower prefill and ~3-4x slower decode.
 - The NEON port was tested on macOS only. On arm64 the tests that compare generated text against the
   goldens recorded on x86 fail (8 of them), because the compilers round some Q8_0 sums differently.
   Everything else passes there, but the goldens need an arm64 baseline, and the Qwen3 1.7B-8B fixes have

@@ -142,10 +142,10 @@ conversation goes.
   batched decode of several sequences (Step 10a): small-batch AVX-512 kernels, a decode-rows worker,
   batched sampling, bit-identical to decoding each sequence alone; continuous batching in `runq serve`
   (Step 10b).
-- `src/kquants.h`: the Q4_K / Q6_K block formats, their dequantization, the repacked layouts (Q4P,
+- `src/kquants.h`: the Q4_K / Q5_K / Q6_K block formats, their dequantization, the repacked layouts (Q4P, Q5P,
   Q6P) and the generic kernels; the arithmetic of a K-quant matmul output is defined there.
 - `src/kernels_avx512.h`: the AVX-512 VNNI Q8_0 GEMM / GEMV (group size 64 or 32) and the weight
-  repacking, the Q4_K / Q6_K GEMV / GEMM on the Q4P / Q6P layouts, and the fp32 attention with the KV
+  repacking, the Q4_K / Q5_K / Q6_K GEMV / GEMM / small-batch kernels on the Q4P / Q5P / Q6P layouts, and the fp32 attention with the KV
   cache layouts (fp32 / bf16 / f16; layouts, arithmetic and bit-identity argument in its comments).
 - `src/threads.h`: the thread pool and the phase synchronization (design and measurements in its
   header comment; OpenMP's parallel region instead with `-DRUNQ_NO_POOL` and on Windows).
@@ -198,8 +198,8 @@ vs the f32 cache +8-10% / +17-22% / +23-29% after 451 / 1,500 / 3,000-token prom
 
 ## Platform notes and test status
 
-- Q8_0 (.bin or GGUF) and Q4_K_M GGUF (any mix of Q8_0 / Q4_K / Q6_K matrices). Other GGUF types
-  (F16, Q5_K, IQ*, ...) are rejected with a clean error. Without AVX-512 VNNI (or `make generic`)
+- Q8_0 (.bin or GGUF) and Q4_K_M / Q5_K_M GGUF (any mix of Q8_0 / Q4_K / Q5_K / Q6_K matrices). Other GGUF types
+  (F16, IQ*, Q4_0, ...) are rejected with a clean error. Without AVX-512 VNNI (or `make generic`)
   every format runs on the generic C kernels, with the same results; for Q4_K_M they are ~10x
   slower in prefill and ~3-4x in decode than the AVX-512 ones. On AArch64 (with `sdot`) every
   format and the attention have NEON kernels (same results; on an M1 Pro vs generic: Q4_K_M 7-8.5x
@@ -316,5 +316,6 @@ lists open work only; the full log is in git: `git show b3e48a3:TODO.md`. The st
 | 10a, 10b | batched decode of several sequences; continuous batching in `runq serve` | `302e0b2`, `38b71d9` |
 | 11 | the other Qwen3 dense models (1.7B-8B, 2507), fixes and tests | `fb2b9fb`, `6e1f251` |
 | 12 | Qwen3.5-0.8B: Gated DeltaNet + gated attention, recurrent-state checkpoints ([qwen35.md](qwen35.md)) | `99dfa79`, `8d3be20` |
+| 13 | Q5_K (Unsloth's Qwen3.5-0.8B Q4_K_M, Qwen3 Q5_K_M files): Q5P layout, generic / AVX-512 / NEON kernels | `fc7fca6` |
 
 The macOS / NEON port (`67d7296` onwards) was developed on a separate branch and merged after Step 7b.

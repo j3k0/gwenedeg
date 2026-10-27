@@ -77,7 +77,7 @@ and generic kernels, a request batched or alone), and a change of numerics must 
 
 ## Qwen3.5 (hybrid: Gated DeltaNet + gated attention)
 
-Qwen3.5-0.8B Q8_0 runs and is tested (`make test`'s `q35` group); design, results and measurements in
+Qwen3.5-0.8B (Q8_0 and Unsloth's Q4_K_M) runs and is tested (`make test`'s `q35` group); design, results and measurements in
 [docs/qwen35.md](docs/qwen35.md). The rules stay: `make test` green, Qwen3's outputs byte-identical
 (`tests/compare_bins.sh`), the bitwise invariants on the new paths.
 
@@ -90,9 +90,6 @@ Qwen3.5-0.8B Q8_0 runs and is tested (`make test`'s `q35` group); design, result
   head), and the decay folded into one pass over the state. Decode the same way (16 -> 64 items). Done when prefill
   is >= 0.8x Qwen3-0.6B's tok/s (now ~0.6x) with the q35 group unchanged; then the NEON check of the recurrence
   (vectorized along v: it should be bit-identical to the generic build there too, untested).
-- [ ] **Q5_K, for the Unsloth Q4_K_M** (`Qwen3.5-0.8B-Q4_K_M.gguf`: `attn_qkv` and `ssm_out` of the 18 linear layers
-  are Q5_K, rejected today): the "More GGUF types" item below, Q5_K first. Done when the file passes vs a
-  `make_model_ref.py` golden (`3.5-0.8b-q4km`) and the bitwise groups (a `FAMILY` entry in `tests/check_models.py`).
 - [ ] **The other sizes**: Qwen3.5-2B / 4B / 9B have `num_v_heads != num_k_heads` (rejected at load): the converter
   reorders the value heads, check against HF (`tests/ref_qwen35.py` asserts equal counts too); MoE models
   (Qwen3.6-35B-A3B: these layers plus expert routing); images (MRoPE's 3-D positions, the vision tower).
@@ -102,11 +99,12 @@ Qwen3.5-0.8B Q8_0 runs and is tested (`make test`'s `q35` group); design, result
 
 ## Models and formats
 
-- [ ] **More GGUF types**: Q5_K (Q5_K_M and the Unsloth "UD" files), Q4_0 / Q4_1, IQ4_XS, F16 / BF16 weights. Each
-  needs its block format, a repacked layout and generic, AVX-512 and NEON kernels that follow one arithmetic
-  definition, as in `src/kquants.h`. Tests: dequantization bitwise against gguf-py (`-m dequant`), logits against
-  the file's dequantized-weights reference (`tests/make_model_ref.py`), and the bitwise groups. Q6_K-only files
-  should already load, but are untested.
+- [ ] **More GGUF types**: Q4_0 / Q4_1, Q3_K / Q2_K (the Unsloth "UD" files of the small bit widths), IQ4_XS, F16 / BF16
+  weights. Each needs its block format, a repacked layout and generic, AVX-512 and NEON kernels that follow one
+  arithmetic definition, as in `src/kquants.h` (Q5_K, done, is the template: a new bit plane on Q4_K's fold). Tests:
+  dequantization bitwise against gguf-py (`-m dequant`, `tests/make_dequant_golden.py`), logits against the file's
+  dequantized-weights reference (`tests/make_model_ref.py`), and the bitwise groups. Q6_K-only files should already
+  load, but are untested.
 - [ ] **Qwen3-14B and larger dense models**: probably work (the Step 11 audit found no other size assumptions), but
   are untested (~9 GB at Q4_K_M). Done when `tests/run_tests.sh --models` covers one.
 - [ ] **YaRN RoPE scaling**: contexts past 40,960 tokens for the hybrid Qwen3 models (Qwen documents YaRN up to

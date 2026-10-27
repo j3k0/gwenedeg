@@ -7,6 +7,9 @@ sequence's logits never depend on the path, the thread count or what it is batch
 
 ## Speculative decoding by prompt lookup
 
+(A draft *model* for Qwen3.8-27B is planned work: TODO.md, docs/qwen38-speculative.md. Prompt lookup would plug into
+the same verify loop.)
+
 Draft the next few tokens by finding the last n-gram of the sequence earlier in the context (prompt lookup: no
 draft model), then verify them in one pass: the sequence's last token plus the k drafted tokens as one segment of
 k + 1 rows, with logits for every row. Accept drafts while they equal the token sampled at their position.

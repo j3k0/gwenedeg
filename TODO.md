@@ -9,6 +9,123 @@ and generic kernels, a request batched or alone), and a change of numerics must 
 (`make test`, [tests/README.md](tests/README.md)). Numbers below are from the shared 16-vCPU AMD EPYC Genoa VM of
 [BENCHMARKS.md](BENCHMARKS.md) (run-to-run noise ±15-30%) unless noted.
 
+## Qwen3.8-27B with speculative decoding (the current target)
+
+Decode Qwen3.8-27B (`qwen35`, 64 layers, r = 3, untied, an MTP block) at ~13-18 tok/s on the dev box with
+Qwen3.5-0.8B as the draft, the output **exactly** plain decoding's (tokens, greedy and seeded, and each emitted
+token's logits bits). Facts, measurements and decisions: [docs/qwen38-speculative.md](docs/qwen38-speculative.md).
+Added rule for this section: speculative output == plain output (tokens + a hash of each emitted token's logits).
+Order: the preparation items (P) first, each a no-behaviour-change step checked by the regression net of P1, then
+the steps (S). **Disk and RAM:** ~44 GB free, `models/` 42 GB, `/tmp` is a 16 GB tmpfs (RAM: no models or venvs
+there); check `df` / `MemAvailable` before every download or 27B run, keep >= 15 GB of disk free, and use
+`flock /tmp/cwayn-bench.lock` for timings (several agents share the box).
+
+Preparation (no output changes; `make test` and `tests/compare_bins.sh` byte-identical after each):
+
+- [ ] **P1. The regression net covers Qwen3.5.** `tests/compare_bins.sh` has only Qwen3 jobs; the Qwen3.5 changes so
+  far were compared by hand (40-180 files each time). Add the Qwen3.5-0.8B Q8_0 / Q4_K_M files and the synthetic
+  r = 2 / 3 models (`tests/make_synth_q35.py`): the `-m logits` grid (-b 1 / 7 / 64 / 512, 3 / 8 threads, both
+  builds), greedy and seeded generate, a `-r 1` chat that rolls back to a checkpoint (`RUNQ_CHAT_DUMP`), and
+  `api_test --digest` (batched passes). Skipped if a file is missing; `--quick` stays short. Done when one command
+  checks every model family against a base commit, and a deliberately broken DeltaNet build is caught.
+- [ ] **P2. Two models in one process, tested.** The pool, the group size `GS` and `rq_nt` are process-wide
+  (`src/threads.c`, `src/model.c`); a draft and a target will alternate passes on one pool. An `api_test` case:
+  load two models (Qwen3-0.6B + 1.7B; Qwen3.5-0.8B + a synthetic r = 3 model), interleave their prefills, decodes and
+  batched passes: each context's logits bitwise == the model alone. Also check the error paths (a second model with
+  another GS, freeing one while the other runs). Done when it passes on both builds.
+- [ ] **P3. Checkpoints as a set, not two fixed slots.** `RQ_SEQ_CK` = 2 and one pending `ck_at` per pass
+  (`src/internal.h`, `ck_plan` / `ck_done` in `src/forward.c`). Refactor to a per-sequence set of n slots (a context
+  setting, default 2: today's behaviour) with a sorted list of pending positions per pass, each (layer, head) item
+  copying its part after each of them; `rq_seq_truncate` / `copy` / `keep` unchanged for the current callers.
+  Prepares S3 (a checkpoint per verified row). Done when the q35 group, the API tests and P1 are byte-identical,
+  plus an `api_test` case with 3 pending positions in one prefill chunk (truncate to each continues bitwise).
+- [ ] **P4. Memory accounting and the page cache.** (a) `runq serve`'s per-slot budget (`src/engine.c`) counts only
+  the KV cache: add the recurrent state and its checkpoints (~0.45 GB per 27B slot). (b) Print a load-time estimate
+  (repacked weights, KV reserve, state + checkpoints per sequence) and refuse to load past `MemAvailable` unless
+  forced (`--mem`), so a 27B run cannot OOM the box's other services. (c) After the repack, drop the file's page
+  cache (`posix_fadvise(POSIX_FADV_DONTNEED)`; the loader `pread`s). (d) Record load peak RSS for the 8B Q4_K_M and
+  the 4B Q8_0 as the baseline (tests/README or BENCHMARKS). Done when the estimates are within ~5% of the measured
+  RSS and outputs are unchanged.
+- [ ] **P5. Sampling as a reusable step, then top-k.** Factor `rq_generate`'s per-token body (sample with the
+  sequence's RNG, the stop / limit checks, the `on_logits` hook) into one function that the speculative loop calls
+  too, so its RNG pattern (one draw per prefilled token but the last, one per emitted token) is shared by
+  construction, not copied; expose a logits-hash hook in `src/runq.h` for the equivalence tests. Then top-k and the
+  per-model defaults from `general.sampling.*` (Qwen3.8: 1.0 / 0.95 / 20; the older item "Top-k sampling and
+  per-model sampling defaults" is folded in here), with the sampler's exact-order rules. Done when the refactor is
+  byte-identical (P1) and top-k matches a numpy reference of the sampler on recorded logits.
+- [ ] **P6. The 27B's shapes without the 27B.** Extend `tests/make_synth_q35.py` with a model cut to the 27B's
+  ratios: untied `token_embd` Q4_K + `output` Q6_K, GQA 6 (24 / 4 heads of 256), r = 3, a dim that is not a power of
+  two, Q5_K / Q4_K / Q6_K matrices as in the Q4_K_M file; and a variant with an extra MTP block (`block_count` n + 1,
+  `nextn_predict_layers` 1, the `nextn.*` tensors) that today must be refused cleanly (S6 makes it load). Done when
+  the synthetic models pass `logits_ref` and the bitwise groups in the default suite.
+- [ ] **P7. Disk budget before the 27B download** (13.8-17.1 GB). Candidates to remove, all re-downloadable from
+  pinned sets and needed only to regenerate committed goldens: `models/Qwen3.5-4B` (HF, 8.8 GB), `models/Qwen3-1.7B`
+  (HF, 3.8 GB), the HF cache's duplicate `ggml-org/Qwen3.5-0.8B-GGUF` (0.8 GB). Ask before deleting. Ties in with
+  "A model directory convention" (one copy per file, the HF cache searched too).
+
+Steps:
+
+- [ ] **S0. Keep the measurement tooling.** Move `logs/specmeas-2026-10-27/{prompts,gen,measure}.py` into
+  `scripts/spec_accept.py` (endpoint, key file and models configurable; the 3.8 rendering with the reasoning-effort
+  line). Measure: the 0.8B Q4_K_M as the draft; adaptive draft length (stop when the draft's top-1 probability < tau:
+  changes the guesses, never the output); real prompts and longer reasoning. Done when it reproduces the table of
+  docs/qwen38-speculative.md from the saved JSON.
+- [ ] **S1. The speculative loop on Qwen3** (no recurrent state). Target Qwen3-1.7B, draft Qwen3-0.6B.
+  `rq_generate_spec(ctx_t, seq_t, ctx_d, seq_d, tokens, n, cfg, max_new, k, cb, st)`: draft k tokens greedily on
+  `seq_d`, verify `[last, d1..dk]` as one segment on `seq_t` (`RQ_LOGITS_ALL`), sample the rows in order with P5's
+  step, accept while sample == draft (the first mismatch's sample is the next token), truncate both sequences.
+  Refuse a draft whose vocabulary or token bytes (hash) differ. CLI `-D draft.gguf -K k`; stats in `[timing]`. Done
+  when, greedy and seeded, thinking on / off: tokens == `rq_generate`'s, each emitted token's logits hash == plain
+  decoding's, `-K 0` is plain decoding; in `make test` on the 0.6B pair.
+- [ ] **S2. Verify-pass cost** (measure first). A segment of 2-8 rows of one sequence takes the prefill path
+  (`rq_forward_batch`: `n == nseg` selects the decode rows). Time it against one decode step and against the same
+  number of decode rows of different sequences. If small segments are slow, route them through the small-batch
+  kernels, keeping causal attention inside the segment (`batch_mixed`-style bitwise tests). Done when f(rows) is
+  recorded and a 4-row segment costs <= ~1.3x one decode step (Qwen3-1.7B, Qwen3.5-4B).
+- [ ] **S3. Rollback for hybrid models: a checkpoint per verified row** (on P3). `rq_seq_checkpoint_rows(s, pos, n)`:
+  the next pass checkpoints after each of rows pos..pos+n-1; `rq_seq_truncate(s, L)` lands exactly on any of them.
+  Cost: 27B ~150 MiB per row (0.6 GB at k = 3, ~4-5 ms of copying per ~130 ms pass); 0.8B 18.9 MB per token. Later,
+  only if profiles show it: swap state buffers instead of copying back, or keep each row's DeltaNet inputs (~2 MB per
+  row for the 27B) and replay from the pre-pass checkpoint. Done when truncating to any position inside the last
+  segment continues bitwise like an uninterrupted run (`api_test`, 0.8B and 4B).
+- [ ] **S4b. Q3_K weights** (only if the Q3 files are chosen: see the RAM question below). As Q5_K was done:
+  block format, repacked layout, generic + AVX-512 (+ NEON) kernels on one definition in `src/kquants.h`; `-m
+  dequant` bitwise vs gguf-py, logits vs the file's reference, the bitwise groups; a small Q3_K_M test file
+  (< 0.5 GB). Part of "More GGUF types" below.
+- [ ] **S5. The speculative loop on Qwen3.5.** Target Qwen3.5-4B Q8_0 + draft 0.8B (~6 GB), S3's rollback on both.
+  Expect ~1.3-1.6x (a 0.8B guess costs ~18% of a 4B token). Done when outputs equal plain decoding bitwise (greedy,
+  seeded, thinking on / off) and tok/s + acceptance are recorded.
+- [ ] **S6. Qwen3.8 specifics** (on P6's synthetic MTP model and a tiny random-init `qwen3_5` with an MTP layer,
+  converted by llama.cpp's converter in a scratch venv off `/tmp`). Loader: `block_count` 65 with
+  `nextn_predict_layers` 1 = 64 main layers + the MTP block (loaded for S9, else skipped), not a layer-pattern
+  error. Chat variant for 3.8, detected by its text (`reasoning_effort`): thinking on by default, the effort's
+  system line merged with the system / developer message, `-r` plus an effort option, the server's
+  `reasoning_effort`; the template in `tests/golden/templates/` (license noted). Done when `-m render` equals HF's
+  `apply_chat_template` for thinking off / on x each effort, with and without a system message.
+- [ ] **S7. 27B bring-up** (after P4, P7, and the RAM question). Download the pinned file with `hf` (into
+  `models/`, sha256 checked); load: peak RSS, page cache dropped. Logits vs `tests/ref_qwen35.py` on the dequantized
+  weights (layer by layer, a few GB; a classifier subset); teacher-forced top-1 vs the API's model on S0's outputs
+  (a sanity check). Speed: plain decode (~120 ms per token at Q4_K_M, ~96 at Q3_K_M), then with the 0.8B draft
+  (thinking on: ~13-14 tok/s at Q4_K_M, ~16-17 at Q3_K_M; off: ~17 / ~21). Q3 only: perplexity vs Q4_K_M and the
+  draft's acceptance against the 3-bit target. Not in `make test` (an opt-in group, like `models`). Done when the
+  numbers are in the README and docs, and the 27B's speculative output equals plain decoding bitwise.
+- [ ] **S8. Server.** `runq serve --draft FILE`: the draft rows join the job's segment in the batched pass, k per
+  request; speculate less as the batch fills. Done when `server_test.py` shows equal outputs with and without the
+  draft, and `scripts/bench_serve.py` numbers at 1 / 4 clients.
+- [ ] **S9. The MTP drafter** (`blk.64`, same file). The target's last hidden state + the next token's embedding ->
+  `eh_proj` -> one full-attention layer with its own KV cache -> the shared output (~9-10 ms per guess for the 1 GB
+  classifier; a vocabulary subset is fine, exactness does not care which guesses). Needs the final hidden state per
+  row from the verify pass (a new `rq_forward_batch` output). Measure acceptance first; keep whichever draft gives
+  more tok/s.
+- [ ] **S10. Seed-coupled drafting at temperature > 0.** The draft samples its guess with the target's next uniform
+  draw u_j (known from a copy of the target's RNG) and the same settings, instead of its argmax: more accepted
+  guesses (up to sum min(p, q)), output unchanged. Measure first with the API's `top_logprobs` = 20 on S0's outputs.
+  Needs P5's top-k and the same candidate order in both models.
+
+Open question: **RAM for the 27B runs.** ~14-17 GB is available; the Q4 files need ~18.5-19.5 GB. Either 2-5 GB is
+freed while testing (Q4_K_S / Q4_K_M, no new kernels), or S4b (Q3_K) and Q3_K_M with ~1.5 GB freed, or Q3_K_S as is
+(no margin).
+
 ## Platforms
 
 - [ ] **macOS / NEON after Steps 8-11.** The full suite last ran on the Mac before the library split (Step 8); since
@@ -88,7 +205,7 @@ Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M. The rules stay: `make test` 
   so it should be bit-identical to the generic build on arm64 too, and as fast as the new layouts allow; untested
   (the q35 group's AVX-512 vs generic checks, `tests/check_models.py`, on the Mac; then `-DRUNQ_PROFILE` for the
   split). Speed left: `dn_prep` scales poorly past 8 threads and `dn_rec` is ~2x its hot-cache cost (docs/qwen35.md).
-- [ ] **MoE** (`qwen35moe`: Qwen3.5 / 3.6-35B-A3B and up; images are out of scope for this project, ideas:
+- [ ] **MoE** (not now: the Qwen3.8-27B section first) (`qwen35moe`: Qwen3.5 / 3.6-35B-A3B and up; images are out of scope for this project, ideas:
   [IDEAS.md](IDEAS.md#images-qwen35-vision)).
   - Qwen3.6-35B-A3B and a tiny test model: router `ffn_gate_inp` (F32), experts
     `ffn_{gate,up,down}_exps` (3-D tensors), a shared expert `ffn_*_shexp` with its sigmoid gate
@@ -115,8 +232,6 @@ Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M. The rules stay: `make test` 
   are untested (~9 GB at Q4_K_M). Done when `tests/run_tests.sh --models` covers one.
 - [ ] **YaRN RoPE scaling**: contexts past 40,960 tokens for the hybrid Qwen3 models (Qwen documents YaRN up to
   131,072). The 2507 models need none up to 262,144. Files with RoPE scaling are rejected today.
-- [ ] **Top-k sampling and per-model sampling defaults**, e.g. 2507: temperature 0.7, top-p 0.8, top-k 20 (Qwen's
-  `generation_config.json`; runq has no top-k). The sampler's exact-order rules (`src/sampler.c`) apply.
 - [ ] **Qwen3-Embedding / Qwen3-Reranker** (0.6B: the same architecture, vocabulary 151,669): a pooled-embedding
   output mode and the reranker's yes / no score, in the library and as `/v1/embeddings` (and a rerank endpoint).
 

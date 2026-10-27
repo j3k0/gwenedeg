@@ -15,7 +15,8 @@ Decode Qwen3.8-27B (`qwen35`, 64 layers, r = 3, untied, an MTP block) at ~13-18 
 Qwen3.5-0.8B as the draft, the output **exactly** plain decoding's (tokens, greedy and seeded, and each emitted
 token's logits bits). Facts, measurements and decisions: [docs/qwen38-speculative.md](docs/qwen38-speculative.md).
 Added rule for this section: speculative output == plain output (tokens + a hash of each emitted token's logits).
-Order: the preparation items (P1-P6) first, each a no-behaviour-change step checked by the regression net of P1, then
+Order: the preparation items (P2-P6) first, each a no-behaviour-change step checked by the regression net
+(`tests/compare_bins.sh REF_DIR NEW_DIR`: every model family, Qwen3.5 and the synthetic r = 2 / 3 models too), then
 the steps (S). **Disk and RAM:** ~44 GB free, `models/` 42 GB, `/tmp` is a 16 GB tmpfs (RAM: no models or venvs
 there); check `df` / `MemAvailable` before every download or 27B run, keep >= 15 GB of disk free (58 GB free after
 removing the 4B / 1.7B HF checkpoints, which only regenerate committed goldens: re-download their pinned sets), and use
@@ -23,12 +24,6 @@ removing the 4B / 1.7B HF checkpoints, which only regenerate committed goldens: 
 
 Preparation (no output changes; `make test` and `tests/compare_bins.sh` byte-identical after each):
 
-- [ ] **P1. The regression net covers Qwen3.5.** `tests/compare_bins.sh` has only Qwen3 jobs; the Qwen3.5 changes so
-  far were compared by hand (40-180 files each time). Add the Qwen3.5-0.8B Q8_0 / Q4_K_M files and the synthetic
-  r = 2 / 3 models (`tests/make_synth_q35.py`): the `-m logits` grid (-b 1 / 7 / 64 / 512, 3 / 8 threads, both
-  builds), greedy and seeded generate, a `-r 1` chat that rolls back to a checkpoint (`RUNQ_CHAT_DUMP`), and
-  `api_test --digest` (batched passes). Skipped if a file is missing; `--quick` stays short. Done when one command
-  checks every model family against a base commit, and a deliberately broken DeltaNet build is caught.
 - [ ] **P2. Two models in one process, tested.** The pool, the group size `GS` and `rq_nt` are process-wide
   (`src/threads.c`, `src/model.c`); a draft and a target will alternate passes on one pool. An `api_test` case:
   load two models (Qwen3-0.6B + 1.7B; Qwen3.5-0.8B + a synthetic r = 3 model), interleave their prefills, decodes and
@@ -38,7 +33,7 @@ Preparation (no output changes; `make test` and `tests/compare_bins.sh` byte-ide
   (`src/internal.h`, `ck_plan` / `ck_done` in `src/forward.c`). Refactor to a per-sequence set of n slots (a context
   setting, default 2: today's behaviour) with a sorted list of pending positions per pass, each (layer, head) item
   copying its part after each of them; `rq_seq_truncate` / `copy` / `keep` unchanged for the current callers.
-  Prepares S3 (a checkpoint per verified row). Done when the q35 group, the API tests and P1 are byte-identical,
+  Prepares S3 (a checkpoint per verified row). Done when the q35 group, the API tests and compare_bins are identical,
   plus an `api_test` case with 3 pending positions in one prefill chunk (truncate to each continues bitwise).
 - [ ] **P4. Memory accounting and the page cache.** (a) `runq serve`'s per-slot budget (`src/engine.c`) counts only
   the KV cache: add the recurrent state and its checkpoints (~0.45 GB per 27B slot). (b) Print a load-time estimate
@@ -53,7 +48,7 @@ Preparation (no output changes; `make test` and `tests/compare_bins.sh` byte-ide
   construction, not copied; expose a logits-hash hook in `src/runq.h` for the equivalence tests. Then top-k and the
   per-model defaults from `general.sampling.*` (Qwen3.8: 1.0 / 0.95 / 20; the older item "Top-k sampling and
   per-model sampling defaults" is folded in here), with the sampler's exact-order rules. Done when the refactor is
-  byte-identical (P1) and top-k matches a numpy reference of the sampler on recorded logits.
+  byte-identical (compare_bins) and top-k matches a numpy reference of the sampler on recorded logits.
 - [ ] **P6. The 27B's shapes without the 27B.** Extend `tests/make_synth_q35.py` with a model cut to the 27B's
   ratios: untied `token_embd` Q4_K + `output` Q6_K, GQA 6 (24 / 4 heads of 256), r = 3, a dim that is not a power of
   two, Q5_K / Q4_K / Q6_K matrices as in the Q4_K_M file; and a variant with an extra MTP block (`block_count` n + 1,

@@ -29,7 +29,7 @@ HDR = $(wildcard src/*.h)
 Q8  = models/Qwen3-0.6B-q8.bin
 B   = build
 
-.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test api-test bench-batch bench-verify mem-probe FORCE
+.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test api-test bench-batch bench-verify long-ctx mem-probe FORCE
 
 all: runq
 
@@ -84,6 +84,15 @@ $(B)/bench_verify: tests/bench_verify.c src/runq.h $(LIB:%=$(B)/native/%.o)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
 
 bench-verify: $(B)/bench_verify
+
+# the long-context driver of tests/check_long.py (tests/long_ctx.c: tokenize a file, logits at given positions, the
+# verify / decode paths there, greedy generation after ~100k tokens), on both kernel sets
+$(B)/long_ctx: tests/long_ctx.c src/runq.h $(LIB:%=$(B)/native/%.o)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
+$(B)/long_ctx-generic: tests/long_ctx.c src/runq.h $(LIB:%=$(B)/generic/%.o)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DRUNQ_GENERIC $< $(LIB:%=$(B)/generic/%.o) $(LDLIBS) -o $@
+
+long-ctx: $(B)/long_ctx $(B)/long_ctx-generic
 
 # the load-time memory estimate vs the measured RSS, the page cache after the load (tests/mem_probe.c; Linux)
 $(B)/mem_probe: tests/mem_probe.c src/runq.h $(LIB:%=$(B)/native/%.o)

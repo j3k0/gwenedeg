@@ -40,6 +40,9 @@ Tests (see tests/README.md):
              (tests/check_models.py; in the background from the start)
   models     (not in the default set: run_tests.sh --models) every downloaded Qwen3 family model: logits vs
              HF / the dequantized-weights reference, bitwise invariants, greedy goldens, templates, runq serve
+  long       (not in the default set: run_tests.sh --long-context) Qwen3.5 at 16k-98k positions (tests/check_long.py,
+             build/long_ctx): logits at sampled positions vs the numpy reference (golden/long), the verify / decode
+             paths == prefill and the generic build == native there (bitwise), a fact retrieved from ~88k tokens back
   api        the library API (tests/api_test.c per model, in the background from the start): sequences
              interleaved / batched / truncated == alone, batched decode of N sequences (1..17, 65) ==
              each alone incl. past 256 positions and mixed passes, rq_sample_batch, errors, chat
@@ -91,6 +94,7 @@ import numpy as np  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import check_models  # noqa: E402  (groups synth and models: tests/check_models.py)
+import check_long  # noqa: E402  (group long: tests/check_long.py)
 import check_spec  # noqa: E402  (group spec: tests/check_spec.py)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1252,7 +1256,8 @@ def main():
     ap.add_argument("--api-test", default="", help="tests/api_test binary for the api group (empty: skip)")
     ap.add_argument("--q35", default="", help="Qwen3.5-0.8B Q8_0 GGUF for the q35 group (empty: skip)")
     ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv,api,server,synth,q35,spec",
-                    help="comma-separated subset of tests to run (models: the bigger Qwen3 models, opt-in)")
+                    help="comma-separated subset of tests to run (models: the bigger Qwen3 models, long: the "
+                         "long-context checks; both opt-in)")
     ap.add_argument("--update-models", action="store_true", help="write the models group's greedy goldens")
     ap.add_argument("--model-tags", default="", help="models group: only these FAMILY tags (comma-separated; default all)")
     ap.add_argument("--update-greedy", action="store_true", help="regenerate the greedy goldens")
@@ -1307,7 +1312,9 @@ def main():
                          ("q35", lambda: check_models.test_q35(a, res, tmp, texts, q35)),
                          ("spec", lambda: check_spec.test_spec(a, res, spec)),
                          ("models", lambda: check_models.test_models(a, res, tmp, texts, a.update_models,
-                                                                     set(a.model_tags.split(",")) if a.model_tags else None))]:
+                                                                     set(a.model_tags.split(",")) if a.model_tags else None)),
+                         ("long", lambda: check_long.test_long(a, res, tmp, set(a.model_tags.split(",")) if a.model_tags
+                                                               else None))]:
             if name in only:
                 t = time.time()
                 print(f"== {name}")

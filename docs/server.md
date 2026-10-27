@@ -3,7 +3,7 @@
 The reference for [Gwenedeg](../README.md)'s server: flags, endpoints, behaviour, the LiteLLM
 router setup and measurements (on the 16-vCPU AMD EPYC Genoa VM of [BENCHMARKS.md](../BENCHMARKS.md),
 shared, so the numbers are noisy). The design is described in the header comments of `src/engine.c` (scheduler,
-slot pool) and `src/constrain.c` (constrained decoding); the full measurements are in Steps 9 and 10b of the
+slot pool), `src/constrain.c` (constrained decoding) and `src/tools.c` (tool calls); the full measurements are in Steps 9 and 10b of the
 development log ([DEVELOPMENT.md, History](DEVELOPMENT.md#history)), the tuning of the defaults in
 [DEVELOPMENT.md](DEVELOPMENT.md#design-notes-and-rejected-experiments) (Server).
 
@@ -39,7 +39,8 @@ curl -s localhost:8080/v1/chat/completions -d '{"messages": [{"role": "user", "c
 
 Endpoints: `POST /v1/chat/completions` (also `/chat/completions`), `GET /v1/models`, `GET /v1/models/{id}`,
 `GET /health` (also `/v1/health`: status, running and queued requests). Chat completions take `messages`
-(system / developer / user / assistant; content a string or an array of `{"type": "text"}` parts),
+(system / developer / user / assistant, and with Qwen3.5 / Qwen3.8 tool, with assistant `tool_calls`; content a string or an
+array of `{"type": "text"}` parts), `tools` / `tool_choice` / `parallel_tool_calls` (Qwen3.5 / Qwen3.8: below),
 `max_tokens` / `max_completion_tokens`, `temperature` (0 = greedy), `top_p`, `top_k` (an extension, as vLLM's
 and llama.cpp's: an integer, 0 or -1 = off; top-p then applies among the k), `seed`, `stop` (a string or
 up to 16), `n` (1 only), `stream` (SSE `data:` chunks, `data: [DONE]`, a final usage chunk with
@@ -48,9 +49,10 @@ up to 16), `n` (1 only), `stream` (SSE `data:` chunks, `data: [DONE]`, a final u
 low / medium / high / xhigh (`none` / `minimal`: off) or `chat_template_kwargs.enable_thinking` (off by default,
 except Qwen3.8: below; the reasoning comes back as `reasoning_content`), and `cache_prompt: false` (llama.cpp's flag: prefill from scratch). `usage` counts
 prompt, completion and cached prompt tokens (`prompt_tokens_details.cached_tokens`); `finish_reason` is
-`stop` or `length`. Errors are OpenAI error objects: 400 (invalid request; a prompt longer than the context
+`stop`, `length` or `tool_calls`. Errors are OpenAI error objects: 400 (invalid request; a prompt longer than the context
 has `code: context_length_exceeded`), 401, 404, 405, 411 (chunked uploads), 413, 503 (queue full / shutting
-down), 504. Not supported: tools / function calls, images, `n > 1`, `json_object`, penalties (ignored).
+down), 504. Not supported: tools with Qwen3's templates (400), `tool_choice` required / a named function, the legacy
+`functions`, images, `n > 1`, `json_object`, penalties (ignored).
 
 - **Conversation**: rendered with Qwen3's template (the model's variant: README, Chat templates) in the CLI chat's form (`runq -m chat`), so a greedy
   request gives the same text as the CLI for the same messages (tested bitwise, also with a seed: the RNG
@@ -65,6 +67,46 @@ down), 504. Not supported: tools / function calls, images, `n > 1`, `json_object
   contain `</think>`), else from its content split at its last `</think>` (none: an empty think block). Tested
   (`q35/synth-q35-27b-f32/server38/*`): each request's prompt == `runq -m render` of its messages, the greedy reply
   == the CLI's.
+- **Tool calls** (`src/tools.c`; the Qwen3.5 and Qwen3.8 templates; Qwen3's older variants use another format and get a
+  400). A request with `tools` (OpenAI's function tools), a `tool` message or an assistant message with `tool_calls` is
+  rendered exactly as the model's template renders it (HF's `apply_chat_template`; tested on every case of
+  `tests/golden/chat_render.json` with a request): the tool list in the system block (each tool as transformers'
+  `tojson`, i.e. Python's `json.dumps`, then the template's instructions and the system text; Qwen3.8 merges system and
+  developer messages and puts its effort instruction first), consecutive `tool` messages as one user turn of
+  `<tool_response>` blocks, earlier calls as `<tool_call><function=NAME><parameter=P>value</parameter>...` (arguments
+  given as a JSON string, OpenAI's form, are parsed first, as vLLM does; a string value as is, else JSON for Qwen3.8,
+  Python's `str()` of a scalar for Qwen3.5: its template's). Earlier assistant messages keep their reasoning
+  (`reasoning_content`, else a `<think>` block in the content) where the template does: Qwen3.8 always, Qwen3.5 after the
+  last user query (in an agent loop: every reply since the user's message), so the history matches what was generated
+  and a turn prefills only the tool results (pi: 1,095 of 1,130 tokens cached on the second request). A system message
+  after the first other one, or (Qwen3.5) no user message at all, is a 400 (the templates raise); `developer` is taken
+  as `system`; text parts are joined without a separator (the templates' `render_content`). The reply's content (after
+  the reasoning: a call inside `<think>` stays reasoning) is parsed as it is generated: text before a `<tool_call>` is
+  `content` (its trailing whitespace dropped), each `<function=NAME>` block becomes a `tool_calls` item (`id`
+  `call_<16 hex>`, `arguments` a JSON object written as `json.dumps` writes it), each parameter (one leading and trailing
+  newline removed) converted to its type in the tool's schema (`type`, a list of types or `anyOf` / `oneOf`): `null` if
+  allowed and the text is `null`, a string if allowed, else an integer / number literal, `true` / `false` (any case), or
+  any JSON for object / array; otherwise (an unknown parameter or tool, a value that does not convert) a string. After
+  the calls the model may only add whitespace and more calls: other text ends the generation (the template asks for "NO
+  suffix"); `parallel_tool_calls: false` ends it after the first call. A block that does not parse (no
+  `<function=...>`, text between the parts) is content if no call came before it, and ends the generation after one; a
+  block cut by the end of the reply counts if its `</function>` was generated. Non-streamed: `message.tool_calls`,
+  `content` null if empty, `finish_reason: tool_calls` (`length` if the limit cut the reply); streamed: the content
+  first, then each call whole in one `tool_calls` delta (`index`, `id`, `type`, `function.name`, `function.arguments`).
+  `tool_choice: none` renders the tools but does not parse the reply (the XML stays in `content`; the model is not
+  stopped from writing it); `auto` (the default) parses. `response_format` `json_schema` with tools (parsed) is a 400.
+  Not done: constraining the parameter values by the schema while decoding.
+  With pi (`openai-completions`), a `models.json` provider such as
+  `{"baseUrl": "http://127.0.0.1:8080/v1", "api": "openai-completions", "apiKey": "none", "compat":
+  {"supportsDeveloperRole": false, "supportsReasoningEffort": true, "supportsStore": false, "maxTokensField":
+  "max_tokens"}, "models": [{"id": "Qwen3.5-0.8B-Q8_0", "reasoning": true, "contextWindow": 16384, "maxTokens": 2048}]}`
+  (`reasoning`: pi's thinking levels sent as `reasoning_effort`; the streamed `reasoning_content` comes back in the
+  history): smoke-tested with Qwen3.5-0.8B Q8_0 and pi 1.4.0 (`pi --mode json --tools read,bash,edit` in a scratch
+  directory, a temporary `PI_CODING_AGENT_DIR`): `read`, `bash` and `edit` calls (`edit`'s nested `edits` array
+  included) parsed, executed and answered, sessions of up to ~45 tool turns with thinking, each turn prefilling only its
+  new tokens; the 0.8B itself is weak at the tasks (wrong paths, loops: it did not finish the edit task).
+  `stream_options.include_usage`, `max_tokens` / `max_completion_tokens` (the latter wins) and `cache_prompt` work as
+  for other requests.
 - **Prefix reuse**: a new request takes the idle slot with the longest common token prefix, truncated
   to it, and prefills only the rest (if that saves at least 32 tokens or half the prompt; else the least
   recently used idle slot). If a running request's slot shares a longer prefix, it is copied
@@ -138,7 +180,8 @@ Q4_K_M 88-92% at ~130 ms, Qwen3-8B Q4_K_M 92% at ~260 ms.
 ## Limitations
 
 - Output is constrained only to JSON schemas with a finite set of outputs (no `json_object`, no free strings);
-  no tools / function calls, images, `n > 1`; penalties are ignored.
+  tool calls only with the Qwen3.5 / Qwen3.8 templates, `tool_choice` auto / none, tool parameters not constrained
+  while decoding; no images, `n > 1`; penalties are ignored.
 - No TLS: bind it to localhost or a trusted network (`--api-key` is a shared secret over plain HTTP).
 - The KV memory is a fixed pool (`--slots` x `-c`, no paging or preemption): a request keeps its slot until it ends.
 - One model per process. POSIX only (on Windows the server reports that it is not available).

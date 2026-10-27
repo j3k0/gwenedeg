@@ -90,7 +90,9 @@ threads; G0 replaces them):
   attention work grows with its rows.
 - **Compaction:** the summary request prefills the serialized history from scratch (20-60k tokens: tens of
   minutes), then the next request re-prefills the kept ~20k after the system prompt.
-- **Tools:** `runq serve` rejects them, so pi cannot run its agent loop against it at all today.
+- **Tools:** done (G1, docs/server.md): `runq serve` renders tools and tool history as the Qwen3.5 / 3.8 templates do and
+  returns the XML calls as OpenAI `tool_calls`; pi's agent loop (read / bash, thinking on) ran against the 0.8B. Not yet
+  run against the 27B (its first pi session belongs to G0's replay).
 
 Goal (provisional, G0 sets it from measurements): a 96k session with the draft fits with >= 2 GiB to spare; a
 2.5k-token turn at 90k positions prefills in ~1 min; decode >= 8 tok/s at 90k with speculation; no turn re-prefills
@@ -105,18 +107,6 @@ more than its new tokens plus the last reply.
   the 27B. (c) Draft acceptance on the sessions' real replies (`scripts/spec_accept.py`, teacher-forced): the 0.8B
   draft, prompt lookup (G6), both. Done when docs/qwen38-speculative.md has a turn-latency model checked against the
   replay, and the goal above has real numbers.
-- [ ] **G1. Tool calls in `runq serve`.** Requests with `tools` (OpenAI format) rendered by the Qwen3.8 template
-  (the tool list in the system prompt; `tool` messages and earlier `tool_calls` in the history, as
-  `tests/golden/templates/qwen3.8-hf.jinja`), and replies parsed from Qwen3.8's XML format
-  (`<tool_call><function=NAME><parameter=P>value</parameter>...</function></tool_call>`) into `tool_calls`, with
-  `finish_reason: tool_calls`, streamed as `tool_calls` deltas; text before the call stays content. Arguments are
-  converted to the JSON types of the tool's schema; optionally constrained by it while decoding (`src/constrain.c`
-  already does `json_schema`). Also check pi's other expectations end to end: `stream_options.include_usage`,
-  `reasoning_content` on replayed assistant messages, `reasoning_effort` / `chat_template_kwargs` (both accepted
-  since S6), `max_tokens` vs `max_completion_tokens`. Tests: render goldens with tools vs HF's
-  `apply_chat_template`; parsing (malformed calls, several calls, multi-line parameters, calls inside reasoning not
-  parsed); `tests/server_test.py` with a tool round trip; a short pi session against the 0.8B. Done when pi runs a
-  multi-turn agent session (read / edit / bash tools) against `runq serve` with the 0.8B, then the 27B.
 - [ ] **G2. Correctness at long context.** Nothing in the tests goes past ~2,000 positions; Qwen3.8's native window
   is 262,144 (RoPE theta 1e7, no scaling, `-c` accepts it). Check runq against a reference at 32k-96k positions
   (Qwen3.5-0.8B: HF fp32 with SDPA, or `tests/ref_qwen35.py` with chunked attention; logits at sampled positions and
@@ -217,6 +207,18 @@ more than its new tokens plus the last reply.
   combine order of `att_combine`, must stay as it is.
 
 ## Server (`runq serve`)
+
+- [ ] **Tool calls, after G1.** (a) Stream a call's arguments as they are generated: each call goes out whole when its
+  `</function>` arrives, so a long `write` / `edit` call shows no progress until it is complete (OpenAI streams the
+  arguments' JSON in pieces; the typed conversion needs a parameter's end, a string parameter could stream its text).
+  (b) `tool_choice: "required"` / a named function (a 400 today): force `<tool_call>\n<function=` (+ the name) as
+  constrained decoding forces tokens; `none` could also mask the `<tool_call>` token (today the model may still write
+  the XML, returned as content). (c) Constrain the parameter values by the tool's schema while decoding (enums,
+  booleans, integers: `src/constrain.c`'s byte-level masking inside a `<parameter=...>` block; free strings need the
+  JSON grammar below). (d) Qwen3's older templates (Qwen3 0.6B-8B, 2507: JSON `{"name": ..., "arguments": ...}` inside
+  `<tool_call>`): another renderer and parser, a 400 today. (e) A multi-turn pi session on the 27B (G0): on the 0.8B the
+  loop runs (read, bash and edit calls, nested `edits` arrays included, parsed and executed, results sent back, each
+  turn prefilling only its new tokens), but the model is too weak to finish an edit task (wrong paths, loops).
 
 - [ ] **Subset classifier at constrained decisions.** A decision step computes all 151,936 classifier rows, but only
   the allowed tokens matter (~13 for LiteLLM's four tiers). The last-row classifier costs 1.2 ms (8 threads; 1.8 ms

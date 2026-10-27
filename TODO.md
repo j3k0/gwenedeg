@@ -15,7 +15,7 @@ Decode Qwen3.8-27B (`qwen35`, 64 layers, r = 3, untied, an MTP block) at ~13-18 
 Qwen3.5-0.8B as the draft, the output **exactly** plain decoding's (tokens, greedy and seeded, and each emitted
 token's logits bits). Facts, measurements and decisions: [docs/qwen38-speculative.md](docs/qwen38-speculative.md).
 Added rule for this section: speculative output == plain output (tokens + a hash of each emitted token's logits).
-Order: the preparation items (P3-P5) first, each a no-behaviour-change step checked by the regression net
+Order: the preparation items (P4, P5) first, each a no-behaviour-change step checked by the regression net
 (`tests/compare_bins.sh REF_DIR NEW_DIR`: every model family, Qwen3.5 and the synthetic r = 2 / 3 models too), then
 the steps (S). **Disk and RAM:** ~40 GB free with the 27B Q4_K_M downloaded (`models/Qwen3.8-27B-GGUF`, sha256 checked),
 `models/` 45 GB; `/tmp` is a 16 GB tmpfs (RAM: no models or venvs there); check `df` / `MemAvailable` before every
@@ -25,12 +25,6 @@ committed goldens, re-download their pinned sets), and use
 
 Preparation (no output changes; `make test` and `tests/compare_bins.sh` byte-identical after each):
 
-- [ ] **P3. Checkpoints as a set, not two fixed slots.** `RQ_SEQ_CK` = 2 and one pending `ck_at` per pass
-  (`src/internal.h`, `ck_plan` / `ck_done` in `src/forward.c`). Refactor to a per-sequence set of n slots (a context
-  setting, default 2: today's behaviour) with a sorted list of pending positions per pass, each (layer, head) item
-  copying its part after each of them; `rq_seq_truncate` / `copy` / `keep` unchanged for the current callers.
-  Prepares S3 (a checkpoint per verified row). Done when the q35 group, the API tests and compare_bins are identical,
-  plus an `api_test` case with 3 pending positions in one prefill chunk (truncate to each continues bitwise).
 - [ ] **P4. Memory accounting and the page cache.** (a) `runq serve`'s per-slot budget (`src/engine.c`) counts only
   the KV cache: add the recurrent state and its checkpoints (~0.45 GB per 27B slot). (b) Print a load-time estimate
   (repacked weights, KV reserve, state + checkpoints per sequence) and refuse to load past `MemAvailable` unless
@@ -62,12 +56,15 @@ Steps:
   number of decode rows of different sequences. If small segments are slow, route them through the small-batch
   kernels, keeping causal attention inside the segment (`batch_mixed`-style bitwise tests). Done when f(rows) is
   recorded and a 4-row segment costs <= ~1.3x one decode step (Qwen3-1.7B, Qwen3.5-4B).
-- [ ] **S3. Rollback for hybrid models: a checkpoint per verified row** (on P3). `rq_seq_checkpoint_rows(s, pos, n)`:
-  the next pass checkpoints after each of rows pos..pos+n-1; `rq_seq_truncate(s, L)` lands exactly on any of them.
-  Cost: 27B ~150 MiB per row (0.6 GB at k = 3, ~4-5 ms of copying per ~130 ms pass); 0.8B 18.9 MB per token. Later,
-  only if profiles show it: swap state buffers instead of copying back, or keep each row's DeltaNet inputs (~2 MB per
-  row for the 27B) and replay from the pre-pass checkpoint. Done when truncating to any position inside the last
-  segment continues bitwise like an uninterrupted run (`api_test`, 0.8B and 4B).
+- [ ] **S3. Rollback for hybrid models: a checkpoint per verified row: its cost.** The API is in:
+  `rq_seq_checkpoint_rows(s, pos, n)` takes a checkpoint after each of rows pos..pos+n-1 of the next pass (or of
+  the next n decode steps, the draft's), replacing the previous call's; `rq_seq_set_checkpoints(s, k + 2)` keeps the
+  prompt's checkpoint too; `rq_seq_truncate` lands exactly on any of them (`api_test`'s `checkpoint_sets`: the 0.8B
+  and the synthetic models, both builds, and the 4B Q8_0). Left: measure the copies of a verify pass with k + 1
+  checkpoints vs none (0.8B 18.9 MB per row, 4B; the 27B ~150 MiB per row: 0.6 GB at k = 3, estimated ~4-5 ms per
+  ~130 ms pass, measured at S7). Later, only if profiles show it: swap state buffers instead
+  of copying back, or keep each row's DeltaNet inputs (~2 MB per row for the 27B) and replay from the pre-pass
+  checkpoint. Done when the cost per row is recorded (docs/qwen38-speculative.md).
 - [ ] **S5. The speculative loop on Qwen3.5.** Target Qwen3.5-4B Q8_0 + draft 0.8B (~6 GB), S3's rollback on both.
   Expect ~1.3-1.6x (a 0.8B guess costs ~18% of a 4B token). Done when outputs equal plain decoding bitwise (greedy,
   seeded, thinking on / off) and tok/s + acceptance are recorded.

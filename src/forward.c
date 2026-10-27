@@ -164,8 +164,8 @@ RqSeq *rq_seq_new(const RqModel *m, int capacity, int kv_type, int *err) {
     s->key_cache = alloc_big(s->kv_size * s->kv_esz);
     s->value_cache = alloc_big(s->kv_size * s->kv_esz);
     s->tokens = malloc((size_t)capacity * sizeof(int));
-    s->ck_slot = -1;
-    for (int i = 0; i < RQ_SEQ_CK; i++)
+    s->nck = RQ_SEQ_CK;
+    for (int i = 0; i < RQ_SEQ_CK_MAX; i++)
         s->ck[i].pos = -1;
     if (m->hy.on) {
         s->ssm_bytes = (size_t)m->hy.n_lin * m->ssm_layer * sizeof(float);
@@ -186,67 +186,158 @@ void rq_seq_free(RqSeq *s) {
     free_big(s->key_cache, s->kv_size * s->kv_esz);
     free_big(s->value_cache, s->kv_size * s->kv_esz);
     free_big(s->ssm, s->ssm_bytes);
-    for (int i = 0; i < RQ_SEQ_CK; i++)
+    for (int i = 0; i < RQ_SEQ_CK_MAX; i++)
         free_big(s->ck[i].st, s->ssm_bytes);
     free(s->tokens);
     free(s);
 }
 
 // Qwen3.5: the recurrent state of the linear-attention layers is the state after the last position: it cannot
-// be rewound. A sequence keeps RQ_SEQ_CK checkpoints of it (position + copy); rq_seq_checkpoint_at asks for
-// one at a position, taken by the forward pass that reaches it (each (layer, head) item copies its part,
-// dn_save), or at once if the sequence is there. Truncating / copying to an earlier length goes back to the
-// longest checkpoint at or below it (else to 0): the KV entries up to there are kept, the rest is re-prefilled
-// by the caller (rq_seq_len tells how much was kept). The state of a position-0 token is zero (dn_prep, dn_rec clear it), so
-// the state needs no reset
+// be rewound. A sequence keeps a set of nck checkpoints of it (position + copy; rq_seq_set_checkpoints, default
+// RQ_SEQ_CK = 2, buffers allocated at first use) and a sorted list of pending positions: rq_seq_checkpoint_at /
+// _rows ask for checkpoints at positions >= the length, taken by the forward pass that reaches them (ck_plan
+// assigns their slots, CkPass; each (layer, head / channel group) work item copies its part after each of those
+// rows, dn_prep_part / dn_rec_run), or at once if the sequence is there. A new checkpoint takes a free slot, else
+// the one at the lowest position (the pass's earlier ones if all slots are its own: the highest stay).
+// Truncating / copying to an earlier length goes back to the longest checkpoint at or below it (else to 0): the
+// KV entries up to there are kept, the rest is re-prefilled by the caller (rq_seq_len tells how much was kept).
+// The state of a position-0 token is zero (dn_prep, dn_rec clear it), so the state needs no reset
+static void ck_unplan(RqSeq *s) {
+    // the slots of a pass that ck_plan prepared but that failed before running (rq_forward_batch's errors after
+    // ck_plan): free again (their old checkpoints were given up already)
+    for (int i = 0; i < s->ckw.n; i++) {
+        s->ck[s->ckw.slot[i]].pos = -1;
+        s->ck[s->ckw.slot[i]].wr = 0;
+    }
+    s->ckw.n = 0;
+}
+
 static void ck_drop(RqSeq *s, int above) {
     // forget the checkpoints past position `above`
-    for (int i = 0; i < RQ_SEQ_CK; i++)
+    for (int i = 0; i < s->nck; i++)
         if (s->ck[i].pos > above) s->ck[i].pos = -1;
 }
 
 static int ck_best(const RqSeq *s, int n) {
     // the checkpoint with the largest position <= n, or -1
     int b = -1;
-    for (int i = 0; i < RQ_SEQ_CK; i++)
-        if (s->ck[i].pos >= 0 && s->ck[i].pos <= n && (b < 0 || s->ck[i].pos > s->ck[b].pos)) b = i;
+    for (int i = 0; i < s->nck; i++)
+        if (s->ck[i].pos >= 0 && !s->ck[i].wr && s->ck[i].pos <= n && (b < 0 || s->ck[i].pos > s->ck[b].pos)) b = i;
     return b;
 }
 
 static int ck_slot(RqSeq *s) {
-    // a checkpoint slot to (over)write: a free one, else the one at the lowest position; its buffer allocated
-    // (-1: no memory, no checkpoint then)
+    // a checkpoint slot to (over)write: a free one (one with a buffer first), else the one at the lowest position
+    // (a slot the pass being planned writes: its lowest, removed from the plan); its buffer allocated (-1: no memory,
+    // no checkpoint then)
     int b = -1;
-    for (int i = 0; i < RQ_SEQ_CK; i++) // a free slot, one with a buffer first
+    for (int i = 0; i < s->nck; i++)
         if (s->ck[i].pos < 0 && (b < 0 || (s->ck[i].st && !s->ck[b].st))) b = i;
-    for (int i = 0; i < RQ_SEQ_CK && b < 0; i++)
-        b = i;
-    for (int i = 0; i < RQ_SEQ_CK; i++) // (all taken: b is 0 here) the lowest position
-        if (s->ck[b].pos >= 0 && s->ck[i].pos < s->ck[b].pos) b = i;
+    if (b < 0) {
+        b = 0;
+        for (int i = 1; i < s->nck; i++)
+            if (s->ck[i].pos < s->ck[b].pos) b = i;
+    }
     if (!s->ck[b].st && !(s->ck[b].st = alloc_big(s->ssm_bytes))) return -1;
+    if (s->ck[b].wr) { // (the plan's lowest: its first entry)
+        CkPass *w = &s->ckw;
+        int j = 0;
+        while (w->slot[j] != b) j++;
+        for (w->n--; j < w->n; j++) {
+            w->at[j] = w->at[j + 1];
+            w->row[j] = w->row[j + 1];
+            w->slot[j] = w->slot[j + 1];
+            w->st[j] = w->st[j + 1];
+        }
+    }
     s->ck[b].pos = -1;
+    s->ck[b].wr = 0;
+    s->ck[b].rows = 0;
     return b;
+}
+
+static void pend_add(RqSeq *s, int pos, int rows) {
+    // a pending checkpoint at length pos (kept sorted; already there: rows only if both are; the list full: the
+    // lowest goes, as its slot would)
+    int i = 0;
+    while (i < s->npend && s->pend[i].pos < pos) i++;
+    if (i < s->npend && s->pend[i].pos == pos) {
+        s->pend[i].rows &= rows;
+        return;
+    }
+    if (s->npend == RQ_SEQ_CK_MAX) {
+        if (i == 0) return;
+        memmove(s->pend, s->pend + 1, (size_t)--s->npend * sizeof(s->pend[0]));
+        i--;
+    }
+    memmove(s->pend + i + 1, s->pend + i, (size_t)(s->npend - i) * sizeof(s->pend[0]));
+    s->pend[i].pos = pos;
+    s->pend[i].rows = rows;
+    s->npend++;
+}
+
+static void ck_forget_pending(RqSeq *s) {
+    // (rq_seq_truncate / copy / reset: the pending checkpoints were for the tokens that were to follow)
+    ck_unplan(s);
+    s->npend = 0;
 }
 
 void rq_seq_reset(RqSeq *s) {
     s->len = 0;
-    s->ck_at = 0;
+    ck_forget_pending(s);
     ck_drop(s, -1);
 }
 
 int rq_seq_checkpoint_at(RqSeq *s, int pos) {
     if (!s->m->hy.on) return RQ_OK; // (nothing to keep: every length can be truncated to)
     if (pos < s->len || pos > s->cap) return RQ_ERR_ARG;
-    s->ck_at = 0;
+    ck_unplan(s);
     if (pos == s->len) {
         int b = ck_best(s, pos);
-        if (b >= 0 && s->ck[b].pos == pos) return RQ_OK;
-        if ((b = ck_slot(s)) < 0) return RQ_ERR_NOMEM;
-        memcpy(s->ck[b].st, s->ssm, s->ssm_bytes);
-        s->ck[b].pos = pos;
+        if (b < 0 || s->ck[b].pos != pos) {
+            if ((b = ck_slot(s)) < 0) return RQ_ERR_NOMEM;
+            memcpy(s->ck[b].st, s->ssm, s->ssm_bytes);
+            s->ck[b].pos = pos;
+        }
+        s->ck[b].rows = 0;
         return RQ_OK;
     }
-    s->ck_at = pos;
+    pend_add(s, pos, 0);
+    return RQ_OK;
+}
+
+int rq_seq_checkpoint_rows(RqSeq *s, int pos, int n) {
+    if (!s->m->hy.on) return RQ_OK;
+    if (n < 1 || n > RQ_SEQ_CK_MAX || pos < s->len || pos > s->cap - n) return RQ_ERR_ARG;
+    ck_unplan(s);
+    for (int i = 0; i < s->nck; i++) // the previous call's: free (their buffers kept)
+        if (s->ck[i].rows) {
+            s->ck[i].pos = -1;
+            s->ck[i].rows = 0;
+        }
+    int k = 0;
+    for (int i = 0; i < s->npend; i++)
+        if (!s->pend[i].rows) s->pend[k++] = s->pend[i];
+    s->npend = k;
+    for (int i = 1; i <= n; i++)
+        pend_add(s, pos + i, 1);
+    return RQ_OK;
+}
+
+int rq_seq_set_checkpoints(RqSeq *s, int n) {
+    if (n < 1 || n > RQ_SEQ_CK_MAX) return RQ_ERR_ARG;
+    ck_unplan(s);
+    while (s->nck > n) { // a free slot goes first, else the lowest position; the last slot moves into its place
+        int b = 0;
+        for (int i = 1; i < s->nck; i++)
+            if (s->ck[i].pos < s->ck[b].pos) b = i;
+        free_big(s->ck[b].st, s->ssm_bytes);
+        s->ck[b] = s->ck[--s->nck];
+        s->ck[s->nck].pos = -1;
+        s->ck[s->nck].rows = 0;
+        s->ck[s->nck].st = NULL;
+    }
+    s->nck = n;
     return RQ_OK;
 }
 
@@ -261,12 +352,14 @@ int rq_seq_truncate(RqSeq *s, int n) {
     // (the cache entries past n are overwritten by the next tokens: positions only ever grow from len). A
     // hybrid model: back to the longest checkpoint <= n, else to 0, unless n == len
     if (n < 0 || n > s->len) return RQ_ERR_ARG;
-    if (s->m->hy.on && n < s->len) {
-        int b = ck_best(s, n);
-        n = b >= 0 ? s->ck[b].pos : 0;
-        if (b >= 0) memcpy(s->ssm, s->ck[b].st, s->ssm_bytes);
-        ck_drop(s, n);
-        s->ck_at = 0;
+    if (s->m->hy.on) {
+        ck_forget_pending(s);
+        if (n < s->len) {
+            int b = ck_best(s, n);
+            n = b >= 0 ? s->ck[b].pos : 0;
+            if (b >= 0) memcpy(s->ssm, s->ck[b].st, s->ssm_bytes);
+            ck_drop(s, n);
+        }
     }
     s->len = n;
     return RQ_OK;
@@ -321,8 +414,8 @@ int rq_seq_copy(RqSeq *dst, const RqSeq *src, int n) {
         int b = n == src->len ? -1 : ck_best(src, n);
         n = n == src->len ? n : b >= 0 ? src->ck[b].pos : 0;
         if (n > 0) memcpy(dst->ssm, b >= 0 ? src->ck[b].st : src->ssm, src->ssm_bytes);
+        ck_forget_pending(dst);
         ck_drop(dst, -1);
-        dst->ck_at = 0;
     }
     if (n > 0) {
         CopyJob j = { dst, src, n, 0 };
@@ -1519,17 +1612,19 @@ DN_EXACT static DN_INLINE void dn_p21(float *S, const float *qv, const float *kv
 }
 
 DN_EXACT static void dn_rec_run(const RqModel *m, int h, int jb, float *st, int first, const float *row, size_t rs, float *o,
-                                size_t os, int n, float *ck, int ckrow) { RQ_FP_EXACT
+                                size_t os, int n, const CkPass *ck, size_t ckoff) { RQ_FP_EXACT
     // step 2 for n consecutive tokens of one sequence, value head h, v columns jb * DN_BW ..: row = the first
     // token's projections as dn_prep left them (the next ones rs floats on), o = its head's dv outputs (os floats
     // to the next; only this block's columns are written: the raw S^T q); first: the first token is at position 0
-    // (S cleared); ck != NULL: the checkpoint's state of the layer, whose block gets S after token ckrow
+    // (S cleared); ck: the checkpoints of the run's sequence that this pass takes (ck_plan: after its rows ck->row[i],
+    // ascending, all in this run), whose block of layer state (ck->st[i] + ckoff) gets S after that token
     const Hybrid *hy = &m->hy;
     int cd = hy->conv_dim, dk = hy->dk, dv = hy->dv, nv = hy->nv;
     size_t oq = (size_t)(h % hy->nk) * dk, ok = (size_t)hy->nk * dk + oq; // (the key head's q / k)
     size_t ov = (size_t)2 * hy->nk * dk + (size_t)h * dv + (size_t)jb * DN_BW, oe = (size_t)cd + hy->vdim + h;
     float *S = dn_sblock(m, st, h, jb);
     float u[DN_BW], un[DN_BW], oa[DN_BW];
+    int ci = 0, cn = ck->n;
     if (first)
         memset(S, 0, (size_t)dk * DN_BW * sizeof(float));
     dn_p1(S, row + ok, row[oe], u, dk);
@@ -1559,20 +1654,17 @@ DN_EXACT static void dn_rec_run(const RqModel *m, int h, int jb, float *st, int 
         DN_UNROLL
         for (int j = 0; j < DN_BW; j++)
             ob[j] = oa[j];
-        if (ck && t == ckrow)
-            memcpy(dn_sblock(m, ck, h, jb), S, (size_t)dk * DN_BW * sizeof(float));
+        if (ci < cn && t == ck->row[ci]) {
+            memcpy(dn_sblock(m, ck->st[ci] + ckoff, h, jb), S, (size_t)dk * DN_BW * sizeof(float));
+            ci++;
+        }
     }
 }
 
-static inline int dn_ckrow(const RqSeq *s, int pos0, int n) {
-    // the row of a run at positions pos0 .. pos0 + n - 1 after which the checkpoint is taken (rq_seq_checkpoint_at), or -1
-    return s->ck_slot >= 0 && s->ck_at > pos0 && s->ck_at <= pos0 + n ? s->ck_at - 1 - pos0 : -1;
-}
-
-DN_EXACT static void dn_rec(const RqModel *m, int h, int jb, float *st, int first, float *ck, const float *row,
-                            float *o) { RQ_FP_EXACT
-    // dn_rec_run for one token
-    dn_rec_run(m, h, jb, st, first, row, 0, o, 0, 1, ck, 0);
+DN_EXACT static void dn_rec(const RqModel *m, int h, int jb, float *st, int first, const CkPass *ck, size_t ckoff,
+                            const float *row, float *o) { RQ_FP_EXACT
+    // dn_rec_run for one token (the pass's only row of its sequence)
+    dn_rec_run(m, h, jb, st, first, row, 0, o, 0, 1, ck, ckoff);
 }
 
 DN_EXACT static void dn_out(const RqModel *m, int li, int h, const float *row, float *o) { RQ_FP_EXACT
@@ -1593,24 +1685,42 @@ DN_EXACT static void attn_gate(float *o, const float *gate, int n) { RQ_FP_EXACT
 }
 
 static inline float *dn_ck(const RqSeq *s, int li, int pos) {
-    // the checkpoint state of layer li to write after the token at pos, or NULL (rq_seq_checkpoint_at)
-    return s->ck_slot >= 0 && pos + 1 == s->ck_at ? s->ck[s->ck_slot].st + (size_t)li * s->m->ssm_layer : NULL;
+    // the checkpoint state of layer li to write after the token at pos, or NULL (ck_plan)
+    for (int i = 0; i < s->ckw.n; i++)
+        if (s->ckw.at[i] == pos + 1) return s->ckw.st[i] + (size_t)li * s->m->ssm_layer;
+    return NULL;
 }
 
 static void ck_plan(RqSeq *s, int pos0, int n) {
-    // before a pass adding positions pos0..pos0+n-1 to s: the checkpoint slot if the pass reaches its position
-    s->ck_slot = -1;
-    if (s->m->hy.on && s->ck_at > pos0 && s->ck_at <= pos0 + n && (s->ck_slot = ck_slot(s)) < 0)
-        s->ck_at = 0; // (no memory: no checkpoint)
+    // before a pass adding positions pos0..pos0+n-1 to s: a slot for each pending checkpoint the pass reaches (s->ckw;
+    // no memory: that checkpoint is dropped)
+    if (s->ckw.n) ck_unplan(s);
+    for (int i = 0; i < s->npend && s->pend[i].pos <= pos0 + n;) {
+        int at = s->pend[i].pos, b = ck_slot(s);
+        if (b < 0) {
+            memmove(s->pend + i, s->pend + i + 1, (size_t)(--s->npend - i) * sizeof(s->pend[0]));
+            continue;
+        }
+        CkPass *w = &s->ckw;
+        s->ck[b].pos = at;
+        s->ck[b].wr = 1;
+        s->ck[b].rows = s->pend[i].rows;
+        w->at[w->n] = at;
+        w->row[w->n] = at - 1 - pos0;
+        w->slot[w->n] = b;
+        w->st[w->n++] = s->ck[b].st;
+        i++;
+    }
 }
 
 static void ck_done(RqSeq *s) {
-    // after the pass: the checkpoint it took
-    if (s->ck_slot >= 0) {
-        s->ck[s->ck_slot].pos = s->ck_at;
-        s->ck_at = 0;
-        s->ck_slot = -1;
-    }
+    // after the pass (s->len updated): the checkpoints it took are usable, the pending ones it reached gone
+    for (int i = 0; i < s->ckw.n; i++)
+        s->ck[s->ckw.slot[i]].wr = 0;
+    s->ckw.n = 0;
+    int k = 0;
+    while (k < s->npend && s->pend[k].pos <= s->len) k++;
+    if (k) memmove(s->pend, s->pend + k, (size_t)(s->npend -= k) * sizeof(s->pend[0]));
 }
 
 static void kv_populate_one(const RqSeq *s, const Config *p, int pos0, int n, int it) {
@@ -1760,7 +1870,7 @@ static void decode_worker(void *arg, int tid, int nt) {
                 rq_wait_count(S, dc + 1 + h, 1);
                 if (h >= hy->nk) // (its key head's q / k)
                     rq_wait_count(S, dc + 1 + h % hy->nk, 1);
-                dn_rec(m, h, jb, st, pos == 0, dn_ck(s, li, pos), c->lin, c->xb + i0);
+                dn_rec(m, h, jb, st, pos == 0, &s->ckw, (size_t)li * m->ssm_layer, c->lin, c->xb + i0);
                 if (rq_count(S, dc + 1 + hy->nv + h, 1) < nblk)
                     continue;
                 dn_out(m, li, h, c->lin, c->xb + i0);
@@ -2062,9 +2172,8 @@ static void prefill_worker(void *arg, int tid, int nt) {
                 RqSeq *sq = sg->seq;
                 int h = it / nblk % hy->nv, jb = it % nblk, i0 = h * hy->dv;
                 float *st = sq->ssm + (size_t)li * m->ssm_layer;
-                int ckr = dn_ckrow(sq, sg->pos0, sg->n);
                 dn_rec_run(m, h, jb, st, sg->pos0 == 0, lb + (size_t)sg->b0 * lw, lw, c->xb_b + (size_t)sg->b0 * xs + i0, xs, sg->n,
-                           ckr >= 0 ? dn_ck(sq, li, sg->pos0 + ckr) : NULL, ckr);
+                           &sq->ckw, (size_t)li * m->ssm_layer);
             }
             PH_END_NOEPI
             PPROF(PF_DNREC);
@@ -2486,8 +2595,8 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
                 for (int b = 0; b < n; b++) {
                     RqSeq *sq = seg[b].seq;
                     int pos = c->row_pos[b];
-                    dn_rec(m, h, jb, sq->ssm + (size_t)li * m->ssm_layer, pos == 0, dn_ck(sq, li, pos), lb + (size_t)b * lw,
-                           c->xb_b + (size_t)b * xs + i0);
+                    dn_rec(m, h, jb, sq->ssm + (size_t)li * m->ssm_layer, pos == 0, &sq->ckw, (size_t)li * m->ssm_layer,
+                           lb + (size_t)b * lw, c->xb_b + (size_t)b * xs + i0);
                 }
                 if (rq_count(S, cb + 1 + hy->nv + h, 1) < nblk)
                     continue;

@@ -578,19 +578,20 @@ static int prepare_weights(RqModel *m, int fd, int drop, LoadErr *e, char *warni
 
 // ---------------------------------------------------------------------------- memory estimates
 
-static int seq_checkpoints(const RqModel *m) {
-    // the recurrent-state checkpoints a sequence keeps at most (rq_seq_checkpoint_at): read only here
-    return m->hy.on ? RQ_SEQ_CK : 0;
+static int seq_checkpoints(const RqModel *m, int n) {
+    // the recurrent-state checkpoints a sequence keeps at most (rq_seq_checkpoint_at; n > 0: rq_seq_set_checkpoints(n),
+    // e.g. the server's --checkpoints): read only here
+    return m->hy.on ? (n > 0 ? n : RQ_SEQ_CK) : 0;
 }
 
 static size_t pages(size_t n) { return (n + 4095) / 4096 * 4096; }
 
-static void seq_mem(const RqModel *m, int cap, size_t esz, RqSeqMem *o) {
+static void seq_mem(const RqModel *m, int cap, size_t esz, int ck, RqSeqMem *o) {
     // rq_seq_new's buffers (KV cache of whole attention blocks, tokens, state) and its checkpoints (ck_slot)
     size_t kv_len = ((size_t)cap + ATT_P - 1) / ATT_P * ATT_P;
     o->kv = 2 * pages((size_t)m->n_attn * kv_len * m->kv_dim * esz) + (size_t)cap * sizeof(int);
     o->state = m->hy.on ? pages((size_t)m->hy.n_lin * m->ssm_layer * sizeof(float)) : 0;
-    o->checkpoints = seq_checkpoints(m);
+    o->checkpoints = seq_checkpoints(m, ck);
     o->total = o->kv + (1 + (size_t)o->checkpoints) * o->state;
 }
 
@@ -616,7 +617,7 @@ static size_t ctx_mem(const RqModel *m, int nb, int max_ctx, int nt) {
     return n;
 }
 
-static void model_mem(RqModel *m, size_t esz) {
+static void model_mem(RqModel *m, size_t esz, int ck) {
     // the estimates (rq_model_mem) from the shapes and the tensor directory (no tensor data read)
     RqModelMem *o = &m->mem;
     PrepMat mt[16];
@@ -637,7 +638,7 @@ static void model_mem(RqModel *m, size_t esz) {
     size_t meta = m->is_gguf ? m->gguf.data_off : 16 * V;
     o->runtime = V * (sizeof(char *) + 3 * sizeof(int)) + cap * 8 + 2 * meta +
                  ctx_mem(m, RQ_BATCH_MAX, m->config.seq_len, rq_threads()) + ((size_t)8 << 20);
-    seq_mem(m, m->config.seq_len, esz, &o->seq);
+    seq_mem(m, m->config.seq_len, esz, ck, &o->seq);
     o->total = o->weights + o->runtime + o->seq.total;
 }
 
@@ -660,7 +661,7 @@ double rq_mem_available(void) {
 static void mem_check(RqModel *m, const RqModelOpts *o, const char *path, LoadErr *e) {
     // the estimate against the budget (RqModelOpts.mem), before any weight is read: a refusal if it does not fit
     RqModelMem *mm = &m->mem;
-    model_mem(m, o->kv_bytes == 4 ? 4 : 2);
+    model_mem(m, o->kv_bytes == 4 ? 4 : 2, o->checkpoints);
     double avail = o->mem < 0 ? -1 : o->mem > 0 ? o->mem * 1073741824.0 : rq_mem_available();
     if (avail < 0) return;
     mm->budget = avail;
@@ -698,7 +699,7 @@ int rq_seq_mem(const RqModel *m, int capacity, int kv_type, RqSeqMem *mem) {
     if (!m->has_weights) return RQ_ERR_STATE;
     if (capacity <= 0) capacity = m->config.seq_len;
     if (capacity > m->config.seq_len || kv_type < KV_F32 || kv_type > KV_F16) return RQ_ERR_ARG;
-    seq_mem(m, capacity, kv_type == KV_F32 ? 4 : 2, mem);
+    seq_mem(m, capacity, kv_type == KV_F32 ? 4 : 2, 0, mem);
     return RQ_OK;
 }
 

@@ -151,9 +151,10 @@ typedef struct {
     int parallel;               // running jobs at most (--parallel; 0: 16)
     int slots;                  // sequences in the pool (running jobs + prefix caches; 0: parallel + 4)
     double kv_mem;              // GiB for the pool at most (slots x rq_seq_mem of ctx positions; 0: half the RAM, at most MemAvailable)
-    int copy_min;               // copy a running job's prefix if that saves >= this many tokens (0: never)
+    int copy_min;               // copy a cached prefix into another slot if that saves >= this many tokens (0: never)
     int queue;                  // queued jobs at most (waiting, not running)
     int verbose;
+    int checkpoints;            // Qwen3.5: recurrent-state checkpoints per slot (0: 4; engine.c, ck_plan_job)
 } EngineOpts;
 
 typedef struct Engine Engine;

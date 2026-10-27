@@ -945,7 +945,10 @@ static void usage(void) {
             "                      file is >= 1/4 of the RAM)\n"
             "  -b <int>            prompt tokens per pass when no request is decoding, default 512\n"
             "  --chunk <int>       prompt tokens per pass while others decode, default 64\n"
-            "  --prefix-copy <int> copy a running request's prompt prefix if that saves this many tokens, default 32 (0: never)\n"
+            "  --prefix-copy <int> copy a cached prompt prefix into another slot if that saves this many tokens, default 32\n"
+            "                      (0: never)\n"
+            "  --checkpoints <int> Qwen3.5 / 3.8: recurrent-state checkpoints per slot (the end of the system prompt, the\n"
+            "                      assistant header, the turn's first reply, the reply's end), 1..32, default 4\n"
             "  --queue <int>       requests waiting at most (more: 503), default 64\n"
             "  --max-conns <int>   connections at most (more: 503), default 128\n"
             "  --max-body <bytes>  request body limit (more: 413), default 4194304\n"
@@ -965,7 +968,7 @@ int serve_main(int argc, char **argv) {
     if (argc < 2 || argv[1][0] == '-') usage();
     const char *path = argv[1], *name = NULL, *host = "127.0.0.1", *key = NULL;
     int port = 8080, ctx = 8192, kv = RQ_KV_DEFAULT, batch = RQ_BATCH_MAX, slots = 0, queue = 64, conns = 128, threads = 0, verbose = 0, maxtok = 0;
-    int parallel = 16, chunk = 64, copy_min = 32;
+    int parallel = 16, chunk = 64, copy_min = 32, ckpts = 4;
     long long maxbody = 4 << 20;
     double timeout = 600, temp = 1.0, topp = 1.0, kv_mem = 0, mem = 0;
     int page_cache = 0;
@@ -998,6 +1001,7 @@ int serve_main(int argc, char **argv) {
         }
         else if (!strcmp(f, "--chunk")) chunk = atoi(v);
         else if (!strcmp(f, "--prefix-copy")) copy_min = atoi(v);
+        else if (!strcmp(f, "--checkpoints")) ckpts = atoi(v);
         else if (!strcmp(f, "--queue")) queue = atoi(v);
         else if (!strcmp(f, "--max-conns")) conns = atoi(v);
         else if (!strcmp(f, "--max-body")) maxbody = atoll(v);
@@ -1010,7 +1014,7 @@ int serve_main(int argc, char **argv) {
         else usage();
     }
     if (port < 0 || port > 65535 || ctx < 16 || slots < 0 || slots > 1024 || parallel < 1 || parallel > 256 || kv_mem < 0 || chunk < 1 ||
-        copy_min < 0 || queue < 1 || conns < 1 || maxbody < 1024 || temp < 0 || temp > 2 || topp <= 0 || topp > 1 || topk < 0 || maxtok < 0 || batch < 1)
+        copy_min < 0 || ckpts < 1 || ckpts > RQ_CHECKPOINTS_MAX || queue < 1 || conns < 1 || maxbody < 1024 || temp < 0 || temp > 2 || topp <= 0 || topp > 1 || topk < 0 || maxtok < 0 || batch < 1)
         usage();
     if (batch > RQ_BATCH_MAX) batch = RQ_BATCH_MAX;
 
@@ -1021,7 +1025,7 @@ int serve_main(int argc, char **argv) {
     char err[512];
     // (positions up to -c: the default cap of 40,960 would clamp a larger -c; the memory check counts one sequence of -c
     // positions, the pool is bounded by --kv-mem)
-    RqModelOpts mo = { ctx, 0, 0, mem, kv == RQ_KV_F32 ? 4 : 2, page_cache };
+    RqModelOpts mo = { ctx, 0, 0, mem, kv == RQ_KV_F32 ? 4 : 2, page_cache, ckpts };
     RqModel *m = rq_model_load(path, &mo, err, sizeof(err));
     if (!m) { fprintf(stderr, "%s\n", err); return 1; }
     App a;
@@ -1055,7 +1059,7 @@ int serve_main(int argc, char **argv) {
         else if (n > 4 && !strcmp(b + n - 4, ".bin")) n -= 4;
         snprintf(a.model_id, sizeof(a.model_id), "%.*s", (int)n, b);
     }
-    EngineOpts eo = { path, ctx, kv, batch, chunk, parallel, slots, kv_mem, copy_min, queue, verbose };
+    EngineOpts eo = { path, ctx, kv, batch, chunk, parallel, slots, kv_mem, copy_min, queue, verbose, ckpts };
     double t0 = rq_now();
     a.eng = engine_start(m, &eo, err, sizeof(err));
     if (!a.eng) { fprintf(stderr, "runq serve: %s\n", err); return 1; }

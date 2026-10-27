@@ -68,6 +68,8 @@ typedef struct {
     int kv_bytes;       // bytes per KV cache value of the sequence the check counts (0: 2, f16 / bf16; 4: f32)
     int page_cache;     // the file's page cache after the repack (the loader reads it with pread): 0 = dropped
                         // if the file is >= 1/4 of the RAM, 1 = dropped, -1 = kept
+    int checkpoints;    // Qwen3.5: the checkpoint slots of the sequence the check counts (rq_seq_set_checkpoints; 0: the
+                        // default 2)
 } RqModelOpts;
 
 // A qwen3.c .bin (with its .tokenizer / .template* side files) or a GGUF file (Q8_0, Q3_K_M .. Q5_K_M), by
@@ -150,6 +152,13 @@ int rq_seq_checkpoint_rows(RqSeq *s, int pos, int n);
 // the highest positions stay, the others' buffers are freed. RQ_ERR_ARG
 #define RQ_CHECKPOINTS_MAX 32
 int rq_seq_set_checkpoints(RqSeq *s, int n);
+// Qwen3.5: the lengths of the checkpoints the sequence holds (taken; not the pending ones), ascending, at most max of
+// them written to pos; returns their count (0 for Qwen3). With rq_seq_checkpoint_drop, a caller can keep the ones it
+// values (e.g. the server: the end of the system prompt) from the lowest-first replacement
+int rq_seq_checkpoints(const RqSeq *s, int *pos, int max);
+// Qwen3.5: forget the checkpoint at length pos (its slot becomes free; the buffer stays allocated). RQ_ERR_ARG if the
+// sequence holds none there
+int rq_seq_checkpoint_drop(RqSeq *s, int pos);
 int rq_seq_len(const RqSeq *s);                // positions in the cache = the next token's position
 int rq_seq_capacity(const RqSeq *s);
 const int *rq_seq_tokens(const RqSeq *s);      // the tokens at positions 0..len-1

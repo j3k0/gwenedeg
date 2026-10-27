@@ -20,7 +20,19 @@
  * least recently used idle slot instead; if a job being prefilled will share a longer prefix than
  * anything cached (e.g. LiteLLM's rubric for a burst of classifications), the new job waits until that
  * part is prefilled and then copies it. Otherwise the least recently used idle slot is taken (LRU
- * eviction). The whole prompt cached: its last token is prefilled again, for the logits.
+ * eviction). The whole prompt cached: its last token is prefilled again, for the logits. Slot affinity: an idle
+ * slot that would lose more tokens than it keeps (it shares only a prefix, e.g. the system prompt with a new
+ * session or with a compaction's next request) is not truncated: the prefix is copied into the least recently
+ * used other idle slot, so that the conversation it holds finds it whole at its next request.
+ *
+ * Qwen3.5 / 3.8 (hybrid: the recurrent state cannot be rewound, a slot keeps only checkpointed lengths): each job
+ * asks for checkpoints where its conversation's next requests leave the cache (ck_plan_job, --checkpoints per slot,
+ * default 4): the prompt's assistant header (a reply sent back differently from what was generated: an empty
+ * reasoning re-tokenized, a stop string), the end of the system block (the system prompt and the tools: shared by
+ * every request of the agent, kept through a compaction), Qwen3.5's turn start (its template drops the turn's
+ * reasoning at the next user query) and the reply's end (ck_reply_end: a retry or a branch after the reply). The
+ * slot's other checkpoints are dropped first (rq_seq_checkpoint_drop), so the lowest-first replacement of new ones
+ * never takes these. An agent's next turn then prefills only its new tokens (scripts/replay_sessions.py).
  *
  * Generation, per job (as Step 9's one-job loop did it): the RNG is seeded per request and draws once
  * per prompt token but the last, as the CLI's chat does for a first turn (rq_generate), however much of
@@ -66,6 +78,8 @@ struct Engine {
     ConVocab *vocab;
     int V, eos, think_start, think_end, chat; // chat: the template variant (RQ_CHAT_*)
     int hybrid;                               // Qwen3.5's linear layers: a copy keeps only a checkpointed length
+    int ckn;                                  // their checkpoints per slot (--checkpoints)
+    int t_im_start, t_system, t_user, t_assistant, t_nl, t_toolresp; // the chat tokens ck_plan_job looks for
     Run **run;            // running jobs, in admission order
     int nrun;
     // per pass
@@ -366,6 +380,8 @@ struct Run {
     int row;              // its logits row in this pass, or -1
     int nallow;           // allowed tokens set in the slot's mask
     int forcing;          // force_reply: 0 not yet fed, 1 fed whole, 2 fed but cut (max tokens / context)
+    int thought;          // the reply's </think> was sampled
+    int ckw[4], nckw;     // Qwen3.5: the checkpoints the job wants kept (ck_plan_job; + the reply's </think>, ck_think)
     int done;             // finished: the slot is free, reaped after the step
     ConState cs;
     Out o;
@@ -379,11 +395,34 @@ static int slot_scratch(Engine *e, Slot *sl, int logprobs) {
     return RQ_OK;
 }
 
+static void ck_reply_end(Engine *e, Run *r) {
+    // Qwen3.5: a checkpoint at the end of a finished reply (the state now: the next request of the conversation starts
+    // here, and a request that branches off after it, a retry or another slot's copy, lands here instead of the header),
+    // in a free checkpoint slot, else in place of the lowest one the job does not want (ck_plan_job); none if all are
+    RqSeq *s = e->slot[r->si].seq;
+    int len = rq_seq_len(s), held[RQ_CHECKPOINTS_MAX], nh = rq_seq_checkpoints(s, held, RQ_CHECKPOINTS_MAX);
+    if (len < 1) return;
+    for (int k = 0; k < nh; k++)
+        if (held[k] == len) return;
+    if (nh >= e->ckn) {
+        int drop = -1;
+        for (int k = 0; k < nh && drop < 0; k++) {
+            int w = 0;
+            for (int i = 0; i < r->nckw; i++) w |= r->ckw[i] == held[k];
+            if (!w) drop = held[k];
+        }
+        if (drop < 0) return;
+        rq_seq_checkpoint_drop(s, drop);
+    }
+    rq_seq_checkpoint_at(s, len);
+}
+
 static void end_run(Engine *e, Run *r, int finish, int status, int err, const char *emsg) {
     // the job is over (finish reason, an HTTP status for interruptions, or an RQ_ERR_*): flush its text,
     // publish the result, free its slot (a prefix cache from now on)
     Job *j = r->j;
     Slot *sl = &e->slot[r->si];
+    if (e->hybrid && !status && err == RQ_OK) ck_reply_end(e, r);
     for (int i = 0; i < r->nallow; i++) sl->allow[sl->list[i]] = 0;
     r->nallow = 0;
     job_lock(j);
@@ -438,6 +477,14 @@ static int prep(Engine *e, Run *r) {
     return 1;
 }
 
+static void ck_think(Engine *e, Run *r, int pos) {
+    // Qwen3.5: a checkpoint after the reply's </think> (length pos, the token not fed yet): a reply whose content or calls
+    // come back differently (a token sampled where the text's tokenization has another) rolls back there, not to the
+    // header (the reasoning is most of a reply). In the slot ck_plan_job left for the reply; kept by ck_reply_end
+    if (!e->hybrid || r->nckw >= 4 || pos > rq_seq_capacity(e->slot[r->si].seq)) return;
+    if (rq_seq_checkpoint_at(e->slot[r->si].seq, pos) == RQ_OK) r->ckw[r->nckw++] = pos;
+}
+
 static void force_feed(Engine *e, Run *r) {
     // force_reply, after the prefill: its tokens are the reply (output as if sampled, fed as one decode segment, in passes
     // of several rows), then the reply ends at the segment's logits row (step) as if the end token had been sampled
@@ -451,6 +498,11 @@ static void force_feed(Engine *e, Run *r) {
     j->n_gen += k;
     job_notify(j);
     job_unlock(j);
+    for (int i = 0; i < k && j->thinking; i++)
+        if (j->force.v[i] == e->think_end) {
+            ck_think(e, r, rq_seq_len(s) + i + 1);
+            break;
+        }
     r->forcing = k < j->force.n ? 2 : 1;
     r->feed.n = r->fed = 0;
     int err = rq_tokens_push(&r->feed, j->force.v, k);
@@ -483,6 +535,10 @@ static void take_token(Engine *e, Run *r, int tok) {
     }
     if (r->o.stopped || r->o.tstop) { end_run(e, r, FINISH_STOP, 0, RQ_OK, NULL); return; }
     if (j->n_gen >= j->max_new || rq_seq_len(sl->seq) >= rq_seq_capacity(sl->seq)) { end_run(e, r, FINISH_LENGTH, 0, RQ_OK, NULL); return; }
+    if (tok == e->think_end && j->thinking && !r->thought) { // (the reasoning's end: fed with the next pass)
+        r->thought = 1;
+        ck_think(e, r, rq_seq_len(sl->seq) + 1);
+    }
     r->feed.n = 0;
     r->fed = 0;
     int err = rq_tokens_push(&r->feed, &tok, 1);
@@ -499,6 +555,58 @@ static int lcp(const int *a, int na, const int *b, int nb) {
 }
 
 static int real_reuse(int L, int n) { return L >= 32 || (L > 0 && 2 * L >= n); }
+
+static int prompt_sys_end(const Engine *e, const int *P, int n) {
+    // the end of the prompt's leading system block ("<|im_start|>system...<|im_end|>\n": the system prompt and the tools),
+    // the position of the next <|im_start|>; -1 if none
+    if (n < 3 || P[0] != e->t_im_start || P[1] != e->t_system) return -1;
+    for (int i = 2; i < n; i++)
+        if (P[i] == e->t_im_start) return i;
+    return -1;
+}
+
+static int prompt_turn_start(const Engine *e, const int *P, int n) {
+    // the first assistant header after the last user query (a user turn that is not "\n<tool_response>..."): Qwen3.5's
+    // template drops the reasoning of the turn's replies once the next user query comes, so that request leaves the
+    // cache there; -1 if none
+    int u = -1;
+    for (int i = n - 2; i >= 0 && u < 0; i--)
+        if (P[i] == e->t_im_start && P[i + 1] == e->t_user && !(i + 3 < n && P[i + 2] == e->t_nl && P[i + 3] == e->t_toolresp)) u = i;
+    for (int i = u + 2; u >= 0 && i + 1 < n; i++)
+        if (P[i] == e->t_im_start && P[i + 1] == e->t_assistant) return i;
+    return -1;
+}
+
+static void ck_plan_job(Engine *e, Run *r, int L) {
+    // Qwen3.5: the job's checkpoints, in priority order: the prompt's assistant header (a reply sent back differently from
+    // what was generated rolls back there), the end of the system block (every request with this system prompt and these
+    // tools shares it: a compaction's next request, a new session), the turn's first reply (Qwen3.5: where the next user
+    // query's request leaves the cache); at most --checkpoints of them, one slot left for the reply's end (ck_reply_end).
+    // Those at or past L are taken by the passes (or now, at L); of those below L only the held ones remain; the slot's
+    // other checkpoints are dropped, the highest kept within the budget, so that the lowest-first replacement of new
+    // checkpoints (forward.c) never takes the wanted ones
+    RqSeq *s = e->slot[r->si].seq;
+    const int *P = r->j->prompt.v;
+    int n = r->j->prompt.n, B = e->ckn, held[RQ_CHECKPOINTS_MAX], nh = rq_seq_checkpoints(s, held, RQ_CHECKPOINTS_MAX);
+    int cand[3] = { rq_chat_checkpoint_pos(e->m, P, n), prompt_sys_end(e, P, n), e->chat == RQ_CHAT_QWEN35 ? prompt_turn_start(e, P, n) : -1 };
+    r->nckw = 0;
+    for (int k = 0; k < 3 && r->nckw < B; k++) {
+        int p = cand[k], skip = p < 1 || p >= n, h = 0; // (position 0: the empty state)
+        for (int i = 0; i < r->nckw && !skip; i++) skip = r->ckw[i] == p;
+        for (int i = 0; i < nh; i++) h |= held[i] == p;
+        if (!skip && (p >= L || h)) r->ckw[r->nckw++] = p;
+    }
+    int room = B - r->nckw - 1;
+    for (int k = nh - 1; k >= 0; k--) {
+        int w = 0;
+        for (int i = 0; i < r->nckw; i++) w |= r->ckw[i] == held[k];
+        if (w) continue;
+        if (room > 0) room--;
+        else rq_seq_checkpoint_drop(s, held[k]);
+    }
+    for (int i = 0; i < r->nckw; i++)
+        if (r->ckw[i] >= L) rq_seq_checkpoint_at(s, r->ckw[i]);
+}
 
 static void start_run(Engine *e, Job *j, int si, int src, int L) {
     // the job takes slot si with its first L prompt positions (cached in place, or copied from slot src)
@@ -547,15 +655,23 @@ static void start_run(Engine *e, Job *j, int si, int src, int L) {
         if (src >= 0) L = 0;
         rq_seq_truncate(s, L);
     }
-    // (Qwen3.5: copy / truncate keep a checkpointed length <= L; the next request of this conversation diverges
-    // after its assistant header, so the state there is kept, rq_chat_checkpoint_pos)
+    // (Qwen3.5: copy / truncate keep a checkpointed length <= L; the checkpoints this conversation's next requests
+    // need: ck_plan_job)
     L = rq_seq_len(s);
-    int ckp = rq_chat_checkpoint_pos(m, j->prompt.v, n);
-    if (ckp >= L) rq_seq_checkpoint_at(s, ckp);
+    if (e->hybrid) ck_plan_job(e, r, L);
     if (e->o.verbose) {
         char cp[48] = "";
         if (src >= 0) snprintf(cp, sizeof(cp), " (copied from slot %d)", src);
-        fprintf(stderr, "[engine] job -> slot %d: %d of %d prompt tokens cached%s, %d running\n", si, L, n, cp, e->nrun);
+        fprintf(stderr, "[engine] job -> slot %d: %d of %d prompt tokens cached%s, %d running", si, L, n, cp, e->nrun);
+        if (e->hybrid) {
+            int held[RQ_CHECKPOINTS_MAX], nh = rq_seq_checkpoints(s, held, RQ_CHECKPOINTS_MAX);
+            fprintf(stderr, "; checkpoints");
+            for (int k = 0; k < nh; k++) fprintf(stderr, " %d", held[k]);
+            fprintf(stderr, " + at");
+            for (int k = 0; k < r->nckw; k++)
+                if (r->ckw[k] > L) fprintf(stderr, " %d", r->ckw[k]);
+        }
+        fprintf(stderr, "\n");
         if (j->n_common < j->n_slot && j->n_common < n - 1) { // (where the prompt left the cached tokens: a few tokens of each side)
             const int *ct = rq_seq_tokens(from);
             fprintf(stderr, "[engine]   diverged at %d of %d cached tokens:", j->n_common, j->n_slot);
@@ -652,8 +768,16 @@ static int admit(Engine *e, Job *j) {
             return 1;
         }
     }
-    if (real_reuse(li, n)) start_run(e, j, ib, -1, li);
-    else start_run(e, j, lru, -1, rq_seq_keep(e->slot[lru].seq, rq_seq_common_prefix(e->slot[lru].seq, P, n)));
+    if (real_reuse(li, n)) {
+        // slot affinity: a slot holding a longer conversation than it would keep (it shares only a prefix, e.g. the system
+        // prompt with a new session or a compaction's next request) stays for that conversation's next request; the
+        // prefix is copied into the least recently used other idle slot (the same bits, rq_seq_copy)
+        int lost = rq_seq_len(e->slot[ib].seq) - li, other = -1;
+        for (int i = 0; i < e->nslot; i++)
+            if (i != ib && !e->slot[i].run && (other < 0 || e->slot[i].used < e->slot[other].used)) other = i;
+        if (e->o.copy_min > 0 && other >= 0 && lost >= e->o.copy_min && lost > li) start_run(e, j, other, ib, li);
+        else start_run(e, j, ib, -1, li);
+    } else start_run(e, j, lru, -1, rq_seq_keep(e->slot[lru].seq, rq_seq_common_prefix(e->slot[lru].seq, P, n)));
     return 1;
 }
 
@@ -905,6 +1029,14 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
     e->eos = info.eos;
     e->chat = info.chat;
     e->hybrid = info.linear_layers > 0;
+    e->ckn = o->checkpoints > 0 ? o->checkpoints : 4;
+    if (e->ckn > RQ_CHECKPOINTS_MAX) e->ckn = RQ_CHECKPOINTS_MAX;
+    e->t_im_start = single_token(m, "<|im_start|>");
+    e->t_system = single_token(m, "system");
+    e->t_user = single_token(m, "user");
+    e->t_assistant = single_token(m, "assistant");
+    e->t_nl = single_token(m, "\n");
+    e->t_toolresp = single_token(m, "<tool_response>");
     e->think_start = single_token(m, "<think>");
     e->think_end = single_token(m, "</think>");
     // the pool: --slots sequences of -c positions (default --parallel + 4), within --kv-mem (default: half the RAM, at
@@ -914,6 +1046,10 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
         snprintf(err, errlen, "cannot create a sequence of %d positions: %s", o->ctx, rq_strerror(rc));
         engine_free(e);
         return NULL;
+    }
+    if (e->sm.state) { // (the slots keep --checkpoints copies of the state: rq_seq_set_checkpoints below)
+        e->sm.checkpoints = e->ckn;
+        e->sm.total = e->sm.kv + (1 + (size_t)e->ckn) * e->sm.state;
     }
     double per_slot = (double)e->sm.total, mem = o->kv_mem > 0 ? o->kv_mem * 1073741824.0 : 0;
     e->mem_src = "--kv-mem";
@@ -960,6 +1096,7 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
     }
     for (int i = 0; i < e->nslot; i++) {
         e->slot[i].seq = rq_seq_new(m, o->ctx, o->kv_type, &rc);
+        if (e->slot[i].seq && e->hybrid) rq_seq_set_checkpoints(e->slot[i].seq, e->ckn);
         if (!e->slot[i].seq) {
             snprintf(err, errlen, "cannot create a sequence of %d positions: %s", o->ctx, rq_strerror(rc));
             engine_free(e);

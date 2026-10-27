@@ -342,6 +342,31 @@ int rq_seq_set_checkpoints(RqSeq *s, int n) {
     return RQ_OK;
 }
 
+int rq_seq_checkpoints(const RqSeq *s, int *pos, int max) {
+    // the lengths of the checkpoints held (taken, not pending), ascending; their count (only the first max written)
+    int k = 0, last = -1;
+    for (;;) {
+        int b = -1;
+        for (int i = 0; i < s->nck; i++)
+            if (s->ck[i].pos > last && !s->ck[i].wr && (b < 0 || s->ck[i].pos < s->ck[b].pos)) b = i;
+        if (b < 0) return k;
+        last = s->ck[b].pos;
+        if (k < max && pos) pos[k] = last;
+        k++;
+    }
+}
+
+int rq_seq_checkpoint_drop(RqSeq *s, int pos) {
+    // forget the checkpoint at length pos (its buffer stays, for the next one)
+    for (int i = 0; i < s->nck; i++)
+        if (s->ck[i].pos == pos && pos >= 0 && !s->ck[i].wr) {
+            s->ck[i].pos = -1;
+            s->ck[i].rows = 0;
+            return RQ_OK;
+        }
+    return RQ_ERR_ARG;
+}
+
 int rq_seq_keep(const RqSeq *s, int n) {
     if (n < 0 || n > s->len) return RQ_ERR_ARG;
     if (!s->m->hy.on || n == s->len) return n;

@@ -605,9 +605,25 @@ int main(int argc, char **argv) {
         ok &= rq_seq_checkpoint_rows(s, rq_seq_len(s), RQ_CHECKPOINTS_MAX + 1) == RQ_ERR_ARG;
         ok &= rq_seq_checkpoint_rows(s, rq_seq_capacity(s) - 1, 2) == RQ_ERR_ARG;
         ok &= ck_cont(c, s, 40, u, refC, out);
+        // rq_seq_checkpoints / rq_seq_checkpoint_drop (the server keeps the checkpoints it values from the lowest-first
+        // replacement): the list (taken ones only, ascending), a dropped slot taken by the next checkpoint instead of the
+        // lowest one, which still continues exactly
+        int pos[8];
+        rq_seq_reset(s);
+        ok &= rq_seq_set_checkpoints(s, 3) == RQ_OK && rq_seq_checkpoints(s, pos, 8) == 0;
+        ok &= rq_seq_checkpoint_at(s, 10) == RQ_OK && rq_seq_checkpoint_at(s, 30) == RQ_OK && rq_seq_checkpoint_at(s, 20) == RQ_OK;
+        ok &= rq_seq_checkpoints(s, pos, 8) == 0; // (pending)
+        ok &= rq_prefill(c, s, u, 40, RQ_LOGITS_NONE, NULL, NULL) == RQ_OK;
+        ok &= rq_seq_checkpoints(s, pos, 8) == 3 && pos[0] == 10 && pos[1] == 20 && pos[2] == 30;
+        ok &= rq_seq_checkpoints(s, pos, 1) == 3 && pos[0] == 10 && rq_seq_checkpoints(s, NULL, 0) == 3;
+        ok &= rq_seq_checkpoint_drop(s, 20) == RQ_OK && rq_seq_checkpoint_drop(s, 20) == RQ_ERR_ARG && rq_seq_checkpoint_drop(s, 15) == RQ_ERR_ARG;
+        ok &= rq_seq_checkpoints(s, pos, 8) == 2 && pos[0] == 10 && pos[1] == 30 && rq_seq_keep(s, 25) == 10;
+        ok &= rq_seq_checkpoint_at(s, 50) == RQ_OK && rq_prefill(c, s, u + 40, 15, RQ_LOGITS_NONE, NULL, NULL) == RQ_OK;
+        ok &= rq_seq_checkpoints(s, pos, 8) == 3 && pos[0] == 10 && pos[1] == 30 && pos[2] == 50;
+        ok &= ck_cont(c, s, 50, u, refC, out) && ck_cont(c, s, 10, u, refC, out);
         report(ok, "checkpoint_sets", "3 pending in one prefill chunk (2 slots: the highest 2), 6 across chunks, eviction, fewer "
-               "slots, a batched pass of 3 sequences, rq_seq_checkpoint_rows (verify segments, decode steps): each "
-               "truncation continues == a fresh run");
+               "slots, a batched pass of 3 sequences, rq_seq_checkpoint_rows (verify segments, decode steps), "
+               "rq_seq_checkpoints / rq_seq_checkpoint_drop: each truncation continues == a fresh run");
         free(u);
         free(out);
         rq_seq_free(s);

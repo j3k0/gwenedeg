@@ -313,6 +313,8 @@ def run_tools(a, t, port):
     rep(st == 200 and x["usage"]["completion_tokens"] == 3 and x["choices"][0]["finish_reason"] == "length", "tools/max_completion_tokens",
         f"{x.get('usage')}")
 
+    run_checkpoints(a, t, port, env)
+
     def err(name, body, words):
         st, x, _ = chat(port, body)
         msg = x.get("error", {}).get("message", "") if isinstance(x, dict) else ""
@@ -325,6 +327,115 @@ def run_tools(a, t, port):
     err("json_schema", dict(base, response_format={"type": "json_schema", "json_schema": {"schema": {"enum": ["a"]}}}), "tools")
     err("late_system", dict(base, messages=WEATHER + [{"role": "system", "content": "late"}]), "at the beginning")
     err("no_user_query", dict(base, messages=[{"role": "system", "content": "x"}, {"role": "tool", "content": "y"}]), "no user query")
+
+
+def run_checkpoints(a, t, port, env):
+    """force_reply, timings and the agent-loop checkpoints (Qwen3.5: the end of the system block, the assistant header,
+    the turn's first reply, the reply's end; slot affinity): what each request reuses, and a reused prefix's reply ==
+    a fresh prefill's, bitwise (logprobs)"""
+    rep = t.report
+
+    def ids(body):
+        p = subprocess.run([a.runq, a.model, "-m", "render", "-i", json.dumps([{"request": body}])], capture_output=True, env=env)
+        return [int(x) for x in p.stdout.decode().split()]
+
+    def msg_of(d):
+        m = d["choices"][0]["message"]
+        return {k: m[k] for k in ("content", "reasoning_content", "tool_calls") if m.get(k) is not None}
+
+    def sys_end(p):
+        return p.index(p[0], 1)  # (the second <|im_start|>)
+
+    sysm = {"role": "system", "content": LONG_SYS}
+    a1 = [sysm, {"role": "user", "content": "Read the file notes.txt, then tell me what it says."}]
+    rep1 = {"content": "I will read it.", "reasoning_content": "The user wants notes.txt. " * 20,
+            "tool_calls": [{"type": "function", "function": {"name": "read", "arguments": json.dumps({"path": "notes.txt"})}}]}
+    base = {"tools": TOOLS, "reasoning_effort": "high", "temperature": 0}
+    st, d, _ = chat(port, dict(base, messages=a1, force_reply=rep1))
+    m1 = msg_of(d) if st == 200 else {}
+    calls = [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in m1.get("tool_calls", [])]
+    ok = st == 200 and m1.get("content") == rep1["content"] and m1.get("reasoning_content") == rep1["reasoning_content"].strip() and \
+        calls == [("read", {"path": "notes.txt"})] and d["choices"][0]["finish_reason"] == "tool_calls" and \
+        d["timings"]["prompt_n"] == d["usage"]["prompt_tokens"] - d["usage"]["prompt_tokens_details"]["cached_tokens"] and \
+        d["timings"]["predicted_n"] == d["usage"]["completion_tokens"] > 20
+    rep(ok, "tools/force_reply", f"{m1.get('content')!r}, {calls}, usage {d.get('usage')}, timings {d.get('timings')}")
+    u1 = d["usage"] if st == 200 else {"prompt_tokens": 0, "completion_tokens": 0}
+    # the reply as the client sends it back: the next request prefills only the tool result (the reply's tokens are those
+    # of its re-rendering)
+    a2 = a1 + [dict(m1, role="assistant"), {"role": "tool", "tool_call_id": "c1", "content": "Buy milk. Call Ada at noon."}]
+    st, d2, _ = chat(port, dict(base, messages=a2, max_tokens=4))
+    c2 = d2["usage"]["prompt_tokens_details"]["cached_tokens"] if st == 200 else -1
+    rep(st == 200 and c2 == u1["prompt_tokens"] + u1["completion_tokens"], "tools/force_round_trip",
+        f"cached {c2} == the first prompt {u1['prompt_tokens']} + its reply {u1['completion_tokens']}")
+    st, dr, _ = chat(port, {"messages": [{"role": "user", "content": "Say hi"}], "force_reply": "Hi there!"})
+    rep(st == 200 and dr["choices"][0]["message"]["content"] == "Hi there!" and dr["choices"][0]["finish_reason"] == "stop",
+        "tools/force_reply_text", f"{dr.get('choices', [{}])[0].get('message')}")
+    # the reply's end: a request that branches off right after the reply (another tool result, e.g. a retry) after the
+    # next one moved on lands there (Qwen3.5: next to the header's, the system block's, the turn's and the </think>
+    # checkpoints: the test server runs with --checkpoints 5; with the default 4 the reply's end goes first)
+    r1 = a1[1:]
+    st, f1, _ = chat(port, dict(base, messages=r1, force_reply=rep1))
+    uf = f1["usage"]
+    chat(port, dict(base, messages=r1 + [dict(msg_of(f1), role="assistant"), {"role": "tool", "tool_call_id": "c1", "content": "Buy milk."}],
+                    max_tokens=4))
+    st, d3, _ = chat(port, dict(base, messages=r1 + [dict(msg_of(f1), role="assistant"), {"role": "tool", "tool_call_id": "c1",
+                                                                                        "content": "The file is empty."}], max_tokens=4))
+    c3 = d3["usage"]["prompt_tokens_details"]["cached_tokens"] if st == 200 else -1
+    rep(st == 200 and c3 == uf["prompt_tokens"] + uf["completion_tokens"], "tools/ckpt_reply_end",
+        f"cached {c3} == the first prompt + its reply ({uf['prompt_tokens'] + uf['completion_tokens']}): the checkpoint at the reply's end")
+    # the reply's </think>: the reply sent back with other content after the reasoning (as when a token was sampled where
+    # the text's tokenization has another) rolls back to the end of the reasoning, not to the header
+    think_end = int(subprocess.run([a.runq, a.model, "-m", "tokenize", "-i", "</think>"], capture_output=True, env=env).stdout.split()[0])
+    k1 = [sysm, {"role": "user", "content": "Please read notes.txt for me."}]
+    st, g1, _ = chat(port, dict(base, messages=k1, force_reply=rep1))
+    k2 = k1 + [dict(msg_of(g1), role="assistant", content="Reading it now."), {"role": "tool", "tool_call_id": "c1", "content": "Buy milk."}]
+    pk1, pk2 = ids(dict(base, messages=k1)), ids(dict(base, messages=k2))
+    tpos = pk2.index(think_end, len(pk1)) + 1
+    st, g2, _ = chat(port, dict(base, messages=k2, max_tokens=6, logprobs=True, top_logprobs=3))
+    c10 = g2["usage"]["prompt_tokens_details"]["cached_tokens"] if st == 200 else -1
+    st2, g3, _ = chat(port, dict(base, messages=k2, max_tokens=6, logprobs=True, top_logprobs=3, cache_prompt=False))
+    rep(st == st2 == 200 and c10 == tpos > len(pk1) + 100 and g2["timings"]["common_tokens"] > tpos and msg_of(g2) == msg_of(g3) and
+        g2["choices"][0]["logprobs"] == g3["choices"][0]["logprobs"], "tools/ckpt_think",
+        f"cached {c10} == the reply's </think> at {tpos} (its header at {len(pk1) - 5}, the prompt left the cache at "
+        f"{g2['timings']['common_tokens']}); the reply == a fresh prefill's (text, logprobs)")
+    # the end of the system block: another conversation with the same system prompt and tools
+    b1 = [sysm, {"role": "user", "content": "What is in the folder?"}]
+    pb = ids(dict(base, messages=b1))
+    st, d4, _ = chat(port, dict(base, messages=b1, max_tokens=8, logprobs=True, top_logprobs=3))
+    c4 = d4["usage"]["prompt_tokens_details"]["cached_tokens"] if st == 200 else -1
+    rep(st == 200 and c4 == sys_end(pb) > 300, "tools/ckpt_system", f"cached {c4} == the system block's {sys_end(pb)} tokens")
+    st, d5, _ = chat(port, dict(base, messages=b1, max_tokens=8, logprobs=True, top_logprobs=3, cache_prompt=False))
+    rep(st == 200 and d5["usage"]["prompt_tokens_details"]["cached_tokens"] == 0 and msg_of(d5) == msg_of(d4) and
+        d5["choices"][0]["logprobs"] == d4["choices"][0]["logprobs"], "tools/ckpt_bitwise",
+        "the reply on the system block's checkpoint == a fresh prefill's (text, logprobs)")
+    # slot affinity: conversation A grows long (a long forced reply), then C shares only the system block: its prefix is
+    # copied into another slot, so A's next request still finds all of A
+    long_rep = {"content": "Here is what I found. " * 100, "reasoning_content": "Summarize.", "tool_calls": rep1["tool_calls"]}
+    a3 = a2 + [{"role": "assistant", "content": "It says: buy milk."}, {"role": "user", "content": "Summarize the plan in detail."}]
+    st, d6, _ = chat(port, dict(base, messages=a3, force_reply=long_rep))
+    u6 = d6["usage"]
+    st, d7, _ = chat(port, dict(base, messages=[sysm, {"role": "user", "content": "Another task."}], max_tokens=2))
+    a4 = a3 + [dict(msg_of(d6), role="assistant"), {"role": "tool", "tool_call_id": "c1", "content": "Nothing new."}]
+    st8, d8, _ = chat(port, dict(base, messages=a4, max_tokens=2))
+    c8 = d8["usage"]["prompt_tokens_details"]["cached_tokens"] if st8 == 200 else -1
+    rep(st8 == 200 and d7["timings"]["copied"] and d7["timings"]["cache_n"] == sys_end(pb) and
+        c8 >= u6["prompt_tokens"] + u6["completion_tokens"] - 1, "tools/ckpt_affinity",
+        f"the other conversation: copied {d7['timings']['copied']}, cached {d7['timings']['cache_n']}; the long one next: cached "
+        f"{c8} of {d8['usage']['prompt_tokens']} (its previous prompt + reply {u6['prompt_tokens'] + u6['completion_tokens']})")
+    # Qwen3.5: a new user query drops the turn's reasoning (its template): the request goes back to the turn's first reply
+    # (the checkpoint at its header), not further
+    t1 = [sysm, {"role": "user", "content": "Check notes.txt."}]
+    st, e1, _ = chat(port, dict(base, messages=t1, force_reply=rep1))
+    t2 = t1 + [dict(msg_of(e1), role="assistant"), {"role": "tool", "tool_call_id": "c1", "content": "Buy milk."}]
+    st, e2, _ = chat(port, dict(base, messages=t2, force_reply={"content": "It says to buy milk.", "reasoning_content": "Easy. " * 30}))
+    t3 = t2 + [dict(msg_of(e2), role="assistant"), {"role": "user", "content": "And then?"}]
+    p3 = ids(dict(base, messages=t3))
+    p1 = ids(dict(base, messages=t1))
+    st, e3, _ = chat(port, dict(base, messages=t3, max_tokens=2))
+    c9 = e3["usage"]["prompt_tokens_details"]["cached_tokens"] if st == 200 else -1
+    hdr = len(p1) - 5  # (the first reply's header: "<|im_start|>assistant\n<think>\n" ends the first prompt)
+    rep(st == 200 and p3[:hdr + 3] == p1[:hdr + 3] and c9 == hdr, "tools/ckpt_user_turn",
+        f"cached {c9} == the turn's first reply header at {hdr} (prompt {len(p3)})")
 
 
 def main():
@@ -341,7 +452,8 @@ def main():
     log = tempfile.NamedTemporaryFile(prefix="runq-serve-", suffix=".log", delete=False)
     env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
     srv = subprocess.Popen([a.runq, "serve", a.model, "--port", "0", "-c", "2048", "--parallel", "4", "--slots", "6", "--chunk", "16", "--queue", "4",
-                            "--max-body", "65536", "--name", "test-model"], stderr=log, stdout=subprocess.DEVNULL, env=env)
+                            "--max-body", "65536", "--name", "test-model"] + (["--checkpoints", "5"] if a.tools else []),
+                           stderr=log, stdout=subprocess.DEVNULL, env=env)
     # the CLI references, in parallel with the server tests
     ex = cf.ThreadPoolExecutor(max_workers=3)
     ref = {} if a.tools else {

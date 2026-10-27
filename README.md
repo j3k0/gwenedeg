@@ -96,7 +96,10 @@ accepted, tokens per pass, the draft's and the verify passes' time). Qwen3-1.7B 
 draft, 8 threads, 256 tokens, `-G 3` (2026-10-27, the shared VM at load 4-10): 111 tok/s on code, 88 on chat, 119 with
 thinking, 87 on code at temperature 1, against 70-78 plain (1.15-1.5x; 45-80% of the guesses accepted). A Q8_0 draft
 guesses the same but its step is slower (5.6 vs 4.2 ms). Qwen3.5 targets and drafts work too (rolled back through
-state checkpoints). Not in `runq serve` yet. Measurements: [docs/qwen38-speculative.md](docs/qwen38-speculative.md#the-loop-s1).
+state checkpoints). **Qwen3.8-27B Q4_K_M** with Qwen3.5-0.8B Q4_K_M as the draft, 8 threads, 256 tokens, the mean of
+chat, code, math and summary prompts: 8.7 tok/s plain; thinking on 13.2 at `-G 3`, 14.1 at `-G 6 --tau 0.4` (1.6x),
+thinking off 16.6 / 17.2 (2.0x; code and math 19-22); 12 threads: up to 15.3 / 20.6. Not in `runq serve` yet.
+Measurements: [docs/qwen38-speculative.md](docs/qwen38-speculative.md#the-27b-bring-up-s7).
 
 ## Models
 
@@ -113,6 +116,7 @@ state checkpoints). Not in `runq serve` yet. Measurements: [docs/qwen38-speculat
 | `3.5-0.8b-q8` | `Qwen3.5-0.8B-Q8_0.gguf` (unsloth) | 812 MB | Qwen3.5: hybrid layers, 248k vocabulary, thinking off by default ([docs/qwen35.md](docs/qwen35.md)) |
 | `3.5-0.8b-q4km` | `Qwen3.5-0.8B-Q4_K_M.gguf` (unsloth) | 533 MB | Q4_K / Q5_K / Q6_K / Q8_0 mix: decode ~1.27x the Q8_0 file (188 vs 148 tok/s), prefill ~0.88x, peak RSS 662 vs 963 MB; vs HF fp32 pooled cos 0.9946, top-1 57/62 |
 | `3.5-4b-q8` | `Qwen3.5-4B-Q8_0.gguf` (unsloth) | 4,482 MB | Qwen3.5-4B: 32 value heads on 16 key heads in its linear layers; as fast as Qwen3-4B Q8_0, perplexity 10.59 (Qwen3-4B: 15.65) |
+| `3.8-27b-q4km` | `Qwen3.8-27B-Q4_K_M.gguf` (unsloth) | 17,107 MB | Qwen3.8-27B (thinks by default; its MTP block is not used): ~16-16.5 GB of RAM, 8.7 tok/s plain, 13-17 with `-D` Qwen3.5-0.8B ([docs/qwen38-speculative.md](docs/qwen38-speculative.md)) |
 | `hf`, `1.7b-hf`, `3.5-0.8b-hf`, `3.5-4b-hf` | `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-1.7B`, `Qwen/Qwen3.5-0.8B`, `Qwen/Qwen3.5-4B` (bf16 safetensors) | 1.5 / 4.1 / 1.8 / 9.3 GB | for the `.bin` export and the test goldens |
 
 Measured on the 16-vCPU AMD EPYC Genoa VM (shared, noisy: best of 2, interleaved, 2026-10-26; prefill of
@@ -132,6 +136,7 @@ Measured on the 16-vCPU AMD EPYC Genoa VM (shared, noisy: best of 2, interleaved
 | Qwen3-8B Q4_K_M | 4.9 GB | 158 / 219 | 30 / 30 | 91 / 119 | 11.53 |
 | Qwen3.5-0.8B Q8_0 (\*) | 0.96 GB | 1,506 / 2,039 | 141 / 182 | | 18.86 (512-token windows: 22.729, HF 22.728) |
 | Qwen3.5-4B Q8_0 (\*\*) | 4.8 GB | 308 / 443 | 31 / 30 | | 10.59 (512-token windows: 12.645) |
+| Qwen3.8-27B Q4_K_M (\*\*\*) | 15.9 GB | 45 / 65 | 8.5 / 10.0 | | |
 
 (\*) Another session: prefill 2026-10-27 (`scripts/bench_models.py`, 451 tokens; Qwen3-0.6B Q8_0 alongside: 1,832 /
 2,511), decode 2026-10-26 (0.6B alongside: 209 / 230). Its decode barely slows down with the context (160 / 174 tok/s
@@ -139,6 +144,9 @@ after 1,500 tokens): only 6 of its 24 layers have a KV cache, at 12 KB per token
 ~0.64x before the linear attention's recurrence was blocked and tuned, docs/qwen35.md, Performance).
 (\*\*) 2026-10-27, `scripts/bench_models.py -r 3`, load 13-15 (with the run's own threads); Qwen3-4B Q8_0 alongside:
 314 / 440 and 31 / 31, the same within noise (after 1,500 tokens 26 / 32 vs 32 / 32).
+(\*\*\*) 2026-10-27, `scripts/bench_models.py`, best of 2, load 9-14 (with the run's own threads); prefill of 488 tokens
+(Qwen3.8's template adds its reasoning instruction); 16 threads: 76 / 10.3; after 1,500 tokens 8.7 / 10.6; startup
+20 s at 8 threads (the 17 GB file read cold: its page cache is dropped after each load).
 
 Decode is memory-bound and moves with the machine's load (8B ranged 12-30 tok/s); startup takes 0.1-0.2 s
 up to 1.7B, ~0.5 s for 4B and ~1 s for 8B. Q4_K_M is the better trade at 4B / 8B (decode ~1.6x Q8_0 at
@@ -172,8 +180,9 @@ sizes should load but are untested: 2B (as many value heads as key heads, like 0
 as many value heads, like 4B; the 27B shape is covered by synthetic test models). **Qwen3.8-27B** (Unsloth's Q4_K_M,
 docs/qwen38-speculative.md) loads its main model: the MTP block after its 64 layers (`nextn_predict_layers` 1,
 `blk.64`: an attention layer + `nextn.*`) is checked (names, shapes, types) but not read nor used yet, and its F32
-`ssm_alpha` / `ssm_beta` matrices are applied in fp32; the bring-up on the real file (accuracy, speed) is open
-(TODO). Other MTP layouts (several blocks, `qwen3` files) are refused with a clear message.
+`ssm_alpha` / `ssm_beta` matrices are applied in fp32; tested on the real file (logits vs its numpy reference cos
+0.9999, top-1 62/62; the bitwise invariants; the models group's `3.8-27b-q4km`, opt-in). Other MTP layouts (several
+blocks, `qwen3` files) are refused with a clear message.
 
 ## Performance
 
@@ -349,7 +358,7 @@ and builds mynah-slm, an optional reference engine for comparison (not part of t
   qwen35 pre-tokenizer). GGUF Q8_0 / Q4_K_M / Q5_K_M (any mix of Q8_0, Q4_K, Q5_K and Q6_K tensors; F32 only for Qwen3.5's
   `ssm_alpha` / `ssm_beta`, as in Qwen3.8-27B) and qwen3.c's `.bin`. No other quantization types, no MoE, no RoPE scaling,
   no images, no Jinja interpreter (the templates are built in: Qwen3's, Qwen3.5's, Qwen3.8's). Qwen3.8-27B: its MTP block
-  is not used (not a draft yet), and the real file is not validated yet (TODO).
+  is not used (not a draft yet: TODO S9); it needs ~17 GB of free RAM (18.65 GiB estimated at the default `-c` 40,960).
 - Fast paths: x86-64 with AVX-512 VNNI (selected at compile time with `-march=native`) and AArch64 with
   the dot-product extension. Other CPUs, including x86 without AVX-512 VNNI, use the generic C kernels:
   the same results, but for Q4_K_M / Q5_K_M ~10x slower prefill and ~3-4x slower decode.

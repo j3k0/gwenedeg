@@ -4,7 +4,7 @@ Status (2026-10-27): **Qwen3.5-0.8B Q8_0 and Unsloth's Q4_K_M are supported** (G
 `qwen35` pre-tokenizer, the chat template variant, the hybrid forward pass in every path (decode, batched prefill,
 batched decode rows) with the bitwise invariants, recurrent-state checkpoints for truncate / copy, the CLI chat and
 `runq serve`, and the tests (`tests/check_models.py` group `q35` in `make test`, the file in the `models` group).
-Open: the recurrence's speed, the bigger Qwen3.5 / 3.6 models ([TODO.md](../TODO.md)).
+Open: the NEON check of the recurrence, the bigger Qwen3.5 / 3.6 models ([TODO.md](../TODO.md)).
 This file records what Qwen3.5 is, what was verified, and the design. Test model: **Qwen3.5-0.8B**: the same layer
 types as the larger Qwen3.5 / 3.6 models, with a dense FFN instead of MoE.
 
@@ -16,11 +16,13 @@ Results (2026-10-26, 16-vCPU dev box):
   22.729, HF fp32 22.728 (full text: runq 18.86; HF's reference kernels ran out of memory there).
 - Bit-identical: `-b 1 / 7 / 64 / 512`, 8 vs 3 threads, AVX-512 vs generic, KV f16 / bf16 / f32, a batched decode
   row vs the sequence alone (`api_test`), a CLI chat that rolls back to a checkpoint vs a single-shot run.
-- Speed (8 / 12 threads, `scripts/bench_models.py`): prefill of 448 tokens 1,117 / 1,580 tok/s (Qwen3-0.6B Q8_0 in
-  the same session: 1,817 / 2,494), decode 141 / 182 tok/s (0.6B: 209 / 230), after a 1,500-token prompt 160 / 174
-  (0.6B: 182 / 183: the 6-layer KV cache barely slows it down); peak RSS 964 MB (1,500 + 128 tokens, `-c 4096`),
-  startup 0.1 s. The recurrence takes ~45% of prefill (`-DRUNQ_PROFILE`, the "attention+quant" bucket): see
-  Performance below.
+- Speed (8 / 12 threads, `scripts/bench_models.py`, 2026-10-27, load 3-6 from another agent): prefill of 451 / 1,500
+  tokens 1,506 / 1,461 and 2,039 / 2,029 tok/s (Qwen3-0.6B Q8_0 in the same session: 1,832 / 1,396 and 2,511 / 1,974:
+  0.82x / 1.05x at 8 threads, 0.81x / 1.03x at 12; before the blocked recurrence 1,170 / 1,127 and 1,568 / 1,590),
+  decode 162 / 174 tok/s (0.6B: 180 / 219; 141 / 182 in the quiet session of 2026-10-26, 0.6B 209 / 230), after a
+  1,500-token prompt 142 / 160 (0.6B: 161 / 194: the 6-layer KV cache barely slows it down); peak RSS 964 MB (1,500 +
+  128 tokens, `-c 4096`), startup 0.1 s. The recurrence takes ~17% of prefill (`-DRUNQ_PROFILE`): see Performance
+  below.
 - Tokenizer: `tests/golden/tokenizer_qwen35.json` (90 cases, 23 of them pre-tokenized differently from Qwen3's
   regex) and `fuzz_tokenizer.py` (5,000 random strings + the repo's text, 1.4 M tokens): equal to HF.
 
@@ -118,11 +120,18 @@ uses Q4_K / Q6_K, plus **Q5_K** for `attn_qkv` and `ssm_out` of every linear lay
 runq's rule is that batched and sequential logits are bit-identical, so prefill runs the same per-token
 recurrence as decode. It is cheap: per token and layer, the recurrence costs 16 heads x 128 x 128 x ~8 flops,
 ~2 MFLOP, so 38 MFLOP over 18 layers. The matmuls cost ~1.5 GFLOP per token, which makes the recurrence ~2.5%.
-(That estimate was wrong in practice: the recurrence is memory-bound, see Performance.) Implemented as `dn_head`
-in `src/forward.c`: one token of one value head, the same function in every path. Work items: decode, one per
-value head (after an alpha / beta item: a dependency counter); batched prefill, one (segment, head) for all the
-segment's rows in order (the head's 64 KB state stays in that core's cache); batched decode rows, one per head over
-all rows. Arithmetic order, fixed so that SIMD widths agree: elementwise along the channels / the v index
+(That estimate was wrong in practice: the recurrence is memory-bound, see Performance.) Implemented in
+`src/forward.c` as three steps, the same functions in every path: `dn_prep` (one token of one value head: the
+causal conv + SiLU, the l2norm of q / k and the gates; the conv state, so the rows of a segment in order), `dn_rec`
+(the delta rule on a block of 32 v columns of the head's state, a 128 x 32 block of 16 KB that stays in L1; the
+state's rows in order), and `dn_out` (the gated RMSNorm over the head's dv outputs, once all its blocks are done).
+Each v lane's recurrence is independent of the others, so the blocks give exactly the bits of a whole head. Work
+items: decode, one alpha / beta item, then one `dn_prep` item per value head (after it: a dependency counter) and
+one `dn_rec` item per (head, block) (after its head's prep; the last block of a head runs `dn_out` and quantizes):
+1 + 16 + 64 items; batched prefill, three phases: `dn_prep` per (segment, head, q / k / v group), `dn_rec` per
+(segment, head, block) over the segment's rows in order, `dn_out` + the row's quantization per row; batched decode
+rows, the decode's items over all rows (each row on its own sequence). Arithmetic order, fixed so that SIMD widths
+agree: elementwise along the channels / the v index
 (vectorized along them), the reductions over k sequential per v lane (`S^T k`, `S^T q`), the l2 / rms sums in 16
 lanes + a fixed tree, `exp` by the attention's polynomial, the per-head scalars (`exp(g)`, `beta`: libm `expf` /
 `log1pf`) by one non-inlined scalar function.
@@ -158,7 +167,7 @@ processed. Implemented (llama.cpp handles hybrid and SWA models the same way, "c
   and re-prefill the rest; `rq_seq_keep(s, n)` tells in advance what would be kept. `rq_seq_copy(dst, src, n)`
   likewise: src's current state if n is its length, else its best checkpoint <= n, else 0. The return codes did
   not change; a model without linear layers keeps the exact behaviour (Qwen3's outputs are byte-identical,
-  `tests/compare_bins.sh`). The state of a position-0 token is zero (`dn_head` clears it), so a reset needs no work.
+  `tests/compare_bins.sh`). The state of a position-0 token is zero (`dn_prep` / `dn_rec` clear it), so a reset needs no work.
 - Where: `rq_chat_checkpoint_pos` is the prompt's last `<|im_start|>` (the assistant header). The CLI chat and the
   server's engine ask for a checkpoint there for each prompt: a thinking chat's next turn diverges right after it
   (the history drops `<think>\n` and the reasoning), as does a reply cut at a stop string or re-tokenized
@@ -201,13 +210,36 @@ attention weights, norms and the KV cache are indexed by attention layer, the li
 Estimated before: decode ~0.8x Qwen3-0.6B's rate (the Q8_0 file reads ~810 MB per token vs ~640 MB; the tied
 classifier is a third of it: 248,320 x 1,024), a lower long-context slowdown, prefill at the matmul rate plus a
 ~2.5% recurrence. Measured: decode as estimated (141 vs 209 tok/s at 8 threads; 160 vs 182 after 1,500 tokens).
-Prefill is ~0.6x the 0.6B's instead of ~0.8x: the recurrence phase takes ~45% of it (`-DRUNQ_PROFILE`, 712-token
-prompt, -b 512: 0.28 s of 0.61 s at 8 threads, 0.20 of 0.43 at 16). `dn_head` alone (one thread, a micro-benchmark)
-takes ~5 us per token and head, ~4 of them in the two passes over the 64 KB state (read and write each): it is
-bound by the cache bandwidth, not by the flops; in prefill, ~11 us per token and head at 8 threads. With one work
-item per head, a segment has only 16 items. Next (TODO.md): split each head's v columns into blocks (each v lane's
-recurrence is independent: the same bits; a 128 x 32 block, 16 KB, stays in L1, and a segment gets 64 items), with
-the conv / l2norm and the gated norm as phases of their own; the decay folded into one pass.
+
+Prefill was ~0.64x the 0.6B's instead of ~0.8x (451 tokens, 8 threads): the recurrence took ~48% of it
+(`-DRUNQ_PROFILE`, 1,492-token prompt, -b 512: 0.62-0.69 s of 1.29-1.43 s at 8 threads, 0.42 of 0.89 at 16).
+`dn_head` alone (one thread, a micro-benchmark) took ~5 us per token and head, ~4 of them in two passes over the
+64 KB state (read and write each): bound by the cache bandwidth, not by the flops; in prefill ~12 us per token and
+head at 8 threads, with only 16 work items per segment. Done (the design above): v blocks of 32 columns,
+64 items per segment and the state of a block in L1, bit-identical. What measuring found, in order of effect:
+- The FMA chains over k (128 dependent FMAs per v lane for `S^T k`, again for `S^T q`) are latency-bound: with 32
+  lanes, 2 independent chains of 512-bit vectors. They have to live in registers (the j loops unrolled,
+  `DN_UNROLL`): as arrays gcc kept them in memory and every step waited for a store forward.
+- The second pass of row t and the first pass of row t + 1 are fused (`dn_p21`): the first reads each S row right
+  after the second wrote it, so the same floats go in, and 4 chains run side by side (hot-cache micro-benchmark:
+  ~1,750 -> ~880 TSC cycles per block and row). The decay `exp(g) * S` is recomputed in the second pass instead of
+  being stored by the first (the same product of the same floats): one write pass less.
+- 4K aliasing: the conv state and taps were rows of the whole layer (6144 floats = 24 KB apart), so the 8-9 streams
+  of the conv's index i fell on one set of the 8-way L1 (`dn_conv` took ~900 cycles per 128 channels, ~4x its
+  work). The state and the taps are now stored per channel group (a head's q, k or v channels as contiguous
+  rows; the loader transposes into it), S block-major: `dn_prep` 0.17 -> 0.09 s.
+- The inputs of a head are 512 B pieces of rows 33 KB apart that other cores' GEMM items wrote: each line was a
+  miss waiting for the previous one. Prefetching the rows ahead in `dn_prep` / `dn_rec` gave ~20%.
+
+Result (8 threads, 1,492 tokens, interleaved, medians; load 3-12): prefill 1,099 -> 1,428 tok/s (Qwen3-0.6B Q8_0
+alongside: 1,373), 1,470 -> 1,949 at 12 threads, 1,644 -> 2,129 at 16; `bench_models.py` at 451 / 1,500 tokens: 0.82x /
+1.05x of the 0.6B at 8 threads, 0.81x / 1.03x at 12 (was 0.64x / 0.81x); decode unchanged. Profile at 8 threads (1,492
+tokens, 1.0 s): the recurrence is `dn_prep` 0.08 s + `dn_rec` 0.15 s + `dn_out` 0.016 s (was ~0.55-0.6 s of the
+"attention+quant" bucket, whose remaining 0.09 s is the 6 attention layers); at 16 threads (0.67 s) 0.06-0.07 + 0.10 +
+0.013-0.026. What is left of it: `dn_prep` scales poorly past 8 threads (48 items per segment, each one sequential
+over the rows: the conv's SiLU is a vectorized exp polynomial + a division per channel), and `dn_rec` is still
+~2x its hot-cache cost (the q / k rows are read from the other cores' caches by each of a head's 4 blocks; a compact
+per-head copy written by `dn_prep` could help).
 
 ## Commands
 

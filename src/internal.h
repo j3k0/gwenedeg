@@ -128,7 +128,7 @@ typedef struct {
     QuantizedTensor *wa;   // (nv, dim): alpha, the decay's input
     QuantizedTensor *wb;   // (nv, dim): beta
     QuantizedTensor *wso;  // (dim, vdim): the output projection
-    float *ssm_conv;       // (conv, conv_dim): the conv kernel, tap-major (the GGUF's (conv_dim, conv) transposed)
+    float *ssm_conv;       // the conv kernel (the GGUF's (conv_dim, conv) transposed) per channel group of a head's q / k / v (conv, n) rows
     float *ssm_a;          // (nv): -exp(A_log)
     float *ssm_dt;         // (nv): the dt bias
     float *ssm_norm;       // (dv): the gated RMSNorm's weight (shared by the heads)
@@ -272,7 +272,7 @@ struct RqSeq {
     int len;            // positions in the cache
     int *tokens;        // [cap]: the token at each position
     // Qwen3.5: the recurrent state of the linear-attention layers after position len - 1 (it cannot be rewound),
-    // per linear layer RqModel.ssm_layer floats: the last conv - 1 inputs of the conv (conv - 1, conv_dim), then
+    // per linear layer RqModel.ssm_layer floats: the last conv - 1 inputs of the conv (per channel group (conv - 1, n) rows, as ssm_conv), then
     // per value head S (dk, dv); and a few checkpoints of it (position + copy), for truncate / copy to an
     // earlier length (forward.c, rq_seq_checkpoint_at)
     float *ssm;

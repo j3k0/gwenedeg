@@ -316,6 +316,7 @@ lists open work only; the full log is in git: `git show b3e48a3:TODO.md`. The st
 | 10a, 10b | batched decode of several sequences; continuous batching in `runq serve` | `302e0b2`, `38b71d9` |
 | 11 | the other Qwen3 dense models (1.7B-8B, 2507), fixes and tests | `fb2b9fb`, `6e1f251` |
 | 12 | Qwen3.5-0.8B: Gated DeltaNet + gated attention, recurrent-state checkpoints ([qwen35.md](qwen35.md)) | `99dfa79`, `8d3be20` |
+| 12b | Qwen3.5's recurrence in blocks of 32 v columns: prefill 0.64x -> 0.82x of Qwen3-0.6B's | `902b66b` |
 | 13 | Q5_K (Unsloth's Qwen3.5-0.8B Q4_K_M, Qwen3 Q5_K_M files): Q5P layout, generic / AVX-512 / NEON kernels | `fc7fca6` |
 
 The macOS / NEON port (`67d7296` onwards) was developed on a separate branch and merged after Step 7b.

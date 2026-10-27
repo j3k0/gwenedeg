@@ -81,25 +81,21 @@ Qwen3.5-0.8B (Q8_0 and Unsloth's Q4_K_M) runs and is tested (`make test`'s `q35`
 [docs/qwen35.md](docs/qwen35.md). The rules stay: `make test` green, Qwen3's outputs byte-identical
 (`tests/compare_bins.sh`), the bitwise invariants on the new paths.
 
-- [ ] **The recurrence's speed.** It takes ~45% of a Qwen3.5-0.8B prefill (0.28 of 0.61 s for 712 tokens at 8
-  threads, `-DRUNQ_PROFILE`'s "attention+quant" bucket), against ~2.5% of the flops: `dn_head` streams each head's
-  64 KB state twice per token (~4 of ~5 us per token and head, one thread), and a segment has 16 work items (one
-  per value head), so 12-16 threads barely help (0.20 s at 16). Plan: split each head's v columns into blocks of 32
-  (each v lane's recurrence is independent, so the bits stay the same; a 128 x 32 block of S, 16 KB, stays in L1;
-  64 items per segment), with the conv + l2norm + gates and the gated norm as phases of their own (per row and
-  head), and the decay folded into one pass over the state. Decode the same way (16 -> 64 items). Done when prefill
-  is >= 0.8x Qwen3-0.6B's tok/s (now ~0.6x) with the q35 group unchanged; then the NEON check of the recurrence
-  (vectorized along v: it should be bit-identical to the generic build there too, untested).
+- [ ] **NEON check of the recurrence.** The blocked recurrence (`dn_prep` / `dn_rec` / `dn_out`, docs/qwen35.md) is
+  plain C vectorized along v (no AVX-512 specifics; `DN_UNROLL` is `_Pragma("clang loop unroll(full)")` for clang),
+  so it should be bit-identical to the generic build on arm64 too, and as fast as the new layouts allow; untested
+  (the q35 group's AVX-512 vs generic checks, `tests/check_models.py`, on the Mac; then `-DRUNQ_PROFILE` for the
+  split). Speed left: `dn_prep` scales poorly past 8 threads and `dn_rec` is ~2x its hot-cache cost (docs/qwen35.md).
 - [ ] **The other sizes**: the text models of Qwen3.5 / 3.6 are dense or MoE; **images are out of scope for this
   project** (ideas: [IDEAS.md](IDEAS.md#images-qwen35-vision)).
   - Qwen3.5-0.8B and 2B have as many value heads as key heads and should load (2B: untested). 4B / 9B / 27B have
     `num_v_heads` = 2 x `num_k_heads` (rejected at load). llama.cpp's converter reorders the value heads from
     HF's grouped order to a tiled one in every GGUF (the v rows of `attn_qkv`, `attn_gate`, `ssm_alpha` / `ssm_beta`
     / `ssm_a` / `ssm_dt`, the v channels of `ssm_conv1d`, the input columns of `ssm_out`; not the q / k rows nor
-    `ssm_norm`): GGUF value head h uses q / k head `h % nk` (HF: `h // r`). In `dn_head` that is the q / k channel
+    `ssm_norm`): GGUF value head h uses q / k head `h % nk` (HF: `h // r`). In `dn_rec` that is the q / k channel
     offset `(h % nk) * dk`, but the q / k conv state then advances once per **key** head, not per value head (two
-    value heads would shift the same channels: wrong, and a race): a per-(row, key head) phase for the q / k conv +
-    SiLU + l2norm, and `dn_copy_head` likewise. `tests/ref_qwen35.py` takes `h % nk` on GGUF weights and `h // r`
+    value heads would shift the same channels: wrong, and a race): `dn_prep`'s q / k conv + SiLU + l2norm per
+    (row, key head), the v part and the gates per (row, value head), and the checkpoint copy likewise. `tests/ref_qwen35.py` takes `h % nk` on GGUF weights and `h // r`
     on HF weights. Reject files with `prism.hadamard.*` keys. Test model: unsloth `Qwen3.5-4B-Q8_0.gguf`
     (4.48 GB, Q8_0 + F32, tied embedding, no MTP). Its HF fp32 reference (16.8 GB) does not fit next to other work:
     run `ref_qwen35.py` on the HF weights layer by layer (~4 GB), and test the reorder end to end on a tiny

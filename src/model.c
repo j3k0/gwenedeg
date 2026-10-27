@@ -196,16 +196,21 @@ static void gguf_map_weights(RqModel *m) {
             f += nm[i].len;
         }
     }
-    if (NL) { // the conv kernels: (conv_dim, conv) in the file, (conv, conv_dim) here
+    if (NL) { // the conv kernels: (conv_dim, conv) in the file, per channel group (conv, n) here
         w->ssm_conv = f;
         for (int l = 0; l < L; l++) {
             if (m->lin_layer[l] < 0) continue;
             char name[96];
             snprintf(name, sizeof(name), "blk.%d.ssm_conv1d.weight", l);
             const float *src = (const float *)gguf_weight(g, name, GGML_F32, hy->conv, hy->conv_dim);
-            for (int c = 0; c < hy->conv_dim; c++)
-                for (int j = 0; j < hy->conv; j++)
-                    memcpy(f + (size_t)j * hy->conv_dim + c, src + (size_t)c * hy->conv + j, sizeof(float));
+            // (per channel group, forward.c dn_prep: q heads, k heads, v heads; group g = channels c0 .. c0 + n - 1 at conv * c0)
+            for (int g = 0; g < 2 * hy->nk + hy->nv; g++) {
+                int n = g < 2 * hy->nk ? hy->dk : hy->dv;
+                int c0 = g < 2 * hy->nk ? g * hy->dk : 2 * hy->nk * hy->dk + (g - 2 * hy->nk) * hy->dv;
+                for (int c = 0; c < n; c++)
+                    for (int j = 0; j < hy->conv; j++)
+                        memcpy(f + (size_t)hy->conv * c0 + (size_t)j * n + c, src + (size_t)(c0 + c) * hy->conv + j, sizeof(float));
+            }
             f += (size_t)hy->conv * hy->conv_dim;
         }
     }

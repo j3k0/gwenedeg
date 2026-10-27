@@ -228,7 +228,7 @@ const uint8_t *gguf_weight(const Gguf *g, const char *name, uint32_t type, uint6
 void gguf_config(const Gguf *g, Config *c, float *rope_theta, int *rope_dim, Hybrid *hy) {
     // the hyperparameters from the metadata (llama.cpp's qwen3 / qwen35 keys), checked against what this
     // engine implements: Qwen3 (any RoPE theta: 1e6, the 2507 models 5e6; no RoPE scaling) with RMSNorm
-    // eps 1e-6 (the constant in rmsnorm); Q8_0 / Q4_K / Q6_K weights (gguf_matrices). Qwen3.5 (qwen35, the
+    // eps 1e-6 (the constant in rmsnorm); Q8_0 / Q4_K / Q5_K / Q6_K weights (gguf_matrices). Qwen3.5 (qwen35, the
     // hybrid layers: docs/qwen35.md): also the linear-attention shapes (ssm.*), the attention layer interval
     // and the partial RoPE (rope.dimension_count); key heads == value heads only (the 0.8B; the converter
     // reorders the value heads of the bigger models, not checked yet)
@@ -315,7 +315,7 @@ void gguf_config(const Gguf *g, Config *c, float *rope_theta, int *rope_dim, Hyb
     c->head_dim = (int)v[6];
     c->vocab_size = (int)emb->ne[1];
     c->shared_classifier = gguf_tensor(g, "output.weight") == NULL; // absent: tied to token_embd
-    c->group_size = 32; // activation groups: Q8_0 blocks, Q4_K sub-blocks, 2 Q6_K sub-blocks
+    c->group_size = 32; // activation groups: Q8_0 blocks, Q4_K / Q5_K sub-blocks, 2 Q6_K sub-blocks
     *rope_theta = theta;
     *rope_dim = (int)rd;
 }

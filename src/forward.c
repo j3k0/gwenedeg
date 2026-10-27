@@ -92,7 +92,7 @@ struct RqCtx {
     // rows; the norms as an epilogue up to bd_epi rows (else a phase); a row's attention split over its
     // blocks of ATT_P positions when the pass has fewer than bd_split * threads (row, kv head) items; the
     // small-batch kernels up to smb_max rows per weight type (gemm_plan). Tuning: RUNQ_SMB, RUNQ_BD
-    int smb_max[3], bd_max, bd_epi, bd_split;
+    int smb_max[4], bd_max, bd_epi, bd_split;
     float *att_sp; size_t att_sp_n; // split attention: per (row, query head, block) partial results
     int *row_it0;       // batch_decode_worker: attention items of rows 0..b-1 (per kv head)
     void *probindex;    // sampler scratch (sampler.c: vocab_size candidates)
@@ -760,8 +760,8 @@ typedef struct {
 // over at most smb_max rows of its weight type (else the GEMM's tiles), and always in batch_decode_worker.
 // Crossover (one thread, measured in Step 10a): Q4_K / Q6_K faster than the GEMM up to ~24 rows (1.6-2.3x at
 // 1-4 rows: no tile unpacking), equal at 32, ~4% slower at 48-64; Q8_0 equal (the GEMM tile streams the
-// packed weights too). RUNQ_SMB=Q8,Q4,Q6 overrides them (tuning; 0 = never). Results never depend on it
-enum { SMB_Q8, SMB_Q4, SMB_Q6 };
+// packed weights too). RUNQ_SMB=Q8,Q4,Q6,Q5 overrides them (tuning; 0 = never). Results never depend on it
+enum { SMB_Q8, SMB_Q4, SMB_Q6, SMB_Q5 };
 #ifndef BD_MAX
 #define BD_MAX 64 // decode rows per batched pass in batch_decode_worker (if the small-batch kernels take them)
 #endif
@@ -777,11 +777,12 @@ static void env_ints(const char *name, int *v, int n) {
 }
 
 static void smb_config(RqCtx *c) {
-    // the context's small-batch / batched-decode settings: defaults, RUNQ_SMB=Q8,Q4,Q6 (rows), RUNQ_BD=max,epi,split
+    // the context's small-batch / batched-decode settings: defaults, RUNQ_SMB=Q8,Q4,Q6,Q5 (rows), RUNQ_BD=max,epi,split
     c->smb_max[SMB_Q8] = 32;
     c->smb_max[SMB_Q4] = 32;
     c->smb_max[SMB_Q6] = 32;
-    env_ints("RUNQ_SMB", c->smb_max, 3);
+    c->smb_max[SMB_Q5] = 32;
+    env_ints("RUNQ_SMB", c->smb_max, 4);
     int bd[3] = { BD_MAX, 2, 8 };
     env_ints("RUNQ_BD", bd, 3);
 #ifdef RUNQ_NEON
@@ -792,10 +793,15 @@ static void smb_config(RqCtx *c) {
     c->bd_split = bd[2];
 }
 
+static inline int smb_slot(int type) {
+    // smb_max index of a K-quant type (the small-batch kernels have one per type)
+    return type == GGML_Q4_K ? SMB_Q4 : type == GGML_Q5_K ? SMB_Q5 : SMB_Q6;
+}
+
 static inline int smb_use(const RqCtx *c, const QuantizedTensor *w, int nb) {
     // the small-batch kernel for nb rows of w
 #ifdef RUNQ_SMB
-    if (w->kp) return nb <= c->smb_max[w->type == GGML_Q4_K ? SMB_Q4 : SMB_Q6];
+    if (w->kp) return nb <= c->smb_max[smb_slot(w->type)];
     return w->p && nb <= c->smb_max[SMB_Q8];
 #else
     (void)c; (void)w; (void)nb;

@@ -140,7 +140,10 @@ Value transforms by llama.cpp's converter, checked bit-exactly (`maxabs 0`) on l
 Tensor types: the Unsloth **Q8_0** file is Q8_0 + F32 only, so runq's kernels cover it. The Unsloth **Q4_K_M**
 uses Q4_K / Q6_K, plus **Q5_K** for `attn_qkv` and `ssm_out` of every linear layer (36 tensors), and Q8_0 for
 `ssm_alpha` / `ssm_beta`. Q5_K is supported since Step 13 (`src/kquants.h`: the Q5P layout, and the Q5_K arithmetic
-= Q4_K's fold on 5-bit values); the Q8_0 file came first.
+= Q4_K's fold on 5-bit values); the Q8_0 file came first. Qwen3.8-27B's Q4_K_M has `ssm_alpha` / `ssm_beta` as **F32**
+matrices: accepted for those two only, applied in fp32 to the fp32 activations with a fixed summation order (TODO S6:
+[qwen38-speculative.md](qwen38-speculative.md#loader-the-mtp-block-and-the-f32-matrices)), and an MTP block after its
+64 layers (`nextn_predict_layers` 1), validated but not loaded.
 
 ## Design decisions
 

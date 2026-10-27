@@ -1,6 +1,8 @@
 # Qwen3.8-27B with speculative decoding: facts and design
 
-Status (2026-10-27): **planned, not implemented.** The steps are in [TODO.md](../TODO.md) (section "Qwen3.8-27B with
+Status (2026-10-27): **in progress.** The file's specifics are in (the MTP block, F32 `ssm_alpha` / `ssm_beta`, the
+3.8 chat template: TODO S6, checked on synthetic files); the speculative loop and the 27B bring-up are open. The steps
+are in [TODO.md](../TODO.md) (section "Qwen3.8-27B with
 speculative decoding"); this file holds what was verified and the design decisions, so that the two cannot drift.
 The architecture is Qwen3.5's (`qwen35`, [qwen35.md](qwen35.md)).
 
@@ -18,16 +20,16 @@ the same logits bits for every emitted token. Later: the 27B's own MTP layer as 
   re-tokenized every non-thinking 27B answer of the measurement below to the API's ids.
 - **An MTP layer in the file:** `block_count` = 65 and `nextn_predict_layers` = 1. `blk.64` is a full-attention
   layer plus `nextn.eh_proj` [10240 -> 5120], `nextn.enorm`, `nextn.hnorm`, `nextn.shared_head_norm`; it shares
-  `token_embd` and `output` with the main model. runq's layer pattern is computed from `block_count`, so the loader
-  refuses a file with `nextn_predict_layers` > 0 (a clear message, before any weight is read; the tokenizer alone
-  loads) until the nextn handling (TODO S6). Details: [file layout](#file-layout).
+  `token_embd` and `output` with the main model. runq loads the 64 main layers (`block_count` - `nextn_predict_layers`)
+  and validates the block without reading it ([loader](#loader-the-mtp-block-and-the-f32-matrices)). Details:
+  [file layout](#file-layout).
 - Sampling defaults in the GGUF (`general.sampling.*`): temperature 1.0, top-p 0.95, top-k 20 (runq's defaults for
   the options not given, CLI and server: `rq_model_sampling`).
 
 **The file:** unsloth `Qwen3.8-27B-Q4_K_M.gguf` at revision `4a03c640833598c0fb5ddd11e846135e906eb764`, 17.1 GB,
 sha256 `7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169`. Types: Q4_K 11.4 GB, Q6_K 4.5, Q5_K 1.0,
-Q8_0 0.06, F32 0.1, all supported by runq's kernels, but `ssm_alpha` / `ssm_beta` are F32 *matrices* here, which the
-loader does not take yet (TODO S6). Avoid: `main`'s `UD-Q4_K_M` (16.5 GB: IQ4_XS / Q3_K / IQ4_NL / IQ3_S),
+Q8_0 0.06, F32 0.1, all supported by runq's kernels; `ssm_alpha` / `ssm_beta` are F32 *matrices* here (an fp32 path:
+[loader](#loader-the-mtp-block-and-the-f32-matrices)). Avoid: `main`'s `UD-Q4_K_M` (16.5 GB: IQ4_XS / Q3_K / IQ4_NL / IQ3_S),
 `Q8_0` (29.0 GB, does not fit), `MTP/mtp-...gguf` (a standalone MTP with Q3_K tensors; not needed).
 
 | file (unsloth @ `4a03c64`) | size | types | runq | RSS est. |
@@ -50,7 +52,8 @@ The header and tensor directory of the Q4_K_M file (read with `tests/ggufmini.py
 `rope.dimension_sections` [11, 11, 10, 0], `rope.freq_base` 1e7, `layer_norm_rms_epsilon` 1e-6, `ssm.conv_kernel` 4,
 `ssm.state_size` 128, `ssm.group_count` 16, `ssm.time_step_rank` 48, `ssm.inner_size` 6144, `full_attention_interval` 4.
 `general.sampling.top_k` (i32 20), `top_p` (f32 0.95), `temp` (f32 1.0): the defaults for the options not given. Keys
-runq does not read: `nextn_predict_layers` (only to refuse the file), `tokenizer.ggml.bos_token_id` 248044 (absent in the 0.8B's), `general.*`,
+runq reads besides the usual: `nextn_predict_layers` (the MTP block), `tokenizer.ggml.bos_token_id` 248044 (absent in the
+0.8B's: `<|endoftext|>`, the token runq takes without it, so nothing changes: a stop token, never prepended); not read: `general.*`,
 `quantize.imatrix.*`; the tokenizer: `gpt2` / pre `qwen35`, 248,320 tokens, 247,587 merges, eos 248046, pad 248055;
 the 3.8 chat template (9,993 bytes). Tensors (row-major [rows, columns]; llama.cpp's order: `output`, `output_norm`,
 `token_embd`, then per block sorted by name):
@@ -70,11 +73,47 @@ the 3.8 chat template (9,993 bytes). Tensors (row-major [rows, columns]; llama.c
 | `blk.64` (MTP): the attention layer's tensors (`attn_v`, `ffn_down` Q6_K) + `nextn.eh_proj` | [5120, 10240] | Q8_0 |
 | `nextn.enorm`, `nextn.hnorm`, `nextn.shared_head_norm` | [5120] | F32 |
 
-No `nextn.embed_tokens` / `nextn.shared_head_head`: the MTP block uses `token_embd` and `output`. Two things the loader
-must learn (TODO S6): the main layers are `block_count` - `nextn_predict_layers` (today: refused), and F32 matrices
-for `ssm_alpha` / `ssm_beta` (today: "has ggml type 0, need Q8_0 ..."). `tests/make_synth_q35.py` builds this layout
-at a small scale (`synth-q35-27b.gguf`, dim 768, GQA 6, r = 3, the types per role; `-mtp`: + the MTP block), checked by
-the `q35` group ([tests/README.md](../tests/README.md)).
+No `nextn.embed_tokens` / `nextn.shared_head_head`: the MTP block uses `token_embd` and `output`.
+`tests/make_synth_q35.py` builds this layout at a small scale (`synth-q35-27b.gguf`, dim 768, GQA 6, r = 3, the types
+per role; `-mtp`: + the MTP block; `-f32`: + F32 alpha / beta, the 3.8 template and the bos key), checked by the `q35`
+group ([tests/README.md](../tests/README.md)).
+
+### Loader: the MTP block and the F32 matrices
+
+(TODO S6, 2026-10-27; on the synthetic files: running the real one is S7's.) The real file's tensor directory passes
+every check: `runq Qwen3.8-27B-Q4_K_M.gguf --mem 0.1` maps the 64 main layers (F32 alpha / beta taken), validates
+`blk.64` and refuses at the memory check, before any tensor data is read (0.04 s, 12 MiB peak RSS): "needs ~18.50 GiB
+(weights 15.32, runtime 0.24, a sequence of 40960 positions: KV cache 2.50 + recurrent state 150 MiB x (1 + 2
+checkpoints))", the script's estimate below.
+
+- **Main layers** = `block_count` - `nextn_predict_layers` (`gguf_config`): the layer pattern, the linear layers, the
+  KV cache, the state and the memory estimate count those only; the forward passes are unchanged. Checked:
+  `synth-q35-27b-mtp.gguf`'s logits == `synth-q35-27b.gguf`'s, bitwise (`q35/synth/mtp_logits/*`).
+- **The MTP block** (`MtpBlock`, `src/internal.h`; `gguf_map_mtp`, `src/model.c`): a qwen35 file with exactly one
+  block, `blk.<n_layers>`: the attention layer's 7 matrices (Q8_0 / Q4_K / Q5_K / Q6_K, the shapes of the main
+  attention layers), `nextn.eh_proj` (dim, 2 dim) and the 7 F32 norms (`attn_norm`, `post_attention_norm`,
+  `attn_q_norm` / `attn_k_norm`, `nextn.enorm` / `hnorm` / `shared_head_norm`) are checked from the tensor directory
+  (present, shape, type, data inside the file) and kept as pointers into the mapping: **not read, not repacked, not
+  in the memory estimate** (the 27B's: ~0.6 GB as repacked weights + an attention KV cache of its own). Decision: the
+  drafter (TODO S9) converts them when it is built, so that a run without it pays nothing; the validation catches a
+  bad file now. Other layouts (several blocks, a `qwen3` file with `nextn_predict_layers`) are refused at load
+  ("MTP (multi-token prediction) blocks: ... is not supported"); a tokenizer-only load (`-m tokenize`, `-m render`)
+  never looks at the block.
+- **F32 `ssm_alpha` / `ssm_beta`** (`gguf_matrix`: F32 accepted for these two roles only, every other matrix still
+  needs Q8_0 / Q4_K / Q5_K / Q6_K): copied at load into the weight buffer (`prepare_weights`, an inf / NaN refused as
+  a corrupt file, the page cache dropped as for the others) and applied to the **fp32** rmsnorm'd activations
+  (`f32_rows`, `src/forward.c`), not the int8 ones the quantized matrices take: as llama.cpp and
+  `tests/ref_qwen35.py` do. The summation order is the definition for every path and build: 16 partial sums
+  (column mod 16) in column order, product then sum (no FMA), then a fixed tree (8, 4, 2, 1); under `KQ_EXACT` /
+  `RQ_FP_EXACT`, gcc vectorizes it as one zmm (vmulps + vaddps, a ymm / xmm tree), the same operations in the
+  generic build. Decode and the batched decode rows split the two matrices into items of 16 rows (6 for the 27B's 48:
+  ~320 KB each, in parallel, before the heads' preps); batched prefill takes them as blocks of 4 rows over all the
+  chunk's rows in the GEMM phase. Q8_0 alpha / beta (every other Qwen3.5 file) run exactly as before. Checked on
+  `synth-q35-27b-f32.gguf` (`q35/synth-q35-27b-f32/*`): vs `tests/ref_qwen35.py` cos mean 0.9984 / 0.9976 / 0.9966
+  (en, code, long2), min 0.9791, top-1 290/338 (Q8_0 file: 0.9984 / 0.9979 / 0.9966, 0.9803, 281/338); bitwise
+  -b 1 / 7 / 64 / 512, 4 vs 3 threads, AVX-512 vs generic, `api_test` 28/28 (batched decode rows == alone,
+  checkpoints) and its digests across builds. Cost for the 27B (estimated): 2 x 48 x 5120 x 4 B = 1.9 MB per linear
+  layer, 94 MB per token (0.6% of the 16.8 GB read per token).
 
 ## Memory and disk
 
@@ -85,7 +124,7 @@ the `q35` group ([tests/README.md](../tests/README.md)).
 - The load-time estimate (`--mem`; computed from the tensor directory before any weight is read, refused past
   MemAvailable; within 3% of the peak RSS with the context full for Qwen3-0.6B to 8B and Qwen3.5-0.8B / 4B,
   [tests/README.md](../tests/README.md#memory)), for the 27B from its tensor directory with the same rules
-  (2026-10-27, by script; the file is refused at its MTP block before the check, TODO S6): repacked weights
+  (2026-10-27, by script; runq's own on the file: TODO S7; the MTP block is not counted, it is not loaded): repacked weights
   **15.3 GiB** (the 64 main layers and `output`; K-quants +1-3% repacked; `ssm_alpha` / `ssm_beta` counted as F32),
   runtime ~0.3 GiB, one sequence at the default `-c` 40,960: KV 2.5 GiB + state 150 MiB x 3: **~18.6 GiB** (~20 GB);
   at `-c 8192`: ~16.6 GiB.
@@ -104,7 +143,18 @@ the `q35` group ([tests/README.md](../tests/README.md)).
 
 - Thinking is **on** by default. With thinking on it adds a system message with reasoning instructions: effort
   `xhigh` by default, `medium` adds no text, `low` a short one (+~40 tokens). System and developer messages are
-  merged. `RQ_CHAT_QWEN35` renders none of this: a new variant (TODO S6).
+  merged. Earlier assistant turns keep their reasoning (`preserve_thinking`, on by default): `<think>\n` reasoning
+  `\n</think>\n\n` answer, also with thinking off.
+- runq: `RQ_CHAT_QWEN38` (TODO S6), detected in a qwen35 file whose template has `reasoning_effort` (the 27B GGUF's
+  = `tests/golden/templates/qwen3.8.jinja`, Unsloth's rewrite; Qwen's own, `qwen3.8-hf.jinja`, is detected too; it
+  lacks the developer role, the merging and `high`). CLI: thinking on unless `-r 0`, `-e xhigh|high|medium|low`;
+  `runq serve`: on by default, `reasoning_effort` / `chat_template_kwargs` ([server.md](server.md)); the library:
+  the effort in the `thinking` argument (`RQ_THINK_*`, `src/runq.h`). The CLI's history keeps each reply as
+  generated, which is what the template renders: a second turn prefills only `<|im_end|>\n` + its user turn (no
+  rollback to a checkpoint, unlike Qwen3.5 with thinking). `-m render` == HF's `apply_chat_template` in 40 of 45
+  golden cases (thinking off / xhigh / medium / low / high x 9 conversations); the 5 others (a reply with a reasoning
+  block) equal HF's with the reasoning as `reasoning_content`: runq splits an assistant text at its last `</think>`.
+  On the real file, `-m render` reads the header only (0.10 s, 26.5 MiB peak RSS; the 54 golden ids).
 
 ## Draft acceptance (measured 2026-10-27)
 
@@ -138,7 +188,7 @@ $P report --by-kind $L/meas_Qwen3.5-0.8B-Q8_0_out_*.json [--draft-ms 6] [--tau 0
 
 `gen` defaults to the run above (endpoint, model `Qwen3.8-27B`, 2 parallel requests, max 400 tokens, `--set base`
 the 30 prompts; `--set long` 3 prompts that reason at length; `--top-logprobs N` for TODO S10). `measure` renders
-Qwen3.8's template itself (thinking on: the `xhigh` effort line, `--effort`; `--template tmpl_38.jinja` checks it
+Qwen3.8's template itself (runq's `-m render` gives the same since TODO S6) (thinking on: the `xhigh` effort line, `--effort`; `--template tmpl_38.jinja` checks it
 against the model's own template with jinja2), checks the prompt length against the API's and saves per answer token
 the target id, the draft's argmax, its top-1 probability and the target token's probability (~0.5 s per answer at 8
 threads; the logits files, ~1 MB per position, go to `--tmp`). `report` simulates the loop and applies the cost

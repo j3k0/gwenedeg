@@ -88,8 +88,8 @@ typedef struct {
     int conv_dim;  // 2 nk dk + nv dv: the qkv projection rows = the conv channels [q | k | v] (6144)
     int vdim;      // nv dv: the output gate z and the input of the output projection (2048)
     int n_lin;     // linear-attention layers (18 of 24)
-    int nextn;     // MTP blocks (<arch>.nextn_predict_layers, either architecture: the last nextn of block_count;
-                   // Qwen3.8-27B: 1, blk.64): read so that load_model can refuse them (not supported yet)
+    int nextn;     // MTP blocks (<arch>.nextn_predict_layers, either architecture: the last nextn of block_count, not
+                   // counted in Config.n_layers; Qwen3.8-27B: 1, blk.64): qwen35 with 1 is loaded as RqModel.mtp, else refused
 } Hybrid;
 
 typedef struct {
@@ -100,9 +100,25 @@ typedef struct {
     const uint8_t *b; // GGUF weights: the blocks in the file mapping (Q8_0: per 32 values an fp16
                   // scale + 32 int8, Q8_0_BLOCK bytes; Q4_K / Q5_K / Q6_K: kquants.h), converted at load
                   // (prepare_weights); or NULL
-    int type;     // weights: ggml type, GGML_Q8_0 (also the .bin's group-64 Q8), GGML_Q4_K / Q5_K / Q6_K
+    int type;     // weights: ggml type, GGML_Q8_0 (also the .bin's group-64 Q8), GGML_Q4_K / Q5_K / Q6_K, GGML_F32
     uint8_t *kp;  // K-quant weights: repacked (Q4P / Q5P / Q6P layout, kquants.h), else NULL
+    float *f;     // F32 weights (ssm_alpha / ssm_beta only: Qwen3.8-27B's): the rows copied at load (prepare_weights),
+                  // applied to the fp32 activations (forward.c, f32_rows), else NULL
 } QuantizedTensor;
+
+// The MTP (multi-token prediction) block of a qwen35 file with nextn_predict_layers 1 (Qwen3.8-27B's blk.64, after the
+// main layers): a full-attention layer (its own attn_* / ffn_* / norms) + nextn.eh_proj (dim, 2 dim) and the norms
+// nextn.enorm / hnorm / shared_head_norm (dim); it shares token_embd and output with the main model. Validated at load
+// (names, shapes, types: the file is untrusted) from the tensor directory only: nothing of it is read, converted or
+// counted in the memory estimate; the forward passes never use it (for the MTP drafter, TODO S9). The matrices are
+// as gguf_matrices maps them (b, type in the mapping; Q8_0 / Q4_K / Q5_K / Q6_K), the norms point into the mapping
+typedef struct {
+    int layer;                  // blk.<layer>: the block's index in the file (= Config.n_layers), -1 if none
+    QuantizedTensor wq, wk, wv, wo, w1, w2, w3; // attn_q ([q | gate] per head), attn_k / v, attn_output, ffn_gate / down / up
+    QuantizedTensor eh_proj;    // (dim, 2 dim): [enorm(embedding) | hnorm(hidden)] -> dim
+    const float *attn_norm, *ffn_norm, *q_norm, *k_norm; // (dim), (dim) post_attention_norm, (head_dim) x 2
+    const float *enorm, *hnorm, *head_norm;               // (dim) each: nextn.enorm / hnorm / shared_head_norm
+} MtpBlock;
 
 typedef struct {
     // (attention weights are per attention layer, RqModel.kv_layer: every layer for Qwen3, 6 of 24 for Qwen3.5)
@@ -214,6 +230,7 @@ struct RqModel {
     float rope_log_theta;       // (float)ln(rope_theta), the form rope_row uses
     int rope_dim;               // rotated dims per head (Qwen3: head_dim; Qwen3.5: 64 of 256, the rest passes through)
     Hybrid hy;                  // Qwen3.5's hybrid layers (hy.on), else all 0
+    MtpBlock mtp;               // an MTP block (mtp.layer >= 0; with weights only), not used by the forward passes
     int n_attn;                 // attention layers: the KV cache's layers (Qwen3: n_layers)
     int *kv_layer;              // [n_layers]: the layer's attention layer index (KV cache, attention weights), or -1
     int *lin_layer;             // [n_layers]: the layer's linear-attention layer index (state, weights), or -1

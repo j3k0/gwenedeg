@@ -112,11 +112,28 @@ static void bin_map_weights(RqModel *m, const char *path, LoadErr *e) {
 
 // ---------------------------------------------------------------------------- GGUF weights
 
-static void gguf_matrices(RqModel *m, QuantizedTensor **dst, int L, const int *sel, const char *fmt, int d, int k) {
+static void gguf_matrix(const Gguf *g, QuantizedTensor *res, const char *name, int d, int k, int f32) {
+    // one matrix (d, k): Q8_0, Q4_K, Q5_K or Q6_K (dispatch per tensor: Q4_K_M mixes them within a role), or F32 if
+    // f32 (only where forward.c's fp32 path takes it: ssm_alpha / ssm_beta), its data in the mapping (q / s / p /
+    // kp / f are set by prepare_weights)
+    const GgufTensor *t = gguf_tensor(g, name);
+    uint32_t type = t ? t->type : GGML_Q8_0; // (missing: gguf_weight reports it)
+    if (type != GGML_Q8_0 && type != GGML_Q4_K && type != GGML_Q5_K && type != GGML_Q6_K && !(f32 && type == GGML_F32)) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "tensor %%s has ggml type %u, need Q8_0 (8), Q4_K (12), Q5_K (13)%s or Q6_K (14)", type,
+                 f32 ? ", F32 (0)" : "");
+        gguf_fail(g, msg, name);
+    }
+    res->b = gguf_weight(g, name, type, k, d);
+    res->type = (int)type;
+    // the repacked layouts: 16-row blocks, 256-column super-blocks (activation groups of 32)
+    if (type != GGML_Q8_0 && type != GGML_F32 && (d % KQ_ROWS || k % QK_K || GS != 32))
+        gguf_fail(g, "tensor %s: K-quant shape not supported (rows % 16, columns % 256)", name);
+}
+
+static void gguf_matrices(RqModel *m, QuantizedTensor **dst, int L, const int *sel, const char *fmt, int d, int k, int f32) {
     // the matrices (d, k) of layers 0..L-1 (fmt: name with the layer number, or a plain name for L = 1), those
-    // with sel[l] >= 0 into (*dst)[sel[l]] (sel NULL: all, into (*dst)[l]), each Q8_0, Q4_K or Q6_K (dispatch
-    // per tensor: Q4_K_M mixes them within a role): their blocks in the mapping; q / s / p / kp are set by
-    // prepare_weights
+    // with sel[l] >= 0 into (*dst)[sel[l]] (sel NULL: all, into (*dst)[l]): gguf_matrix (f32: F32 accepted too)
     const Gguf *g = &m->gguf;
     int n = 0;
     for (int l = 0; l < L; l++)
@@ -128,21 +145,44 @@ static void gguf_matrices(RqModel *m, QuantizedTensor **dst, int L, const int *s
         int l = sel ? sel[l0] : l0;
         char name[96];
         snprintf(name, sizeof(name), fmt, l0);
-        const GgufTensor *t = gguf_tensor(g, name);
-        uint32_t type = t ? t->type : GGML_Q8_0; // (missing: gguf_weight reports it)
-        if (type != GGML_Q8_0 && type != GGML_Q4_K && type != GGML_Q5_K && type != GGML_Q6_K) {
-            char msg[160];
-            snprintf(msg, sizeof(msg), "tensor %%s has ggml type %u, need Q8_0 (8), Q4_K (12), Q5_K (13) or Q6_K (14)", type);
-            gguf_fail(g, msg, name);
-        }
-        res[l].b = gguf_weight(g, name, type, k, d);
-        res[l].type = (int)type;
-        if (type != GGML_Q8_0) {
-            // the repacked layouts: 16-row blocks, 256-column super-blocks (activation groups of 32)
-            if (d % KQ_ROWS || k % QK_K || GS != 32) gguf_fail(g, "tensor %s: K-quant shape not supported (rows % 16, columns % 256)", name);
+        gguf_matrix(g, &res[l], name, d, k, f32);
+        if (res[l].type != GGML_Q8_0 && res[l].type != GGML_F32)
             m->kq = 1;
-        }
     }
+}
+
+static void gguf_map_mtp(RqModel *m) {
+    // the MTP block (MtpBlock): qwen35 with nextn_predict_layers 1, blk.<n_layers> after the main layers. Validated
+    // from the tensor directory (every tensor present with its shape and a type the kernels take; norms F32); not
+    // read. Other MTP layouts (several blocks, another architecture) are refused: the layer pattern of a
+    // future one is unknown
+    const Config *p = &m->config;
+    const Gguf *g = &m->gguf;
+    MtpBlock *x = &m->mtp;
+    int dim = p->dim, hd = p->head_dim, hid = p->hidden_dim, kvd = p->n_kv_heads * hd, b = p->n_layers;
+    if (!m->hy.on || m->hy.nextn != 1) {
+        char a[64];
+        snprintf(a, sizeof(a), "%s.nextn_predict_layers = %d", m->hy.on ? "qwen35" : "qwen3", m->hy.nextn);
+        gguf_fail(g, "MTP (multi-token prediction) blocks: %s is not supported (qwen35 with one block only)", a);
+    }
+    struct { QuantizedTensor *t; const char *role; int d, k; } mt[] = {
+        { &x->wq, "attn_q", p->n_heads * m->qh, dim }, { &x->wk, "attn_k", kvd, dim }, { &x->wv, "attn_v", kvd, dim },
+        { &x->wo, "attn_output", dim, p->n_heads * hd }, { &x->w1, "ffn_gate", hid, dim }, { &x->w2, "ffn_down", dim, hid },
+        { &x->w3, "ffn_up", hid, dim }, { &x->eh_proj, "nextn.eh_proj", dim, 2 * dim } };
+    struct { const float **v; const char *role; int n; } nv[] = {
+        { &x->attn_norm, "attn_norm", dim }, { &x->ffn_norm, "post_attention_norm", dim }, { &x->q_norm, "attn_q_norm", hd },
+        { &x->k_norm, "attn_k_norm", hd }, { &x->enorm, "nextn.enorm", dim }, { &x->hnorm, "nextn.hnorm", dim },
+        { &x->head_norm, "nextn.shared_head_norm", dim } };
+    char name[96];
+    for (size_t i = 0; i < sizeof(mt) / sizeof(mt[0]); i++) {
+        snprintf(name, sizeof(name), "blk.%d.%s.weight", b, mt[i].role);
+        gguf_matrix(g, mt[i].t, name, mt[i].d, mt[i].k, 0);
+    }
+    for (size_t i = 0; i < sizeof(nv) / sizeof(nv[0]); i++) {
+        snprintf(name, sizeof(name), "blk.%d.%s.weight", b, nv[i].role);
+        *nv[i].v = (const float *)gguf_weight(g, name, GGML_F32, nv[i].n, 0);
+    }
+    x->layer = b;
 }
 
 static void model_layers(RqModel *m, LoadErr *e) {
@@ -229,25 +269,27 @@ static void gguf_map_weights(RqModel *m) {
     TransformerWeights *w = &m->weights;
     const Hybrid *hy = &m->hy;
     int L = p->n_layers, dim = p->dim, hd = p->head_dim, qd = p->n_heads * hd, kvd = p->n_kv_heads * hd, NL = hy->n_lin;
-    gguf_matrices(m, &w->q_tokens, 1, NULL, "token_embd.weight", p->vocab_size, dim);
-    gguf_matrices(m, &w->wq, L, m->kv_layer, "blk.%d.attn_q.weight", p->n_heads * m->qh, dim);
-    gguf_matrices(m, &w->wk, L, m->kv_layer, "blk.%d.attn_k.weight", kvd, dim);
-    gguf_matrices(m, &w->wv, L, m->kv_layer, "blk.%d.attn_v.weight", kvd, dim);
-    gguf_matrices(m, &w->wo, L, m->kv_layer, "blk.%d.attn_output.weight", dim, qd);
-    gguf_matrices(m, &w->w1, L, NULL, "blk.%d.ffn_gate.weight", p->hidden_dim, dim);
-    gguf_matrices(m, &w->w2, L, NULL, "blk.%d.ffn_down.weight", dim, p->hidden_dim);
-    gguf_matrices(m, &w->w3, L, NULL, "blk.%d.ffn_up.weight", p->hidden_dim, dim);
-    if (NL) {
-        gguf_matrices(m, &w->wqkv, L, m->lin_layer, "blk.%d.attn_qkv.weight", hy->conv_dim, dim);
-        gguf_matrices(m, &w->wz, L, m->lin_layer, "blk.%d.attn_gate.weight", hy->vdim, dim);
-        gguf_matrices(m, &w->wa, L, m->lin_layer, "blk.%d.ssm_alpha.weight", hy->nv, dim);
-        gguf_matrices(m, &w->wb, L, m->lin_layer, "blk.%d.ssm_beta.weight", hy->nv, dim);
-        gguf_matrices(m, &w->wso, L, m->lin_layer, "blk.%d.ssm_out.weight", dim, hy->vdim);
+    gguf_matrices(m, &w->q_tokens, 1, NULL, "token_embd.weight", p->vocab_size, dim, 0);
+    gguf_matrices(m, &w->wq, L, m->kv_layer, "blk.%d.attn_q.weight", p->n_heads * m->qh, dim, 0);
+    gguf_matrices(m, &w->wk, L, m->kv_layer, "blk.%d.attn_k.weight", kvd, dim, 0);
+    gguf_matrices(m, &w->wv, L, m->kv_layer, "blk.%d.attn_v.weight", kvd, dim, 0);
+    gguf_matrices(m, &w->wo, L, m->kv_layer, "blk.%d.attn_output.weight", dim, qd, 0);
+    gguf_matrices(m, &w->w1, L, NULL, "blk.%d.ffn_gate.weight", p->hidden_dim, dim, 0);
+    gguf_matrices(m, &w->w2, L, NULL, "blk.%d.ffn_down.weight", dim, p->hidden_dim, 0);
+    gguf_matrices(m, &w->w3, L, NULL, "blk.%d.ffn_up.weight", p->hidden_dim, dim, 0);
+    if (NL) { // (alpha / beta: F32 in Qwen3.8-27B's file, [48, 5120]; forward.c's fp32 path, f32_rows)
+        gguf_matrices(m, &w->wqkv, L, m->lin_layer, "blk.%d.attn_qkv.weight", hy->conv_dim, dim, 0);
+        gguf_matrices(m, &w->wz, L, m->lin_layer, "blk.%d.attn_gate.weight", hy->vdim, dim, 0);
+        gguf_matrices(m, &w->wa, L, m->lin_layer, "blk.%d.ssm_alpha.weight", hy->nv, dim, 1);
+        gguf_matrices(m, &w->wb, L, m->lin_layer, "blk.%d.ssm_beta.weight", hy->nv, dim, 1);
+        gguf_matrices(m, &w->wso, L, m->lin_layer, "blk.%d.ssm_out.weight", dim, hy->vdim, 0);
     }
     if (p->shared_classifier)
         w->wcls = w->q_tokens;
     else
-        gguf_matrices(m, &w->wcls, 1, NULL, "output.weight", p->vocab_size, dim);
+        gguf_matrices(m, &w->wcls, 1, NULL, "output.weight", p->vocab_size, dim, 0);
+    if (hy->nextn)
+        gguf_map_mtp(m);
 }
 
 // ---------------------------------------------------------------------------- weight conversion
@@ -308,12 +350,16 @@ static int prep_pack(const PrepMat *mt, int nm, char *warning, size_t wlen) {
     (void)mt; (void)nm; (void)warning; (void)wlen;
 #ifdef RUNQ_Q8X
     pack = 1;
-    for (int i = 0; i < nm && pack; i++)
-        if (mt[i].n > 0 && !q8x_ok(mt[i].d, mt[i].k, GS)) {
+    for (int i = 0; i < nm && pack; i++) {
+        int q8 = 0; // (roles without a Q8_0 matrix do not count: e.g. F32 alpha / beta of 12 rows)
+        for (int l = 0; l < mt[i].n && !q8; l++)
+            q8 = mt[i].t[l].type == GGML_Q8_0;
+        if (q8 && !q8x_ok(mt[i].d, mt[i].k, GS)) {
             if (warning)
                 snprintf(warning, wlen, "weights not packable for the SIMD Q8_0 kernels (GS %d, %d x %d), using the generic ones", GS, mt[i].d, mt[i].k);
             pack = 0;
         }
+    }
 #endif
     return pack;
 }
@@ -321,7 +367,9 @@ static int prep_pack(const PrepMat *mt, int nm, char *warning, size_t wlen) {
 static size_t prep_bytes(const QuantizedTensor *t, int d, int k, int pack) {
     // a matrix's place in the packed buffer (64-byte multiples)
     size_t sz = (size_t)d * k + (size_t)d * (k / GS) * sizeof(float); // (generic kernels on GGUF Q8_0: q / s arrays)
-    if (t->type != GGML_Q8_0) // Q4_K / Q5_K / Q6_K (GGUF; d % 16 == 0, k % 256 == 0 checked)
+    if (t->type == GGML_F32) // (the rows as in the file)
+        sz = (size_t)d * k * sizeof(float);
+    else if (t->type != GGML_Q8_0) // Q4_K / Q5_K / Q6_K (GGUF; d % 16 == 0, k % 256 == 0 checked)
         sz = kq_size(t->type, d, k);
 #ifdef RUNQ_Q8X
     else if (pack)
@@ -339,7 +387,7 @@ typedef struct {
     size_t rows_max; int kmax, gguf, pack, fd;
     long *left;                   // drop: per matrix its items not done yet (the last one drops its page cache), else NULL
     const void *base;             // the file mapping (read_at)
-    long next_pg, next_it; int bad; // shared: claim counters; bad: 1 a corrupt scale, 2 no memory
+    long next_pg, next_it; int bad; // shared: claim counters; bad: 1 a corrupt scale, 2 no memory, 4 an F32 inf / NaN
 } PrepJob;
 
 static void prep_item_done(PrepJob *P, int j) {
@@ -348,8 +396,9 @@ static void prep_item_done(PrepJob *P, int j) {
     const PrepItem *it = &P->job[j];
     const QuantizedTensor *t = it->t;
     if (t->b) {
-        drop_cached(P->fd, P->base, t->b, t->type != GGML_Q8_0 ? (size_t)it->d * (it->k / QK_K) * kq_block_bytes(t->type)
-                                                               : (size_t)it->d * (it->k / 32) * Q8_0_BLOCK);
+        drop_cached(P->fd, P->base, t->b, t->type == GGML_F32 ? (size_t)it->d * it->k * sizeof(float)
+                                          : t->type != GGML_Q8_0 ? (size_t)it->d * (it->k / QK_K) * kq_block_bytes(t->type)
+                                                                 : (size_t)it->d * (it->k / 32) * Q8_0_BLOCK);
     } else {
         drop_cached(P->fd, P->base, t->q, (size_t)it->d * it->k);
         drop_cached(P->fd, P->base, t->s, (size_t)it->d * (it->k / GS) * sizeof(float));
@@ -392,6 +441,17 @@ static void prepare_worker(void *arg, int tid, int nt) {
         int nb = nblk - rb0 < job[jj].bpi ? nblk - rb0 : job[jj].bpi;
         size_t r0 = (size_t)rb0 * 16, nr = (size_t)nb * 16;
         if (r0 + nr > (size_t)job[jj].d) nr = job[jj].d - r0;
+        if (t->f) { // F32: the rows as they are; a value inf / NaN is a corrupt file (as a Q8_0 scale)
+            float *dst = t->f + r0 * k;
+            read_at(fd, P->base, dst, nr * k * sizeof(float), t->b + r0 * k * sizeof(float));
+            for (size_t i = 0; i < nr * k; i++) {
+                uint32_t u;
+                memcpy(&u, dst + i, 4);
+                bad |= ((u & 0x7f800000u) == 0x7f800000u) << 2;
+            }
+            prep_item_done(P, jj);
+            continue;
+        }
         if (t->kp) { // Q4_K / Q5_K / Q6_K: blocks of nr rows (k / 256 each) -> Q4P / Q5P / Q6P
             size_t rowb = (size_t)(k / QK_K) * kq_block_bytes(t->type);
             read_at(fd, P->base, bb, nr * rowb, t->b + r0 * rowb);
@@ -420,7 +480,7 @@ static void prepare_worker(void *arg, int tid, int nt) {
     free(sb);
     free(bb);
     if (bad)
-        __atomic_fetch_or(&P->bad, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_or(&P->bad, bad, __ATOMIC_RELAXED);
 }
 
 static int prepare_weights(RqModel *m, int fd, int drop, LoadErr *e, char *warning, size_t wlen) {
@@ -484,7 +544,9 @@ static int prepare_weights(RqModel *m, int fd, int drop, LoadErr *e, char *warni
     for (j = 0; j < nt; j++) {
         QuantizedTensor *t = job[j].t;
         size_t nq = (size_t)job[j].d * job[j].k;
-        if (t->type != GGML_Q8_0)
+        if (t->type == GGML_F32)
+            t->f = (float *)(w->packed + job[j].off);
+        else if (t->type != GGML_Q8_0)
             t->kp = w->packed + job[j].off;
 #ifdef RUNQ_Q8X
         else if (pack)
@@ -508,7 +570,8 @@ static int prepare_weights(RqModel *m, int fd, int drop, LoadErr *e, char *warni
     free(job);
     free(left);
     if (bad & 2) load_fail(e, "malloc failed!");
-    if (bad) load_fail(e, "Corrupt checkpoint: a weight scale (fp16 d / dmin) is inf or NaN");
+    if (bad & 1) load_fail(e, "Corrupt checkpoint: a weight scale (fp16 d / dmin) is inf or NaN");
+    if (bad) load_fail(e, "Corrupt checkpoint: an F32 weight is inf or NaN");
     return 1;
 }
 
@@ -664,13 +727,14 @@ static int drop_page_cache(const RqModel *m, const RqModelOpts *o) {
 
 const char *rq_chat_name(int v) {
     return v == RQ_CHAT_INSTRUCT ? "instruct-2507" : v == RQ_CHAT_THINKING ? "thinking-2507" : v == RQ_CHAT_QWEN35 ? "qwen3.5"
-                                                                                                                 : "qwen3";
+         : v == RQ_CHAT_QWEN38 ? "qwen3.8" : "qwen3";
 }
 
 const char *chat_gen_suffix(const RqModel *m, int thinking) {
     // what the generation prompt adds after "<|im_start|>assistant\n" (chat.c, load_templates)
     if (m->chat == RQ_CHAT_INSTRUCT) return "";
-    if (m->chat == RQ_CHAT_THINKING || m->chat == RQ_CHAT_QWEN35) return thinking ? QWEN3_TMPL_THINK : QWEN3_TMPL_NOTHINK;
+    if (m->chat == RQ_CHAT_THINKING || m->chat == RQ_CHAT_QWEN35 || m->chat == RQ_CHAT_QWEN38)
+        return thinking ? QWEN3_TMPL_THINK : QWEN3_TMPL_NOTHINK;
     return thinking ? "" : QWEN3_TMPL_NOTHINK;
 }
 
@@ -822,10 +886,7 @@ static void load_model(RqModel *m, const char *path, const RqModelOpts *o, Loade
         gguf_config(&m->gguf, c, &m->rope_theta, &m->rope_dim, &m->hy);
         m->chat = gguf_chat_variant(&m->gguf);
         m->samp_set = gguf_sampling(&m->gguf, &m->samp_temp, &m->samp_topp, &m->samp_topk);
-        if (m->hy.nextn) // (the layer pattern would count the MTP block as a main layer; tokenizer-only loads are fine)
-            load_fail(e, "GGUF %s: MTP (multi-token prediction) layers are not supported yet: %s.nextn_predict_layers = %d, "
-                      "block_count %d includes the nextn block%s", path, m->hy.on ? "qwen35" : "qwen3", m->hy.nextn,
-                      c->n_layers, m->hy.nextn > 1 ? "s" : "");
+        // (an MTP block: not in c->n_layers, gguf_config; validated by gguf_map_weights, gguf_map_mtp)
     } else {
         // checkpoint format is 256-byte header, and then the model weights
         memcpy(c, map, sizeof(Config));
@@ -912,6 +973,7 @@ RqModel *rq_model_load(const char *path, const RqModelOpts *opts, char *err, siz
         return NULL;
     }
     m->rope_theta = 1e6f; // (.bin files: Qwen3's; GGUF: gguf_config)
+    m->mtp.layer = -1;
     ld->e.msg = err;
     ld->e.len = errlen;
     int ok = load_guarded(m, ld, path, opts ? opts : &defaults);

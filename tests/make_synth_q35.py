@@ -23,7 +23,7 @@ synth-q35-27b.gguf (330 MB): 8 layers (linear 0, 1, 2, 4, 5, 6, attention 3, 7: 
   heads of 128 (r = 3, as 16 / 48), an untied Q4_K token_embd and a Q6_K output, the 27B's types per role: attn_q / k /
   output / gate, ffn_gate / up Q4_K; attn_v and ffn_down Q6_K or Q4_K; attn_qkv Q6_K or Q4_K (the 0.8B's are Q5_K:
   rows of its Q6_K token_embd resp. of a Q4_K ffn_up); ssm_out Q5_K. Not the 27B's: ssm_alpha / ssm_beta stay Q8_0
-  (the 27B's are F32 matrices, which runq does not load yet), the 0.8B's tokenizer and template. Cut out of the 0.8B
+  (the 27B's are F32 matrices: synth-q35-27b-f32.gguf), the 0.8B's tokenizer and template. Cut out of the 0.8B
   Q4_K_M file in whole super-blocks: the first 768 columns (rows 0 .. d - 1 of the matrices with dim rows), an
   attention layer's q heads 0..7 from one source layer (with its 2 kv heads) and 8..11 from another (attn_q rows,
   attn_output columns side by side), the q / k channels of key heads 0..3 and the v channels of value heads 0..11 as
@@ -32,7 +32,14 @@ synth-q35-27b.gguf (330 MB): 8 layers (linear 0, 1, 2, 4, 5, 6, attention 3, 7: 
   for the options not given: the q35 group's sampling_defaults check).
 synth-q35-27b-mtp.gguf: the same + the MTP block as the 27B lays it out: block_count 9, qwen35.nextn_predict_layers 1,
   blk.8 a full-attention layer (attn_* , ffn_*, the norms) + nextn.eh_proj [2 dim -> dim] Q8_0, nextn.enorm / hnorm /
-  shared_head_norm F32, sharing token_embd / output. Today runq refuses it (TODO S6 makes it load).
+  shared_head_norm F32, sharing token_embd / output. runq loads the main model only (its logits == synth-q35-27b.gguf's,
+  bitwise: the q35 group's mtp_logits check).
+synth-q35-27b-f32.gguf: synth-q35-27b-mtp.gguf with the rest of the 27B file's layout: ssm_alpha / ssm_beta F32 (the
+  Q8_0 rows dequantized: the same values, applied in fp32 by runq), Qwen3.8's chat template (tests/golden/templates/
+  qwen3.8.jinja, the 27B's) and its tokenizer.ggml.bos_token_id 248044 (<|endoftext|>, what runq takes without it).
+synth-tok-qwen3.8.gguf, synth-tok-qwen3.8-hf.gguf (~8 MB): tokenizer-only files (the 0.8B's tokenizer and metadata, a
+  token_embd entry of an unknown type without data) with Qwen3.8's template: the 27B GGUF's (Unsloth's) resp. Qwen's
+  own (qwen3.8-hf.jinja): `runq -m render` vs tests/golden/chat_render.json (needs the Q8_0 source only).
 
 Usage: python3 tests/make_synth_q35.py [--src Qwen3.5-0.8B-Q8_0.gguf] [--src-q4 Qwen3.5-0.8B-Q4_K_M.gguf]
                                       [--out build/synth-q35] [--force]
@@ -137,6 +144,10 @@ def build_bad(f, path, extra):
 SRC_Q4 = os.path.join(ROOT, "models", "Qwen3.5-0.8B-GGUF", "Qwen3.5-0.8B-Q4_K_M.gguf")
 M27 = "synth-q35-27b.gguf"
 M27_MTP = "synth-q35-27b-mtp.gguf"
+M27_F32 = "synth-q35-27b-f32.gguf"
+TEMPLATES = os.path.join(ROOT, "tests", "golden", "templates")
+TOK38 = {"synth-tok-qwen3.8.gguf": "qwen3.8", "synth-tok-qwen3.8-hf.gguf": "qwen3.8-hf"}  # file: template
+BOS38 = 248044  # the 27B's tokenizer.ggml.bos_token_id (<|endoftext|>)
 D27, FFN27, H27, KVH27, NK27, NV27, L27 = 768, 2560, 12, 2, 4, 12, 8  # GQA 6, r = 3; layers 3, 7 attention
 QKV27 = {0: G.Q6_K, 1: G.Q4_K, 2: G.Q6_K, 4: G.Q4_K, 5: G.Q6_K, 6: G.Q4_K}  # attn_qkv per linear layer (27B: Q6_K / Q4_K)
 ATT27 = {3: (3, 11), 7: (15, 19), 8: (23, 7)}  # attention layer: the source layers of q heads 0..7, 8..11 (8: the MTP block)
@@ -152,8 +163,32 @@ def cut_cols(f, srcs, d):
     return np.ascontiguousarray(np.concatenate(parts, axis=1)).tobytes()
 
 
-def build_27b(f8, f4, path, mtp):
-    """the 27B's layout and types at a small scale, cut out of the 0.8B Q4_K_M file (f4; eh_proj: Q8_0, from f8)"""
+def template(name):
+    with open(os.path.join(TEMPLATES, name + ".jinja"), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def with_template(kvs, tmpl, bos):
+    """kvs with the chat template replaced (tmpl: its text, None: kept) and tokenizer.ggml.bos_token_id added (bos)"""
+    out = []
+    for key, raw in kvs:
+        if key == "tokenizer.chat_template" and tmpl is not None:
+            raw = G.raw_kv(G.GV_STR, tmpl)
+        out.append((key, raw))
+        if key == "tokenizer.ggml.eos_token_id" and bos is not None:  # (at its place in the 27B's file)
+            out.append(("tokenizer.ggml.bos_token_id", G.raw_kv(G.GV_U32, bos)))
+    return out
+
+
+def build_tok(f, path, tmpl, bos):
+    """a tokenizer-only file: the source's metadata with the template tmpl (+ bos), a token_embd entry without data"""
+    kvs = with_template([(k, r) for k, r in f.kv_raw if not k.startswith("quantize.imatrix")], tmpl, bos)
+    G.write_gguf(path, kvs, [("token_embd.weight", f.tensors["token_embd.weight"][0], 255, None)])
+
+
+def build_27b(f8, f4, path, mtp, f32=False):
+    """the 27B's layout and types at a small scale, cut out of the 0.8B Q4_K_M file (f4; eh_proj: Q8_0, from f8); f32:
+    ssm_alpha / ssm_beta F32 (dequantized), Qwen3.8's template and bos_token_id (synth-q35-27b-f32.gguf)"""
     A = "qwen35."
     T = lambda name: f4.tensors[name][1]  # noqa: E731
     dk = int(f4.kv[A + "ssm.state_size"])
@@ -175,6 +210,8 @@ def build_27b(f8, f4, path, mtp):
                     ("general.sampling.temp", G.raw_kv(G.GV_F32, 1.0))]
         if key == A + "attention.value_length" and mtp:
             kvs.append((A + "nextn_predict_layers", G.raw_kv(G.GV_U32, 1)))
+    if f32:
+        kvs = with_template(kvs, template("qwen3.8"), BOS38)
     V = f4.tensors["token_embd.weight"][0][1]
     F32, sb = G.F32, D27 // 256
     # token_embd: untied Q4_K, each row 3 consecutive super-blocks of a pool of the source's Q4_K matrices
@@ -220,9 +257,14 @@ def build_27b(f8, f4, path, mtp):
             blk += [("attn_gate.weight", (D27, vd), T(s + "attn_gate.weight"), rows(f4, s + "attn_gate.weight", [(0, vd)], D27)),
                     ("attn_norm.weight", (D27,), F32, cut_cols(f4, [(s + "attn_norm.weight", D27)], 1)),
                     ("attn_qkv.weight", (D27, cd), qt, qkv)]
-            blk += [("ssm_a", (NV27,), F32, cut_cols(f4, [(s + "ssm_a", NV27)], 1)),
-                    ("ssm_alpha.weight", (D27, NV27), T(s + "ssm_alpha.weight"), rows(f4, s + "ssm_alpha.weight", [(0, NV27)], D27)),
-                    ("ssm_beta.weight", (D27, NV27), T(s + "ssm_beta.weight"), rows(f4, s + "ssm_beta.weight", [(0, NV27)], D27)),
+            ab = []
+            for role in ("ssm_alpha", "ssm_beta"):
+                n, ty = s + role + ".weight", T(s + role + ".weight")
+                b = rows(f4, n, [(0, NV27)], D27)
+                if f32:  # (the F32 matrices of the 27B's file: these rows, dequantized exactly)
+                    b, ty = G.dequant(ty, np.frombuffer(b, np.uint8).reshape(NV27, -1), NV27, D27).astype("<f4").tobytes(), F32
+                ab.append((role + ".weight", (D27, NV27), ty, b))
+            blk += [("ssm_a", (NV27,), F32, cut_cols(f4, [(s + "ssm_a", NV27)], 1))] + ab + [
                     ("ssm_conv1d.weight", (K, cd), F32, rows(f4, s + "ssm_conv1d.weight", ch, K)),
                     ("ssm_dt.bias", (NV27,), F32, cut_cols(f4, [(s + "ssm_dt.bias", NV27)], 1)),
                     ("ssm_norm.weight", (dv,), F32, cut_cols(f4, [(s + "ssm_norm.weight", dv)], 1)),
@@ -254,7 +296,8 @@ def main():
     if not q4:
         print(f"note: missing {a.src_q4}: no {M27} / {M27_MTP}", file=sys.stderr)
     h = hashlib.sha256()
-    for p in [os.path.abspath(__file__), os.path.join(os.path.dirname(os.path.abspath(__file__)), "ggufmini.py")]:
+    for p in [os.path.abspath(__file__), os.path.join(os.path.dirname(os.path.abspath(__file__)), "ggufmini.py")] + \
+             [os.path.join(TEMPLATES, t + ".jinja") for t in TOK38.values()]:
         with open(p, "rb") as fh:
             h.update(fh.read())
     st = os.stat(a.src)
@@ -262,7 +305,7 @@ def main():
     if q4:
         st = os.stat(q4)
         stamp.update(src_q4=os.path.abspath(q4), size_q4=st.st_size, mtime_q4=int(st.st_mtime))
-    names = list(MODELS) + BAD + ([M27, M27_MTP] if q4 else [])
+    names = list(MODELS) + BAD + list(TOK38) + ([M27, M27_MTP, M27_F32] if q4 else [])
     sp = os.path.join(a.out, "stamp.json")
     if not a.force and os.path.exists(sp) and all(os.path.exists(os.path.join(a.out, n)) for n in names):
         with open(sp) as fh:
@@ -279,13 +322,16 @@ def main():
                                                "qwen35.ssm.inner_size": (G.GV_U32, 6 * 128)})
     build_bad(f, os.path.join(a.out, BAD[1]), {"prism.hadamard.gdn_v_grouped": (G.GV_BOOL, True)})
     build_bad(f, os.path.join(a.out, BAD[2]), {"qwen35.nextn_predict_layers": (G.GV_U32, int(f.kv["qwen35.block_count"]))})
-    for n in (M27, M27_MTP):
+    for n, t in TOK38.items():
+        build_tok(f, os.path.join(a.out, n), template(t), BOS38 if t == "qwen3.8" else None)
+    for n in (M27, M27_MTP, M27_F32):
         if os.path.exists(os.path.join(a.out, n)):
             os.remove(os.path.join(a.out, n))
     if q4:
         f4 = G.GgufFile(q4)
         build_27b(f, f4, os.path.join(a.out, M27), False)
         build_27b(f, f4, os.path.join(a.out, M27_MTP), True)
+        build_27b(f, f4, os.path.join(a.out, M27_F32), True, True)
     with open(sp, "w") as fh:
         json.dump(stamp, fh)
     print(a.out)

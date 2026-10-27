@@ -18,7 +18,8 @@ Added rule for this section: speculative output == plain output (tokens + a hash
 The preparation is done (2026-10-27: the regression net `tests/compare_bins.sh REF_DIR NEW_DIR` over every model
 family incl. Qwen3.5 and the synthetic r = 2 / 3 / 27B-shaped models; two models in one process; checkpoint sets and
 `rq_seq_checkpoint_rows`; the memory estimate, `--mem` and the page-cache drop; `rq_gen_start` / `rq_gen_step`, top-k
-and `general.sampling.*`): each step below keeps `make test` green and compare_bins identical where it promises no
+and `general.sampling.*`; the file's specifics: the MTP block validated and skipped, F32 `ssm_alpha` / `ssm_beta` in
+fp32, the 3.8 chat template with its reasoning effort): each step below keeps `make test` green and compare_bins identical where it promises no
 output change. **Disk and RAM:** ~40 GB free with the 27B Q4_K_M downloaded (`models/Qwen3.8-27B-GGUF`, sha256
 checked), `models/` 45 GB; `/tmp` is a 16 GB tmpfs (RAM: no models or venvs there); check `df` / `MemAvailable`
 before every download or 27B run, keep >= 15 GB of disk free (the 4B / 1.7B HF checkpoints were removed: they only
@@ -54,18 +55,9 @@ Steps:
 - [ ] **S5. The speculative loop on Qwen3.5.** Target Qwen3.5-4B Q8_0 + draft 0.8B (~6 GB), S3's rollback on both.
   Expect ~1.3-1.6x (a 0.8B guess costs ~18% of a 4B token). Done when outputs equal plain decoding bitwise (greedy,
   seeded, thinking on / off) and tok/s + acceptance are recorded.
-- [ ] **S6. Qwen3.8 specifics** (on `tests/make_synth_q35.py`'s `synth-q35-27b-mtp.gguf` and a tiny random-init
-  `qwen3_5` with an MTP layer, converted by llama.cpp's converter in a scratch venv off `/tmp`). Loader: `block_count`
-  65 with `nextn_predict_layers` 1 = 64 main layers + the MTP block (loaded for S9, else skipped) instead of today's
-  refusal (`load_model`; the `q35/synth/reject_mtp` check becomes a load whose logits == `synth-q35-27b.gguf`'s,
-  bitwise); and F32 `ssm_alpha` / `ssm_beta` matrices ([48, 5120] in the 27B file, Q8_0 in the 0.8B's:
-  `gguf_matrices` refuses type 0 today; an fp32 matvec, checked on a synthetic model with F32 ones; the file layout:
-  docs/qwen38-speculative.md). Chat variant for 3.8, detected by its text (`reasoning_effort`): thinking on by
-  default, the effort's system line merged with the system / developer message, `-r` plus an effort option, the server's
-  `reasoning_effort`; the template in `tests/golden/templates/` (license noted). Done when `-m render` equals HF's
-  `apply_chat_template` for thinking off / on x each effort, with and without a system message.
 - [ ] **S7. 27B bring-up** (Q4_K_M). Download the pinned file with `hf` (into
-  `models/`, sha256 checked); load: peak RSS vs the load-time estimate (`build/mem_probe`, ~18.6 GiB at `-c` 40,960),
+  `models/`, sha256 checked); load: peak RSS vs the load-time estimate (`build/mem_probe`; runq's on the file: 18.50 GiB
+  at `-c` 40,960, the `--mem 0.1` refusal),
   page cache dropped (`auto`: the file is > 1/4 of the RAM). Logits vs `tests/ref_qwen35.py` on the dequantized
   weights (layer by layer, a few GB; a classifier subset); teacher-forced top-1 vs the API's model on the saved outputs
   (a sanity check). Speed: plain decode (~120 ms per token), then with the 0.8B Q4_K_M draft (thinking on: ~13-14 tok/s;
@@ -74,7 +66,8 @@ Steps:
 - [ ] **S8. Server.** `runq serve --draft FILE`: the draft rows join the job's segment in the batched pass, k per
   request; speculate less as the batch fills. Done when `server_test.py` shows equal outputs with and without the
   draft, and `scripts/bench_serve.py` numbers at 1 / 4 clients.
-- [ ] **S9. The MTP drafter** (`blk.64`, same file). The target's last hidden state + the next token's embedding ->
+- [ ] **S9. The MTP drafter** (`blk.64`, same file; validated at load into `RqModel.mtp`, `MtpBlock`: pointers into
+  the mapping, to convert / repack when the drafter is built). The target's last hidden state + the next token's embedding ->
   `eh_proj` -> one full-attention layer with its own KV cache -> the shared output (~9-10 ms per guess for the 1 GB
   classifier; a vocabulary subset is fine, exactness does not care which guesses). Needs the final hidden state per
   row from the verify pass (a new `rq_forward_batch` output). Measure acceptance first; keep whichever draft gives

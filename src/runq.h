@@ -282,14 +282,30 @@ int rq_detok_flush(RqDetok *d, char *out, size_t cap);
 //                     on: rendered as Thinking-2507's ("<think>\n" opens the reply, answered turns lose it),
 //                     off: as the hybrid's. Message texts are trimmed of surrounding whitespace (its template's
 //                     |trim)
-enum { RQ_CHAT_HYBRID = 0, RQ_CHAT_INSTRUCT = 1, RQ_CHAT_THINKING = 2, RQ_CHAT_QWEN35 = 3 };
-const char *rq_chat_name(int variant); // "qwen3", "instruct-2507", "thinking-2507", "qwen3.5""
+//   RQ_CHAT_QWEN38    Qwen3.8 (a qwen35 file whose template has reasoning_effort): thinking on by default in the CLI
+//                     and runq serve (as its template); user turns and trimming as Qwen3.5's. With thinking on, the
+//                     reasoning-effort instruction (thinking = RQ_THINK_*, below: medium has none) opens the system
+//                     block: "<|im_start|>system\n" INSTR "\n\n" SYS "<|im_end|>\n", or INSTR alone without a system
+//                     message (rq_chat_system with text NULL; leading system messages are merged with "\n" by
+//                     rq_chat_render). Earlier replies keep their reasoning (the template's default, preserve_thinking):
+//                     "<|im_start|>assistant\n<think>\n" REASONING "\n</think>\n\n" ANSWER, in both modes:
+//                     rq_chat_user_history ends with the assistant header, rq_chat_reply_history is the generation
+//                     suffix + the reply as generated (the KV cache never diverges from the history)
+enum { RQ_CHAT_HYBRID = 0, RQ_CHAT_INSTRUCT = 1, RQ_CHAT_THINKING = 2, RQ_CHAT_QWEN35 = 3, RQ_CHAT_QWEN38 = 4 };
+const char *rq_chat_name(int variant); // "qwen3", "instruct-2507", "thinking-2507", "qwen3.5", "qwen3.8"
+// the thinking argument below: 0 off, nonzero on; Qwen3.8 reads the reasoning effort from it: RQ_THINK_ON = its default
+// xhigh ("high" too, as its template), RQ_THINK_MEDIUM, RQ_THINK_LOW (the other variants: all the same, on)
+enum { RQ_THINK_OFF = 0, RQ_THINK_ON = 1, RQ_THINK_MEDIUM = 2, RQ_THINK_LOW = 3 };
+int rq_chat_effort(const char *name); // "xhigh" / "high" -> RQ_THINK_ON, "medium", "low"; else -1
+const char *rq_chat_effort_name(int thinking); // "off", "xhigh", "medium", "low"
 enum { RQ_ROLE_SYSTEM = 0, RQ_ROLE_USER = 1, RQ_ROLE_ASSISTANT = 2 };
 typedef struct { int role; const char *content; } RqMessage;
 
 // a message text as the variant's template renders it (Qwen3.5: without surrounding whitespace, Python's
 // str.strip(); the others: as is): its start in text and *len bytes. rq_chat_system / user / render apply it
 const char *rq_chat_trim(const RqModel *m, const char *text, size_t *len);
+// the system block (text NULL: the start of a conversation without a system message: nothing, except Qwen3.8's
+// reasoning-effort instruction with thinking on)
 int rq_chat_system(const RqModel *m, const char *text, int thinking, RqTokens *out);
 int rq_chat_user(const RqModel *m, const char *text, int thinking, RqTokens *out);
 int rq_chat_end(const RqModel *m, RqTokens *out);
@@ -300,14 +316,23 @@ int rq_chat_user_history(const RqModel *m, const char *text, int thinking, RqTok
 // the generation prompt alone: "<|im_start|>assistant\n" + what the variant adds for this thinking mode (the
 // end of rq_chat_user's piece; e.g. after a message sequence rq_chat_user cannot express)
 int rq_chat_assistant(const RqModel *m, int thinking, RqTokens *out);
-// the history form of a reply generated as tokens (thinking: without its reasoning block)
+// the history form of a reply generated as tokens (thinking: without its reasoning block; Qwen3.8: the generation
+// suffix + the reply)
 int rq_chat_reply_history(const RqModel *m, const int *reply, int n, int thinking, RqTokens *out);
+// an earlier assistant message's text as the history renders it (rq_chat_render), without the end (rq_chat_end):
+// thinking: the part after its last </think>, leading newlines stripped, else the text (trimmed as rq_chat_trim);
+// Qwen3.8, either mode: "<think>\n" REASONING "\n</think>\n\n" ANSWER (the text split at its last </think>, the
+// reasoning after a <think>, both trimmed; no </think>: the reasoning is empty), as its template renders
+// reasoning_content and content (the part after the assistant header, rq_chat_user_history)
+int rq_chat_reply(const RqModel *m, const char *text, int thinking, RqTokens *out);
 // where a chat prompt's recurrent state is worth a checkpoint (rq_seq_checkpoint_at; Qwen3.5): the position of its
 // last <|im_start|> (the assistant header: the next request of the conversation diverges after it when the
 // reply is rendered from its text, without its reasoning or cut at a stop string), or -1
 int rq_chat_checkpoint_pos(const RqModel *m, const int *tokens, int n);
-// a whole conversation: an optional system message, then user / assistant alternating, ending with
-// a user message (then the assistant header: the prompt to generate from) or an assistant one
+// a whole conversation: an optional system message (Qwen3.8: system messages at the start, merged), then user /
+// assistant alternating, ending with a user message (then the assistant header: the prompt to generate from) or an
+// assistant one. Qwen3.8: an assistant text with "</think>" is its reasoning (before the last one, a leading
+// "<think>" dropped) and its answer (after it), rendered as the template renders reasoning_content and content
 int rq_chat_render(const RqModel *m, const RqMessage *msgs, int n, int thinking, RqTokens *out);
 // RQ_OK if the templates of this thinking mode are available (else the missing file in err)
 int rq_chat_check(const RqModel *m, int thinking, char *err, size_t errlen);

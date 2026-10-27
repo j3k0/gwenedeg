@@ -686,6 +686,10 @@ void embed_row(float *x, const QuantizedTensor *t, int token, int dim) {
     // as the whole dequantized table upstream kept in memory. GGUF: from its blocks, the same
     // expression with the fp16 scale as a float (dim % 32 == 0, checked at load)
     size_t e0 = (size_t)token * dim;
+    if (t->b && t->type == GGML_F32) { // (F32 alpha / beta: rq_dequant_rows)
+        memcpy(x, t->b + e0 * sizeof(float), (size_t)dim * sizeof(float));
+        return;
+    }
     if (t->b && t->type != GGML_Q8_0) {
         // GGUF Q4_K / Q6_K: ggml's dequantization of the row's blocks (dim % 256 == 0). By the tensor's
         // type, not by t->kp: an untied embedding table (Qwen3-8B: Q4_K, output.weight Q6_K) is never
@@ -749,6 +753,50 @@ static inline float dot_q8(const int8_t *wq, const float *ws, const int8_t *xq, 
         val += ((float) ival) * ws[j / GS] * xs[j / GS];
     }
     return val;
+}
+
+// F32 weights (only ssm_alpha / ssm_beta, as in Qwen3.8-27B's file: [48, 5120]; model.c gguf_matrix): out[i] = W row i
+// . x for i0 <= i < i1, on the fp32 activations x (the rmsnorm'd row that the int8 one is quantized from: an F32
+// matrix stays fp32 on both sides, as in llama.cpp and tests/ref_qwen35.py). The order of the operations, the
+// definition for every path (decode, batched prefill, batched decode rows) and build (AVX-512, generic, NEON):
+// 16 partial sums s_j (j = column mod 16), each over its columns in increasing order, s_j = s_j + w * x (the
+// product rounded, then the sum: no FMA), from s_j = 0; then the fixed tree s_j = s_j + s_(j+h) for h = 8, 4, 2, 1
+// (j < h); out = s_0. k % 16 == 0 (dim: forward_model_init). KQ_EXACT (gcc) / RQ_FP_EXACT (clang): no contraction,
+// no reassociation; the 16 lanes may still be one vector register (each lane's operations stay in their order).
+// Tiny: 2 x 48 rows per linear layer (~1 MB each; decode splits them into items of AB_ROWS rows)
+KQ_EXACT static void f32_rows(float *out, const float *w, const float *x, int k, int i0, int i1) { RQ_FP_EXACT
+    for (int i = i0; i < i1; i++) {
+        const float *wr = w + (size_t)i * k;
+        float s[16];
+        for (int j = 0; j < 16; j++)
+            s[j] = 0;
+        for (int c = 0; c < k; c += 16)
+            for (int j = 0; j < 16; j++)
+                s[j] = s[j] + wr[c + j] * x[c + j];
+        for (int h = 8; h >= 1; h /= 2)
+            for (int j = 0; j < h; j++)
+                s[j] = s[j] + s[j + h];
+        out[i] = s[0];
+    }
+}
+
+// decode's (and the batched decode rows') alpha / beta items of a linear layer: one for both if quantized (item 0,
+// as before), else per matrix, F32: blocks of AB_ROWS rows (2 x 3 items of ~320 KB for the 27B's)
+#define AB_ROWS 16
+static inline int ab_items_of(const QuantizedTensor *w, int nv) { return w->f ? (nv + AB_ROWS - 1) / AB_ROWS : 1; }
+static inline int ab_items(const QuantizedTensor *wa, const QuantizedTensor *wb, int nv) {
+    return wa->f || wb->f ? ab_items_of(wa, nv) + ab_items_of(wb, nv) : 1;
+}
+
+static inline const QuantizedTensor *ab_item(const QuantizedTensor *wa, const QuantizedTensor *wb, int nv, int it, int *r0,
+                                             int *r1, int *beta) {
+    // item it (< ab_items, which is > 1): its matrix (wa or wb: *beta), rows r0..r1-1
+    int na = ab_items_of(wa, nv), j = it < na ? it : it - na;
+    const QuantizedTensor *t = it < na ? wa : wb;
+    *beta = it >= na;
+    *r0 = t->f ? j * AB_ROWS : 0;
+    *r1 = t->f && *r0 + AB_ROWS < nv ? *r0 + AB_ROWS : nv;
+    return t;
 }
 
 // Decode GEMV, in pieces: decode_step runs all of a token in one parallel region, with the rows
@@ -853,6 +901,7 @@ typedef struct {
     int chunk, unit;     // items per claim; ranges of whole units (tiled: a tile's chunks)
     QuantizedTensor *x; int ldx, nb, k;
     const int32_t *corr; const float *xf; const int32_t *c16;
+    const float *xa; int ldxa; // the fp32 activation rows (row b at xa + b * ldxa) for F32 weights (f32_rows), else NULL
 } Gemm;
 
 // Small-batch kernels (AVX-512, kernels_avx512.h smb_rows): in prefill_worker's GEMM phases for a matmul
@@ -912,6 +961,7 @@ static void gemm_plan(const RqCtx *c, Gemm *g, int nj, const MatJob *job, Quanti
                       const int32_t *corr, const float *xf, const int32_t *c16, int nt) {
     // (computed by every thread of the job: the same plan everywhere; results never depend on it)
     g->nj = nj; g->x = x; g->ldx = ldx; g->nb = nb; g->k = k; g->corr = corr; g->xf = xf; g->c16 = c16;
+    g->xa = NULL; g->ldxa = 0; // (F32 weights: the caller sets them)
     int ntile = 0, all_tiled = 1;
     for (int j = 0; j < nj; j++) {
         g->job[j] = job[j];
@@ -925,7 +975,7 @@ static void gemm_plan(const RqCtx *c, Gemm *g, int nj, const MatJob *job, Quanti
         g->smb[j] = smb_use(c, job[j].w, nb);
         if (g->smb[j])
             g->tiled[j] = 0;
-        all_tiled &= g->tiled[j];
+        all_tiled &= g->tiled[j] || job[j].w->f; // (F32 alpha / beta, last in their phase: blocks of MB_ROWS rows, any range)
         if (g->tiled[j])
             ntile += (job[j].d / 16 + 1) / 2;
     }
@@ -956,6 +1006,12 @@ NO_FP_CONTRACT static void gemm_item(const Gemm *g, int it, uint8_t *scr, const 
     const MatJob *jb = &g->job[j];
     QuantizedTensor *w = jb->w, *x = g->x;
     int i = it - g->it0[j], k = g->k, ldx = g->ldx, nb = g->nb;
+    if (w->f) { // F32: MB_ROWS rows over all activation rows, on the fp32 rows
+        int i0 = i * MB_ROWS, i1 = i0 + MB_ROWS < jb->d ? i0 + MB_ROWS : jb->d;
+        for (int b = 0; b < nb; b++)
+            f32_rows(jb->out + (size_t)b * jb->ldo, w->f, g->xa + (size_t)b * g->ldxa, k, i0, i1);
+        return;
+    }
 #ifdef RUNQ_SMB
     if (g->smb[j]) { // 16-row block i, all rows
         smb_rows(w->kp ? w->type : 0, jb->out, jb->ldo, x->q, ldx, x->s, g->corr, g->xf, g->c16, nb, w->kp ? w->kp : w->p, k, GS,
@@ -1844,29 +1900,40 @@ static void decode_worker(void *arg, int tid, int nt) {
             // (after item 0; counter dc + 1 + h); then per (head, block of DN_BW v columns) dn_rec (after the prep of
             // the head and of its key head's item h % nk); the last block of a head to finish runs dn_out and quantizes
             // the head's outputs for ssm_out (into aq; head slices are whole groups)
+            // (F32 alpha / beta: items 0 .. nab - 1, ab_items, on the fp32 row xb; counter dc counts them)
             float *st = s->ssm + (size_t)li * m->ssm_layer;
-            int nblk = dn_nblk(hy), dc = dn_counter0(m, l);
-            PH_BEGIN_DYN(1 + hy->nv + hy->nv * nblk, 1)
+            int nblk = dn_nblk(hy), dc = dn_counter0(m, l), nab = ab_items(w->wa + li, w->wb + li, hy->nv);
+            PH_BEGIN_DYN(nab + hy->nv + hy->nv * nblk, 1)
             for (int it = lo; it < hi; it++) {
-                if (it == 0) {
-                    matvec_rows(c->lin + hy->conv_dim + hy->vdim, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wa + li, dim, 0, hy->nv);
-                    matvec_rows(c->lin + hy->conv_dim + hy->vdim + hy->nv, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wb + li, dim, 0,
-                                hy->nv);
+                if (it < nab) {
+                    float *ab = c->lin + hy->conv_dim + hy->vdim;
+                    if (nab == 1) {
+                        matvec_rows(ab, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wa + li, dim, 0, hy->nv);
+                        matvec_rows(ab + hy->nv, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wb + li, dim, 0, hy->nv);
+                    } else {
+                        int r0, r1, beta;
+                        QuantizedTensor *t = (QuantizedTensor *)ab_item(w->wa + li, w->wb + li, hy->nv, it, &r0, &r1, &beta);
+                        if (t->f)
+                            f32_rows(ab + beta * hy->nv, t->f, c->xb, dim, r0, r1);
+                        else
+                            matvec_rows(ab + beta * hy->nv, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, t, dim, r0, r1);
+                    }
                     rq_count(S, dc, 1);
                     continue;
                 }
-                if (it <= hy->nv) {
-                    int h = it - 1, i0 = h * hy->dv;
+                int iv = it - (nab - 1); // (the items below numbered as with one alpha / beta item)
+                if (iv <= hy->nv) {
+                    int h = iv - 1, i0 = h * hy->dv;
                     int r0[3] = { h * hy->dk, hy->nk * hy->dk + h * hy->dk, 2 * hy->nk * hy->dk + h * hy->dv }, rn[3] = { hy->dk, hy->dk, hy->dv };
                     for (int t = h < hy->nk ? 0 : 2; t < 3; t++)
                         matvec_rows(c->lin, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wqkv + li, dim, r0[t], r0[t] + rn[t]);
                     matvec_rows(c->lin + hy->conv_dim, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wz + li, dim, i0, i0 + hy->dv);
-                    rq_wait_count(S, dc, 1);
+                    rq_wait_count(S, dc, nab);
                     dn_prep(m, li, h, st, pos == 0, dn_ck(s, li, pos), c->lin);
                     rq_count(S, dc + 1 + h, 1);
                     continue;
                 }
-                int h = (it - 1 - hy->nv) / nblk, jb = (it - 1 - hy->nv) % nblk, i0 = h * hy->dv;
+                int h = (iv - 1 - hy->nv) / nblk, jb = (iv - 1 - hy->nv) % nblk, i0 = h * hy->dv;
                 rq_wait_count(S, dc + 1 + h, 1);
                 if (h >= hy->nk) // (its key head's q / k)
                     rq_wait_count(S, dc + 1 + h % hy->nk, 1);
@@ -2141,6 +2208,8 @@ static void prefill_worker(void *arg, int tid, int nt) {
                              { c->lin_b + hy->conv_dim + hy->vdim, lw, w->wa + li, hy->nv },
                              { c->lin_b + hy->conv_dim + hy->vdim + hy->nv, lw, w->wb + li, hy->nv } };
             gemm_plan(c, &G, 4, lj, &c->xq_b, xs, n, dim, c->bq_corr, c->bq_xf, c->bq_c16, nt);
+            G.xa = c->xb_b; // (F32 alpha / beta: the rmsnorm'd rows)
+            G.ldxa = xs;
             {
                 const void *last = NULL;
                 PH_BEGIN_U(G.it0[G.nj], G.chunk, G.unit)
@@ -2563,23 +2632,34 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
             // last block of a head to finish runs dn_out on every row
             // (the rows are quantized by the next phase)
             int nblk = dn_nblk(hy);
-            PH_BEGIN_DYN(1 + hy->nv + hy->nv * nblk, 1)
+            int nab = ab_items(w->wa + li, w->wb + li, hy->nv); // (F32 alpha / beta: items 0 .. nab - 1 on the fp32 rows)
+            PH_BEGIN_DYN(nab + hy->nv + hy->nv * nblk, 1)
             for (int it = lo; it < hi; it++) {
                 float *lb = c->lin_b;
-                if (it == 0) {
-                    rows_mm(w->wa + li, lb + hy->conv_dim + hy->vdim, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, 0, hy->nv);
-                    rows_mm(w->wb + li, lb + hy->conv_dim + hy->vdim + hy->nv, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, 0,
-                            hy->nv);
+                if (it < nab) {
+                    float *ab = lb + hy->conv_dim + hy->vdim;
+                    if (nab == 1) {
+                        rows_mm(w->wa + li, ab, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, 0, hy->nv);
+                        rows_mm(w->wb + li, ab + hy->nv, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, 0, hy->nv);
+                    } else {
+                        int r0, r1, beta;
+                        QuantizedTensor *t = (QuantizedTensor *)ab_item(w->wa + li, w->wb + li, hy->nv, it, &r0, &r1, &beta);
+                        for (int b = 0; b < n && t->f; b++)
+                            f32_rows(ab + (size_t)b * lw + beta * hy->nv, t->f, c->xb_b + (size_t)b * xs, dim, r0, r1);
+                        if (!t->f)
+                            rows_mm(t, ab + beta * hy->nv, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, r0, r1);
+                    }
                     rq_count(S, cb, 1);
                     continue;
                 }
-                if (it <= hy->nv) {
-                    int h = it - 1, i0 = h * hy->dv;
+                int iv = it - (nab - 1); // (the items below numbered as with one alpha / beta item)
+                if (iv <= hy->nv) {
+                    int h = iv - 1, i0 = h * hy->dv;
                     int r0[3] = { h * hy->dk, hy->nk * hy->dk + h * hy->dk, 2 * hy->nk * hy->dk + h * hy->dv }, rn[3] = { hy->dk, hy->dk, hy->dv };
                     for (int t = h < hy->nk ? 0 : 2; t < 3; t++)
                         rows_mm(w->wqkv + li, lb, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, r0[t], r0[t] + rn[t]);
                     rows_mm(w->wz + li, lb + hy->conv_dim, lw, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, i0, i0 + hy->dv);
-                    rq_wait_count(S, cb, 1);
+                    rq_wait_count(S, cb, nab);
                     for (int b = 0; b < n; b++) {
                         RqSeq *sq = seg[b].seq;
                         int pos = c->row_pos[b];
@@ -2588,7 +2668,7 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
                     rq_count(S, cb + 1 + h, 1);
                     continue;
                 }
-                int h = (it - 1 - hy->nv) / nblk, jb = (it - 1 - hy->nv) % nblk, i0 = h * hy->dv;
+                int h = (iv - 1 - hy->nv) / nblk, jb = (iv - 1 - hy->nv) % nblk, i0 = h * hy->dv;
                 rq_wait_count(S, cb + 1 + h, 1);
                 if (h >= hy->nk) // (its key head's q / k)
                     rq_wait_count(S, cb + 1 + h % hy->nk, 1);

@@ -277,11 +277,14 @@ void gguf_config(const Gguf *g, Config *c, float *rope_theta, int *rope_dim, Hyb
     if (gguf_get_int(g, key, &rd) && (rd < 2 || rd > v[6] || rd % 2))
         gguf_fail(g, "%s must be even and at most the head dimension", key);
     memset(hy, 0, sizeof(*hy));
-    // multi-token prediction blocks (llama.cpp's nextn: Qwen3.8-27B's blk.64 with nextn.* tensors, counted in block_count)
+    // multi-token prediction blocks (llama.cpp's nextn: Qwen3.8-27B's blk.64 with nextn.* tensors) are the last nextn
+    // of block_count: the main model has block_count - nextn layers (their pattern, n_lin, counts those only); the
+    // block itself is validated by the weight load (model.c, gguf_map_mtp; a tokenizer-only load does not look at it)
     int64_t nx = 0;
     snprintf(key, sizeof(key), "%s.nextn_predict_layers", A);
     if (gguf_get_int(g, key, &nx) && (nx < 0 || nx >= v[0])) gguf_fail(g, "metadata %s out of range", key);
     hy->nextn = (int)nx;
+    v[0] -= nx;
     if (q35) {
         const char *sk[] = { "ssm.conv_kernel", "ssm.state_size", "ssm.group_count", "ssm.time_step_rank", "ssm.inner_size",
                              "full_attention_interval" };
@@ -346,11 +349,15 @@ int gguf_chat_variant(const Gguf *g) {
     //   thinking only (Qwen3-*-Thinking-2507): '<|im_start|>assistant\n<think>\n', no enable_thinking
     //   instruct (Qwen3-*-Instruct-2507): '<|im_start|>assistant\n', no think block at all
     // Absent, or not a ChatML template: hybrid (the built-in templates, as before). A qwen35 file: Qwen3.5's
-    // (its template has enable_thinking too, but thinking off by default and Thinking-2507's "<think>\n" when on)
-    uint64_t n = 0;
+    // (its template has enable_thinking too, but thinking off by default and Thinking-2507's "<think>\n" when on),
+    // or Qwen3.8's if its template has reasoning_effort (the reasoning-effort system line, thinking on by default,
+    // earlier replies keep their reasoning: Qwen's and Unsloth's 3.8 templates; chat.c)
+    uint64_t n = 0, tn = 0;
     const char *arch = gguf_get_str(g, "general.architecture", &n);
-    if (arch && n == 6 && !memcmp(arch, "qwen35", 6)) return RQ_CHAT_QWEN35; // (by architecture: one template)
-    const char *t = gguf_get_str(g, "tokenizer.chat_template", &n);
+    const char *t = gguf_get_str(g, "tokenizer.chat_template", &tn);
+    if (arch && n == 6 && !memcmp(arch, "qwen35", 6)) // (by architecture and one keyword)
+        return t && has_text(t, tn, "<|im_start|>") && has_text(t, tn, "reasoning_effort") ? RQ_CHAT_QWEN38 : RQ_CHAT_QWEN35;
+    n = tn;
     if (!t || !has_text(t, n, "<|im_start|>") || has_text(t, n, "enable_thinking")) return RQ_CHAT_HYBRID;
     if (has_text(t, n, "<|im_start|>assistant\\n<think>\\n'") || has_text(t, n, "<|im_start|>assistant\n<think>\n'") ||
         has_text(t, n, "<|im_start|>assistant\\n<think>\\n\"") || has_text(t, n, "<|im_start|>assistant\n<think>\n\""))

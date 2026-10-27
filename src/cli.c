@@ -233,8 +233,7 @@ static void chat(RqModel *m, RqCtx *c, RqSeq *s, const RqSampling *cfg, char *cl
     RqModelInfo info;
     rq_model_info(m, &info);
 
-    if (system_prompt)
-        check(rq_chat_system(m, system_prompt, enable_thinking, &sys), NULL);
+    check(rq_chat_system(m, system_prompt, enable_thinking, &sys), NULL); // (none: Qwen3.8's effort instruction, if any)
     check(rq_chat_end(m, &close), NULL);
     int reserve = max_new_tokens > 0 ? max_new_tokens : seq_len / 4;
     if (reserve > seq_len / 2) reserve = seq_len / 2;
@@ -304,8 +303,8 @@ static void chat(RqModel *m, RqCtx *c, RqSeq *s, const RqSampling *cfg, char *cl
         if (ckp >= L) check(rq_seq_checkpoint_at(s, ckp), c);
         ReplyOut ro = { m, &tn->reply };
         RqCallbacks cb = { on_reply_token, on_reply_logits, &ro };
-        if ((info.chat == RQ_CHAT_THINKING || info.chat == RQ_CHAT_QWEN35) && enable_thinking)
-            printf("<think>\n"); // (Thinking-2507, Qwen3.5: the prompt opened the block, the reply starts inside it)
+        if ((info.chat == RQ_CHAT_THINKING || info.chat == RQ_CHAT_QWEN35 || info.chat == RQ_CHAT_QWEN38) && enable_thinking)
+            printf("<think>\n"); // (Thinking-2507, Qwen3.5 / 3.8: the prompt opened the block, the reply starts inside it)
         RqGenStats st;
         check(rq_generate(c, s, want.v + L, want.n - L, cfg, max_new_tokens, &cb, &st), c);
         if (st.stop == RQ_STOP_CONTEXT)
@@ -354,7 +353,7 @@ static void render_one(const RqModel *m, const Js *a, int thinking) {
     for (int i = 0; i < a->n; i++) {
         const Js *r = json_get(a->v[i], "role"), *c = json_get(a->v[i], "content");
         if (!r || !c || c->t != JS_STR) die("-m render: each message needs a role and a string content");
-        msg[i].role = json_str_eq(r, "system") ? RQ_ROLE_SYSTEM : json_str_eq(r, "user") ? RQ_ROLE_USER
+        msg[i].role = json_str_eq(r, "system") || json_str_eq(r, "developer") ? RQ_ROLE_SYSTEM : json_str_eq(r, "user") ? RQ_ROLE_USER
                     : json_str_eq(r, "assistant") ? RQ_ROLE_ASSISTANT : -1;
         msg[i].content = c->s;
     }
@@ -366,15 +365,20 @@ static void render_one(const RqModel *m, const Js *a, int thinking) {
     printf("\n");
     RqModelInfo info;
     rq_model_info(m, &info);
-    fprintf(stderr, "[render] chat template %s, thinking %d: %d tokens\n", rq_chat_name(info.chat), thinking, t.n);
+    if (info.chat == RQ_CHAT_QWEN38) // (the effort: Qwen3.8 only, the other lines unchanged)
+        fprintf(stderr, "[render] chat template %s, thinking %d (%s): %d tokens\n", rq_chat_name(info.chat), thinking != 0,
+                rq_chat_effort_name(thinking), t.n);
+    else
+        fprintf(stderr, "[render] chat template %s, thinking %d: %d tokens\n", rq_chat_name(info.chat), thinking != 0, t.n);
     rq_tokens_free(&t);
     free(msg);
 }
 
 static void render_chat(const RqModel *m, const char *json, int thinking) {
     // -m render (test hook): the token ids of the conversation -i (a JSON array of {"role": system / user /
-    // assistant, "content": text}) rendered by rq_chat_render with -r, space-separated on stdout; or of several
-    // (-i: an array of {"messages": [...], "thinking": 0 / 1 (default -r)}), one line each
+    // assistant, "content": text}) rendered by rq_chat_render with -r (and -e), space-separated on stdout; or of several
+    // (-i: an array of {"messages": [...], "thinking": 0 / 1 (default -r), "reasoning_effort": xhigh / high / medium /
+    // low (default -e)}), one line each
     char err[256];
     JsDoc *d = json_parse(json, strlen(json), err, sizeof(err));
     if (!d) { fprintf(stderr, "-m render: invalid JSON: %s\n", err); exit(EXIT_FAILURE); }
@@ -383,9 +387,12 @@ static void render_chat(const RqModel *m, const char *json, int thinking) {
     if (a->n > 0 && json_get(a->v[0], "messages")) {
         for (int i = 0; i < a->n; i++) {
             const Js *ms = json_get(a->v[i], "messages"), *th = json_get(a->v[i], "thinking");
-            long long t = thinking;
+            const Js *ef = json_get(a->v[i], "reasoning_effort");
+            long long t = thinking != 0;
+            int eff = thinking ? thinking : RQ_THINK_ON;
             if (!ms || ms->t != JS_ARR || (th && !json_is_int(th, &t))) die("-m render: bad conversation");
-            render_one(m, ms, t != 0);
+            if (ef && (ef->t != JS_STR || (eff = rq_chat_effort(ef->s)) < 0)) die("-m render: bad reasoning_effort");
+            render_one(m, ms, t ? eff : 0);
         }
     } else {
         render_one(m, a, thinking);
@@ -395,7 +402,7 @@ static void render_chat(const RqModel *m, const char *json, int thinking) {
 
 static int thinking_for(const RqModel *m, int thinking, int given) {
     // -r for the template variant: Instruct-2507 has no thinking mode, Thinking-2507 always thinks (a note
-    // when -r asked for the other)
+    // when -r asked for the other); thinking: 0 or the effort (RQ_THINK_*)
     RqModelInfo info;
     rq_model_info(m, &info);
     if (info.chat == RQ_CHAT_INSTRUCT && thinking) {
@@ -404,9 +411,19 @@ static int thinking_for(const RqModel *m, int thinking, int given) {
     }
     if (info.chat == RQ_CHAT_THINKING && !thinking) {
         if (given) fprintf(stderr, "note: this model (chat template %s) always thinks: -r 0 ignored\n", rq_chat_name(info.chat));
-        return 1;
+        return RQ_THINK_ON;
     }
     return thinking;
+}
+
+static int thinking_default(const RqModel *m, int thinking, int given, int effort, int effort_given, int note) {
+    // Qwen3.8: thinking on unless -r 0 (its template's default); -e for another template: a note (chat)
+    RqModelInfo info;
+    rq_model_info(m, &info);
+    if (info.chat == RQ_CHAT_QWEN38) return given ? thinking : effort;
+    if (effort_given && note)
+        fprintf(stderr, "note: this model (chat template %s) has no reasoning effort: -e ignored\n", rq_chat_name(info.chat));
+    return thinking != 0;
 }
 
 static void dump_logits(const RqModel *m, RqCtx *c, RqSeq *s, char *text, char *out_path) {
@@ -512,7 +529,8 @@ static void error_usage(void) {
     fprintf(stderr, "  -o <string> output file for -m logits / dequant\n");
     fprintf(stderr, "  -y <string> system prompt in chat mode, default is none\n");
     fprintf(stderr, "  -r <int>    reasoning mode, 0 (default) = no thinking, 1 = thinking (Qwen3-*-Instruct-2507: never,\n");
-    fprintf(stderr, "              -Thinking-2507: always; the chat template variant is read from the GGUF)\n");
+    fprintf(stderr, "              -Thinking-2507: always; Qwen3.8: 1 by default; the chat template variant is read from the GGUF)\n");
+    fprintf(stderr, "  -e <string> reasoning effort with thinking (Qwen3.8's template): xhigh (default) | high (= xhigh) | medium | low\n");
     fprintf(stderr, "  -n <int>    max new tokens per response, 0 (default) = unlimited\n");
     fprintf(stderr, "  -b <int>    prefill chunk size (batched prompt processing), default %d, max %d;\n", RQ_BATCH_MAX, RQ_BATCH_MAX);
     fprintf(stderr, "              0 or 1 = one token at a time\n");
@@ -540,7 +558,9 @@ int main(int argc, char *argv[]) {
     char *mode = "chat";        // generate|chat
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
     int enable_thinking = 0;    // 1 enables thinking
-    int thinking_given = 0;     // -r given (Thinking-2507: a note for -r 0)
+    int thinking_given = 0;     // -r given (Thinking-2507: a note for -r 0; Qwen3.8: on unless -r 0)
+    int effort = RQ_THINK_ON;   // -e: the reasoning effort with thinking (Qwen3.8), RQ_THINK_*
+    int effort_given = 0;
     int ctx_length = 0;         // context length
     char *out_path = NULL;      // output file for -m logits
     int prefill_chunk = RQ_BATCH_MAX; // -b: rows per batched prefill chunk (0 / 1: token by token)
@@ -580,6 +600,11 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'm') { mode = argv[i + 1]; }
         else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
         else if (argv[i][1] == 'r') { enable_thinking = atoi(argv[i + 1]); thinking_given = 1; }
+        else if (argv[i][1] == 'e') {
+            effort = rq_chat_effort(argv[i + 1]);
+            if (effort < 0) error_usage();
+            effort_given = 1;
+        }
         else if (argv[i][1] == 'n') { max_new_tokens = atoi(argv[i + 1]); }
         else if (argv[i][1] == 'o') { out_path = argv[i + 1]; }
         else if (argv[i][1] == 'b') { prefill_chunk = atoi(argv[i + 1]); }
@@ -600,7 +625,7 @@ int main(int argc, char *argv[]) {
     if (prefill_chunk < 0) prefill_chunk = 0;
     if (prefill_chunk > RQ_BATCH_MAX) prefill_chunk = RQ_BATCH_MAX;
     if (ctx_length < 0) die("-c: the context size must be >= 0");
-    enable_thinking = enable_thinking != 0;
+    enable_thinking = enable_thinking != 0 ? effort : 0; // (from here: 0 or the effort, RQ_THINK_*)
 
     char err[512];
     if (strcmp(mode, "tokenize") == 0 || strcmp(mode, "render") == 0) {
@@ -611,6 +636,7 @@ int main(int argc, char *argv[]) {
         RqModelOpts o = { 0, 1, 0 };
         RqModel *m = rq_model_load(checkpoint_path, &o, err, sizeof(err));
         if (!m) die(err);
+        enable_thinking = thinking_default(m, enable_thinking, thinking_given, effort, effort_given, 0);
         // (-m render: the library's rendering for -r as given, e.g. Thinking-2507 with thinking off as runq serve
         // renders a constrained request; the chat forces the variant's mode: thinking_for)
         if (rq_chat_check(m, enable_thinking, err, sizeof(err)) == RQ_ERR_LOAD) {
@@ -643,6 +669,7 @@ int main(int argc, char *argv[]) {
         rq_model_free(m);
         return 0;
     }
+    enable_thinking = thinking_default(m, enable_thinking, thinking_given, effort, effort_given, strcmp(mode, "chat") == 0);
     if (strcmp(mode, "chat") == 0)
         enable_thinking = thinking_for(m, enable_thinking, thinking_given);
     if (rq_chat_check(m, enable_thinking, err, sizeof(err)) == RQ_ERR_LOAD) {

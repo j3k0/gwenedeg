@@ -707,17 +707,21 @@ int main(int argc, char **argv) {
         for (int th = 0; th < 2; th++) {
             RqTokens r = { 0 }, x = { 0 };
             int eff = I.chat == RQ_CHAT_INSTRUCT ? 0 : th; // (the mode rendered)
+            int q38 = I.chat == RQ_CHAT_QWEN38; // (Qwen3.8: earlier replies keep their reasoning, in both modes)
             ok &= rq_chat_render(M, msgs, 4, th, &r) == RQ_OK;
             rq_chat_system(M, "Be brief.", th, &x);
             rq_chat_user_history(M, "Hi", th, &x);
-            RqTokens h = toks(eff ? "Hello!" : "<think>\nhmm\n</think>\n\nHello!");
+            RqTokens h = toks(eff && !q38 ? "Hello!" : "<think>\nhmm\n</think>\n\nHello!");
             rq_tokens_push(&x, h.v, h.n);
             rq_chat_end(M, &x);
             rq_chat_user(M, "Bye", th, &x);
             ok &= r.n == x.n && !memcmp(r.v, x.v, r.n * sizeof(int));
-            // the history form from the generated tokens equals the one from the text
-            RqTokens g = toks("<think>\nhmm\n</think>\n\nHello!"), hg = { 0 };
-            ok &= rq_chat_reply_history(M, g.v, g.n, th, &hg) == RQ_OK && hg.n == h.n && !memcmp(hg.v, h.v, h.n * sizeof(int));
+            // the history form from the generated tokens equals the one from the text (Qwen3.8: generated after the
+            // generation suffix, "<think>\n" / the empty think block, which the history form puts back)
+            RqTokens g = toks(!q38 ? "<think>\nhmm\n</think>\n\nHello!" : th ? "hmm\n</think>\n\nHello!" : "Hello!"), hg = { 0 };
+            RqTokens hw = q38 && !th ? toks("<think>\n\n</think>\n\nHello!") : h;
+            ok &= rq_chat_reply_history(M, g.v, g.n, th, &hg) == RQ_OK && hg.n == hw.n && !memcmp(hg.v, hw.v, hw.n * sizeof(int));
+            if (hw.v != h.v) rq_tokens_free(&hw);
             // the generation prompt alone: the end of the user turn's piece
             RqTokens u = { 0 }, ua = { 0 }, ga = { 0 };
             rq_chat_user(M, "Hi", th, &u);
@@ -739,6 +743,7 @@ int main(int argc, char **argv) {
         report(ok, "chat_render", I.chat == RQ_CHAT_HYBRID ? "system, user, assistant, user; thinking off / on"
                                   : I.chat == RQ_CHAT_INSTRUCT ? "system, user, assistant, user (instruct-2507: no thinking)"
                                   : I.chat == RQ_CHAT_QWEN35 ? "system, user, assistant, user (qwen3.5); thinking off / on"
+                                  : I.chat == RQ_CHAT_QWEN38 ? "system, user, assistant, user (qwen3.8: reasoning kept); thinking off / on"
                                   : "system, user, assistant, user (thinking-2507)");
     }
 

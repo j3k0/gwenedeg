@@ -778,6 +778,7 @@ static void load_tokenizer_only(RqModel *m, const char *path, Loader *ld) {
         gguf_parse(&m->gguf);
         gguf_config(&m->gguf, &m->config, &m->rope_theta, &m->rope_dim, &m->hy);
         m->chat = gguf_chat_variant(&m->gguf);
+        m->samp_set = gguf_sampling(&m->gguf, &m->samp_temp, &m->samp_topp, &m->samp_topk);
         build_tokenizer_gguf(&m->tok, &m->gguf, m->config.vocab_size);
         m->has_tok = 1;
         unmap_file(m); // (the tokenizer copied what it needs)
@@ -820,6 +821,7 @@ static void load_model(RqModel *m, const char *path, const RqModelOpts *o, Loade
         gguf_parse(&m->gguf);
         gguf_config(&m->gguf, c, &m->rope_theta, &m->rope_dim, &m->hy);
         m->chat = gguf_chat_variant(&m->gguf);
+        m->samp_set = gguf_sampling(&m->gguf, &m->samp_temp, &m->samp_topp, &m->samp_topk);
         if (m->hy.nextn) // (the layer pattern would count the MTP block as a main layer; tokenizer-only loads are fine)
             load_fail(e, "GGUF %s: MTP (multi-token prediction) layers are not supported yet: %s.nextn_predict_layers = %d, "
                       "block_count %d includes the nextn block%s", path, m->hy.on ? "qwen35" : "qwen3", m->hy.nextn,

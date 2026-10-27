@@ -63,6 +63,7 @@ struct Job {
     RqTokens prompt;            // the rendered conversation, ending with the assistant header
     int max_new;                // generated tokens at most (>= 1)
     float temperature, top_p;
+    int top_k;                  // 0: off
     unsigned long long seed;
     int thinking;               // the reply starts in a <think> block: reasoning / content split
     const ConSet *con;          // json_schema constraint, or NULL

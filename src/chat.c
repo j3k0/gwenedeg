@@ -207,11 +207,63 @@ int rq_chat_render(const RqModel *m, const RqMessage *msgs, int n, int thinking,
     return e == RQ_OK && users == 0 ? RQ_ERR_ARG : e;
 }
 
+void rq_gen_start(RqGen *g, RqSeq *s, const RqSampling *cfg, int max_new, const RqCallbacks *cb, int n) {
+    // the RNG: one draw per prefilled token but the last (a reply sampled after a prompt fed in one prefill
+    // draws as one fed token by token, sampling after each, would)
+    g->s = s;
+    g->cfg = cfg;
+    g->cb = cb;
+    g->max_new = max_new;
+    g->n_gen = 0;
+    g->token = -1;
+    g->stop = -1;
+    if (cfg->temperature != 0)
+        for (int i = 0; i < n - 1; i++)
+            random_f32(rq_seq_rng(s));
+}
+
+int rq_gen_step(RqGen *g, RqCtx *c, int pos, float *logits) {
+    // one token of the loop: report the logits, sample, then the stop checks in rq_generate's order
+    RqSeq *s = g->s;
+    const RqCallbacks *cb = g->cb;
+    if (cb && cb->on_logits)
+        cb->on_logits(cb->user, pos, logits);
+    int next = rq_sample(c, s, logits, g->cfg);
+    if (next < 0) return next;
+    g->token = next;
+    if (rq_is_end_token(s->m, next)) {
+        g->stop = RQ_STOP_END;
+        return RQ_GEN_DONE;
+    }
+    if (cb && cb->on_token && cb->on_token(cb->user, next)) {
+        g->stop = RQ_STOP_CALLBACK;
+        return RQ_GEN_DONE;
+    }
+    if (pos + 1 >= rq_seq_capacity(s)) {
+        g->stop = RQ_STOP_CONTEXT;
+        return RQ_GEN_DONE;
+    }
+    g->n_gen++;
+    if (g->max_new > 0 && g->n_gen >= g->max_new) {
+        g->stop = RQ_STOP_LIMIT;
+        return RQ_GEN_LAST;
+    }
+    return RQ_GEN_NEXT;
+}
+
+unsigned long long rq_logits_hash(const float *logits, int n) {
+    const unsigned char *b = (const unsigned char *)logits;
+    unsigned long long h = 1469598103934665603ull;
+    for (size_t i = 0; i < (size_t)n * sizeof(float); i++)
+        h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+
 int rq_generate(RqCtx *c, RqSeq *s, const int *tokens, int n, const RqSampling *cfg, int max_new,
                 const RqCallbacks *cb, RqGenStats *st) {
-    // the CLI chat's loop: prefill what is new, then sample, report, feed back; ends at an end token
-    // (sampled, not fed: a next turn's prefill starts with it, so it is in the cache before the next
-    // turn), at max_new tokens, at the end of the context (the token that does not fit is reported
+    // the CLI chat's loop: prefill what is new, then sample, report, feed back (rq_gen_step); ends at an
+    // end token (sampled, not fed: a next turn's prefill starts with it, so it is in the cache before the
+    // next turn), at max_new tokens, at the end of the context (the token that does not fit is reported
     // but not fed), or when on_token asks to stop
     RqGenStats z;
     if (!st) st = &z;
@@ -221,38 +273,20 @@ int rq_generate(RqCtx *c, RqSeq *s, const int *tokens, int n, const RqSampling *
     int e = rq_prefill(c, s, tokens, n, RQ_LOGITS_LAST, NULL, &logits);
     if (e != RQ_OK) return e;
     st->n_prompt = n;
-    if (cfg->temperature != 0)
-        for (int i = 0; i < n - 1; i++)
-            random_f32(rq_seq_rng(s));
+    RqGen g;
+    rq_gen_start(&g, s, cfg, max_new, cb, n);
     double t_prefill = rq_now();
     st->t_prefill = t_prefill - t0;
-    const RqModel *m = s->m;
     while (1) {
-        if (cb && cb->on_logits)
-            cb->on_logits(cb->user, rq_seq_len(s) - 1, logits);
-        int next = rq_sample(c, s, logits, cfg);
-        if (next < 0) { e = next; break; }
-        if (rq_is_end_token(m, next)) {
-            st->stop = RQ_STOP_END;
-            break;
-        }
-        if (cb && cb->on_token && cb->on_token(cb->user, next)) {
-            st->stop = RQ_STOP_CALLBACK;
-            break;
-        }
-        if (rq_seq_len(s) >= rq_seq_capacity(s)) {
-            st->stop = RQ_STOP_CONTEXT;
-            break;
-        }
-        int last = max_new > 0 && st->n_gen + 1 >= max_new;
-        e = rq_decode(c, s, next, last ? NULL : &logits);
+        int r = rq_gen_step(&g, c, rq_seq_len(s) - 1, logits);
+        if (r < 0) { e = r; break; }
+        if (r == RQ_GEN_DONE) break;
+        e = rq_decode(c, s, g.token, r == RQ_GEN_LAST ? NULL : &logits);
         if (e != RQ_OK) break;
         st->n_gen++;
-        if (last) {
-            st->stop = RQ_STOP_LIMIT;
-            break;
-        }
+        if (r == RQ_GEN_LAST) break;
     }
+    if (e == RQ_OK) st->stop = g.stop; // (an error: RQ_STOP_END, as before)
     st->t_gen = rq_now() - t_prefill;
     return e;
 }

@@ -357,3 +357,26 @@ int gguf_chat_variant(const Gguf *g) {
         return RQ_CHAT_THINKING;
     return RQ_CHAT_INSTRUCT;
 }
+
+int gguf_sampling(const Gguf *g, float *temp, float *topp, int *topk) {
+    // the recommended sampling settings (general.sampling.temp / top_p / top_k, llama.cpp's keys): a mask of
+    // RQ_SAMPLING_* for those present with a usable type and value (others ignored: they are advice, not a
+    // reason to refuse the file)
+    int set = 0;
+    const GgufKV *kv;
+    float f;
+    if ((kv = gguf_find(g, "general.sampling.temp")) && kv->type == GV_F32) {
+        memcpy(&f, g->map + kv->off, 4);
+        if (f >= 0 && f <= 100) { *temp = f; set |= RQ_SAMPLING_TEMP; }
+    }
+    if ((kv = gguf_find(g, "general.sampling.top_p")) && kv->type == GV_F32) {
+        memcpy(&f, g->map + kv->off, 4);
+        if (f > 0 && f <= 1) { *topp = f; set |= RQ_SAMPLING_TOPP; }
+    }
+    if ((kv = gguf_find(g, "general.sampling.top_k")) && (kv->type == GV_I32 || kv->type == GV_U32)) {
+        int32_t k;
+        memcpy(&k, g->map + kv->off, 4);
+        if (k >= 0) { *topk = k; set |= RQ_SAMPLING_TOPK; }
+    }
+    return set;
+}

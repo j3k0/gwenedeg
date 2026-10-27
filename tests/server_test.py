@@ -11,8 +11,8 @@ builds). Checks:
   basic      /health, /v1/models, /v1/models/{id}, keep-alive (several requests on one connection)
   chat       greedy completions == `runq -m chat -t 0` for the same messages, bitwise: single turn, with
              a system prompt, a second turn (history re-sent as messages; its prompt reuses the cached
-             first turn: usage.prompt_tokens_details.cached_tokens); seeded sampling (-t 0.8 -s 42) ==
-             the CLI's; thinking (reasoning_effort): reasoning_content is the CLI's <think> text
+             first turn: usage.prompt_tokens_details.cached_tokens); seeded sampling (-t 0.8 -s 42; top_k 3:
+             -K 3) == the CLI's; thinking (reasoning_effort): reasoning_content is the CLI's <think> text
   cache      prefix reuse == fresh prefill: the same request repeated (all but one prompt token cached),
              a request sharing only the system prompt, and cache_prompt: false give identical text and
              logprobs (9 significant digits of every logit's log-softmax: bit-identical logits)
@@ -219,6 +219,7 @@ def main():
         "pirate": ex.submit(cli, a, ["-t", "0", "-n", "16", "-y", PIRATE_SYS, "-i", PIRATE]),
         "ada": ex.submit(cli, a, ["-t", "0", "-n", "32"], "\n".join(ADA) + "\n"),
         "cats": ex.submit(cli, a, ["-t", "0.8", "-p", "0.9", "-s", "42", "-n", "16", "-i", CATS]),
+        "cats_k": ex.submit(cli, a, ["-t", "1.2", "-p", "0.95", "-K", "3", "-s", "42", "-n", "16", "-i", CATS]),
         "think": ex.submit(cli, a, ["-t", "0", "-n", "16", "-r", "1", "-i", MULT]),
     }
     port = None
@@ -299,6 +300,10 @@ def run_all(a, t, port, ref, slow, logname):
     st, d, _ = chat(port, {"messages": [{"role": "user", "content": CATS}], "temperature": 0.8, "top_p": 0.9, "seed": 42, "max_tokens": 16})
     want = ref["cats"].result()
     rep(st == 200 and text_of(d) + "\n" == want, "chat/seeded", "" if text_of(d) + "\n" == want else f"{text_of(d)!r} vs {want!r}")
+    st, d, _ = chat(port, {"messages": [{"role": "user", "content": CATS}], "temperature": 1.2, "top_p": 0.95, "top_k": 3, "seed": 42,
+                           "max_tokens": 16})
+    want = ref["cats_k"].result()
+    rep(st == 200 and text_of(d) + "\n" == want, "chat/seeded_top_k", "" if text_of(d) + "\n" == want else f"{text_of(d)!r} vs {want!r}")
     st, d, _ = chat(port, {"messages": [{"role": "user", "content": MULT}], "temperature": 0, "max_tokens": 16, "reasoning_effort": "high"})
     want, m = ref["think"].result(), d["choices"][0]["message"]
     rs = m.get("reasoning_content") or ""
@@ -510,6 +515,7 @@ def run_all(a, t, port, ref, slow, logname):
     err("bad_ref", 400, body={"messages": U, "response_format": {"type": "json_schema", "json_schema": {"schema": {"$ref": "#/$defs/Nope"}}}})
     err("json_object", 400, body={"messages": U, "response_format": {"type": "json_object"}})
     err("temperature", 400, body={"messages": U, "temperature": 5})
+    err("top_k", 400, body={"messages": U, "top_k": 2.5})
     err("max_tokens", 400, body={"messages": U, "max_tokens": 0})
     err("tools", 400, body={"messages": U, "tools": [{"type": "function", "function": {"name": "f"}}]})
     err("context_length", 400, "context_length_exceeded", body={"messages": [{"role": "user", "content": "word " * 2500}]})

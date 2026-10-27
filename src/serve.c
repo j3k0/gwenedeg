@@ -30,7 +30,7 @@ typedef struct {
     RqModelInfo info;
     char model_id[256];
     const char *api_key;
-    int ctx, verbose, def_max_tokens;
+    int ctx, verbose, def_max_tokens, def_topk;
     float def_temp, def_topp;
     double timeout;
     long long created;
@@ -307,9 +307,13 @@ static int parse_chat(App *a, const Js *root, Chat *ch, Job *j, ReqErr *e) {
 
     // sampling and limits
     double temp = a->def_temp, topp = a->def_topp;
-    if (get_num(root, "temperature", 0, 2, &temp, e) || get_num(root, "top_p", 0, 1, &topp, e)) return -1;
+    long long topk = a->def_topk; // (an extension, as vLLM's / llama.cpp's: -1 or 0 = off)
+    if (get_num(root, "temperature", 0, 2, &temp, e) || get_num(root, "top_p", 0, 1, &topp, e) ||
+        get_int(root, "top_k", -1, 1 << 30, &topk, e))
+        return -1;
     j->temperature = (float)temp;
     j->top_p = (float)topp;
+    j->top_k = topk > 0 ? (int)topk : 0;
     long long seed = 0, maxt = 0, maxc = 0;
     int has_seed = json_get(root, "seed") && json_get(root, "seed")->t != JS_NULL;
     if (get_int(root, "seed", -(1LL << 53), 1LL << 53, &seed, e)) return -1;
@@ -664,6 +668,8 @@ static void usage(void) {
             "  --timeout <s>       time limit per request incl. queueing (504), default 600, 0 = none\n"
             "  -t <float>          default temperature (requests without one), default 1.0\n"
             "  -p <float>          default top_p, default 1.0\n"
+            "  --top-k <int>       default top_k, default 0 = off (-t / -p / --top-k not given: the model's recommended\n"
+            "                      values if its GGUF has them, general.sampling.*)\n"
             "  -n <int>            default max tokens (requests without one), default 0 = up to the context\n"
             "  --threads <int>     threads per forward pass, default OMP_NUM_THREADS or nproc - nproc/8\n"
             "  -v, --verbose       log request bodies and responses\n");
@@ -679,6 +685,7 @@ int serve_main(int argc, char **argv) {
     long long maxbody = 4 << 20;
     double timeout = 600, temp = 1.0, topp = 1.0, kv_mem = 0, mem = 0;
     int page_cache = 0;
+    int topk = 0, samp_given = 0; // (RQ_SAMPLING_* given: else the model's values, if any)
     for (int i = 2; i < argc; i++) {
         const char *f = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         if (!strcmp(f, "-v") || !strcmp(f, "--verbose")) { verbose = 1; continue; }
@@ -711,14 +718,15 @@ int serve_main(int argc, char **argv) {
         else if (!strcmp(f, "--max-conns")) conns = atoi(v);
         else if (!strcmp(f, "--max-body")) maxbody = atoll(v);
         else if (!strcmp(f, "--timeout")) timeout = atof(v);
-        else if (!strcmp(f, "-t")) temp = atof(v);
-        else if (!strcmp(f, "-p")) topp = atof(v);
+        else if (!strcmp(f, "-t")) { temp = atof(v); samp_given |= RQ_SAMPLING_TEMP; }
+        else if (!strcmp(f, "-p")) { topp = atof(v); samp_given |= RQ_SAMPLING_TOPP; }
+        else if (!strcmp(f, "--top-k")) { topk = atoi(v); samp_given |= RQ_SAMPLING_TOPK; }
         else if (!strcmp(f, "-n")) maxtok = atoi(v);
         else if (!strcmp(f, "--threads")) threads = atoi(v);
         else usage();
     }
     if (port < 0 || port > 65535 || ctx < 16 || slots < 0 || slots > 1024 || parallel < 1 || parallel > 256 || kv_mem < 0 || chunk < 1 ||
-        copy_min < 0 || queue < 1 || conns < 1 || maxbody < 1024 || temp < 0 || temp > 2 || topp <= 0 || topp > 1 || maxtok < 0 || batch < 1)
+        copy_min < 0 || queue < 1 || conns < 1 || maxbody < 1024 || temp < 0 || temp > 2 || topp <= 0 || topp > 1 || topk < 0 || maxtok < 0 || batch < 1)
         usage();
     if (batch > RQ_BATCH_MAX) batch = RQ_BATCH_MAX;
 
@@ -746,8 +754,11 @@ int serve_main(int argc, char **argv) {
     a.ctx = ctx;
     a.verbose = verbose;
     a.api_key = key;
-    a.def_temp = (float)temp;
-    a.def_topp = (float)topp;
+    RqSampling ms = { (float)temp, (float)topp, NULL, topk };
+    int mset = rq_model_sampling(m, &ms) & ~samp_given; // (the file's values for the options not given; silent)
+    a.def_temp = (mset & RQ_SAMPLING_TEMP) && ms.temperature <= 2 ? ms.temperature : (float)temp;
+    a.def_topp = mset & RQ_SAMPLING_TOPP ? ms.topp : (float)topp;
+    a.def_topk = mset & RQ_SAMPLING_TOPK ? ms.top_k : topk;
     a.def_max_tokens = maxtok;
     a.timeout = timeout;
     a.created = (long long)time(NULL);

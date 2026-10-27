@@ -46,7 +46,8 @@ Tests (see tests/README.md):
              rendering, detokenization; the batched passes' digests at 1 / 8 / 16 threads and on the
              generic build == the main runs; two models in one process (api_test --two: the GGUF Q8_0 and
              Q4_K_M files interleaved == each alone, one freed while the other goes on, the .bin's group
-             size refused while they are loaded)
+             size refused while they are loaded); the sampler's top-k (api_test --sample, both builds) == a numpy
+             replay draw for draw (tests/sampler_ref.py)
 
 Logits metrics, per position, over U = (fixed 4096-id vocab subset) + (HF top-64 ids):
   cos   cosine similarity of runq vs HF logits on U
@@ -405,8 +406,12 @@ def api_runs(a, ex, gx):
             for tag, m in models if m}
     if a.gguf and a.q4:  # two models in one process (Q8_0 + Q4_K_M; the .bin: another group size, refused)
         main["pair"] = ex.submit(run, [a.api_test, "--two", a.gguf, a.q4, "--gs", a.model], API_THREADS["pair"])
-    dg = {}
     gen = a.api_test + "-generic"
+    # the sampler's top-k draws == tests/sampler_ref.py's numpy replay, both builds (one thread each)
+    main["sampler"] = ex.submit(run, [sys.executable, "-I", os.path.join(ROOT, "tests", "sampler_ref.py"), "--runq", a.runq,
+                                      "--api-test", a.api_test] + (["--api-test", gen] if os.path.exists(gen) else []) +
+                                ["--model", a.model], 1)
+    dg = {}
     if os.path.exists(gen):
         for tag, m in models:
             if m and tag != "gguf":
@@ -442,7 +447,7 @@ def test_api(a, res, runs):
         for l in lines:
             ok, rest = l.startswith("PASS "), l[5:]
             name, _, detail = rest.partition("  ")
-            res.report(ok, f"api_{tag}/{name.strip()}", detail.strip())
+            res.report(ok, name.strip() if tag == "sampler" else f"api_{tag}/{name.strip()}", detail.strip())
         if p.returncode not in (0, 1) or not lines:
             res.report(False, f"api_{tag}/run", f"exit status {p.returncode}: {p.stderr.decode(errors='replace')[-300:]}")
     for (tag, label), fut in dfuts.items():

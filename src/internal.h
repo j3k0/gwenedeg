@@ -222,6 +222,8 @@ struct RqModel {
     int ctx_max;                // the model's context length (metadata) before the ctx_len cap
     int chat;                   // chat template variant (RQ_CHAT_*): from the GGUF's tokenizer.chat_template
     RqModelMem mem;             // the load-time memory estimate (model.c, rq_model_mem)
+    float samp_temp, samp_topp; // the file's recommended sampling settings (general.sampling.*: rq_model_sampling),
+    int samp_topk, samp_set;    // samp_set: which (RQ_SAMPLING_*), 0: none
     // chat templates per thinking mode (0 off, 1 on): the user turn + assistant header with one %s
     // (.template / .template.with-thinking), the system block with one %s (the start of
     // .template.with-system[-and-thinking]); tmpl_missing: the .bin side file that could not be read
@@ -240,6 +242,7 @@ const GgufTensor *gguf_tensor(const Gguf *g, const char *name);
 const uint8_t *gguf_weight(const Gguf *g, const char *name, uint32_t type, uint64_t ne0, uint64_t ne1);
 void gguf_config(const Gguf *g, Config *c, float *rope_theta, int *rope_dim, Hybrid *hy);
 int gguf_chat_variant(const Gguf *g); // RQ_CHAT_* from tokenizer.chat_template (hybrid if absent / unknown)
+int gguf_sampling(const Gguf *g, float *temp, float *topp, int *topk); // general.sampling.*: RQ_SAMPLING_* set
 // model.c
 const char *chat_gen_suffix(const RqModel *m, int thinking); // after the assistant header (the variant's)
 void *alloc_big(size_t n);

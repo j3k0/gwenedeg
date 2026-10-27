@@ -57,6 +57,7 @@ CLI options (`./runq` without arguments prints them all):
 |---|---|
 | `-c N` | context size in tokens; default: the model's maximum, at most 40,960. Pass it: the KV cache is reserved for the whole context (as address space, touched only as used) |
 | `-t T`, `-p P`, `-s S` | temperature (default 1.0, 0 = greedy), top-p (0.9), seed |
+| `-K N` | top-k: sample among the N most likely tokens, then top-p among them (default 0 = off). `-t` / `-p` / `-K` not given: the model's recommended values if its GGUF has them (`general.sampling.*`, e.g. Qwen3.8-27B 1.0 / 0.95 / 20; none of the Qwen3 / Qwen3.5 files here do) |
 | `-n N` | max new tokens per answer (default unlimited) |
 | `-i TEXT`, `-y TEXT` | a single prompt (one turn, then exit); the system prompt |
 | `-r 0\|1` | thinking off (default) / on |
@@ -244,7 +245,8 @@ has three kinds of objects:
 The forward passes are `rq_decode` (one token), `rq_prefill` (a sequence's tokens in chunks) and
 `rq_forward_batch` (one pass over rows of several sequences, each at its own position: prefill chunks
 next to decode rows). On top of them sit `rq_sample` / `rq_sample_batch` (temperature, top-p, an optional
-token mask), `rq_generate` (the chat loop with per-token callbacks), `rq_tokenize`, `rq_detok_push`
+token mask), `rq_generate` (the chat loop with per-token callbacks; built on `rq_gen_start` / `rq_gen_step`, one
+token at a time, for loops that feed the tokens themselves, e.g. speculative decoding), `rq_tokenize`, `rq_detok_push`
 (incremental, UTF-8 safe) and `rq_chat_render`. Errors come back as `RQ_ERR_*` codes and messages; the
 library never prints or exits. `RqModelOpts.mem` / `.page_cache` set the load's memory check and page-cache policy
 (Memory, above); `rq_model_mem` and `rq_seq_mem` return the estimates (the server sizes its slot pool with the latter).

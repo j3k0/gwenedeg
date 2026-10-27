@@ -33,13 +33,15 @@ curl -s localhost:8080/v1/chat/completions -d '{"messages": [{"role": "user", "c
 | `--max-conns N`, `--max-body B` | 128, 4 MB | connections (more: 503), request body size (more: 413) |
 | `--timeout S` | 600 | per request incl. queueing (504; 0 = none) |
 | `-t`, `-p`, `-n` | 1.0, 1.0, 0 | defaults for requests without temperature / top_p / max_tokens (0: up to the context) |
+| `--top-k N` | 0 (off) | default for requests without top_k. `-t` / `-p` / `--top-k` not given: the model's recommended values if its GGUF has them (`general.sampling.temp` / `top_p` / `top_k`, e.g. Qwen3.8-27B 1.0 / 0.95 / 20) |
 | `--threads N` | `OMP_NUM_THREADS`, else nproc - nproc/8 | threads per forward pass |
 | `-v`, `--verbose` | off | log request bodies and responses |
 
 Endpoints: `POST /v1/chat/completions` (also `/chat/completions`), `GET /v1/models`, `GET /v1/models/{id}`,
 `GET /health` (also `/v1/health`: status, running and queued requests). Chat completions take `messages`
 (system / developer / user / assistant; content a string or an array of `{"type": "text"}` parts),
-`max_tokens` / `max_completion_tokens`, `temperature` (0 = greedy), `top_p`, `seed`, `stop` (a string or
+`max_tokens` / `max_completion_tokens`, `temperature` (0 = greedy), `top_p`, `top_k` (an extension, as vLLM's
+and llama.cpp's: an integer, 0 or -1 = off; top-p then applies among the k), `seed`, `stop` (a string or
 up to 16), `n` (1 only), `stream` (SSE `data:` chunks, `data: [DONE]`, a final usage chunk with
 `stream_options.include_usage`), `logprobs` / `top_logprobs` (up to 20; not with `stream`), `response_format`
 (`text`; `json_schema`, below; `json_object` is rejected with a message), thinking with `reasoning_effort`

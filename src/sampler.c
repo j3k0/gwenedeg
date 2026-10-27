@@ -1,6 +1,6 @@
-/* The sampler: greedy argmax, sampling from the full distribution, top-p (nucleus) sampling, with a
- * per-call configuration (RqSampling) and the sequence's RNG; an optional token mask for constrained
- * decoding. */
+/* The sampler: greedy argmax, sampling from the full distribution, top-p (nucleus) sampling, top-k (then
+ * top-p among those), with a per-call configuration (RqSampling) and the sequence's RNG; an optional token
+ * mask for constrained decoding. */
 #include "internal.h"
 
 typedef struct {
@@ -14,6 +14,7 @@ typedef struct {
     float temperature;
     float topp;
     unsigned long long rng_state;
+    int topk;
 } Sampler;
 
 void softmax(float *x, int size) {
@@ -171,6 +172,92 @@ int sample_topp(float *probabilities, int n, float topp, ProbIndex *probindex, f
     return probindex[n0 - 1 - last_idx].index; // in case of rounding errors
 }
 
+static void topk_sift_down(ProbIndex *h, int n, int i) {
+    // min-heap of h[0..n) in topp_before order: the root is the candidate that comes last
+    ProbIndex x = h[i];
+    for (;;) {
+        int l = 2 * i + 1;
+        if (l >= n) break;
+        int m = l + 1 < n && topp_before(&h[l], &h[l + 1]) ? l + 1 : l; // (the later child)
+        if (!topp_before(&x, &h[m])) break;
+        h[i] = h[m];
+        i = m;
+    }
+    h[i] = x;
+}
+
+int sample_topk(const float *x, int n, int k, float temperature, float topp, ProbIndex *pi, float coin) {
+    // top-k sampling of the logits x at a temperature > 0, then top-p among the k (topp in (0, 1)). The
+    // exact-order rules (the same token for the same coin in every build; tests/sampler_ref.py replays them in
+    // numpy, draw for draw):
+    //   candidates: the k largest x[i], ties by the lower index (topp_before), in that order: c_0 .. c_{k-1}
+    //     (on the logits: the temperature does not change the order)
+    //   weights: w_j = expf((x[c_j] - x[c_0]) * (1 / temperature)) (float, scalar expf), their sum
+    //     S = w_0 + w_1 + ... in this order
+    //   top-p: the first m with w_0 + .. + w_{m-1} > topp * S (W = that prefix sum), else m = k, W = S
+    //   draw: r = coin * W, the first j < m with r < w_0 + .. + w_j; rounding: the last j < m with w_j > 0
+    // No normalization: the nucleus and the draw compare the prefix sums with topp * S and coin * W. The
+    // temperature is one reciprocal and a multiplication per weight, spelled out: a division per value in a
+    // loop is what -Ofast may turn into a multiplication by the reciprocal anyway (sample()'s division of the
+    // whole vocabulary mostly is, measured), which a reference could not know. 1 <= k < n
+    int n0 = 0, i = 0;
+    for (; i < n && n0 < k; i++) { // the first k values, then a min-heap of the best k so far
+        pi[n0].index = i;
+        pi[n0++].prob = x[i];
+    }
+    for (int j = k / 2 - 1; j >= 0; j--)
+        topk_sift_down(pi, k, j);
+    // the rest: a later index never wins a tie, so only x[i] > the root enters. Blocks of 64 whose max is not
+    // above the root are skipped (the max: a loop gcc vectorizes; comparisons only, exact in any order)
+    for (; i < n && (i & 63); i++)
+        if (x[i] > pi[0].prob) { pi[0].index = i; pi[0].prob = x[i]; topk_sift_down(pi, k, 0); }
+    for (; i + 64 <= n; i += 64) {
+        float m = x[i];
+        for (int j = 1; j < 64; j++)
+            m = x[i + j] > m ? x[i + j] : m;
+        if (!(m > pi[0].prob))
+            continue;
+        for (int j = i; j < i + 64; j++)
+            if (x[j] > pi[0].prob) { pi[0].index = j; pi[0].prob = x[j]; topk_sift_down(pi, k, 0); }
+    }
+    for (; i < n; i++)
+        if (x[i] > pi[0].prob) { pi[0].index = i; pi[0].prob = x[i]; topk_sift_down(pi, k, 0); }
+    // heap sort: the root (the last candidate) to the end, k - 1 times: pi[0..k) in candidate order
+    for (int h = k; h > 1; h--) {
+        ProbIndex t = pi[0];
+        pi[0] = pi[h - 1];
+        pi[h - 1] = t;
+        topk_sift_down(pi, h - 1, 0);
+    }
+    // weights and their sum in candidate order (volatile: a sequential float sum, never vectorized and
+    // reassociated under -Ofast; the expf calls stay scalar with it)
+    const float mx = pi[0].prob, inv_t = 1.0f / temperature;
+    volatile float vs = 0;
+    for (int j = 0; j < k; j++) {
+        float w = expf((pi[j].prob - mx) * inv_t);
+        pi[j].prob = w;
+        vs = vs + w;
+    }
+    float sum = vs, cum = 0, wsum = sum;
+    int m = k;
+    if (topp > 0 && topp < 1) {
+        const float t = topp * sum;
+        for (int j = 0; j < k; j++) {
+            cum += pi[j].prob;
+            if (cum > t) { m = j + 1; wsum = cum; break; }
+        }
+    }
+    const float r = coin * wsum;
+    float cdf = 0;
+    int last = 0;
+    for (int j = 0; j < m; j++) {
+        cdf += pi[j].prob;
+        if (r < cdf) return pi[j].index;
+        if (pi[j].prob > 0) last = j;
+    }
+    return pi[last].index; // (rounding)
+}
+
 unsigned int random_u32(unsigned long long *state) {
     // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
     *state ^= *state >> 12;
@@ -181,10 +268,13 @@ unsigned int random_u32(unsigned long long *state) {
 float random_f32(unsigned long long *state) { // random float32 in [0,1)
     return (random_u32(state) >> 8) / 16777216.0f;
 }
+float rq_rng_f32(unsigned long long *state) { return random_f32(state); }
 
 // (not inlined: as a function of its own, taking the configuration through a pointer, its code is
-// the same as before the API; e.g. the temperature division stays a division per value, which
-// -Ofast would otherwise be free to turn into a multiplication by the reciprocal, other bits)
+// the same as before the API. Its temperature division is not one division per value, though: gcc
+// -Ofast compiles it as multiplications by 1 / T (vectorized; vrcpps + Newton for some, vdivss for
+// the rest, gcc 14; P5 measured it against numpy's division), the same code in both builds; top-k
+// does not use it, sample_topk spells out its own reciprocal)
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noinline))
 #endif
@@ -194,6 +284,9 @@ int sample(Sampler *sampler, float *logits) {
         // greedy argmax sampling: take the token with the highest probability
         return sample_argmax(logits, sampler->vocab_size);
     } else {
+        if (sampler->topk > 0 && sampler->topk < sampler->vocab_size) // top-k (then top-p among the k)
+            return sample_topk(logits, sampler->vocab_size, sampler->topk, sampler->temperature, sampler->topp,
+                               sampler->probindex, random_f32(&sampler->rng_state));
         // apply the temperature to the logits
         for (int q = 0; q < sampler->vocab_size; q++) { logits[q] /= sampler->temperature; }
         // apply softmax to the logits to get the probabilities for next token
@@ -225,10 +318,17 @@ static int sample_row(int V, void *scratch, RqSeq *s, float *logits, const RqSam
         for (int i = 0; i < V; i++)
             if (!cfg->allow[i]) logits[i] = low;
     }
-    Sampler smp = { V, scratch, cfg->temperature, cfg->topp, s->rng };
+    Sampler smp = { V, scratch, cfg->temperature, cfg->topp, s->rng, cfg->top_k };
     int token = sample(&smp, logits);
     s->rng = smp.rng_state;
     return token;
+}
+
+int rq_model_sampling(const RqModel *m, RqSampling *cfg) {
+    if (m->samp_set & RQ_SAMPLING_TEMP) cfg->temperature = m->samp_temp;
+    if (m->samp_set & RQ_SAMPLING_TOPP) cfg->topp = m->samp_topp;
+    if (m->samp_set & RQ_SAMPLING_TOPK) cfg->top_k = m->samp_topk;
+    return m->samp_set;
 }
 
 int rq_sample(RqCtx *c, RqSeq *s, float *logits, const RqSampling *cfg) {

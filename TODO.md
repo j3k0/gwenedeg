@@ -15,7 +15,7 @@ Decode Qwen3.8-27B (`qwen35`, 64 layers, r = 3, untied, an MTP block) at ~13-18 
 Qwen3.5-0.8B as the draft, the output **exactly** plain decoding's (tokens, greedy and seeded, and each emitted
 token's logits bits). Facts, measurements and decisions: [docs/qwen38-speculative.md](docs/qwen38-speculative.md).
 Added rule for this section: speculative output == plain output (tokens + a hash of each emitted token's logits).
-Order: the preparation items (P3-P5) first, each a no-behaviour-change step checked by the regression net
+Order: the preparation items (P3, P4) first, each a no-behaviour-change step checked by the regression net
 (`tests/compare_bins.sh REF_DIR NEW_DIR`: every model family, Qwen3.5 and the synthetic r = 2 / 3 models too), then
 the steps (S). **Disk and RAM:** ~40 GB free with the 27B Q4_K_M downloaded (`models/Qwen3.8-27B-GGUF`, sha256 checked),
 `models/` 45 GB; `/tmp` is a 16 GB tmpfs (RAM: no models or venvs there); check `df` / `MemAvailable` before every
@@ -38,10 +38,6 @@ Preparation (no output changes; `make test` and `tests/compare_bins.sh` byte-ide
   cache (`posix_fadvise(POSIX_FADV_DONTNEED)`; the loader `pread`s). (d) Record load peak RSS for the 8B Q4_K_M and
   the 4B Q8_0 as the baseline (tests/README or BENCHMARKS). Done when the estimates are within ~5% of the measured
   RSS and outputs are unchanged.
-- [ ] **P5. Top-k and the per-model sampling defaults.** (The step part is done: `rq_gen_start` / `rq_gen_step` in
-  `src/runq.h`, which `rq_generate` is built on.) Top-k and the per-model defaults from `general.sampling.*`
-  (Qwen3.8: 1.0 / 0.95 / 20; the older item "Top-k sampling and per-model sampling defaults" is folded in here), with
-  the sampler's exact-order rules. Done when top-k matches a numpy reference of the sampler on recorded logits.
 
 Steps:
 
@@ -52,7 +48,7 @@ Steps:
   sample == draft (the first mismatch's sample is the next token), truncate both sequences.
   Adaptive length as an option: stop drafting at the first guess whose draft top-1 probability < tau, at most k
   (measured +5-6% est. tok/s at tau 0.4-0.5, k 6-8; docs/qwen38-speculative.md). Refuse a draft whose vocabulary or
-  token bytes (hash) differ. CLI `-D draft.gguf -K k` (and the tau); stats in `[timing]`. Done
+  token bytes (hash) differ. CLI `-D draft.gguf -G k` (`-K` is top-k; and the tau); stats in `[timing]`. Done
   when, greedy and seeded, thinking on / off: tokens == `rq_generate`'s, each emitted token's logits hash == plain
   decoding's, `-K 0` is plain decoding; in `make test` on the 0.6B pair.
 - [ ] **S2. Verify-pass cost** (measure first). A segment of 2-8 rows of one sequence takes the prefill path
@@ -94,9 +90,10 @@ Steps:
   row from the verify pass (a new `rq_forward_batch` output). Measure acceptance first; keep whichever draft gives
   more tok/s.
 - [ ] **S10. Seed-coupled drafting at temperature > 0.** The draft samples its guess with the target's next uniform
-  draw u_j (known from a copy of the target's RNG) and the same settings, instead of its argmax: more accepted
-  guesses (up to sum min(p, q)), output unchanged. Measure first with the API's `top_logprobs` = 20
-  (`scripts/spec_accept.py gen --top-logprobs 20`). Needs P5's top-k and the same candidate order in both models.
+  draw u_j (known from a copy of the target's RNG: `rq_seq_rng` + `rq_rng_f32`) and the same settings, instead of its
+  argmax: more accepted guesses (up to sum min(p, q)), output unchanged. Measure first with the API's `top_logprobs`
+  = 20 (`scripts/spec_accept.py gen --top-logprobs 20`). Top-k is in the sampler (`rq_sample`'s exact order,
+  `src/runq.h`).
 
 RAM for the 27B runs (decided 2026-10-27): the parcolab, billing and triominos-server containers are stopped
 for the runs (`docker compose -p NAME stop`; `start` brings them back), which leaves ~24 GB available: the Q4_K_M

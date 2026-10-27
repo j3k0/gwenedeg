@@ -57,6 +57,7 @@ CLI options (`./runq` without arguments prints them all):
 |---|---|
 | `-c N` | context size in tokens; default: the model's maximum, at most 40,960. Pass it: the KV cache is reserved for the whole context (as address space, touched only as used) |
 | `-t T`, `-p P`, `-s S` | temperature (default 1.0, 0 = greedy), top-p (0.9), seed |
+| `-K N` | top-k: sample among the N most likely tokens, then top-p among them (default 0 = off). `-t` / `-p` / `-K` not given: the model's recommended values if its GGUF has them (`general.sampling.*`, e.g. Qwen3.8-27B 1.0 / 0.95 / 20; none of the Qwen3 / Qwen3.5 files here do) |
 | `-n N` | max new tokens per answer (default unlimited) |
 | `-i TEXT`, `-y TEXT` | a single prompt (one turn, then exit); the system prompt |
 | `-r 0\|1` | thinking off (default) / on |

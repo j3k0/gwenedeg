@@ -173,11 +173,25 @@ typedef struct {
     float temperature;          // 0 = greedy (argmax)
     float topp;                 // nucleus sampling in (0, 1); else the full distribution
     const unsigned char *allow; // optional token mask (vocab_size entries, nonzero = allowed): constrained decoding
+    int top_k;                  // sample among the top_k most likely tokens (then top-p among them); <= 0 or >=
+                                // vocab_size: off (the full distribution / top-p as above)
 } RqSampling;
 
 // The next token from logits (modified in place when temperature > 0), with the sequence's RNG
-// (one draw when temperature > 0). RQ_ERR_ARG if the mask allows no token
+// (one draw when temperature > 0). RQ_ERR_ARG if the mask allows no token. The order is exact (the same
+// token for the same draw in every build): top-p takes the tokens by decreasing probability, ties by the
+// lower id, until their sum exceeds topp; top-k (temperature > 0): the k largest logits (ties: the lower
+// id), weights expf((l - max) x (1 / temperature)) summed in that order, top-p as the first prefix of them
+// whose sum exceeds topp x the k's sum, then the draw u x that prefix's sum against the running sum
+// (src/sampler.c, sample_topk; tests/sampler_ref.py replays it; this path leaves the logits as given)
 int rq_sample(RqCtx *c, RqSeq *s, float *logits, const RqSampling *cfg);
+// The model file's recommended settings (GGUF general.sampling.temp / top_p / top_k, as llama.cpp's converter
+// writes them; e.g. Qwen3.8-27B: 1.0 / 0.95 / 20), for the options a user did not set: the fields the file has
+// are written to *cfg (temperature, topp, top_k; the others untouched), and the return value says which:
+// RQ_SAMPLING_TEMP | RQ_SAMPLING_TOPP | RQ_SAMPLING_TOPK (0: none; .bin files: none). Values out of range
+// (temperature < 0, top_p outside (0, 1], top_k < 0) or of another type are ignored
+enum { RQ_SAMPLING_TEMP = 1, RQ_SAMPLING_TOPP = 2, RQ_SAMPLING_TOPK = 4 };
+int rq_model_sampling(const RqModel *m, RqSampling *cfg);
 // The same for n rows at once, e.g. the logits of an rq_forward_batch pass: row i (logits + i * vocab_size,
 // modified in place as by rq_sample) with seqs[i]'s RNG and cfg[i] (ncfg == n) or cfg[0] (ncfg == 1), on the
 // thread pool; tokens[i] = rq_sample's result for that row (a token, or RQ_ERR_ARG). Returns RQ_OK, or an

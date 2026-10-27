@@ -17,7 +17,10 @@
  * step, give the logits hashes of each model alone (each run in a fresh process first: fork); then A is freed
  * and B goes on (== alone). Also: a sequence of one model on the other's context is refused, and with --gs a
  * model of another group size (the .bin: 64) is refused cleanly while A or B is loaded (they go on unchanged),
- * and loads once both are freed. DIGEST lines (a hash of each model's work) to compare builds. */
+ * and loads once both are freed. DIGEST lines (a hash of each model's work) to compare builds.
+ *   tests/api_test MODEL --sample LOGITS_FILE < PLAN
+ * rq_sample on the rows of a -m logits file, with the settings and RNG states of PLAN's lines ("T P K ROW
+ * SEED..."): SAMPLE lines for tests/sampler_ref.py (the sampler's exact order replayed in numpy: top-k). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -230,9 +233,57 @@ static int gen_verify_loop(RqCtx *c, RqSeq *s, const int *p, int np, const RqSam
 static void batch_tests(RqCtx *c, RqTokens A, RqTokens B, RqTokens C, const float *refB, int only_digest);
 static int two_main(int argc, char **argv);
 
+static int sample_main(int argc, char **argv) {
+    // api_test MODEL --sample LOGITS_FILE < PLAN: rq_sample on rows of a -m logits file (int32 n, vocab, ids[n],
+    // float32 logits[n][vocab]); each PLAN line "T P K ROW SEED..." samples row ROW at temperature T, top-p P,
+    // top-k K once per SEED (the RNG state set to it) and prints "SAMPLE ROW token..." (tests/sampler_ref.py
+    // replays them in numpy)
+    (void)argc;
+    char err[512];
+    rq_threads_init(1);
+    if (!(M = rq_model_load(argv[1], NULL, err, sizeof(err)))) { printf("FAIL setup  %s\n", err); return 1; }
+    rq_model_info(M, &I);
+    V = I.vocab_size;
+    FILE *f = fopen(argv[3], "rb");
+    int32_t hd[2];
+    if (!f || fread(hd, 4, 2, f) != 2 || hd[1] != V || hd[0] < 1) { printf("FAIL setup  %s: not a logits file of this vocabulary\n", argv[3]); return 1; }
+    int n = hd[0], e;
+    float *lg = malloc((size_t)n * V * sizeof(float)), *row = malloc((size_t)V * sizeof(float));
+    if (fseek(f, 4L * n, SEEK_CUR) || fread(lg, sizeof(float), (size_t)n * V, f) != (size_t)n * V) { printf("FAIL setup  short file\n"); return 1; }
+    fclose(f);
+    RqCtx *c = rq_ctx_new(M, 1, 0, &e);
+    RqSeq *s = rq_seq_new(M, 16, RQ_KV_DEFAULT, &e);
+    if (!c || !s) die("rq_ctx_new / rq_seq_new", e);
+    RqSampling cfg = { 0 };
+    int r, k;
+    while (scanf("%f %f %d %d", &cfg.temperature, &cfg.topp, &cfg.top_k, &r) == 4) {
+        if (r < 0 || r >= n) { printf("FAIL setup  row %d of %d\n", r, n); return 1; }
+        printf("SAMPLE %d", r);
+        unsigned long long seed;
+        while ((k = getchar()) == ' ' || k == '\t')
+            ;
+        for (ungetc(k, stdin); k != '\n' && k != EOF && scanf("%llu", &seed) == 1;) {
+            memcpy(row, lg + (size_t)r * V, V * sizeof(float));
+            rq_seq_seed(s, seed);
+            printf(" %d", rq_sample(c, s, row, &cfg));
+            while ((k = getchar()) == ' ' || k == '\t')
+                ;
+            ungetc(k, stdin);
+        }
+        printf("\n");
+    }
+    free(lg);
+    free(row);
+    rq_seq_free(s);
+    rq_ctx_free(c);
+    rq_model_free(M);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int only_digest = 0;
     if (argc > 1 && !strcmp(argv[1], "--two")) return two_main(argc, argv);
+    if (argc > 3 && !strcmp(argv[2], "--sample")) return sample_main(argc, argv);
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--digest")) only_digest = 1;
         else if (!strcmp(argv[i], "--digest-small")) only_digest = 2;
@@ -243,7 +294,8 @@ int main(int argc, char **argv) {
     }
     if (argc < 2) {
         fprintf(stderr, "usage: api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv]\n"
-                        "       api_test --two MODEL_A MODEL_B [--gs MODEL_OTHER_GROUP_SIZE]\n");
+                        "       api_test --two MODEL_A MODEL_B [--gs MODEL_OTHER_GROUP_SIZE]\n"
+                        "       api_test MODEL --sample LOGITS_FILE < PLAN (lines: T P K ROW SEED...)\n");
         return 2;
     }
     char err[512];
@@ -646,6 +698,16 @@ int main(int argc, char **argv) {
         memcpy(l2, lg, V * sizeof(float));
         ok &= rq_sample(c, s, l2, &g) == RQ_ERR_ARG;
         report(ok, "sample_mask", "2 allowed tokens: greedy picks the larger, sampling only those");
+        // the file's sampling defaults (general.sampling.*): only the fields it has are written
+        RqSampling d0 = { -1, -1, allow, -1 }, d1 = d0;
+        int ms = rq_model_sampling(M, &d1);
+        int okd = ms >= 0 && ms <= 7 && d1.allow == allow;
+        okd &= (ms & RQ_SAMPLING_TEMP) ? d1.temperature >= 0 : d1.temperature == d0.temperature;
+        okd &= (ms & RQ_SAMPLING_TOPP) ? d1.topp > 0 && d1.topp <= 1 : d1.topp == d0.topp;
+        okd &= (ms & RQ_SAMPLING_TOPK) ? d1.top_k >= 0 : d1.top_k == d0.top_k;
+        snprintf(d, sizeof(d), "set %d: temperature %g, top_p %g, top_k %d", ms, ms & 1 ? d1.temperature : 0,
+                 ms & 2 ? d1.topp : 0, ms & 4 ? d1.top_k : 0);
+        report(okd, "model_sampling", d);
         free(l2);
         free(allow);
         rq_seq_free(s);
@@ -755,12 +817,13 @@ static void batch_tests(RqCtx *c, RqTokens A, RqTokens B, RqTokens C, const floa
 
     if (!only_digest) {
         // batched sampling == rq_sample per row (tokens and RNG states), mixed settings per row
-        RqSampling cf[4] = { { 0, 0, NULL }, { 0.8f, 0.9f, NULL }, { 1.5f, 0.95f, NULL }, { 1.0f, 1.0f, NULL } }, cfg[9];
+        RqSampling cf[5] = { { 0, 0, NULL }, { 0.8f, 0.9f, NULL }, { 1.5f, 0.95f, NULL }, { 1.0f, 1.0f, NULL },
+                             { 1.0f, 0.95f, NULL, 20 } }, cfg[9];
         float *l2 = malloc((size_t)9 * V * sizeof(float));
         int t1[9], t2[9], oks = bd_batch(c, sq, bs, 8, 25, 9, NULL, out, "batch_sample_rows");
         unsigned long long rng[9];
         for (int i = 0; i < 9; i++) {
-            cfg[i] = cf[i % 4];
+            cfg[i] = cf[i % 5];
             rq_seq_seed(sq[i], 77 + i);
         }
         memcpy(l2, out, (size_t)9 * V * sizeof(float));
@@ -772,7 +835,7 @@ static void batch_tests(RqCtx *c, RqTokens A, RqTokens B, RqTokens C, const floa
             oks &= t1[i] == t2[i] && t1[i] >= 0 && rng[i] == *rq_seq_rng(sq[i]);
         }
         oks &= rq_sample_batch(c, sq, out, 9, cfg, 2, t1) == RQ_ERR_ARG;
-        report(oks, "batch_sample", "rq_sample_batch == rq_sample per row (greedy, top-p, full distribution)");
+        report(oks, "batch_sample", "rq_sample_batch == rq_sample per row (greedy, top-p, full distribution, top-k)");
         free(l2);
 
         // KV bf16 (f16 above; f32: the plain fp32 tile layout of the same kernels): 3 long sequences

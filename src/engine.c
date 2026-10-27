@@ -721,7 +721,7 @@ static void step(Engine *e, int stopping) {
         if (r->row != ns) memcpy(lg + (size_t)ns * V, lg + (size_t)r->row * V, V * sizeof(float));
         if (j->top_logprobs >= 0) memcpy(sl->lcopy, lg + (size_t)ns * V, V * sizeof(float));
         e->sseq[ns] = sl->seq;
-        e->scfg[ns] = (RqSampling) { j->temperature, j->top_p, j->con ? sl->allow : NULL };
+        e->scfg[ns] = (RqSampling) { j->temperature, j->top_p, j->con ? sl->allow : NULL, j->top_k };
         e->srun[ns++] = r;
     }
     if (ns > 0) {

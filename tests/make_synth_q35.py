@@ -28,7 +28,8 @@ synth-q35-27b.gguf (330 MB): 8 layers (linear 0, 1, 2, 4, 5, 6, attention 3, 7: 
   attention layer's q heads 0..7 from one source layer (with its 2 kv heads) and 8..11 from another (attn_q rows,
   attn_output columns side by side), the q / k channels of key heads 0..3 and the v channels of value heads 0..11 as
   in build(); token_embd: 3 consecutive Q4_K super-blocks per row from a pool of the source's Q4_K matrices; output:
-  the source's Q6_K token_embd, its first 768 columns. The general.sampling.* keys of the 27B (not read yet).
+  the source's Q6_K token_embd, its first 768 columns. The general.sampling.* keys of the 27B (runq's defaults
+  for the options not given: the q35 group's sampling_defaults check).
 synth-q35-27b-mtp.gguf: the same + the MTP block as the 27B lays it out: block_count 9, qwen35.nextn_predict_layers 1,
   blk.8 a full-attention layer (attn_* , ffn_*, the norms) + nextn.eh_proj [2 dim -> dim] Q8_0, nextn.enorm / hnorm /
   shared_head_norm F32, sharing token_embd / output. Today runq refuses it (TODO S6 makes it load).
@@ -169,7 +170,7 @@ def build_27b(f8, f4, path, mtp):
         if key in over:
             raw = G.raw_kv(struct.unpack_from("<I", raw)[0], over[key])
         kvs.append((key, raw))
-        if key == "general.type":  # (the 27B's sampling defaults, at its place; not read by runq yet)
+        if key == "general.type":  # (the 27B's sampling defaults, at its place: rq_model_sampling)
             kvs += [("general.sampling.top_k", G.raw_kv(G.GV_I32, 20)), ("general.sampling.top_p", G.raw_kv(G.GV_F32, 0.95)),
                     ("general.sampling.temp", G.raw_kv(G.GV_F32, 1.0))]
         if key == A + "attention.value_length" and mtp:

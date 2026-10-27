@@ -482,6 +482,8 @@ static void error_usage(void) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1], default 0.9\n");
+    fprintf(stderr, "  -K <int>    top-k: sample among the K most likely tokens (then top-p among them), 0 = off (default)\n");
+    fprintf(stderr, "              (-t / -p / -K not given: the model's recommended values if its GGUF has them, general.sampling.*)\n");
     fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
     fprintf(stderr, "  -c <int>    context window size, 0 (default) = the model's maximum, at most %d; chat: holds the whole conversation,\n", RQ_CTX_DEFAULT_MAX);
     fprintf(stderr, "              when full the oldest turns are dropped (the system prompt is kept)\n");
@@ -513,6 +515,8 @@ int main(int argc, char *argv[]) {
     char *checkpoint_path = NULL;  // e.g. out/model.bin
     float temperature = 1.0f;   // 0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
+    int top_k = 0;              // top-k: 0 = off
+    int samp_given = 0;         // RQ_SAMPLING_* of -t / -p / -K given (else the model's values, if any)
     char *prompt = NULL;        // prompt string
     unsigned long long rng_seed = 0; // seed rng with time by default
     char *mode = "chat";        // generate|chat
@@ -532,8 +536,9 @@ int main(int argc, char *argv[]) {
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
         if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
         // read in the args
-        if (argv[i][1] == 't') { temperature = atof(argv[i + 1]); }
-        else if (argv[i][1] == 'p') { topp = atof(argv[i + 1]); }
+        if (argv[i][1] == 't') { temperature = atof(argv[i + 1]); samp_given |= RQ_SAMPLING_TEMP; }
+        else if (argv[i][1] == 'p') { topp = atof(argv[i + 1]); samp_given |= RQ_SAMPLING_TOPP; }
+        else if (argv[i][1] == 'K') { top_k = atoi(argv[i + 1]); samp_given |= RQ_SAMPLING_TOPK; }
         else if (argv[i][1] == 's') { rng_seed = atoi(argv[i + 1]); }
         else if (argv[i][1] == 'c') { ctx_length = atoi(argv[i + 1]); }
         else if (argv[i][1] == 'i') { prompt = argv[i + 1]; }
@@ -554,6 +559,7 @@ int main(int argc, char *argv[]) {
     if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
     if (temperature < 0) temperature = 0;
     if (topp < 0 || 1.0 < topp) topp = 0.9;
+    if (top_k < 0) top_k = 0;
     if ((strcmp(mode, "tokenize") == 0 || strcmp(mode, "logits") == 0 || strcmp(mode, "render") == 0) && !prompt) { error_usage(); }
     if ((strcmp(mode, "logits") == 0 || strcmp(mode, "dequant") == 0) && (!out_path || !prompt)) { error_usage(); }
     if (prefill_chunk < 0) prefill_chunk = 0;
@@ -620,7 +626,11 @@ int main(int argc, char *argv[]) {
     RqCtx *ctx = rq_ctx_new(m, prefill_chunk, 0, &e);
     if (!ctx) die("malloc failed!");
     rq_seq_seed(seq, rng_seed);
-    RqSampling cfg = { temperature, topp, NULL };
+    RqSampling cfg = { temperature, topp, NULL, top_k }, mcfg = cfg;
+    int ms = rq_model_sampling(m, &mcfg) & ~samp_given; // (the file's values for the options not given; silent)
+    if (ms & RQ_SAMPLING_TEMP) cfg.temperature = mcfg.temperature;
+    if (ms & RQ_SAMPLING_TOPP) cfg.topp = mcfg.topp;
+    if (ms & RQ_SAMPLING_TOPK) cfg.top_k = mcfg.top_k;
 
     if (!prompt)
         printf("hidden_size=%d, intermediate_size=%d, num_hidden_layers=%d, num_attention_heads=%d, num_kv_heads=%d, head_dim=%d, ctx_length=%d, vocab_size=%d, shared_classifier=%d, quantization_block_size=%d\n", info.dim, info.hidden_dim, info.n_layers, info.n_heads, info.n_kv_heads, info.head_dim, info.seq_len, info.vocab_size, info.shared_classifier, info.group_size);

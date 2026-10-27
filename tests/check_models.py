@@ -640,6 +640,18 @@ def q35_synth_run(a, tmp, model, texts, full_api):
             f"-b {y[1]} vs -b {x[1]}"
         ok = lf(x)[0] == lf(y)[0]
         out.append((ok, f"{pre}/{kind}/{y[0]}_b{y[1]}", f"{what}: " + ("bit-identical" if ok else "DIFFER")))
+    # the file's sampling defaults (TODO P5; general.sampling.temp / top_p / top_k = 1.0 / 0.95 / 20 as in the 27B's
+    # file, written by make_synth_q35.py): applied to the options not given, silently. Seeded generate without -p / -K
+    # == with -p 0.95 -K 20 (stdout, stderr without the numbers), != with the CLI's own defaults -p 0.9 -K 0
+    if tag == "synth-q35-27b":
+        import re
+        base = [a.runq, model, "-c", "256", "-t", "0.8", "-s", "7", "-n", "24", "-m", "generate", "-i", texts["en"][:60]]
+        ps = [run(base + x, SYNTH_THREADS) for x in ([], ["-p", "0.95", "-K", "20"], ["-p", "0.9", "-K", "0"])]
+        err = [re.sub(rb"[0-9.]+", b"N", p.stderr) for p in ps]
+        ok = all(p.returncode == 0 for p in ps) and ps[0].stdout == ps[1].stdout and err[0] == err[1] and ps[0].stdout != ps[2].stdout
+        out.append((ok, f"{pre}/sampling_defaults", "seeded generate: no -p / -K == -p 0.95 -K 20 (stdout, stderr), != -p 0.9 -K 0"
+                    + ("" if ok else f": exit {[p.returncode for p in ps]}, same {ps[0].stdout == ps[1].stdout} / {err[0] == err[1]}, "
+                       f"differs from the CLI defaults {ps[0].stdout != ps[2].stdout}")))
     # the library API: batched decode rows == alone, checkpoints (full run), the batched passes' digests vs generic
     if a.api_test:
         if full_api:

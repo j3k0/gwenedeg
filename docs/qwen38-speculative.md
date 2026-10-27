@@ -21,7 +21,8 @@ the same logits bits for every emitted token. Later: the 27B's own MTP layer as 
   `token_embd` and `output` with the main model. runq's layer pattern is computed from `block_count`, so the loader
   refuses a file with `nextn_predict_layers` > 0 (a clear message, before any weight is read; the tokenizer alone
   loads) until the nextn handling (TODO S6). Details: [file layout](#file-layout).
-- Sampling defaults in the GGUF (`general.sampling.*`): temperature 1.0, top-p 0.95, top-k 20.
+- Sampling defaults in the GGUF (`general.sampling.*`): temperature 1.0, top-p 0.95, top-k 20 (runq's defaults for
+  the options not given, CLI and server: `rq_model_sampling`).
 
 **The file:** unsloth `Qwen3.8-27B-Q4_K_M.gguf` at revision `4a03c640833598c0fb5ddd11e846135e906eb764`, 17.1 GB,
 sha256 `7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169`. Types: Q4_K 11.4 GB, Q6_K 4.5, Q5_K 1.0,
@@ -48,8 +49,8 @@ The header and tensor directory of the Q4_K_M file (read with `tests/ggufmini.py
 `attention.head_count` 24 / `head_count_kv` 4, `key_length` = `value_length` 256, `rope.dimension_count` 64,
 `rope.dimension_sections` [11, 11, 10, 0], `rope.freq_base` 1e7, `layer_norm_rms_epsilon` 1e-6, `ssm.conv_kernel` 4,
 `ssm.state_size` 128, `ssm.group_count` 16, `ssm.time_step_rank` 48, `ssm.inner_size` 6144, `full_attention_interval` 4.
-Keys runq does not read: `nextn_predict_layers` (only to refuse the file), `general.sampling.top_k` (i32 20), `top_p`
-(f32 0.95), `temp` (f32 1.0) (TODO P5), `tokenizer.ggml.bos_token_id` 248044 (absent in the 0.8B's), `general.*`,
+`general.sampling.top_k` (i32 20), `top_p` (f32 0.95), `temp` (f32 1.0): the defaults for the options not given. Keys
+runq does not read: `nextn_predict_layers` (only to refuse the file), `tokenizer.ggml.bos_token_id` 248044 (absent in the 0.8B's), `general.*`,
 `quantize.imatrix.*`; the tokenizer: `gpt2` / pre `qwen35`, 248,320 tokens, 247,587 merges, eos 248046, pad 248055;
 the 3.8 chat template (9,993 bytes). Tensors (row-major [rows, columns]; llama.cpp's order: `output`, `output_norm`,
 `token_embd`, then per block sorted by name):

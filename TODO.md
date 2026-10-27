@@ -105,6 +105,12 @@ more than its new tokens plus the last reply.
   the 27B. (c) Draft acceptance on the sessions' real replies (`scripts/spec_accept.py`, teacher-forced): the 0.8B
   draft, prompt lookup (G6), both. Done when docs/qwen38-speculative.md has a turn-latency model checked against the
   replay, and the goal above has real numbers.
+  Status (2026-10-27): (b)'s tool is there, `build/bench_long` on `rq_seq_fill_synthetic` (a library test hook), run
+  on the 0.8B, the 4B (to 32k) and the 27B-shaped synthetic model; docs/qwen38-speculative.md, "Long-context costs",
+  has the numbers and a turn-latency model extrapolated to the 27B (decode ~4.8 / 5.6 tok/s at 98k with 8 / 16
+  threads, a 2.5k-chunk prefill ~250 / ~145 s; a verify row at 98k adds ~80-90% of a step's attention, so k = 3
+  passes cost ~2.2x a step there). Left of (b): the 27B run itself, alone on the box (the command is in that section);
+  (a) and (c) not started.
 - [ ] **G1. Tool calls in `runq serve`.** Requests with `tools` (OpenAI format) rendered by the Qwen3.8 template
   (the tool list in the system prompt; `tool` messages and earlier `tool_calls` in the history, as
   `tests/golden/templates/qwen3.8-hf.jinja`), and replies parsed from Qwen3.8's XML format
@@ -117,11 +123,17 @@ more than its new tokens plus the last reply.
   `apply_chat_template`; parsing (malformed calls, several calls, multi-line parameters, calls inside reasoning not
   parsed); `tests/server_test.py` with a tool round trip; a short pi session against the 0.8B. Done when pi runs a
   multi-turn agent session (read / edit / bash tools) against `runq serve` with the 0.8B, then the 27B.
-- [ ] **G2. Correctness at long context.** Nothing in the tests goes past ~2,000 positions; Qwen3.8's native window
-  is 262,144 (RoPE theta 1e7, no scaling, `-c` accepts it). Check runq against a reference at 32k-96k positions
-  (Qwen3.5-0.8B: HF fp32 with SDPA, or `tests/ref_qwen35.py` with chunked attention; logits at sampled positions and
-  the attention's split / combine path), and a retrieval test (a fact placed early in a 90k context, asked at the
-  end) on the 0.8B and the 27B. Done when both pass and the long-context check is in an opt-in group.
+- [ ] **G2. Correctness at long context** (the 27B's retrieval left). Done on Qwen3.5 (2026-10-27, docs/qwen35.md,
+  "Long context"): the opt-in `long` group (`tests/run_tests.sh --long-context`, `tests/check_long.py`,
+  `build/long_ctx`) checks the 0.8B Q8_0 at 14 positions up to 98,303 and the 4B Q8_0 at 6 up to 32,767 against
+  `tests/ref_qwen35.py`'s memory-frugal forward (exact softmax, numpy fp32; goldens in `tests/golden/long`): the 0.8B's
+  cos >= 0.9996 on the full vocabulary, the 4B's >= 0.9999 on the golden's ids, top-1 everywhere, no drift with the
+  position; the verify / decode paths == prefill and the generic build == native, bitwise; a fact planted ~84k tokens
+  back retrieved (0.8B; the 4B ~25k back). RoPE's fp32 angles (as HF's) and the f16 cache's range (|K| <= 22, |V| <=
+  52) checked; no bug found. Left: the retrieval on the 27B, alone on the box (~1-1.5 h of prefill; ~21.5 GiB with
+  the KV cache of its 88k-token prompt): `OMP_NUM_THREADS=16 TMPDIR=/var/tmp .venv/bin/python tests/check_long.py
+  --retrieval models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf`. Not run: HF fp32 at long context (the numpy
+  reference on the HF weights matches it at short context).
 - [ ] **G3. Memory: a 96k session with its draft fits.** First lever: **Q3_K_M weights** (Unsloth
   `Qwen3.8-27B-Q3_K_M.gguf` @ `4a03c64`, 13.82 GB; from its header: Q3_K 6.1 GiB, Q4_K 5.2, Q6_K 1.0, Q5_K 0.3: 3-bit
   `ffn_gate` / `ffn_up`, `attn_gate`, attention q / k and `token_embd`; 4-bit DeltaNet `attn_qkv` / `ssm_out`, attention

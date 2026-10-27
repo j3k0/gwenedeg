@@ -40,6 +40,9 @@ the embedding rows it needs and the classifier in chunks; HfWeights reads the sa
 no torch): 1.3 GB peak for 4B (make_model_ref.py, incl. the logits).
 
 forward(w, prompts, rows=None) -> list of float32 (n_i, len(rows) or vocab) logits per prompt (all positions).
+forward_long(w, ids, positions) -> float32 (len(positions), vocab): one long prompt (tens of thousands of tokens),
+memory-frugal (rows in chunks, attention in query blocks with an exact softmax), the logits at some rows only
+(tests/make_long_ref.py, TODO G2).
 The recurrence runs token by token (the form of a decode step), in fp32 as runq does; HF's prefill uses the
 chunked form, equal up to rounding.
 """
@@ -302,6 +305,151 @@ class _LayerCache:
         return self.mat(name).reshape(-1)
 
 
+def _lin_chunk(w, c, l, h, st):
+    """_linear_attn on rows h of a longer sequence, carrying st = [S, the conv's last K - 1 inputs] (the same
+    operations, row for row)"""
+    n = h.shape[0]
+    nk, nv, dk, dv, K = c["nk"], c["nv"], c["dk"], c["dv"], c["conv"]
+    p = f"blk.{l}."
+    qkv = h @ w.mat(p + "attn_qkv.weight").T
+    z = (h @ w.mat(p + "attn_gate.weight").T).reshape(n, nv, dv)
+    beta = _sigmoid(h @ w.mat(p + "ssm_beta.weight").T)
+    a = h @ w.mat(p + "ssm_alpha.weight").T
+    g = w.vec(p + "ssm_a") * _softplus(a + w.vec(p + "ssm_dt.bias"))
+    cw = w.mat(p + "ssm_conv1d.weight")
+    if st[1] is None:
+        st[0] = np.zeros((nv, dk, dv), np.float32)
+        st[1] = np.zeros((K - 1, qkv.shape[1]), np.float32)
+    xp = np.concatenate([st[1], qkv], 0)
+    st[1] = xp[-(K - 1):].copy()
+    conv = _silu(sum(xp[j:j + n] * cw[:, j] for j in range(K)).astype(np.float32))
+    q = conv[:, :nk * dk].reshape(n, nk, dk)
+    k = conv[:, nk * dk:2 * nk * dk].reshape(n, nk, dk)
+    v = conv[:, 2 * nk * dk:].reshape(n, nv, dv)
+    q = _l2norm(q) * np.float32(1 / np.sqrt(dk))
+    k = _l2norm(k)
+    rep = nv // nk
+    if w.vorder == "grouped":
+        q, k = np.repeat(q, rep, axis=1), np.repeat(k, rep, axis=1)
+    else:
+        q, k = np.tile(q, (1, rep, 1)), np.tile(k, (1, rep, 1))
+    S = st[0]
+    o = np.empty((n, nv, dv), np.float32)
+    eg = np.exp(g).astype(np.float32)[:, :, None, None]
+    q4, k4, k3 = q[:, :, None, :], k[:, :, None, :], k[:, :, :, None]
+    bv = beta[:, :, None]
+    for t in range(n):  # (the recurrence of _linear_attn: matmul forms of its einsums)
+        S *= eg[t]
+        delta = (v[t] - np.matmul(k4[t], S)[:, 0]) * bv[t]
+        S += k3[t] * delta[:, None, :]
+        o[t] = np.matmul(q4[t], S)[:, 0]
+    o = _rmsnorm(o, w.vec(p + "ssm_norm.weight")) * _silu(z)
+    return o.reshape(n, nv * dv) @ w.mat(p + "ssm_out.weight").T
+
+
+def _attn_kv(w, c, l, h, pos):
+    """the roped, normed keys and the values of rows h at positions pos: (n, kv_heads, hd) each"""
+    n, KVH, hd, p = h.shape[0], c["kv_heads"], c["hd"], f"blk.{l}."
+    k = (h @ w.mat(p + "attn_k.weight").T).reshape(n, KVH, hd)
+    v = (h @ w.mat(p + "attn_v.weight").T).reshape(n, KVH, hd)
+    k = _rope_partial(_rmsnorm(k, w.vec(p + "attn_k_norm.weight")), pos, c["theta"], c["rot"])
+    return k.astype(np.float32), v.astype(np.float32)
+
+
+def _attn_q_chunked(w, c, l, h, pos, K, V, qc=128):
+    """_full_attn for rows h at positions pos (any, ascending) over the cache K, V (positions 0..): exact softmax per
+    query, causal, in blocks of qc queries x the keys up to the block's last position (memory: qc x heads/kv x n)"""
+    n, H, KVH, hd, p = h.shape[0], c["heads"], c["kv_heads"], c["hd"], f"blk.{l}."
+    qg = (h @ w.mat(p + "attn_q.weight").T).reshape(n, H, 2 * hd)
+    q, gate = qg[..., :hd], qg[..., hd:].reshape(n, H * hd)
+    q = _rope_partial(_rmsnorm(q, w.vec(p + "attn_q_norm.weight")), pos, c["theta"], c["rot"]).astype(np.float32)
+    rep, o = H // KVH, np.empty((n, H, hd), np.float32)
+    sc = np.float32(1 / np.sqrt(hd))
+    for r0 in range(0, n, qc):
+        r1 = min(n, r0 + qc)
+        e = int(pos[r1 - 1]) + 1
+        c0 = int(pos[r0]) + 1                                    # keys from c0 on: after some query of the block
+        mask = pos[r0:r1, None] < np.arange(c0, e)[None, :]
+        for g in range(KVH):
+            qq = q[r0:r1, g * rep:(g + 1) * rep].transpose(1, 0, 2).reshape(rep * (r1 - r0), hd)
+            s = qq @ K[:e, g].T                                   # (rep rows, e)
+            s *= sc
+            s = s.reshape(rep, r1 - r0, e)
+            s[:, :, c0:][:, mask] = -np.inf
+            s -= s.max(-1, keepdims=True)
+            np.exp(s, out=s)
+            s /= s.sum(-1, keepdims=True, dtype=np.float32)
+            o[r0:r1, g * rep:(g + 1) * rep] = (s.reshape(rep * (r1 - r0), e) @ V[:e, g]).reshape(rep, r1 - r0, hd) \
+                .transpose(1, 0, 2)
+            del s
+    return (o.reshape(n, H * hd) * _sigmoid(gate)) @ w.mat(p + "attn_output.weight").T
+
+
+def forward_long(w, ids, positions, rc=2048, verbose=False, stats=None):
+    """forward() on one long prompt, memory-frugal: the logits (full vocabulary) at the rows `positions` only. Rows in
+    chunks of rc (the linear layers carry their state across chunks; full attention: the layer's K / V for all rows
+    first, then the queries in blocks, _attn_q_chunked); the last layer computes the rows `positions` only if it is a
+    full-attention one. Peak ~ 4 x n x dim floats + K / V + one layer's weights (0.8B at 98k: ~2 GB). stats (dict):
+    per attention layer the max |K| / |V| (the f16 cache's range)"""
+    c, n = w.c, len(ids)
+    positions = np.asarray(positions)
+    x = np.concatenate([w.take("token_embd.weight", ids[r0:r0 + rc]).astype(np.float32) for r0 in range(0, n, rc)])
+    allpos = np.arange(n)
+    t0 = __import__("time").time()
+    for l in range(c["layers"]):
+        lw = _LayerCache(w)
+        an, fn = lw.vec(f"blk.{l}.attn_norm.weight"), lw.vec(f"blk.{l}.post_attention_norm.weight")
+        ffn = {r: lw.mat(f"blk.{l}.{r}.weight") for r in ("ffn_gate", "ffn_up", "ffn_down")}
+        last = l == c["layers"] - 1
+        if is_linear(c, l):
+            st = [None, None]
+            for r0 in range(0, n, rc):
+                x[r0:r0 + rc] += _lin_chunk(lw, c, l, _rmsnorm(x[r0:r0 + rc], an), st)
+            rows = allpos
+        else:
+            K = np.empty((n, c["kv_heads"], c["hd"]), np.float32)
+            V = np.empty_like(K)
+            for r0 in range(0, n, rc):
+                K[r0:r0 + rc], V[r0:r0 + rc] = _attn_kv(lw, c, l, _rmsnorm(x[r0:r0 + rc], an), allpos[r0:r0 + rc])
+            if stats is not None:
+                stats[f"k{l}"], stats[f"v{l}"] = float(np.abs(K).max()), float(np.abs(V).max())
+            rows = positions if last else allpos
+            if last:
+                x = x[rows]
+            for r0 in range(0, len(rows), rc):
+                xr = x[r0:r0 + rc]
+                xr += _attn_q_chunked(lw, c, l, _rmsnorm(xr, an), rows[r0:r0 + rc], K, V)
+            del K, V
+        for r0 in range(0, len(rows), rc):
+            xr = x[r0:r0 + rc]
+            h = _rmsnorm(xr, fn)
+            xr += (_silu(h @ ffn["ffn_gate"].T) * (h @ ffn["ffn_up"].T)) @ ffn["ffn_down"].T
+        del lw, ffn
+        if verbose:
+            print(f"  layer {l} ({'linear' if is_linear(c, l) else 'full'}): {__import__('time').time() - t0:.0f} s",
+                  flush=True)
+    if len(x) != len(positions):
+        x = x[positions]
+    return forward_rows(w, [x])[0]
+
+
+def forward_rows(w, xs, rows=None, chunk=16384):
+    """the final norm and the classifier on hidden states xs (list of (n, dim))"""
+    c = w.c
+    hs = [_rmsnorm(x, w.vec("output_norm.weight")).astype(np.float32) for x in xs]
+    name = "token_embd.weight" if c["tied"] else "output.weight"
+    if rows is not None:
+        W = w.take(name, rows)
+        return [h @ W.T for h in hs]
+    V = c["vocab"]
+    outs = [np.empty((h.shape[0], V), np.float32) for h in hs]
+    for r0 in range(0, V, chunk):
+        W = w.chunk(name, r0, min(chunk, V - r0))
+        for h, o in zip(hs, outs):
+            o[:, r0:r0 + W.shape[0]] = h @ W.T
+    return outs
+
+
 def forward(w, prompts, rows=None, chunk=16384, verbose=False):
     """w: GgufWeights / HfWeights; prompts: lists of token ids; rows: classifier rows to compute (None: all)"""
     c = w.c
@@ -322,15 +470,4 @@ def forward(w, prompts, rows=None, chunk=16384, verbose=False):
         del lw, ffn
         if verbose:
             print(f"  layer {l} ({'linear' if is_linear(c, l) else 'full'})", flush=True)
-    hs = [_rmsnorm(x, w.vec("output_norm.weight")).astype(np.float32) for x in xs]
-    name = "token_embd.weight" if c["tied"] else "output.weight"
-    if rows is not None:
-        W = w.take(name, rows)
-        return [h @ W.T for h in hs]
-    V = c["vocab"]
-    outs = [np.empty((h.shape[0], V), np.float32) for h in hs]
-    for r0 in range(0, V, chunk):
-        W = w.chunk(name, r0, min(chunk, V - r0))
-        for h, o in zip(hs, outs):
-            o[:, r0:r0 + W.shape[0]] = h @ W.T
-    return outs
+    return forward_rows(w, xs, rows, chunk)

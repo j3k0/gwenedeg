@@ -5,6 +5,8 @@
 # Usage: tests/run_tests.sh [--update-greedy] [other tests/check.py options, e.g. -v, --only logits]
 #        tests/run_tests.sh --models   the bigger Qwen3 models only (group models: every downloaded family file,
 #                                      scripts/download_models.py family; slow, minutes; make test-models)
+#        tests/run_tests.sh --long-context   the long-context checks only (group long, tests/check_long.py: Qwen3.5
+#                                      at up to 98k positions; ~15-20 min; TMPDIR=/var/tmp where /tmp is small)
 # Env:   OMP_NUM_THREADS (default 8), RUNQ (binary to test, default ./runq, built with make),
 #        RUNQ_GENERIC (generic-kernel build to compare with, default ./runq-generic when RUNQ is
 #        not set; with RUNQ set and RUNQ_GENERIC unset the kernels test is skipped; with RUNQ set the
@@ -54,9 +56,13 @@ fi
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 ARGS=()
+LONG=0
 for x in "$@"; do
-    if [[ "$x" == "--models" ]]; then ARGS+=(--only models); else ARGS+=("$x"); fi
+    if [[ "$x" == "--models" ]]; then ARGS+=(--only models)
+    elif [[ "$x" == "--long-context" ]]; then ARGS+=(--only long); LONG=1
+    else ARGS+=("$x"); fi
 done
 set -- "${ARGS[@]+"${ARGS[@]}"}"
+if [[ $LONG == 1 ]]; then make -s -j8 long-ctx; fi
 exec "${PY[@]}" tests/check.py --runq "$RUNQ" --generic "${RUNQ_GENERIC:-}" --model "$MODEL" --gguf "$GGUF" --q4 "$Q4" \
     --api-test "$API_TEST" --q35 "$Q35" "$@"

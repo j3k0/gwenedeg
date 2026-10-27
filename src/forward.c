@@ -1826,6 +1826,62 @@ static void kv_populate_one(const RqSeq *s, const Config *p, int pos0, int n, in
 #endif
 }
 
+// rq_seq_fill_synthetic (a test hook, runq.h): a long context without its prefill, for timing (TODO G0 (b))
+typedef struct { RqSeq *s; int n, next; uint64_t seed; } FillJob;
+
+static inline float fill_val(uint64_t *x, float a) {
+    // xorshift64*: a value in [-a, a)
+    *x ^= *x >> 12; *x ^= *x << 25; *x ^= *x >> 27;
+    return ((float)((*x * 0x2545F4914F6CDD1DULL) >> 40) * 0x1p-24f * 2.0f - 1.0f) * a;
+}
+
+static void fill_worker(void *arg, int tid, int nt) {
+    // items: (attention layer, K / V) of the cache, its whole blocks up to position n - 1 pre-faulted (as a prefill
+    // does: kv_populate_one), the first block written with pseudo-random values in the cache's type and copied to the
+    // others; item 2 n_attn: the recurrent state
+    (void)tid; (void)nt;
+    FillJob *j = arg;
+    RqSeq *s = j->s;
+    const RqModel *m = s->m;
+    const Config *p = &m->config;
+    size_t be = (size_t)ATT_P * m->kv_dim, nb = (size_t)(j->n + ATT_P - 1) / ATT_P; // (elements per block, blocks)
+    for (int it; (it = __atomic_fetch_add(&j->next, 1, __ATOMIC_RELAXED)) <= 2 * m->n_attn;) {
+        uint64_t x = j->seed * 0x9E3779B97F4A7C15ULL + (uint64_t)it * 0xD1B54A32D192ED03ULL + 1;
+        if (it == 2 * m->n_attn) { // the state: conv inputs and S, small values
+            float *st = s->ssm;
+            for (size_t i = 0; i < s->ssm_bytes / sizeof(float); i++)
+                st[i] = fill_val(&x, 0.05f);
+            continue;
+        }
+        int l = it / 2, kv = it % 2;
+        kv_populate_one(s, p, 0, j->n, it);
+        char *c = (char *)(kv ? s->value_cache : s->key_cache) + (size_t)l * s->kv_len * m->kv_dim * s->kv_esz;
+        float a = kv ? 1.0f : 4.0f; // (|K| after the k norm: a few units, |V| ~1)
+        for (size_t e = 0; e < be; e++) {
+            float v = fill_val(&x, a);
+            if (s->kvt == KV_F32) ((float *)c)[e] = v;
+            else ((uint16_t *)c)[e] = s->kvt == KV_F16 ? f32_f16(v) : f32_bf16(v);
+        }
+        for (size_t b = 1; b < nb; b++)
+            memcpy(c + b * be * s->kv_esz, c, be * s->kv_esz);
+    }
+}
+
+int rq_seq_fill_synthetic(RqSeq *s, int n, unsigned long long seed) {
+    if (!s || n < 1 || n > s->cap) return RQ_ERR_ARG;
+    if (s->m->hy.on) {
+        ck_forget_pending(s);
+        ck_drop(s, -1);
+    }
+    FillJob j = { s, n, 0, seed };
+    rq_parallel(fill_worker, &j);
+    int V = s->m->config.vocab_size;
+    for (int i = 0; i < n; i++) // (tokens: common words' ids would do; any valid id)
+        s->tokens[i] = (int)((seed + (unsigned long long)i * 7919u) % (unsigned long long)V);
+    s->len = n;
+    return RQ_OK;
+}
+
 static inline QuantizedTensor qsub(QuantizedTensor *t, int i0) {
     // the quantized values from index i0 on (a multiple of GS)
     return (QuantizedTensor) { .q = t->q + i0, .s = t->s + i0 / GS, .p = NULL };

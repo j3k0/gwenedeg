@@ -344,6 +344,64 @@ over the rows: the conv's SiLU is a vectorized exp polynomial + a division per c
 ~2x its hot-cache cost (the q / k rows are read from the other cores' caches by each of a head's 4 blocks; a compact
 per-head copy written by `dn_prep` could help).
 
+## Long context (TODO G2, 2026-10-27)
+
+Nothing else in the tests goes past ~2,000 positions. The `long` group (`tests/run_tests.sh --long-context`,
+`tests/check_long.py`, opt-in) checks runq at up to 98,304 positions against `tests/ref_qwen35.py` on the file's
+dequantized weights, through `build/long_ctx` (`tests/long_ctx.c`, the library API: the CLI's hooks take neither a
+400 KB prompt nor 98k rows of logits).
+
+- **The text:** 18 files of this repository at the fixed commit `5d93873` (`git show`: README, docs, `src/*.c`,
+  `tests/check.py`, the Beagle chapter, interleaved prose / C / Python, no repeat), tokenized by runq: 244,198
+  tokens, the first 98,304 used (sha256 of the ids in the golden).
+- **The reference:** `ref_qwen35.forward_long` (`tests/make_long_ref.py`): the same numpy fp32 forward, rows in
+  chunks of 2,048 (the DeltaNet state and the conv inputs carried across chunks), full attention per layer as all
+  rows' K / V first, then the queries in blocks of 128 with an exact softmax over every key up to the block's last
+  position (no split, no combine: the opposite of runq's per-256-position partial results), the last layer on the
+  sampled rows only, the logits on the full vocabulary. `--check-short` compares it with `forward` (700 tokens, `rc`
+  256): max |diff| 2.5e-5. Cost on the 0.8B at 98,304 tokens: **1,813 s** at 8 BLAS threads (load ~10-25; ~31 s per
+  DeltaNet layer, its token-by-token recurrence, ~150-240 s per attention layer), ~1-2 GB. The golden
+  (`tests/golden/long/3.5-0.8b-q8.npz`, 35 KB): per position the top 64 ids / logits and a fixed subset of 512 ids.
+
+Runtime of runq for the same rows (`long_ctx -V`, 8 threads, load ~10): 524 s (the prefill up to each position plus
+the two extra paths at each).
+
+**Qwen3.5-0.8B Q8_0 vs the reference** (full vocabulary; KL = KL(ref || runq) of the softmax):
+
+| position | 1,023 | 4,095 | 8,191 | 16,383 | 24,575 | 32,767 | 40,959 | 49,151 | 57,343 | 65,535 | 73,727 | 81,919 | 90,111 | 98,303 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| cos | 0.99987 | 0.99990 | 0.99986 | 0.99987 | 0.99982 | 0.99990 | 0.99992 | 0.99974 | 0.99959 | 0.99991 | 0.99991 | 0.99975 | 0.99989 | 0.99971 |
+| max \|diff\| | 0.20 | 0.23 | 0.30 | 0.28 | 0.30 | 0.32 | 0.27 | 0.28 | 0.44 | 0.29 | 0.40 | 0.30 | 0.29 | 0.44 |
+| KL | 5e-4 | 2e-6 | 7e-4 | 9e-4 | 6e-5 | 2e-7 | 1e-4 | 1e-4 | 4e-7 | 8e-6 | 7e-6 | 8e-8 | 3e-4 | 4e-6 |
+
+Top-1 equal at all 14 positions, top-5 5/5 at 13 (4/5 at 57,343). The agreement does not degrade with the
+position: cos over the golden's 576 ids 0.99997 at 1k, 0.99989-0.99995 at 90-98k (the check's bound: 0.995 per
+position), max |diff| 0.2-0.3 at every distance with two 0.44s. What was checked along the way:
+
+- **Split / combine:** past 256 positions every path combines per-block partial results (`att_combine`); at 98k
+  that is 384 blocks per query. Against the reference's exact softmax, nothing accumulates (above). Bitwise, at all
+  14 positions: the last row of a 64-row prefill chunk == a 4-row verify segment (the decode-rows worker, its
+  attention items per (row block, kv head)) == a decode step (`rq_decode`: each kv head's 384 blocks split over the
+  threads, combined by the last item).
+- **RoPE at large positions** (theta 1e7, 64 of 256 dims): runq's frequencies `expf((float)ln(theta) * -j / 32)`
+  carry the fp32 rounding of ln(1e7) (relative error up to 6.7e-7, HF's `1 / theta ** (2j / 64)` 7e-8), but the
+  angle's error is that of the fp32 product `pos * freq` in both: at 98,303 max 2.6e-3 rad from the exact angle for
+  runq and for HF (runq - HF 2.0e-3), at 262,143 6.1e-3 for both (cos error 3.2e-3 / 2.4e-3). Not worth a change
+  (a double-precision angle would beat HF's own computation and change every model's bits).
+- **The f16 cache's range:** max |K| 22.3, |V| 37.2 over the 98k tokens (the reference's, per attention layer: K
+  12.4-22.3, V 5.7-37.2): far from f16's 65,504, and f16's relative step (2^-11) is the precision the short tests
+  already measure.
+- **Retrieval:** a fact ("the access code of the old lighthouse at Penmarc'h is PLUM-7316-HERON") after 4,000 tokens
+  of the corpus, the corpus up to 88,000 tokens, then the question in a chat turn (thinking off): an 88,092-token
+  prompt; the 0.8B's greedy reply is `PLUM-7316-HERON` (prefill + 24 decode steps at ~88k: 602 s at 8 threads,
+  load ~25).
+- **Qwen3.5-4B Q8_0** (32 value heads on 16 key heads) on the first 32,768 tokens (runq at 98k would need ~7.7 GB:
+  more than this run's share of the box; reference 1,233 s at 8 BLAS threads, `golden/long/3.5-4b-q8.npz`): cos over
+  the golden's ids 0.99998 / 0.99993 / 0.99997 / 0.99996 / 0.99990 / 0.99990 at 1k / 4k / 8k / 16k / 24k / 32k, top-1
+  6/6, max |diff| 0.16-0.41; the three paths bitwise equal, the generic build too (to 16k); max |K| 19.6, |V| 52.5;
+  the fact retrieved from a 28,860-token prompt.
+- No bug found: the long-context paths give the reference's logits and the invariants' bits.
+
 ## Commands
 
 ```

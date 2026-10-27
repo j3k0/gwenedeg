@@ -122,7 +122,18 @@ more than its new tokens plus the last reply.
   (Qwen3.5-0.8B: HF fp32 with SDPA, or `tests/ref_qwen35.py` with chunked attention; logits at sampled positions and
   the attention's split / combine path), and a retrieval test (a fact placed early in a 90k context, asked at the
   end) on the 0.8B and the 27B. Done when both pass and the long-context check is in an opt-in group.
-- [ ] **G3. Memory: a 96k session with its draft fits** (from `IDEAS.md`, "int8 (or 8-bit float) KV cache").
+- [ ] **G3. Memory: a 96k session with its draft fits.** First lever: **Q3_K_M weights** (Unsloth
+  `Qwen3.8-27B-Q3_K_M.gguf` @ `4a03c64`, 13.82 GB; from its header: Q3_K 6.1 GiB, Q4_K 5.2, Q6_K 1.0, Q5_K 0.3: 3-bit
+  `ffn_gate` / `ffn_up`, `attn_gate`, attention q / k and `token_embd`; 4-bit DeltaNet `attn_qkv` / `ssm_out`, attention
+  v / output, `ffn_down`; Q6_K `output`): ~12.4 GiB of weights in RAM vs 15.3, so a 96k session + draft + speculation
+  needs ~21.9 GiB (~2 GiB spare); decode reads ~13.0 GB per token instead of ~16.1 (est. ~+20% at short context,
+  ~+10-15% at 90k); prefill unchanged (attention-bound). Needs Q3_K in runq (as Q5_K was done: one arithmetic
+  definition, generic / AVX-512 / NEON and small-batch kernels, the embedding-row lookup, `-m dequant` bitwise vs
+  gguf-py, a small Q3_K_M test file, compare_bins), then a **quality gate** vs Q4_K_M before it becomes the agentic
+  file: teacher-forced top-1 vs the API's model on the saved answers (Q4_K_M: 716/720 thinking off, 579/588 on), KL
+  between the two files on recorded pi sessions, draft acceptance, perplexity. Q4_K_M stays the reference. Not
+  Q3_K_S (nearly all 3-bit for 1.2 GiB more), nor the UD / IQ files (codebook formats: new kernels), nor 2-bit.
+  Second lever, optional after Q3_K_M (from `IDEAS.md`, "int8 (or 8-bit float) KV cache"):
   - An 8-bit KV cache: V first (its bf16 rounding was harmless), then K, which needs per-tile scales: |K| reaches
     ~500 and bf16 K alone already cost +4.4% KL against HF fp32. Each variant judged by the KL measurement of the 16-bit
     types and G2's checks (its baseline: the 16-bit numbers of "KV cache with f16 K and bf16 V", Performance);
@@ -251,7 +262,7 @@ Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M (Qwen3.8-27B Q4_K_M, the same
 
 ## Models and formats
 
-- [ ] **More GGUF types**: Q4_0 / Q4_1, Q3_K / Q2_K (the Unsloth "UD" files of the small bit widths), IQ4_XS, F16 / BF16
+- [ ] **More GGUF types**: Q4_0 / Q4_1, Q2_K (the Unsloth "UD" files of the small bit widths), IQ4_XS, F16 / BF16
   weights. Each needs its block format, a repacked layout and generic, AVX-512 and NEON kernels that follow one
   arithmetic definition, as in `src/kquants.h` (Q5_K, done, is the template: a new bit plane on Q4_K's fold). Tests:
   dequantization bitwise against gguf-py (`-m dequant`, `tests/make_dequant_golden.py`), logits against the file's

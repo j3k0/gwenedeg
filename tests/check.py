@@ -30,7 +30,8 @@ Tests (see tests/README.md):
              goldens (q4_*) run in the greedy group
   server     runq serve over HTTP (tests/server_test.py, in the background from the start): endpoints,
              completions == runq -m chat, prefix reuse bitwise, streaming, json_schema constrained
-             decoding, errors, queue / cancellation, fuzzing, shutdown
+             decoding, errors, queue / cancellation, fuzzing, shutdown; the tool call parser
+             (build/tools_test, tests/tools_test.c: no model)
   kv         the KV cache types other than the default f16 (-k f32, -k bf16): logits vs HF (en, code,
              long2), batched vs sequential, threads and AVX-512 vs generic bitwise; their greedy goldens
              (f32_generate, bf16_generate) run in the greedy group
@@ -492,6 +493,18 @@ def test_server(a, res, fut):
         res.report(ok, f"server/{name.strip()}", detail.strip())
     if p.returncode not in (0, 1) or not lines:
         res.report(False, "server/run", f"exit status {p.returncode}: {(p.stdout + p.stderr).decode(errors='replace')[-500:]}")
+    # the tool call parser and Python-style JSON (tests/tools_test.c, build/tools_test: built by run_tests.sh; no model)
+    tt = os.path.join(ROOT, "build", "tools_test")
+    if not os.path.exists(tt):
+        print("   (tools tests skipped: no build/tools_test; make tools-test)")
+        return
+    q = run([tt])
+    lines = [l for l in q.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
+    for l in lines:
+        name, _, detail = l[5:].partition("  ")
+        res.report(l.startswith("PASS "), f"server/{name.strip()}", detail.strip())
+    if q.returncode not in (0, 1) or not lines:
+        res.report(False, "server/tools_test", f"exit status {q.returncode}: {(q.stdout + q.stderr).decode(errors='replace')[-500:]}")
 
 
 def read_logits(path):

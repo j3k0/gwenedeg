@@ -42,7 +42,7 @@ fi
 
 API_TEST=""
 if [[ -z "${RUNQ:-}" ]]; then
-    make -s -j8 runq runq-generic api-test
+    make -s -j8 runq runq-generic api-test tools-test
     RUNQ="$ROOT/runq"
     RUNQ_GENERIC="${RUNQ_GENERIC:-$ROOT/runq-generic}"
     API_TEST="$ROOT/build/api_test"

@@ -24,12 +24,12 @@ LDLIBS  += -lm -lpthread
 # of the forward passes is in forward.c (README.md, Architecture)
 LIB = model gguf forward tokenizer sampler chat threads spec
 # runq serve (an OpenAI-compatible HTTP server; serve.h): linked into the runq binary, not part of the library
-SRV = json constrain http engine serve
+SRV = json constrain http engine serve tools
 HDR = $(wildcard src/*.h)
 Q8  = models/Qwen3-0.6B-q8.bin
 B   = build
 
-.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test api-test bench-batch bench-verify long-ctx bench-long mem-probe FORCE
+.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test api-test tools-test bench-batch bench-verify long-ctx bench-long mem-probe FORCE
 
 all: runq
 
@@ -72,6 +72,12 @@ $(B)/api_test-generic: tests/api_test.c src/runq.h $(LIB:%=$(B)/generic/%.o)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DRUNQ_GENERIC $< $(LIB:%=$(B)/generic/%.o) $(LDLIBS) -o $@
 
 api-test: $(B)/api_test $(B)/api_test-generic
+
+# runq serve's tool call parser and Python-style JSON (tests/tools_test.c; no model; make test runs it, group server)
+$(B)/tools_test: tests/tools_test.c src/serve.h src/json.h $(LIB:%=$(B)/native/%.o) $(B)/native/json.o $(B)/native/tools.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(B)/native/json.o $(B)/native/tools.o $(LDLIBS) -o $@
+
+tools-test: $(B)/tools_test
 
 # the batched decode benchmark (tests/bench_batch.c; scripts/bench_batch.sh)
 $(B)/bench_batch: tests/bench_batch.c src/runq.h $(LIB:%=$(B)/native/%.o)

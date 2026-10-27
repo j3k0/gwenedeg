@@ -18,6 +18,15 @@ int serve_main(int argc, char **argv) {
     fprintf(stderr, "runq serve: not available on Windows (the server uses POSIX sockets and threads)\n");
     return 1;
 }
+
+int serve_render(RqModel *m, const Js *body, RqTokens *out, int *thinking, char *err, size_t errlen) {
+    (void)m;
+    (void)body;
+    (void)out;
+    *thinking = 0;
+    snprintf(err, errlen, "not available on Windows");
+    return RQ_ERR_STATE;
+}
 #else
 #include <unistd.h>
 #include <strings.h>
@@ -125,7 +134,7 @@ static void get_health(App *a, HttpConn *c, HttpReq *r) {
 
 // ------------------------------------------------------------------------------ chat: the request
 
-typedef struct { int role; char *text, *reasoning; } Msg; // role: 0 system, 1 user, 2 assistant; reasoning: Qwen3.8 (or NULL)
+// (Msg, serve.h: role 0 system, 1 user, 2 assistant, 3 tool; reasoning: Qwen3.8's, or with tools Qwen3.5's too, else NULL)
 
 typedef struct {
     int status;
@@ -140,8 +149,9 @@ static int bad(ReqErr *e, const char *param, const char *fmt, const char *arg) {
     return -1;
 }
 
-static char *content_text(const Js *c, ReqErr *e) {
-    // a message's content: a string, an array of text parts (joined with "\n"), or null (""); malloc'd
+static char *content_text(const Js *c, const char *sep, ReqErr *e) {
+    // a message's content: a string, an array of text parts (joined with sep: "\n"; with tools "", as the Qwen3.5 / 3.8
+    // templates join them), or null (""); malloc'd
     JBuf b = { 0 };
     if (!c || c->t == JS_NULL) jb_cstr(&b, "");
     else if (c->t == JS_STR) jb_raw(&b, c->s, c->n);
@@ -154,7 +164,7 @@ static char *content_text(const Js *c, ReqErr *e) {
                 bad(e, "messages", "only text content parts ({\"type\": \"text\", \"text\": ...}) are supported%s", NULL);
                 return NULL;
             }
-            if (i) jb_raw(&b, "\n", 1);
+            if (i) jb_cstr(&b, sep);
             jb_raw(&b, tx->s, tx->n);
         }
     } else {
@@ -270,18 +280,26 @@ static int render(const RqModel *m, int chat, const Msg *msg, int n, int thinkin
 
 typedef struct {
     int stream, include_usage, logprobs, n_msgs;
+    int tmode;        // tools, tool messages or earlier tool calls: rendered by tools_render (Qwen3.5 / 3.8)
     char model[256];
     Msg *msgs;
     ConSet *con;
+    ToolSet *tools;
 } Chat;
 
 static void chat_free(Chat *ch) {
     for (int i = 0; i < ch->n_msgs; i++) {
         free(ch->msgs[i].text);
         free(ch->msgs[i].reasoning);
+        for (int k = 0; k < ch->msgs[i].ncalls; k++) {
+            free(ch->msgs[i].calls[k].name);
+            json_free(ch->msgs[i].calls[k].doc);
+        }
+        free(ch->msgs[i].calls);
     }
     free(ch->msgs);
     con_free(ch->con);
+    tools_free(ch->tools);
 }
 
 static int get_bool(const Js *root, const char *key, int *out, ReqErr *e) {
@@ -327,30 +345,74 @@ static int parse_chat(App *a, const Js *root, Chat *ch, Job *j, ReqErr *e) {
     const Js *ms = json_get(root, "messages");
     if (!ms) return bad(e, "messages", "'messages' is required%s", NULL);
     if (ms->t != JS_ARR || ms->n == 0) return bad(e, "messages", "'messages' must be a non-empty array%s", NULL);
+    // tool mode (tools_render): tools, a tool message or an earlier tool call; the Qwen3.5 / Qwen3.8 templates only
+    int tvar = a->info.chat == RQ_CHAT_QWEN35 || a->info.chat == RQ_CHAT_QWEN38;
+    const Js *tools = json_get(root, "tools");
+    if (tools && tools->t != JS_NULL && tools->t != JS_ARR) return bad(e, "tools", "'tools' must be an array%s", NULL);
+    int ntools = tools && tools->t == JS_ARR ? tools->n : 0;
+    ch->tmode = ntools > 0;
+    for (int i = 0; i < ms->n; i++) {
+        const Js *m = ms->v[i], *role = json_get(m, "role"), *tc = json_get(m, "tool_calls");
+        if (json_str_eq(role, "tool") || (json_str_eq(role, "assistant") && tc && tc->t == JS_ARR && tc->n > 0)) ch->tmode = 1;
+    }
+    if (ch->tmode && !tvar) {
+        char msg[200];
+        snprintf(msg, sizeof(msg), "tools / function calls are supported with the Qwen3.5 and Qwen3.8 chat templates only (this "
+                 "model's: %s)", rq_chat_name(a->info.chat));
+        return bad(e, ntools > 0 ? "tools" : "messages", "%s", msg);
+    }
+    const char *sep = ch->tmode ? "" : "\n";
     ch->msgs = calloc(ms->n, sizeof(Msg));
     if (!ch->msgs) return bad(e, NULL, "out of memory%s", NULL);
     for (int i = 0; i < ms->n; i++) {
         const Js *m = ms->v[i], *role = json_get(m, "role");
         if (!m || m->t != JS_OBJ || !role || role->t != JS_STR) return bad(e, "messages", "each message must be an object with a 'role'%s", NULL);
-        int r = json_str_eq(role, "system") || json_str_eq(role, "developer") ? 0 : json_str_eq(role, "user") ? 1 : json_str_eq(role, "assistant") ? 2 : -1;
-        if (r < 0) return bad(e, "messages", "unsupported message role '%.40s' (system, developer, user, assistant)", role->s);
+        int r = json_str_eq(role, "system") || json_str_eq(role, "developer") ? 0 : json_str_eq(role, "user") ? 1 : json_str_eq(role, "assistant") ? 2
+              : json_str_eq(role, "tool") && tvar ? 3 : -1;
+        if (r < 0) return bad(e, "messages", tvar ? "unsupported message role '%.40s' (system, developer, user, assistant, tool)"
+                              : "unsupported message role '%.40s' (system, developer, user, assistant)", role->s);
         const Js *tc = json_get(m, "tool_calls");
-        if (tc && !(tc->t == JS_NULL || (tc->t == JS_ARR && tc->n == 0))) return bad(e, "messages", "tool calls are not supported%s", NULL);
+        if (tc && tc->t != JS_NULL && (r != 2 || tc->t != JS_ARR)) return bad(e, "messages", "'tool_calls' must be an array, on an assistant message%s", NULL);
+        if (tc && tc->t == JS_ARR && tc->n > 0) {
+            Msg *x = &ch->msgs[i];
+            if (!(x->calls = calloc(tc->n, sizeof(MsgCall)))) return bad(e, NULL, "out of memory%s", NULL);
+            for (int k = 0; k < tc->n; k++) {
+                const Js *c = tc->v[k], *ty = json_get(c, "type"), *f = json_get(c, "function");
+                const Js *nm = json_get(f, "name"), *ar = json_get(f, "arguments");
+                if (c->t != JS_OBJ || (ty && ty->t != JS_NULL && !json_str_eq(ty, "function")) || !f || f->t != JS_OBJ)
+                    return bad(e, "messages", "each tool call must be {\"type\": \"function\", \"function\": {\"name\": ..., \"arguments\": ...}}%s", NULL);
+                if (!nm || nm->t != JS_STR || nm->n == 0 || (int)strlen(nm->s) != nm->n)
+                    return bad(e, "messages", "a tool call's function.name must be a non-empty string%s", NULL);
+                MsgCall *mc = &x->calls[x->ncalls++];
+                if (!(mc->name = strdup(nm->s))) return bad(e, NULL, "out of memory%s", NULL);
+                if (ar && ar->t == JS_STR) { // (OpenAI's form: a JSON text; "" or blank: none)
+                    char perr[200];
+                    size_t bl = strspn(ar->s, " \t\r\n");
+                    if ((int)bl < ar->n) {
+                        if (!(mc->doc = json_parse(ar->s, ar->n, perr, sizeof(perr))) || json_root(mc->doc)->t != JS_OBJ)
+                            return bad(e, "messages", "a tool call's function.arguments must be a JSON object (or its text)%s", NULL);
+                        mc->args = json_root(mc->doc);
+                    }
+                } else if (ar && ar->t == JS_OBJ) mc->args = ar;
+                else if (ar && ar->t != JS_NULL)
+                    return bad(e, "messages", "a tool call's function.arguments must be a JSON object (or its text)%s", NULL);
+            }
+        }
         const Js *c = json_get(m, "content");
         if (r != 2 && (!c || c->t == JS_NULL)) return bad(e, "messages", "a %s message needs 'content'", role->s);
-        if (!(ch->msgs[i].text = content_text(c, e))) return -1;
+        if (!(ch->msgs[i].text = content_text(c, sep, e))) return -1;
         size_t tl; // (Qwen3.5's template trims every message: rq_chat_trim, in place)
         const char *t0 = rq_chat_trim(a->m, ch->msgs[i].text, &tl);
         memmove(ch->msgs[i].text, t0, tl);
         ch->msgs[i].text[tl] = 0;
         ch->msgs[i].role = r;
         ch->n_msgs = i + 1;
-        if (a->info.chat == RQ_CHAT_QWEN38) { // (its template: system / developer messages first; earlier reasoning kept)
-            if (r == 0 && i > 0 && ch->msgs[i - 1].role != 0)
+        if (a->info.chat == RQ_CHAT_QWEN38 || ch->tmode) { // (its template: system / developer messages first; earlier reasoning kept)
+            if (r == 0 && i > 0 && ch->msgs[i - 1].role != 0 && a->info.chat == RQ_CHAT_QWEN38)
                 return bad(e, "messages", "system / developer messages must be at the beginning (Qwen3.8's chat template)%s", NULL);
             const Js *rc = json_get(m, "reasoning_content");
             if (r == 2 && rc && rc->t == JS_STR) {
-                if (!(ch->msgs[i].reasoning = content_text(rc, e))) return -1;
+                if (!(ch->msgs[i].reasoning = content_text(rc, sep, e))) return -1;
                 if (strstr(ch->msgs[i].reasoning, "</think>") || strstr(ch->msgs[i].text, "</think>"))
                     return bad(e, "messages", "an assistant message with reasoning_content must not contain </think>%s", NULL);
             }
@@ -359,10 +421,28 @@ static int parse_chat(App *a, const Js *root, Chat *ch, Job *j, ReqErr *e) {
     long long n = 1;
     if (get_int(root, "n", 1, 1000000, &n, e)) return -1;
     if (n != 1) return bad(e, "n", "only n = 1 is supported%s", NULL);
-    const Js *tools = json_get(root, "tools");
-    if (tools && !(tools->t == JS_NULL || (tools->t == JS_ARR && tools->n == 0))) return bad(e, "tools", "tools are not supported%s", NULL);
     const Js *fns = json_get(root, "functions");
-    if (fns && fns->t != JS_NULL) return bad(e, "functions", "functions are not supported%s", NULL);
+    if (fns && fns->t != JS_NULL) return bad(e, "functions", "functions are not supported (use tools)%s", NULL);
+    // tools: tool_choice auto (the default) or none (rendered, the reply not parsed); parallel_tool_calls false: one call
+    int parse_calls = ntools > 0;
+    const Js *tch = json_get(root, "tool_choice");
+    if (tch && tch->t != JS_NULL) {
+        if (json_str_eq(tch, "none")) parse_calls = 0;
+        else if (!json_str_eq(tch, "auto"))
+            return bad(e, "tool_choice", "tool_choice must be \"auto\" or \"none\" (\"required\" and a named function are not supported)%s", NULL);
+    }
+    if (ntools > 0) {
+        char terr[300];
+        if (!(ch->tools = tools_compile(tools, terr, sizeof(terr)))) return bad(e, "tools", "%s", terr);
+        if (parse_calls) j->tools = ch->tools;
+        int par = 1;
+        if (get_bool(root, "parallel_tool_calls", &par, e)) return -1;
+        j->single_call = !par;
+        pthread_mutex_lock(&a->mu);
+        unsigned long long k = ++a->seq;
+        pthread_mutex_unlock(&a->mu);
+        j->call_seed = (unsigned long long)time(NULL) * 1000003ULL + k * 0x9e3779b97f4a7c15ULL + (unsigned long long)(rq_now() * 1e6);
+    }
 
     // sampling and limits
     double temp = a->def_temp, topp = a->def_topp;
@@ -437,6 +517,7 @@ static int parse_chat(App *a, const Js *root, Chat *ch, Job *j, ReqErr *e) {
         const Js *ty = json_get(rf, "type");
         if (rf->t != JS_OBJ || !ty || ty->t != JS_STR) return bad(e, "response_format", "'response_format' must be an object with a 'type'%s", NULL);
         if (json_str_eq(ty, "json_schema")) {
+            if (j->tools) return bad(e, "response_format", "response_format json_schema cannot be combined with tools (tool_choice none: it can)%s", NULL);
             const Js *js = json_get(rf, "json_schema"), *sc = js ? json_get(js, "schema") : NULL;
             if (!sc) return bad(e, "response_format", "response_format json_schema needs json_schema.schema%s", NULL);
             char err[400];
@@ -473,7 +554,22 @@ static void usage_json(JBuf *b, const Job *j) {
               "\"prompt_tokens_details\": {\"cached_tokens\": %d}}", j->n_prompt, j->n_gen, j->n_prompt + j->n_gen, j->n_cached);
 }
 
-static const char *finish_name(int f) { return f == FINISH_LENGTH ? "length" : "stop"; }
+static const char *finish_name(const Job *j) {
+    return j->finish == FINISH_LENGTH ? "length" : j->calls.n > 0 ? "tool_calls" : "stop";
+}
+
+static void tool_calls_json(JBuf *b, const Job *j, int from, int stream) {
+    // "tool_calls": [...] items from..n (stream: with their index)
+    jb_cstr(b, "\"tool_calls\": [");
+    for (int i = from; i < j->calls.n; i++) {
+        if (i > from) jb_cstr(b, ", ");
+        if (stream) jb_printf(b, "{\"index\": %d, ", i);
+        else jb_cstr(b, "{");
+        jb_cstr(b, j->calls.v[i]);
+        jb_cstr(b, "}");
+    }
+    jb_cstr(b, "]");
+}
 
 static void wait_job(HttpConn *c, Job *j, double *next_check) {
     // (under the job's lock) wait for news; every 100 ms: a client that went away cancels the job
@@ -490,7 +586,7 @@ static void wait_job(HttpConn *c, Job *j, double *next_check) {
 static void run_stream(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const char *id) {
     JBuf b = { 0 };
     size_t sent_c = 0, sent_r = 0;
-    int status = 200;
+    int status = 200, sent_t = 0;
     double next_check = 0;
     http_stream_start(c, r, 200, "text/event-stream");
     chunk_head(a, &b, id, ch);
@@ -524,6 +620,20 @@ static void run_stream(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const 
             job_lock(j);
             continue;
         }
+        if (j->calls.n > sent_t) { // (each call whole in one delta, after the content before it)
+            jb_reset(&b);
+            chunk_head(a, &b, id, ch);
+            jb_cstr(&b, "{\"index\": 0, \"delta\": {");
+            tool_calls_json(&b, j, sent_t, 1);
+            sent_t = j->calls.n;
+            jb_cstr(&b, "}, \"logprobs\": null, \"finish_reason\": null}]");
+            if (ch->include_usage) jb_cstr(&b, ", \"usage\": null");
+            jb_cstr(&b, "}\n\n");
+            job_unlock(j);
+            if (http_stream_write(c, b.p, b.n)) __atomic_store_n(&j->cancel, 1, __ATOMIC_RELEASE);
+            job_lock(j);
+            continue;
+        }
         if (done) break;
         wait_job(c, j, &next_check);
     }
@@ -535,7 +645,7 @@ static void run_stream(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const 
         jb_cstr(&b, "\n\n");
     } else {
         chunk_head(a, &b, id, ch);
-        jb_printf(&b, "{\"index\": 0, \"delta\": {}, \"logprobs\": null, \"finish_reason\": \"%s\"}]", finish_name(j->finish));
+        jb_printf(&b, "{\"index\": 0, \"delta\": {}, \"logprobs\": null, \"finish_reason\": \"%s\"}]", finish_name(j));
         if (ch->include_usage) jb_cstr(&b, ", \"usage\": null");
         jb_cstr(&b, "}\n\n");
         if (ch->include_usage) {
@@ -574,10 +684,15 @@ static void run_once(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const ch
     jb_printf(&b, "{\"id\": \"%s\", \"object\": \"chat.completion\", \"created\": %lld, \"model\": ", id, (long long)time(NULL));
     jb_strz(&b, ch->model);
     jb_cstr(&b, ", \"system_fingerprint\": \"runq\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": ");
-    jb_str(&b, j->content.p ? j->content.p : "", j->content.n);
+    if (j->calls.n > 0 && j->content.n == 0) jb_cstr(&b, "null"); // (as OpenAI: only tool calls)
+    else jb_str(&b, j->content.p ? j->content.p : "", j->content.n);
     if (j->thinking) {
         jb_cstr(&b, ", \"reasoning_content\": ");
         jb_str(&b, j->reasoning.p ? j->reasoning.p : "", j->reasoning.n);
+    }
+    if (j->calls.n > 0) {
+        jb_cstr(&b, ", ");
+        tool_calls_json(&b, j, 0, 0);
     }
     jb_cstr(&b, "}, \"logprobs\": ");
     if (j->top_logprobs >= 0) {
@@ -586,7 +701,7 @@ static void run_once(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const ch
         jb_cstr(&b, "]}");
     } else
         jb_cstr(&b, "null");
-    jb_printf(&b, ", \"finish_reason\": \"%s\"}], \"usage\": ", finish_name(j->finish));
+    jb_printf(&b, ", \"finish_reason\": \"%s\"}], \"usage\": ", finish_name(j));
     usage_json(&b, j);
     jb_cstr(&b, "}");
     if (b.oom) {
@@ -596,8 +711,47 @@ static void run_once(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const ch
     }
     http_respond(c, r, 200, "application/json", b.p, b.n, NULL);
     if (a->verbose) fprintf(stderr, "[response] %s %.*s\n", r->peer, (int)(b.n < 65536 ? b.n : 65536), b.p);
-    logline(a, r, 200, j, finish_name(j->finish));
+    logline(a, r, 200, j, finish_name(j));
     jb_free(&b);
+}
+
+static int render_req(App *a, Chat *ch, Job *j, ReqErr *e) {
+    // the prompt: tools_render in tool mode, else render; 0, or -1 with the error in e
+    char msg[400] = "";
+    int rc = ch->tmode ? tools_render(a->m, a->info.chat, ch->tools, ch->msgs, ch->n_msgs, j->thinking, &j->prompt, msg, sizeof(msg))
+                       : render(a->m, a->info.chat, ch->msgs, ch->n_msgs, j->thinking, &j->prompt);
+    if (rc == RQ_OK) return 0;
+    e->status = rc == RQ_ERR_NOMEM ? 500 : 400;
+    if (msg[0]) snprintf(e->msg, sizeof(e->msg), "%s", msg);
+    else snprintf(e->msg, sizeof(e->msg), "cannot render the conversation: %s", rq_strerror(rc));
+    e->param = "messages";
+    return -1;
+}
+
+int serve_render(RqModel *m, const Js *body, RqTokens *out, int *thinking, char *err, size_t errlen) {
+    App a;
+    memset(&a, 0, sizeof(a));
+    pthread_mutex_init(&a.mu, NULL);
+    a.m = m;
+    rq_model_info(m, &a.info);
+    a.def_temp = a.def_topp = 1;
+    snprintf(a.model_id, sizeof(a.model_id), "render");
+    Chat ch;
+    memset(&ch, 0, sizeof(ch));
+    ReqErr e;
+    memset(&e, 0, sizeof(e));
+    Job *j = job_new();
+    int rc = RQ_ERR_NOMEM;
+    if (j) {
+        rc = parse_chat(&a, body, &ch, j, &e) == 0 && render_req(&a, &ch, j, &e) == 0 ? RQ_OK : RQ_ERR_ARG;
+        if (rc == RQ_OK) rc = rq_tokens_push(out, j->prompt.v, j->prompt.n);
+        else snprintf(err, errlen, "%s", e.msg);
+        *thinking = j->thinking;
+    }
+    chat_free(&ch);
+    job_release(j);
+    pthread_mutex_destroy(&a.mu);
+    return rc;
 }
 
 static void post_chat(App *a, HttpConn *c, HttpReq *r) {
@@ -620,12 +774,8 @@ static void post_chat(App *a, HttpConn *c, HttpReq *r) {
         send_err(a, c, r, 500, "out of memory", NULL, NULL);
         return;
     }
-    if (parse_chat(a, json_root(doc), &ch, j, &e) == 0) {
-        int rc = render(a->m, a->info.chat, ch.msgs, ch.n_msgs, j->thinking, &j->prompt);
-        if (rc != RQ_OK) {
-            e.status = rc == RQ_ERR_NOMEM ? 500 : 400;
-            snprintf(e.msg, sizeof(e.msg), "cannot render the conversation: %s", rq_strerror(rc));
-        } else if (j->prompt.n >= a->ctx) {
+    if (parse_chat(a, json_root(doc), &ch, j, &e) == 0 && render_req(a, &ch, j, &e) == 0) {
+        if (j->prompt.n >= a->ctx) {
             e.status = 400;
             snprintf(e.msg, sizeof(e.msg), "This model's maximum context length is %d tokens. However, your messages resulted in %d tokens.", a->ctx,
                      j->prompt.n);

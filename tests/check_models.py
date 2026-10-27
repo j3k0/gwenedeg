@@ -571,6 +571,46 @@ def q35_bad_run(a, d):
     return out
 
 
+def q35_serve_slots(a):
+    """runq serve's slot budget on the 0.8B (engine.c): a slot counts its KV cache, its recurrent state and the state's
+    checkpoints (2), as computed here from the file's metadata; --kv-mem 0.25 GiB at -c 2048 holds 3 slots of ~82 MiB
+    (the KV cache alone, 24 MiB, would allow 10): [(ok, name, detail)]"""
+    import re
+    f = G.GgufFile(a.q35)
+    kv = lambda k: int(f.kv[f"qwen35.{k}"])
+    L, iv = kv("block_count"), kv("full_attention_interval")
+    n_attn = L // iv
+    conv, dk, nk, nv, inner = (kv(f"ssm.{k}") for k in ("conv_kernel", "state_size", "group_count", "time_step_rank", "inner_size"))
+    dv, ctx, budget = inner // nv, 2048, 0.25 * 2**30
+    conv_dim = 2 * nk * dk + nv * dv
+    pg = lambda n: -(-n // 4096) * 4096
+    kv_b = 2 * pg(n_attn * ctx * kv("attention.head_count_kv") * kv("attention.key_length") * 2) + 4 * ctx  # (+ the token array)
+    state = pg((L - n_attn) * (((conv - 1) * conv_dim + 15) // 16 * 16 + nv * dk * dv) * 4)
+    per = kv_b + 3 * state
+    want = int(budget // per)
+    p = subprocess.Popen([a.runq, "serve", a.q35, "--port", "0", "-c", str(ctx), "--slots", "8", "--parallel", "2", "--kv-mem", "0.25",
+                          "--threads", "2"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    lines, t0 = [], time.time()
+    try:
+        for line in p.stderr:
+            lines.append(line)
+            if "listening on" in line or time.time() - t0 > 60:
+                break
+    finally:
+        p.send_signal(signal.SIGTERM)
+        try:
+            p.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    m = re.search(r"(\d+) slot\(s\) of 2048 positions \(per slot ([\d.]+) MiB: KV \d+ KB per position \+ recurrent state ([\d.]+) MiB "
+                  r"x \(1 \+ 2 checkpoints\)", "".join(lines))
+    got = (int(m.group(1)), float(m.group(2)), float(m.group(3))) if m else None
+    ok = bool(m) and got[0] == want and abs(got[1] - per / 2**20) < 0.06 and abs(got[2] - state / 2**20) < 0.06 and want < budget // kv_b
+    return [(ok, "q35/serve_slots", f"--kv-mem 0.25 -c 2048: {got[0] if m else '?'} slot(s) of {got[1] if m else '?'} MiB "
+             f"(want {want} of {per / 2**20:.1f} MiB: KV {kv_b / 2**20:.1f} + 3 x state {state / 2**20:.1f}; KV alone: {int(budget // kv_b)})"
+             + ("" if m else f"; no info line in {''.join(lines)[-300:]!r}"))]
+
+
 def q35_two_run(a, d):
     """api_test --two on the 0.8B Q8_0 file and the synthetic r = 3 model (two models in one process: interleaved
     prefills, decodes, batched passes and truncations to checkpoints == each alone; one freed): [(ok, name, detail)]"""
@@ -691,6 +731,7 @@ def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
     synth = [ex.submit(q35_synth_run, a, os.path.join(t, "synth"), os.path.join(sd, fn), texts, full)
              for fn, full in Q35_SYNTH.items() if os.path.exists(os.path.join(sd, fn))] + [ex.submit(q35_bad_run, a, sd)] + \
         ([ex.submit(q35_two_run, a, sd)] if a.api_test else []) if sd else []
+    synth.append(ex.submit(q35_serve_slots, a))
     return {"a": a2, "tok_test": tok_test, "synth": synth, "synth_err": serr,
             "chats": [ex.submit(chat_case, a2, tmp, vocab, d, *c) for c in Q35_CHAT_CASES],
             "rec": rec, "models": [mx.submit(test_models, a, rec, t, texts, False, {Q35_TAG}, "q35", a.q35)] + (

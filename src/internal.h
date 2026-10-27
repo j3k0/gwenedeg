@@ -219,6 +219,7 @@ struct RqModel {
     size_t ssm_layer;           // floats of one linear layer's state in a sequence (conv inputs + S per head)
     int ctx_max;                // the model's context length (metadata) before the ctx_len cap
     int chat;                   // chat template variant (RQ_CHAT_*): from the GGUF's tokenizer.chat_template
+    RqModelMem mem;             // the load-time memory estimate (model.c, rq_model_mem)
     // chat templates per thinking mode (0 off, 1 on): the user turn + assistant header with one %s
     // (.template / .template.with-thinking), the system block with one %s (the start of
     // .template.with-system[-and-thinking]); tmpl_missing: the .bin side file that could not be read

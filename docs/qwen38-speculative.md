@@ -77,9 +77,17 @@ the `q35` group ([tests/README.md](../tests/README.md)).
 
 ## Memory and disk
 
-- Weights: repacked into anonymous memory (17.1 GB for Q4_K_M); the loader `pread`s the file, so it also passes
-  through the page cache (drop it after the repack: TODO P4). Embedding rows are dequantized at lookup (no 5 GB fp32
-  table).
+- Weights: repacked into anonymous memory; the loader `pread`s the file, so it also passes through the page cache,
+  which it drops matrix by matrix as they are repacked for a file of >= 1/4 of the RAM (`--page-cache`; measured on
+  the 8B with `drop`: 4.7 GB of cache freed, +0.35 s on a 6 s cold load). The untied `token_embd` stays in the mapping: its rows are
+  dequantized at lookup (no 5 GB fp32 table).
+- The load-time estimate (`--mem`; computed from the tensor directory before any weight is read, refused past
+  MemAvailable; within 3% of the peak RSS with the context full for Qwen3-0.6B to 8B and Qwen3.5-0.8B / 4B,
+  [tests/README.md](../tests/README.md#memory)), for the 27B from its tensor directory with the same rules
+  (2026-10-27, by script; the file is refused at its MTP block before the check, TODO S6): repacked weights
+  **15.3 GiB** (the 64 main layers and `output`; K-quants +1-3% repacked; `ssm_alpha` / `ssm_beta` counted as F32),
+  runtime ~0.3 GiB, one sequence at the default `-c` 40,960: KV 2.5 GiB + state 150 MiB x 3: **~18.6 GiB** (~20 GB);
+  at `-c 8192`: ~16.6 GiB.
 - Per sequence: KV cache 16 layers x 4 x 256 x 2 x 2 B = 64 KiB per position (f16; 2.5 GiB of address space at
   40,960 positions, touched only as used); DeltaNet state 48 x (48 x 128 x 128 x 4 B + 3 x 10,240 x 4 B) =
   **~150 MiB**, the same per checkpoint. A checkpoint per verified row (S3): ~0.6 GB at k = 3.
@@ -87,8 +95,9 @@ the `q35` group ([tests/README.md](../tests/README.md)).
 - The box (2026-10-27): 31.3 GB RAM. With the parcolab, billing and triominos-server containers stopped (decided
   for the 27B runs; they used ~7.5 GB, 6.2 of it a uvicorn) ~24 GB is available: **Q4_K_M** it is, no Q3_K. Disk:
   58 GB free, `models/` 29 GB; `/tmp` is a 16 GB tmpfs (RAM): never put model files or venvs there.
-- `runq serve`'s slot budget counts only the KV cache today (`src/engine.c`), not the recurrent state and its
-  checkpoints: ~0.45 GB per 27B slot uncounted (TODO P4).
+- `runq serve`'s slot budget (`--kv-mem`, default half the RAM and at most MemAvailable after the load) counts a slot's
+  KV cache, recurrent state and its 2 checkpoints: 0.94 GiB per 27B slot at `-c 8192` (0.5 GiB KV + 0.44 GiB), shown
+  in the startup line.
 
 ## Chat template (`tmpl_38.jinja`, differs from Qwen3.5's)
 

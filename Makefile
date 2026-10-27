@@ -29,7 +29,7 @@ HDR = $(wildcard src/*.h)
 Q8  = models/Qwen3-0.6B-q8.bin
 B   = build
 
-.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test api-test bench-batch FORCE
+.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test api-test bench-batch mem-probe FORCE
 
 all: runq
 
@@ -78,6 +78,12 @@ $(B)/bench_batch: tests/bench_batch.c src/runq.h $(LIB:%=$(B)/native/%.o)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
 
 bench-batch: $(B)/bench_batch
+
+# the load-time memory estimate vs the measured RSS, the page cache after the load (tests/mem_probe.c; Linux)
+$(B)/mem_probe: tests/mem_probe.c src/runq.h $(LIB:%=$(B)/native/%.o)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
+
+mem-probe: $(B)/mem_probe
 
 # NEON kernels (kernels_neon.h: K-quants, Q8_0) vs the generic ones, on random data: bit-identical
 kq-neon-test: tests/kernels/kq_neon_test.c src/kernels_neon.h src/kquants.h

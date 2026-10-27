@@ -649,7 +649,12 @@ static void usage(void) {
             "  -k <type>           KV cache type f16|bf16|f32, default f16\n"
             "  --parallel <int>    requests running at once (batched in each forward pass), default 16\n"
             "  --slots <int>       sequences in the pool: running requests + prefix caches, default parallel + 4\n"
-            "  --kv-mem <GiB>      KV cache of the pool at most (slots x ctx), default half the RAM\n"
+            "  --kv-mem <GiB>      memory of the pool at most (slots x (KV cache of ctx positions + recurrent state and its\n"
+            "                      checkpoints)), default half the RAM, at most MemAvailable after the load\n"
+            "  --mem <GiB>         refuse to load if the estimate (weights, runtime, one sequence) does not fit, default\n"
+            "                      MemAvailable; 0 or force = no check\n"
+            "  --page-cache <mode> auto|drop|keep: the model file's page cache after the load, default auto (dropped if the\n"
+            "                      file is >= 1/4 of the RAM)\n"
             "  -b <int>            prompt tokens per pass when no request is decoding, default 512\n"
             "  --chunk <int>       prompt tokens per pass while others decode, default 64\n"
             "  --prefix-copy <int> copy a running request's prompt prefix if that saves this many tokens, default 32 (0: never)\n"
@@ -672,7 +677,8 @@ int serve_main(int argc, char **argv) {
     int port = 8080, ctx = 8192, kv = RQ_KV_DEFAULT, batch = RQ_BATCH_MAX, slots = 0, queue = 64, conns = 128, threads = 0, verbose = 0, maxtok = 0;
     int parallel = 16, chunk = 64, copy_min = 32;
     long long maxbody = 4 << 20;
-    double timeout = 600, temp = 1.0, topp = 1.0, kv_mem = 0;
+    double timeout = 600, temp = 1.0, topp = 1.0, kv_mem = 0, mem = 0;
+    int page_cache = 0;
     for (int i = 2; i < argc; i++) {
         const char *f = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         if (!strcmp(f, "-v") || !strcmp(f, "--verbose")) { verbose = 1; continue; }
@@ -688,6 +694,17 @@ int serve_main(int argc, char **argv) {
         else if (!strcmp(f, "--slots")) slots = atoi(v);
         else if (!strcmp(f, "--parallel")) parallel = atoi(v);
         else if (!strcmp(f, "--kv-mem")) kv_mem = atof(v);
+        else if (!strcmp(f, "--mem")) {
+            char *end;
+            mem = strtod(v, &end);
+            if (!strcmp(v, "force") || !strcmp(v, "off")) mem = -1;
+            else if (end == v || *end || !(mem >= 0)) usage();
+            else if (mem == 0) mem = -1;
+        }
+        else if (!strcmp(f, "--page-cache")) {
+            page_cache = !strcmp(v, "drop") ? 1 : !strcmp(v, "keep") ? -1 : !strcmp(v, "auto") ? 0 : 2;
+            if (page_cache == 2) usage();
+        }
         else if (!strcmp(f, "--chunk")) chunk = atoi(v);
         else if (!strcmp(f, "--prefix-copy")) copy_min = atoi(v);
         else if (!strcmp(f, "--queue")) queue = atoi(v);
@@ -710,7 +727,9 @@ int serve_main(int argc, char **argv) {
     const char *warn = rq_threads_init(threads);
     if (warn) fprintf(stderr, "%s\n", warn);
     char err[512];
-    RqModelOpts mo = { ctx, 0, 0 }; // (positions up to -c: the default cap of 40,960 would clamp a larger -c)
+    // (positions up to -c: the default cap of 40,960 would clamp a larger -c; the memory check counts one sequence of -c
+    // positions, the pool is bounded by --kv-mem)
+    RqModelOpts mo = { ctx, 0, 0, mem, kv == RQ_KV_F32 ? 4 : 2, page_cache };
     RqModel *m = rq_model_load(path, &mo, err, sizeof(err));
     if (!m) { fprintf(stderr, "%s\n", err); return 1; }
     App a;

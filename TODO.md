@@ -132,3 +132,22 @@ Qwen3.5-0.8B Q8_0 runs and is tested (`make test`'s `q35` group); design, result
   [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Rerun `scripts/bench_all.sh`, `scripts/bench_models.py`,
   `scripts/bench_batch.sh` and `scripts/bench_serve.py` with one binary in one session, against qwen3.c and
   mynah-slm as before, and update its text.
+
+## Distribution and model files
+
+- [ ] **A model directory convention** (today: an explicit path, `./models`, or `$GWENEDEG_MODELS`, which only
+  `scripts/download_models.py` reads; the binaries read neither). Proposal, XDG rather than a `~/.gwenedeg/` of our
+  own: the cache dir is `${HF_HOME:-${XDG_CACHE_HOME:-~/.cache}/huggingface}/hub` (HF's own, see below) and
+  `${XDG_CACHE_HOME:-~/.cache}/gwenedeg/models` second, with `$GWENEDEG_MODELS` overriding both for set
+  resolutions; a bare set name on the command line (`runq qwen3.5-0.8b-q8 -i hi`) resolves as: a path, a file in
+  `$GWENEDEG_MODELS`, then `./models`, then the cache dirs in order. In the HF cache, a set finds its file in
+  `models--<org>--<repo>/snapshots/<rev>/<file>` under any revision (verify the content: the LFS symlink points to
+  `../blobs/<sha256>`, whose name is the hash; else hash it against the pinned one), so anything the user already
+  pulled with `hf download` is used as-is, offline and without re-verification of blobs named by their hash.
+  `runq models` lists what is there (sets found in each location, files, sizes, and what each needs to download).
+  Fetching stays out of the binaries (no TLS in them): `scripts/download_models.py` keeps the pinned sets and uses
+  the `hf` CLI when available (`hf download <repo> <file> --revision <sha>`, resumable, writes the HF cache; it
+  verifies nothing, so still check the sha256 before linking), else plain curl + sha256sum into the gwenedeg cache
+  dir; the same logic as a `scripts/fetch.sh` (no Python needed). Done when a bare set name resolves in every
+  location, `hf`-downloaded files are found and used without copying, `runq models` prints the table, and the docs
+  (`README.md`, `scripts/download_models.py --list`) agree.

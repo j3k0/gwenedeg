@@ -437,18 +437,40 @@ static void render_one(const RqModel *m, const Js *a, int thinking) {
     free(msg);
 }
 
+int serve_render(RqModel *m, const Js *body, RqTokens *out, int *thinking, char *err, size_t errlen); // serve.c
+
+static void render_request(RqModel *m, const Js *body) {
+    // one chat completion request body rendered as runq serve renders it (tools, tool messages: serve.c, tools.c)
+    RqTokens t = { 0 };
+    char err[512] = "";
+    int thinking = 0, e = serve_render(m, body, &t, &thinking, err, sizeof(err));
+    if (e != RQ_OK) { fprintf(stderr, "-m render: %s\n", err[0] ? err : rq_strerror(e)); exit(EXIT_FAILURE); }
+    for (int i = 0; i < t.n; i++)
+        printf(i ? " %d" : "%d", t.v[i]);
+    printf("\n");
+    RqModelInfo info;
+    rq_model_info(m, &info);
+    fprintf(stderr, "[render] chat template %s, thinking %d (%s): %d tokens (request)\n", rq_chat_name(info.chat), thinking != 0,
+            rq_chat_effort_name(thinking), t.n);
+    rq_tokens_free(&t);
+}
+
 static void render_chat(const RqModel *m, const char *json, int thinking) {
     // -m render (test hook): the token ids of the conversation -i (a JSON array of {"role": system / user /
     // assistant, "content": text}) rendered by rq_chat_render with -r (and -e), space-separated on stdout; or of several
     // (-i: an array of {"messages": [...], "thinking": 0 / 1 (default -r), "reasoning_effort": xhigh / high / medium /
-    // low (default -e)}), one line each
+    // low (default -e)}) or {"request": a chat completion request body} (as runq serve renders it: tools), one line each
     char err[256];
     JsDoc *d = json_parse(json, strlen(json), err, sizeof(err));
     if (!d) { fprintf(stderr, "-m render: invalid JSON: %s\n", err); exit(EXIT_FAILURE); }
     const Js *a = json_root(d);
     if (a->t != JS_ARR) die("-m render: -i must be a JSON array of messages");
-    if (a->n > 0 && json_get(a->v[0], "messages")) {
+    if (a->n > 0 && (json_get(a->v[0], "messages") || json_get(a->v[0], "request"))) {
         for (int i = 0; i < a->n; i++) {
+            if (json_get(a->v[i], "request")) {
+                render_request((RqModel *)m, json_get(a->v[i], "request"));
+                continue;
+            }
             const Js *ms = json_get(a->v[i], "messages"), *th = json_get(a->v[i], "thinking");
             const Js *ef = json_get(a->v[i], "reasoning_effort");
             long long t = thinking != 0;
@@ -584,7 +606,8 @@ static void error_usage(void) {
     fprintf(stderr, "  -m <string> mode: generate|chat|tokenize|logits|dequant|render, default: chat\n");
     fprintf(stderr, "              tokenize: print the token ids of -i (raw text, no template)\n");
     fprintf(stderr, "              render (test hook): the token ids of the chat template rendering of -i, a JSON array of\n");
-    fprintf(stderr, "              messages ({\"role\": \"user\", \"content\": \"...\"}), with -r\n");
+    fprintf(stderr, "              messages ({\"role\": \"user\", \"content\": \"...\"}), with -r; or of [{\"request\": BODY}, ...]:\n");
+    fprintf(stderr, "              chat completion request bodies as runq serve renders them (tools)\n");
     fprintf(stderr, "              logits: write the logits at every position of -i to -o (binary)\n");
     fprintf(stderr, "  -i <string> input prompt (chat: one turn, then exit; without -i, one turn per stdin line,\n");
     fprintf(stderr, "              the conversation is kept until an empty line or EOF)\n");

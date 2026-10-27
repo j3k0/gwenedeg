@@ -162,6 +162,7 @@ void job_release(Job *j) {
     jb_free(&j->content);
     jb_free(&j->reasoning);
     jb_free(&j->logprobs);
+    strlist_free(&j->calls);
     free(j);
 }
 
@@ -192,6 +193,8 @@ typedef struct {
     int held_nl;        // reasoning: trailing newlines not published yet
     int lead;           // content after </think>: leading newlines still to strip
     int stopped;        // a stop string matched
+    int tstop;          // tool calls: the reply is complete (tscan_push)
+    ToolScan ts;        // tool calls (j->tools): the content scanned for <tool_call> blocks before it goes on to `text`
 } Out;
 
 static void pub_reasoning(Out *o, const char *s, size_t n) {
@@ -247,8 +250,11 @@ static void out_bytes(Out *o, const char *b, int n) {
         if (n == 0) return;
         o->lead = 0;
     }
-    jb_raw(&o->text, b, n);
-    pub_content(o, 0);
+    if (o->j->tools) { // (the content around the calls goes on; the calls into the job)
+        if (!o->tstop) o->tstop = tscan_push(&o->ts, b, (size_t)n, 0, &o->text, &o->j->calls);
+    } else
+        jb_raw(&o->text, b, n);
+    pub_content(o, o->ts.ncalls > 0); // (after a call no more content comes: all of it out, before the call's delta)
 }
 
 static void out_token(Out *o, int tok) {
@@ -282,6 +288,7 @@ static void out_end(Out *o) {
     char buf[16];
     int n = rq_detok_flush(&o->dt, buf, sizeof(buf));
     out_bytes(o, buf, n);
+    if (o->j->tools && !o->tstop) o->tstop = tscan_push(&o->ts, NULL, 0, 1, &o->text, &o->j->calls);
     if (!o->stopped) pub_content(o, 1);
 }
 
@@ -452,7 +459,7 @@ static void take_token(Engine *e, Run *r, int tok) {
         if (!con_advance(&r->cs, b, len)) { end_run(e, r, 0, 0, RQ_ERR_STATE, "constrained decoding: a disallowed token"); return; }
         if (r->cs.done) { end_run(e, r, FINISH_STOP, 0, RQ_OK, NULL); return; }
     }
-    if (r->o.stopped) { end_run(e, r, FINISH_STOP, 0, RQ_OK, NULL); return; }
+    if (r->o.stopped || r->o.tstop) { end_run(e, r, FINISH_STOP, 0, RQ_OK, NULL); return; }
     if (j->n_gen >= j->max_new || rq_seq_len(sl->seq) >= rq_seq_capacity(sl->seq)) { end_run(e, r, FINISH_LENGTH, 0, RQ_OK, NULL); return; }
     r->feed.n = 0;
     r->fed = 0;
@@ -501,6 +508,7 @@ static void start_run(Engine *e, Job *j, int si, int src, int L) {
     r->row = -1;
     r->o.e = e;
     r->o.j = j;
+    if (j->tools) tscan_init(&r->o.ts, j->tools, j->single_call, j->call_seed);
     if (j->thinking && (e->chat == RQ_CHAT_THINKING || e->chat == RQ_CHAT_QWEN35 || e->chat == RQ_CHAT_QWEN38))
         r->o.mode = 1; // (Thinking-2507, Qwen3.5 / 3.8: the prompt opened the <think> block, the reply starts in the reasoning)
     for (int i = 0; i < j->nstop; i++)
@@ -743,6 +751,7 @@ static void reap(Engine *e) {
         }
         rq_tokens_free(&r->feed);
         jb_free(&r->o.text);
+        tscan_free(&r->o.ts);
         job_release(r->j);
         free(r);
     }

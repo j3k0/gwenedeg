@@ -37,6 +37,16 @@ builds). Checks:
              (stream and non-stream: the next request is served at once, logged as 499)
   fuzz       ~150 mutated / random requests on raw sockets: the server stays up
   shutdown   SIGTERM: a clean exit (status 0)
+With --tools (a Qwen3.5 / Qwen3.8 model; tests/check.py's q35 group runs it on Qwen3.5-0.8B Q8_0), the tool call group
+only (src/tools.c):
+  tools      the prompt of each request (tools, a round trip with assistant tool_calls, tool results and reasoning_content
+             in the history) == `runq -m render` of the request (usage.prompt_tokens); a greedy request that calls a tool:
+             tool_calls == a reference parse (below) of the same reply's raw text (tool_choice none: the XML as content),
+             arguments typed by the schema, finish_reason tool_calls, content null; streamed: the same calls as
+             tool_calls deltas, finish_reason, the usage chunk; thinking (reasoning_effort): reasoning_content kept apart
+             and == the raw reply's; the round trip's second turn reuses the first (cached_tokens) and answers;
+             max_completion_tokens over max_tokens; errors (tool_choice required / a named function, a custom tool, bad
+             arguments, json_schema with tools, a late system message, no user query)
 """
 import argparse
 import concurrent.futures as cf
@@ -198,6 +208,125 @@ def validate(v, s, root):
     return False
 
 
+TOOLS = [{"type": "function", "function": {
+    "name": "get_weather", "description": "Get the weather forecast for a city",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"},
+                                                    "metric": {"type": "boolean"}}, "required": ["city"]}}},
+    {"type": "function", "function": {"name": "read", "description": "Read a file",
+                                      "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}]
+WEATHER = [{"role": "system", "content": "You are a helpful assistant."},
+           {"role": "user", "content": "What's the weather in Paris for the next 3 days, in metric?"}]
+
+
+def ref_parse(text, tools):
+    """a reference parse of a reply's raw text (Qwen3.5 / 3.8's XML tool calls): (content, [(name, arguments)])"""
+    i = text.find("<tool_call>")
+    if i < 0:
+        return text, []
+    types = {t["function"]["name"]: {k: v.get("type") for k, v in t["function"]["parameters"]["properties"].items()} for t in tools}
+    calls = []
+    for block in re.findall(r"<tool_call>(.*?)</tool_call>", text[i:], re.S):
+        for fn, body in re.findall(r"<function=([^>\n]*)>(.*?)</function>", block, re.S):
+            args = {}
+            for k, v in re.findall(r"<parameter=([^>\n]*)>(.*?)</parameter>", body, re.S):
+                v = v[1:] if v.startswith("\n") else v
+                v = v[:-1] if v.endswith("\n") else v
+                ty, w = types.get(fn.strip(), {}).get(k.strip()), v.strip()
+                if ty == "integer" and re.fullmatch(r"-?(0|[1-9][0-9]*)", w):
+                    v = int(w)
+                elif ty == "boolean" and w.lower() in ("true", "false"):
+                    v = w.lower() == "true"
+                args.setdefault(k.strip(), v)
+            calls.append((fn.strip(), args))
+    return text[:i].rstrip(), calls
+
+
+def run_tools(a, t, port):
+    rep = t.report
+    env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
+
+    def render_n(bodies):
+        p = subprocess.run([a.runq, a.model, "-m", "render", "-i", json.dumps([{"request": b} for b in bodies])], capture_output=True, env=env)
+        return [len(l.split()) for l in p.stdout.decode().splitlines()]
+
+    def calls_of(m):
+        return [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in m.get("tool_calls") or []]
+
+    base = {"messages": WEATHER, "tools": TOOLS, "temperature": 0, "max_tokens": 200}
+    st, d, _ = chat(port, base)
+    # the round trip at once (Qwen3.5's slot keeps the whole first turn until another request truncates it to a checkpoint):
+    # the call and its result in the history, the answer
+    tc = [{"id": x["id"], "type": "function", "function": x["function"]} for x in d["choices"][0]["message"].get("tool_calls") or []]
+    msgs2 = WEATHER + [{"role": "assistant", "content": None, "tool_calls": tc},
+                       {"role": "tool", "tool_call_id": tc[0]["id"] if tc else "x",
+                        "content": json.dumps({"forecast": ["sunny 21C", "rain 15C", "cloudy 17C"]})}]
+    body2 = dict(base, messages=msgs2)
+    st2, d2, _ = chat(port, body2)
+    u1, u2 = d["usage"], d2["usage"] if st2 == 200 else {}
+    m2 = d2["choices"][0]["message"] if st2 == 200 else {}
+    rep(st2 == 200 and tc and m2.get("content") and not m2.get("tool_calls") and d2["choices"][0]["finish_reason"] == "stop" and
+        u2["prompt_tokens_details"]["cached_tokens"] >= u1["prompt_tokens"] + u1["completion_tokens"] - 1, "tools/round_trip",
+        f"cached {u2.get('prompt_tokens_details', {}).get('cached_tokens')} of {u2.get('prompt_tokens')} (first turn {u1['prompt_tokens']} + "
+        f"{u1['completion_tokens']}): {m2.get('content', '')[:80]!r}")
+    st_raw, raw, _ = chat(port, dict(base, tool_choice="none"))
+    m, mr = d["choices"][0]["message"], raw["choices"][0]["message"]
+    want = ref_parse(mr["content"], TOOLS)
+    got = calls_of(m)
+    ok = st == st_raw == 200 and len(got) >= 1 and got == want[1] and (m["content"] or "") == want[0] and \
+        d["choices"][0]["finish_reason"] == "tool_calls" and raw["choices"][0]["finish_reason"] == "stop" and \
+        all(c["id"].startswith("call_") and c["type"] == "function" for c in m["tool_calls"]) and \
+        d["usage"]["completion_tokens"] == raw["usage"]["completion_tokens"]
+    typed = got and isinstance(got[0][1].get("days", 0), int) and isinstance(got[0][1].get("metric", True), bool)
+    rep(ok and typed, "tools/call_greedy", f"{got} == the parse of {mr['content']!r}; content {m['content']!r}")
+    first = d
+    # streamed: the same calls as tool_calls deltas
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+    c.request("POST", "/v1/chat/completions", body=json.dumps(dict(base, stream=True, stream_options={"include_usage": True})).encode())
+    ev = [json.loads(l[6:]) for l in c.getresponse().read().decode().split("\n") if l.startswith("data: ") and l != "data: [DONE]"]
+    c.close()
+    deltas = [x["choices"][0]["delta"] for x in ev if x.get("choices")]
+    sc = [(tc["function"]["name"], json.loads(tc["function"]["arguments"])) for dl in deltas for tc in dl.get("tool_calls", [])]
+    idx = [tc["index"] for dl in deltas for tc in dl.get("tool_calls", [])]
+    fins = [x["choices"][0]["finish_reason"] for x in ev if x.get("choices") and x["choices"][0]["finish_reason"]]
+    usage = [x["usage"] for x in ev if x.get("usage")]
+    text = "".join(dl.get("content") or "" for dl in deltas)
+    rep(sc == got and idx == list(range(len(got))) and fins == ["tool_calls"] and usage and usage[0]["completion_tokens"] ==
+        d["usage"]["completion_tokens"] and text == (m["content"] or ""), "tools/call_stream", f"{sc}, finish {fins}, content {text!r}")
+    # thinking: the reasoning stays reasoning_content
+    st, dt, _ = chat(port, dict(base, reasoning_effort="high", max_tokens=400))
+    st2, rt, _ = chat(port, dict(base, reasoning_effort="high", max_tokens=400, tool_choice="none"))
+    mt, mrt = dt["choices"][0]["message"], rt["choices"][0]["message"]
+    gt = calls_of(mt)
+    ok = st == st2 == 200 and mt.get("reasoning_content") and mt["reasoning_content"] == mrt.get("reasoning_content") and \
+        gt == ref_parse(mrt["content"], TOOLS)[1] and (dt["choices"][0]["finish_reason"] == "tool_calls") == bool(gt)
+    rep(ok, "tools/call_thinking", f"reasoning {len(mt.get('reasoning_content') or '')} chars, calls {gt}, finish {dt['choices'][0]['finish_reason']}")
+    msgs3 = WEATHER[1:] + [{"role": "assistant", "content": "", "reasoning_content": "I need the weather tool.", "tool_calls": tc},
+                           {"role": "tool", "tool_call_id": tc[0]["id"], "content": [{"type": "text", "text": "sunny "}, {"type": "text", "text": "21C"}]}]
+    bodies = [base, body2, dict(base, messages=msgs3, reasoning_effort="high"), dict(base, tools=[], messages=msgs2)]
+    want_n = render_n(bodies)
+    got_n = []
+    for b in bodies:
+        st, x, _ = chat(port, dict(b, max_tokens=1))
+        got_n.append(x["usage"]["prompt_tokens"] if st == 200 else st)
+    rep(got_n == want_n and len(want_n) == 4, "tools/prompt_render", f"prompt tokens {got_n} == -m render {want_n}")
+    st, x, _ = chat(port, dict(base, tool_choice="auto", max_tokens=50, max_completion_tokens=3))
+    rep(st == 200 and x["usage"]["completion_tokens"] == 3 and x["choices"][0]["finish_reason"] == "length", "tools/max_completion_tokens",
+        f"{x.get('usage')}")
+
+    def err(name, body, words):
+        st, x, _ = chat(port, body)
+        msg = x.get("error", {}).get("message", "") if isinstance(x, dict) else ""
+        rep(st == 400 and words in msg, f"tools/error_{name}", f"{st} {msg[:90]!r}")
+    err("tool_choice_required", dict(base, tool_choice="required"), "tool_choice")
+    err("tool_choice_named", dict(base, tool_choice={"type": "function", "function": {"name": "read"}}), "tool_choice")
+    err("custom_tool", dict(base, tools=[{"type": "custom", "custom": {"name": "x"}}]), "only function tools")
+    err("bad_arguments", dict(base, messages=WEATHER + [{"role": "assistant", "tool_calls": [{"type": "function", "function": {
+        "name": "read", "arguments": "{not json"}}]}]), "arguments")
+    err("json_schema", dict(base, response_format={"type": "json_schema", "json_schema": {"schema": {"enum": ["a"]}}}), "tools")
+    err("late_system", dict(base, messages=WEATHER + [{"role": "system", "content": "late"}]), "at the beginning")
+    err("no_user_query", dict(base, messages=[{"role": "system", "content": "x"}, {"role": "tool", "content": "y"}]), "no user query")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--runq", required=True)
@@ -205,6 +334,7 @@ def main():
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--slow", action="store_true", help="relaxed latency bounds (sanitizer builds)")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--tools", action="store_true", help="the tool call group only (a Qwen3.5 / Qwen3.8 model)")
     a = ap.parse_args()
     t = T(a)
     slow = 10 if a.slow else 1
@@ -214,7 +344,7 @@ def main():
                             "--max-body", "65536", "--name", "test-model"], stderr=log, stdout=subprocess.DEVNULL, env=env)
     # the CLI references, in parallel with the server tests
     ex = cf.ThreadPoolExecutor(max_workers=3)
-    ref = {
+    ref = {} if a.tools else {
         "aus": ex.submit(cli, a, ["-t", "0", "-n", "40", "-i", AUS]),
         "pirate": ex.submit(cli, a, ["-t", "0", "-n", "16", "-y", PIRATE_SYS, "-i", PIRATE]),
         "ada": ex.submit(cli, a, ["-t", "0", "-n", "32"], "\n".join(ADA) + "\n"),
@@ -235,7 +365,10 @@ def main():
         t.report(False, "server/start", open(log.name).read()[-500:])
         return 1
     try:
-        run_all(a, t, port, ref, slow, log.name)
+        if a.tools:
+            run_tools(a, t, port)
+        else:
+            run_all(a, t, port, ref, slow, log.name)
     except Exception as e:  # (a crash of the server shows up here)
         import traceback
         t.report(False, "server/error", f"{type(e).__name__}: {e} {traceback.format_exc()[-600:]}")

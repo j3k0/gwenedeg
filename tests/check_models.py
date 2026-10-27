@@ -17,7 +17,8 @@ q35     (default suite, if models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf is th
         the r = 3 model in one process (api_test --two: interleaved == each alone); files that must be refused (bad
         metadata); the 27B-shaped model with its MTP block (logits == without it, bitwise), with F32 alpha / beta and
         Qwen3.8's template (the checks above, a CLI chat, runq serve's prompts), Qwen3.8's renderings (tokenizer-only
-        files with its two templates vs tests/golden/chat_render.json)
+        files with its two templates vs tests/golden/chat_render.json, incl. requests with tools); runq serve's tool
+        calls on the 0.8B (tests/server_test.py --tools)
 models  (opt-in: tests/run_tests.sh --models, make test-models) every downloaded family model
         (scripts/download_models.py family; missing files are skipped; Qwen3.8-27B (BIG) also when MemAvailable does
         not cover it): logits vs HF fp32 (Qwen3-1.7B) and vs
@@ -98,7 +99,8 @@ def render_cases(runq, model, variant, res, prefix, jobs=None):
     """runq -m render on model (tokenizer only, one process for all cases) for the golden cases of its variant"""
     with open(os.path.join(GOLDEN, "chat_render.json"), encoding="utf-8") as f:
         cases = [c for c in json.load(f)["cases"] if c["variant"] == variant]
-    conv = [dict({"messages": c["messages"], "thinking": c["thinking"]},
+    conv = [{"request": c["request"]} if "request" in c else  # (tool calls: a chat completion body as runq serve renders it)
+            dict({"messages": c["messages"], "thinking": c["thinking"]},
                  **({"reasoning_effort": c["reasoning_effort"]} if "reasoning_effort" in c else {})) for c in cases]
     p = run([runq, model, "-m", "render", "-i", json.dumps(conv)], 1)
     lines = p.stdout.decode().splitlines() if p.returncode == 0 else []
@@ -109,7 +111,7 @@ def render_cases(runq, model, variant, res, prefix, jobs=None):
     for c, line, err in zip(cases, lines, [e for e in errs if e.startswith("[render]")]):
         ids = [int(x) for x in line.split()]
         det = f"[{variant}] -r {c['thinking']}" + (f" -e {c['reasoning_effort']}" if "reasoning_effort" in c else "") + \
-            f": {len(c['ids'])} tokens" + (", = HF's apply_chat_template" if c["hf"] else ", = HF's with reasoning_content"
+            f": {len(c['ids'])} tokens" + (" (request with tools)" if "request" in c else "") + (", = HF's apply_chat_template" if c["hf"] else ", = HF's with reasoning_content"
                                           if c.get("hf_reasoning_content") else " (runq's documented form, not HF's)")
         ok = ids == c["ids"] and f"chat template {variant}," in err
         if not ok:
@@ -777,6 +779,18 @@ def q35_serve_slots(a):
              + ("" if m else f"; no info line in {''.join(lines)[-300:]!r}"))]
 
 
+def q35_server_tools(a):
+    """tests/server_test.py --tools on the 0.8B (runq serve's tool calls: prompts == -m render, calls parsed and typed,
+    streamed, with thinking, a round trip, errors): [(ok, name, detail)]"""
+    p = run([sys.executable, "-I", os.path.join(HERE, "server_test.py"), "--runq", a.runq, "--model", a.q35, "--tools",
+             "--threads", "2"], 2)
+    lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
+    out = [(l.startswith("PASS "), f"q35/server/{l[5:].partition('  ')[0].strip()}", l[5:].partition("  ")[2].strip()) for l in lines]
+    if p.returncode not in (0, 1) or not lines:
+        out.append((False, "q35/server/tools_run", f"exit status {p.returncode}: {(p.stdout + p.stderr).decode(errors='replace')[-300:]}"))
+    return out
+
+
 def q35_two_run(a, d):
     """api_test --two on the 0.8B Q8_0 file and the synthetic r = 3 model (two models in one process: interleaved
     prefills, decodes, batched passes and truncations to checkpoints == each alone; one freed): [(ok, name, detail)]"""
@@ -913,6 +927,7 @@ def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
          for fn in ("synth-tok-qwen3.8.gguf", "synth-tok-qwen3.8-hf.gguf")] + \
         ([ex.submit(q35_two_run, a, sd)] if a.api_test else []) if sd else []
     synth.append(ex.submit(q35_serve_slots, a))
+    synth.append(ex.submit(q35_server_tools, a))
     return {"a": a2, "tok_test": tok_test, "synth": synth, "synth_err": serr,
             "chats": [ex.submit(chat_case, a2, tmp, vocab, d, *c) for c in Q35_CHAT_CASES],
             "rec": rec, "models": [mx.submit(test_models, a, rec, t, texts, False, {Q35_TAG}, "q35", a.q35)] + (

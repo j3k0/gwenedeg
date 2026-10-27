@@ -30,9 +30,15 @@ template renders as its reasoning_content + content; given the message's content
 block in front of the whole text ("hf_reasoning_content": runq's form == HF's with the message split so). Qwen's own
 template (qwen3.8-hf.jinja) gives the same as Unsloth's except where Unsloth's adds features (developer role,
 several system messages: "hf_qwen" false / null for an error).
+Tool calls (runq serve with tools, src/tools.c; Qwen3.5 and Qwen3.8): the cases with a "request" (an OpenAI chat completion
+body: tools, tool messages, assistant tool_calls with their arguments as a JSON string, reasoning_content, content parts)
+rendered by `runq -m render` as runq serve renders it; `text` = HF's apply_chat_template of the same conversation, the
+arguments parsed into objects first (as vLLM does), thinking per chat_template_kwargs.enable_thinking (Qwen3.8 also its
+reasoning_effort): runq's rendering must equal HF's.
 """
 import json
 import os
+import re
 import sys
 
 import transformers
@@ -145,6 +151,102 @@ def runq_text(variant, thinking, msgs):
     return out
 
 
+# tool calls: tools (unicode, controls, numbers in Python's float forms) and conversations (OpenAI messages)
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "read", "description": "Read a file. Paths are relative to the cwd.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Path to the file"},
+            "offset": {"type": "integer", "description": "Line to start from (1-indexed)", "minimum": 1},
+            "limit": {"type": "number", "minimum": 0.5, "maximum": 1E20, "multipleOf": 1.0, "default": -0, "x": 1e-7}},
+            "required": ["path"], "additionalProperties": False}, "strict": False}},
+    {"type": "function", "function": {
+        "name": "bash", "description": "Run a command \u2014 \u00ablike this\u00bb \u2713 \U0001f41a, tab\there \"quoted\" \\ \u0001 \u007f \u2028.",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string"}, "timeout": {"type": ["integer", "null"]}, "env": {"type": "object"},
+            "flags": {"type": "array", "items": {"type": "string"}}, "dry": {"type": "boolean"}, "ratio": {"type": "number"}},
+            "required": ["command"]}}},
+]
+CALL_READ = {"id": "call_1", "type": "function", "function": {"name": "read", "arguments": json.dumps({"path": "notes/a.txt", "offset": 3})}}
+CALL_BASH = {"id": "call_2", "type": "function", "function": {"name": "bash", "arguments":
+             '{"command": "ls -la\\nwc -l *.c", "timeout": null, "env": {"A": "1", "B": [1, 2.50, true]}, "flags": ["-x", "y"], '
+             '"dry": true, "ratio": 1.50, "big": 1E5, "neg": -0, "tiny": 1e-7, "dup": 1, "dup": "second", "uni": "caf\\u00e9 \\ud83d\\udc1a \\u0007"}'}}
+CALL_EMPTY = {"id": "call_3", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+U, S = {"role": "user", "content": "What is in notes/a.txt?"}, {"role": "system", "content": "You are a coding agent. "}
+TOOL_CASES = [  # (name, tools, messages)
+    ("tools_one_turn", TOOLS, [S, U]),
+    ("tools_no_system", TOOLS, [U]),
+    ("tools_empty_system", TOOLS, [{"role": "system", "content": " "}, U]),
+    ("tool_round_trip", TOOLS, [S, U, {"role": "assistant", "content": None, "tool_calls": [CALL_READ]},
+                                {"role": "tool", "tool_call_id": "call_1", "content": "hello\nworld\n"}]),
+    ("tool_calls_multi", TOOLS, [S, U, {"role": "assistant", "content": "Let me check. ", "tool_calls": [CALL_BASH, CALL_READ, CALL_EMPTY]},
+                                 {"role": "tool", "tool_call_id": "call_2", "content": "a.c b.c"},
+                                 {"role": "tool", "tool_call_id": "call_1", "content": [{"type": "text", "text": "part 1, "},
+                                                                                         {"type": "text", "text": "part 2"}]},
+                                 {"role": "tool", "tool_call_id": "call_3", "content": ""},
+                                 {"role": "assistant", "content": "It has two lines.", "reasoning_content": " The file says hello. "},
+                                 {"role": "user", "content": "Thanks! Now count the C files."}]),
+    ("tool_reasoning", TOOLS, [U, {"role": "assistant", "content": "", "reasoning_content": "I should read it.\n",
+                                   "tool_calls": [CALL_READ]},
+                               {"role": "tool", "tool_call_id": "call_1", "content": "hello"},
+                               {"role": "assistant", "content": "Reading more.", "reasoning_content": "", "tool_calls": [CALL_READ]},
+                               {"role": "tool", "tool_call_id": "call_1", "content": "world"}]),
+    ("tool_history_no_tools", [], [U, {"role": "assistant", "content": None, "tool_calls": [CALL_READ]},
+                                   {"role": "tool", "tool_call_id": "call_1", "content": "hello"}]),
+    ("tool_response_user", TOOLS, [U, {"role": "assistant", "content": "", "tool_calls": [CALL_READ]},
+                                   {"role": "user", "content": "<tool_response>\nhello\n</tool_response>"}]),
+]
+TOOL_CASES_35 = [  # (Qwen3.5 only: its split of an assistant text at </think>; runq's Qwen3.8 form differs, src/chat.c)
+    ("tool_think_text", TOOLS, [U, {"role": "assistant", "content": "<think>\nLet me see.\n</think>\n\nI will read it.",
+                                    "tool_calls": [CALL_READ]}, {"role": "tool", "tool_call_id": "call_1", "content": "hi"}]),
+]
+TOOL_CASES_38 = [  # (Qwen3.8 only: Unsloth's merged system / developer messages)
+    ("tools_developer", TOOLS, [S, {"role": "developer", "content": "Prefer bash."}, U]),
+]
+
+
+def hf_tools(tok, tmpl, tools, msgs, kw):
+    """HF's rendering of an OpenAI request's conversation: tool call arguments parsed into objects (vLLM's form); None
+    if the template raised"""
+    conv = []
+    for m in msgs:
+        m = dict(m)
+        if m.get("tool_calls"):
+            m["tool_calls"] = [dict(c, function=dict(c["function"], arguments=json.loads(c["function"]["arguments"])))
+                               for c in m["tool_calls"]]
+        conv.append(m)
+    try:
+        return tok.apply_chat_template(conv, tools=tools or None, chat_template=tmpl, tokenize=False, add_generation_prompt=True, **kw)
+    except Exception:  # (jinja2's TemplateError from raise_exception)
+        return None
+
+
+def tool_cases(v, tok, tmpl, tmpl_qwen):
+    """the tool call cases of a variant (Qwen3.5: thinking off / on; Qwen3.8: off, on (xhigh), low)"""
+    out = []
+    modes = [(0, None), (1, None)] if v == "qwen3.5" else [(0, None), (1, None), (1, "low")]
+    for thinking, effort in modes:
+        for name, tools, msgs in TOOL_CASES + (TOOL_CASES_35 if v == "qwen3.5" else TOOL_CASES_38):
+            kw = {"enable_thinking": bool(thinking)}
+            body = {"messages": msgs, "chat_template_kwargs": dict(kw)}
+            if tools:
+                body["tools"] = tools
+            if effort:
+                kw["reasoning_effort"] = body["reasoning_effort"] = effort
+            text = hf_tools(tok, tmpl, tools, msgs, kw)
+            if text is None:
+                sys.exit(f"{v} {name}: HF's template raised")
+            c = {"variant": v, "thinking": thinking, "name": name if effort is None else f"{name}_{effort}", "request": body,
+                 "text": text, "ids": tok.encode(text, add_special_tokens=False), "hf": True}
+            if effort:
+                c["reasoning_effort"] = effort
+            if tmpl_qwen:
+                q = hf_tools(tok, tmpl_qwen, tools, msgs, kw)
+                c["hf_qwen"] = None if q is None else q == text
+            out.append(c)
+    return out
+
+
 def main():
     toks = {d: AutoTokenizer.from_pretrained(os.path.join(ROOT, "models", d), local_files_only=True)
             for d in {"Qwen3-0.6B", *TOKENIZERS.values()}}
@@ -175,6 +277,7 @@ def main():
                         c["hf_reasoning_content"] = text == hf_rc
                     c["hf_qwen"] = None if hf_q is None else text == hf_q
                     cases.append(c)
+            cases += tool_cases(v, tok, tmpl, tmpl_qwen)
             continue
         for thinking in (0, 1):
             for name, conv in CONVERSATIONS:
@@ -191,16 +294,21 @@ def main():
                 if text != hf:
                     c["hf_text"] = hf
                 cases.append(c)
+        if v == "qwen3.5":
+            cases += tool_cases(v, tok, tmpl, None)
     meta = {"transformers": transformers.__version__, "tokenizer": "models/Qwen3-0.6B",
             "tokenizers": {v: f"models/{d}" for v, d in TOKENIZERS.items()},
             "templates": {v: f"tests/golden/templates/{v}.jinja" for v in VARIANTS}}
+    text = json.dumps({"meta": meta, "cases": cases}, ensure_ascii=False, indent=1)
+    # (token id lists on one line each)
+    text = re.sub(r"\[\n\s*(-?\d+(?:,\n\s*-?\d+)*)\n\s*\]", lambda m: "[" + re.sub(r",\n\s*", ", ", m.group(1)) + "]", text)
     with open(OUT, "w", encoding="utf-8") as f:
-        json.dump({"meta": meta, "cases": cases}, f, ensure_ascii=False, indent=1)
-        f.write("\n")
+        f.write(text + "\n")
     n38 = [c for c in cases if c["variant"] == "qwen3.8"]
     print(f"wrote {OUT}: {len(cases)} cases, {sum(c['hf'] for c in cases)} equal to HF's rendering; qwen3.8: {len(n38)} cases, "
           f"{sum(c['hf'] for c in n38)} equal to HF's, {sum(c.get('hf_reasoning_content', False) for c in n38)} to HF's with "
-          f"reasoning_content, {sum(c['hf_qwen'] is True for c in n38)} to Qwen's own template's")
+          f"reasoning_content, {sum(c['hf_qwen'] is True for c in n38)} to Qwen's own template's; "
+          f"{sum('request' in c for c in cases)} tool call cases (requests)")
     return 0
 
 

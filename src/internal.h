@@ -7,6 +7,7 @@
  *   tokenizer.c  the BPE tokenizer (HF-compatible: added tokens, NFC, Qwen2 / Qwen3.5 pre-tokenizer), detok
  *   sampler.c    greedy / top-p sampling
  *   chat.c       chat template rendering, the generation loop (rq_generate)
+ *   spec.c       speculative decoding (rq_generate_spec: a draft model's guesses verified by the target)
  *   threads.c    the thread pool (threads.h: phase synchronization)
  *   cli.c        the runq command line (not part of the library)
  */

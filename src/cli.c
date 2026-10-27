@@ -15,6 +15,10 @@
 #include "json.h" // (-m render: the messages as JSON)
 
 static int max_new_tokens = 0; // -n: stop after this many generated tokens, 0 = unlimited
+#define SPEC_K_DEFAULT 3       // -G with -D (the best fixed k for Qwen3-1.7B + 0.6B: docs/qwen38-speculative.md)
+
+// speculative decoding (-D draft.gguf, -G k, --tau): the draft model, its context and sequence (m NULL: plain decoding)
+static struct { RqModel *m; RqCtx *c; RqSeq *s; RqSpecOpts o; } draft;
 
 static void die(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -37,6 +41,30 @@ static void print_token(const RqModel *m, int token) {
 static void report_timing(int n_prompt, double pf, int n_gen, double dc) {
     fprintf(stderr, "\n[timing] prompt: %d tok in %.3f s (%.1f tok/s) | generated: %d tok in %.3f s (%.1f tok/s)\n",
             n_prompt, pf, n_prompt / (pf > 0 ? pf : 1e-9), n_gen, dc, n_gen / (dc > 0 ? dc : 1e-9));
+}
+
+static void report_spec(const RqSpecStats *st) {
+    // the speculative loop's counters (after report_timing)
+    char tau[32] = "";
+    if (draft.o.tau > 0) snprintf(tau, sizeof(tau), ", tau %g", draft.o.tau);
+    fprintf(stderr, "[timing] speculative: k %d%s: %d passes, %d drafted, %d accepted (%.1f%%), %.2f tok/pass | draft %.3f s "
+            "(%d steps), verify %.3f s\n", draft.o.k, tau, st->passes, st->drafted, st->accepted,
+            100.0 * st->accepted / (st->drafted > 0 ? st->drafted : 1), (double)st->gen.n_gen / (st->passes > 0 ? st->passes : 1),
+            st->t_draft, st->draft_steps, st->t_verify);
+}
+
+// -m generate with a draft: the output of generate()'s loop (the prompt, then at most -n - 1 generated tokens, those
+// that fit in the context), through rq_spec_run (no RNG draws for the prompt, as there)
+typedef struct { const RqModel *m; int pos, cap, left; } GenOut;
+
+static int on_gen_token(void *user, int token) {
+    GenOut *g = user;
+    if (g->pos >= g->cap || g->left == 0) return 1; // (generate() stops before printing it)
+    print_token(g->m, token);
+    fflush(stdout);
+    g->pos++;
+    if (g->left > 0) g->left--;
+    return 0;
 }
 
 // ----------------------------------------------------------------------------
@@ -63,6 +91,30 @@ static void generate(RqModel *m, RqCtx *c, RqSeq *s, const RqSampling *cfg, char
     int n_gen = 0;
     double t0 = rq_now(), t_prefill = t0;
     float *pre_logits = NULL; // logits of the last prompt token, from the batched prefill
+
+    if (draft.m && num_prompt_tokens <= seq_len) {
+        // speculative: the prompt (both models), then the loop (rq_spec_run) prints what generate's loop would
+        float *logits;
+        check(rq_prefill(c, s, prompt_tokens, num_prompt_tokens, RQ_LOGITS_LAST, NULL, &logits), c);
+        int nd = num_prompt_tokens < rq_seq_capacity(draft.s) ? num_prompt_tokens : rq_seq_capacity(draft.s);
+        check(rq_prefill(draft.c, draft.s, prompt_tokens, nd, RQ_LOGITS_NONE, NULL, NULL), draft.c);
+        for (int i = 0; i < num_prompt_tokens; i++)
+            print_token(m, prompt_tokens[i]);
+        fflush(stdout);
+        t_prefill = rq_now();
+        GenOut go = { m, num_prompt_tokens, seq_len, max_new_tokens > 0 ? max_new_tokens - 1 : -1 };
+        RqCallbacks cb = { on_gen_token, NULL, &go };
+        RqGen g;
+        rq_gen_start(&g, s, cfg, max_new_tokens > 1 ? max_new_tokens - 1 : 0, &cb, 1);
+        RqSpecStats st;
+        memset(&st, 0, sizeof(st));
+        check(rq_spec_run(&g, c, logits, draft.c, draft.s, &draft.o, &st), c);
+        printf("\n");
+        report_timing(num_prompt_tokens, t_prefill - t0, go.pos - num_prompt_tokens, rq_now() - t_prefill);
+        report_spec(&st);
+        rq_tokens_free(&pt);
+        return;
+    }
 
     if (rq_ctx_max_batch(c) > 1 && num_prompt_tokens <= seq_len) {
         // batched prefill of the whole prompt, then resume the loop at its last token
@@ -304,14 +356,25 @@ static void chat(RqModel *m, RqCtx *c, RqSeq *s, const RqSampling *cfg, char *cl
         if (ckp >= L) check(rq_seq_checkpoint_at(s, ckp), c);
         ReplyOut ro = { m, &tn->reply };
         RqCallbacks cb = { on_reply_token, on_reply_logits, &ro };
+        if (draft.m) { // (the draft follows the same conversation: its common prefix kept, the same checkpoint)
+            check(rq_seq_truncate(draft.s, rq_seq_common_prefix(draft.s, want.v, want.n)), draft.c);
+            if (ckp >= rq_seq_len(draft.s) && ckp <= rq_seq_capacity(draft.s)) check(rq_seq_checkpoint_at(draft.s, ckp), draft.c);
+        }
         if ((info.chat == RQ_CHAT_THINKING || info.chat == RQ_CHAT_QWEN35) && enable_thinking)
             printf("<think>\n"); // (Thinking-2507, Qwen3.5: the prompt opened the block, the reply starts inside it)
+        RqSpecStats sst;
         RqGenStats st;
-        check(rq_generate(c, s, want.v + L, want.n - L, cfg, max_new_tokens, &cb, &st), c);
+        if (draft.m) {
+            check(rq_generate_spec(c, s, draft.c, draft.s, want.v + L, want.n - L, cfg, max_new_tokens, &draft.o, &cb, &sst), c);
+            st = sst.gen;
+        } else {
+            check(rq_generate(c, s, want.v + L, want.n - L, cfg, max_new_tokens, &cb, &st), c);
+        }
         if (st.stop == RQ_STOP_CONTEXT)
             fprintf(stderr, "\n(context window full (-c %d): reply cut)", seq_len);
         printf("\n");
         report_timing(st.n_prompt, st.t_prefill, st.n_gen, st.t_gen);
+        if (draft.m) report_spec(&sst);
         check(rq_chat_reply_history(m, tn->reply.v, tn->reply.n, enable_thinking, &tn->hist), NULL);
     }
     cdump_write(rq_seq_tokens(s), rq_seq_len(s));
@@ -521,11 +584,32 @@ static void error_usage(void) {
     fprintf(stderr, "              positions) does not fit, default MemAvailable; 0 or force = no check; given: prints it ([memory])\n");
     fprintf(stderr, "  --page-cache auto|drop|keep  the model file's page cache after the load: auto (default) drops it if the file\n");
     fprintf(stderr, "              is >= 1/4 of the RAM\n");
+    fprintf(stderr, "  -D <string> draft model for speculative decoding (generate, chat): a smaller model of the same vocabulary\n");
+    fprintf(stderr, "              (e.g. Qwen3-0.6B for Qwen3-1.7B) guesses, the model checks; the output is exactly plain decoding's\n");
+    fprintf(stderr, "  -G <int>    with -D: guesses per pass of the model, at most %d, default %d; 0 = plain decoding (no draft)\n", RQ_SPEC_K_MAX, SPEC_K_DEFAULT);
+    fprintf(stderr, "  --tau <float> with -D: adaptive guess count, stop guessing at a draft top-1 probability < tau, default 0 (off)\n");
     fprintf(stderr, "Threads: OMP_NUM_THREADS, default nproc - nproc/8 (Apple Silicon: the performance cores)\n");
     exit(EXIT_FAILURE);
 }
 
 int serve_main(int argc, char **argv); // serve.c: `runq serve <checkpoint> ...` (the HTTP server)
+
+static void load_draft(const char *path, const RqModel *target, const RqModelOpts *o, int kv_type, int prefill_chunk) {
+    // -D: the draft model (the same load options as the model), its context and sequence; refused unless its
+    // vocabulary is the model's
+    char err[512];
+    if (!(draft.m = rq_model_load(path, o, err, sizeof(err)))) die(err);
+    RqModelInfo info;
+    rq_model_info(draft.m, &info);
+    if (info.warning) fprintf(stderr, "warning: draft: %s\n", info.warning);
+    if (rq_spec_check(target, draft.m, err, sizeof(err)) != RQ_OK) {
+        fprintf(stderr, "-D %s: %s\n", path, err);
+        exit(EXIT_FAILURE);
+    }
+    int e;
+    if (!(draft.s = rq_seq_new(draft.m, 0, kv_type, &e))) die(e == RQ_ERR_NOMEM ? "malloc failed!" : "-D: unsupported draft model shape");
+    if (!(draft.c = rq_ctx_new(draft.m, prefill_chunk, 0, &e))) die("malloc failed!");
+}
 
 int main(int argc, char *argv[]) {
     if (argc >= 2 && !strcmp(argv[1], "serve")) return serve_main(argc - 1, argv + 1);
@@ -547,6 +631,9 @@ int main(int argc, char *argv[]) {
     int kv_type = RQ_KV_DEFAULT;
     double mem = 0;             // --mem: GiB, < 0 no check, 0 MemAvailable
     int mem_given = 0, page_cache = 0;
+    char *draft_path = NULL;    // -D: the draft model (speculative decoding)
+    int spec_k = -1;            // -G: guesses per pass (-1: SPEC_K_DEFAULT)
+    float spec_tau = 0;         // --tau
 
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
@@ -569,6 +656,12 @@ int main(int argc, char *argv[]) {
             if (page_cache == 2) error_usage();
             continue;
         }
+        if (!strcmp(argv[i], "--tau")) {
+            char *end;
+            spec_tau = strtof(argv[i + 1], &end);
+            if (end == argv[i + 1] || *end || !(spec_tau >= 0 && spec_tau <= 1)) error_usage();
+            continue;
+        }
         if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
         // read in the args
         if (argv[i][1] == 't') { temperature = atof(argv[i + 1]); samp_given |= RQ_SAMPLING_TEMP; }
@@ -583,6 +676,13 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'n') { max_new_tokens = atoi(argv[i + 1]); }
         else if (argv[i][1] == 'o') { out_path = argv[i + 1]; }
         else if (argv[i][1] == 'b') { prefill_chunk = atoi(argv[i + 1]); }
+        else if (argv[i][1] == 'D') { draft_path = argv[i + 1]; }
+        else if (argv[i][1] == 'G') {
+            char *end;
+            long k = strtol(argv[i + 1], &end, 10);
+            if (end == argv[i + 1] || *end || k < 0 || k > RQ_SPEC_K_MAX) error_usage();
+            spec_k = (int)k;
+        }
         else if (argv[i][1] == 'k') {
             kv_type = rq_kv_parse(argv[i + 1]);
             if (kv_type < 0) error_usage();
@@ -600,6 +700,8 @@ int main(int argc, char *argv[]) {
     if (prefill_chunk < 0) prefill_chunk = 0;
     if (prefill_chunk > RQ_BATCH_MAX) prefill_chunk = RQ_BATCH_MAX;
     if (ctx_length < 0) die("-c: the context size must be >= 0");
+    if (spec_k > 0 && !draft_path) die("-G: speculative decoding needs a draft model (-D)");
+    if (spec_k < 0) spec_k = SPEC_K_DEFAULT;
     enable_thinking = enable_thinking != 0;
 
     char err[512];
@@ -649,6 +751,12 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Couldn't load prompt template %s\n", err);
         exit(EXIT_FAILURE);
     }
+    // -D (generate, chat; -G 0: plain decoding, not loaded)
+    if (draft_path && spec_k > 0 && (strcmp(mode, "generate") == 0 || strcmp(mode, "chat") == 0)) {
+        load_draft(draft_path, m, &o, kv_type, prefill_chunk);
+        draft.o.k = spec_k;
+        draft.o.tau = spec_tau;
+    }
 
     // the sequence (KV cache of -c positions) and the compute context (batched buffers for -b rows)
     int e;
@@ -696,5 +804,10 @@ int main(int argc, char *argv[]) {
     rq_ctx_free(ctx);
     rq_seq_free(seq);
     rq_model_free(m);
+    if (draft.m) {
+        rq_ctx_free(draft.c);
+        rq_seq_free(draft.s);
+        rq_model_free(draft.m);
+    }
     return 0;
 }

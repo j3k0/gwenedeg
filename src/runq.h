@@ -104,10 +104,22 @@ void rq_seq_reset(RqSeq *s);                   // empty (position 0)
 int rq_seq_truncate(RqSeq *s, int n);
 int rq_seq_keep(const RqSeq *s, int n);        // the length rq_seq_truncate(s, n) would keep (n for Qwen3)
 // Qwen3.5: keep the recurrent state at length pos (>= the current length) as a checkpoint, taken by the forward
-// pass that reaches it (or now, if the sequence is there); the sequence keeps the last few (RQ_SEQ_CK = 2,
-// ~19 MB each for the 0.8B), dropped when truncated below them. E.g. the start of the assistant turn, where the
-// next request of a chat diverges. A no-op for Qwen3. RQ_ERR_ARG (pos below the length), RQ_ERR_NOMEM
+// pass that reaches it (or now, if the sequence is there); several can be pending, inside one pass or later ones.
+// The sequence keeps a set of them (rq_seq_set_checkpoints: 2 by default, ~19 MB each for the 0.8B, ~150 MiB for
+// the 27B, allocated at first use); a new one takes a free slot, else the one at the lowest position. Checkpoints
+// past a truncation are dropped; pending ones are forgotten by rq_seq_truncate / copy (dst) / reset. E.g. the
+// start of the assistant turn, where the next request of a chat diverges. A no-op for Qwen3. RQ_ERR_ARG (pos below
+// the length or past the capacity), RQ_ERR_NOMEM
 int rq_seq_checkpoint_at(RqSeq *s, int pos);
+// Qwen3.5: a checkpoint after each of rows pos..pos+n-1 of the next pass(es) (lengths pos + 1 .. pos + n; pos >= the
+// length, 1 <= n <= RQ_CHECKPOINTS_MAX), e.g. the rows of a speculative verify segment, so that rq_seq_truncate
+// lands exactly on any of them. They replace the previous call's (taken or pending; those of rq_seq_checkpoint_at
+// stay): n + those slots keep them all. A no-op for Qwen3. RQ_ERR_ARG
+int rq_seq_checkpoint_rows(RqSeq *s, int pos, int n);
+// Qwen3.5: the number of checkpoint slots (1..RQ_CHECKPOINTS_MAX; default 2); fewer than in use: the checkpoints at
+// the highest positions stay, the others' buffers are freed. RQ_ERR_ARG
+#define RQ_CHECKPOINTS_MAX 32
+int rq_seq_set_checkpoints(RqSeq *s, int n);
 int rq_seq_len(const RqSeq *s);                // positions in the cache = the next token's position
 int rq_seq_capacity(const RqSeq *s);
 const int *rq_seq_tokens(const RqSeq *s);      // the tokens at positions 0..len-1

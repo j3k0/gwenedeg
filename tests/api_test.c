@@ -68,6 +68,12 @@ static int seq_from(RqCtx *c, RqSeq *dst, const RqSeq *base, int n) {
     return n > 0 ? rq_prefill(c, dst, rq_seq_tokens(base), n, RQ_LOGITS_NONE, NULL, NULL) : RQ_OK;
 }
 
+static int ck_cont(RqCtx *c, RqSeq *s, int P, const int *u, const float *ref, float *out) {
+    // s (on the tokens u) truncated to its checkpoint at P, exactly, and continued with u[P..P+5): every row == ref's
+    if (rq_seq_keep(s, P) != P || rq_seq_truncate(s, P) != RQ_OK || rq_seq_len(s) != P) return 0;
+    return rq_prefill(c, s, u + P, 5, RQ_LOGITS_ALL, out, NULL) == RQ_OK && same(out, ref + (size_t)P * V, (size_t)5 * V);
+}
+
 static float *logits_alone(RqCtx *c, const int *t, int n, const int *dec, int ndec) {
     // reference: a fresh sequence, all-rows prefill of t, then ndec decode steps; rows n + ndec
     float *out = malloc((size_t)(n + ndec) * V * sizeof(float)), *lg;
@@ -349,6 +355,95 @@ int main(int argc, char **argv) {
         rq_tokens_free(&w);
         rq_seq_free(s);
         rq_seq_free(t);
+    }
+
+    // 3c. Qwen3.5: checkpoint sets (rq_seq_set_checkpoints, several pending positions per pass, rq_seq_checkpoint_rows)
+    if (I.linear_layers) {
+        int ok = 1, nu = C.n + 24, *u = malloc((size_t)nu * sizeof(int));
+        float *out = malloc((size_t)64 * V * sizeof(float));
+        memcpy(u, C.v, (size_t)C.n * sizeof(int));
+        memcpy(u + C.n, dC, 24 * sizeof(int)); // (refC: every row of u)
+        RqSeq *s = seq_new(0), *t = seq_new(0), *w = seq_new(0);
+        // the default 2 slots: 3 pending in one prefill chunk, the 2 highest stay
+        ok &= rq_seq_checkpoint_at(s, 25) == RQ_OK && rq_seq_checkpoint_at(s, 50) == RQ_OK && rq_seq_checkpoint_at(s, 10) == RQ_OK;
+        ok &= rq_prefill(c, s, u, 60, RQ_LOGITS_NONE, NULL, NULL) == RQ_OK;
+        ok &= rq_seq_keep(s, 59) == 50 && rq_seq_keep(s, 49) == 25 && rq_seq_keep(s, 24) == 0;
+        ok &= ck_cont(c, s, 50, u, refC, out) && ck_cont(c, s, 25, u, refC, out);
+        // 6 slots: 3 pending in one chunk, 2 at a chunk boundary (64: the chunk's last row, 65: the next one's first), one
+        // in a later chunk; then truncate to each (highest first) and continue
+        static const int P6[6] = { 200, 65, 64, 50, 25, 10 };
+        ok &= rq_seq_set_checkpoints(s, 6) == RQ_OK;
+        rq_seq_reset(s);
+        for (int i = 0; i < 6; i++)
+            ok &= rq_seq_checkpoint_at(s, P6[i]) == RQ_OK;
+        ok &= rq_prefill(c, s, u, C.n, RQ_LOGITS_NONE, NULL, NULL) == RQ_OK;
+        for (int i = 0; i < 6; i++)
+            ok &= rq_seq_keep(s, P6[i]) == P6[i] && rq_seq_keep(s, P6[i] - 1) == (i < 5 ? P6[i + 1] : 0);
+        for (int i = 0; i < 6; i++)
+            ok &= ck_cont(c, s, P6[i], u, refC, out);
+        // eviction: 7 pending + the checkpoint at 10, 6 slots: the 6 highest stay (10 replaced, then 20 inside the pass)
+        static const int P7[7] = { 61, 20, 30, 60, 40, 55, 45 };
+        for (int i = 0; i < 7; i++)
+            ok &= rq_seq_checkpoint_at(s, P7[i]) == RQ_OK;
+        ok &= rq_prefill(c, s, u + 15, 55, RQ_LOGITS_NONE, NULL, NULL) == RQ_OK && rq_seq_len(s) == 70;
+        ok &= rq_seq_keep(s, 29) == 0 && rq_seq_keep(s, 39) == 30 && rq_seq_keep(s, 69) == 61;
+        // fewer slots: the 3 highest stay
+        ok &= rq_seq_set_checkpoints(s, 3) == RQ_OK && rq_seq_keep(s, 54) == 0 && rq_seq_keep(s, 59) == 55;
+        ok &= ck_cont(c, s, 61, u, refC, out) && ck_cont(c, s, 60, u, refC, out) && ck_cont(c, s, 55, u, refC, out);
+        ok &= rq_seq_set_checkpoints(s, 0) == RQ_ERR_ARG && rq_seq_set_checkpoints(s, RQ_CHECKPOINTS_MAX + 1) == RQ_ERR_ARG;
+        // a batched pass of 3 sequences: a 20-row chunk with 4 pending (s, 4 slots), a 5-row chunk with 3 (t, 3 slots), a
+        // decode row with 1 (w)
+        ok &= rq_seq_set_checkpoints(s, 4) == RQ_OK && rq_seq_set_checkpoints(t, 3) == RQ_OK;
+        rq_seq_reset(s);
+        ok &= rq_prefill(c, s, u, 30, RQ_LOGITS_NONE, NULL, NULL) == RQ_OK;
+        ok &= rq_prefill(c, t, u, 100, RQ_LOGITS_NONE, NULL, NULL) == RQ_OK && rq_prefill(c, w, u, 40, RQ_LOGITS_NONE, NULL, NULL) == RQ_OK;
+        static const int PS[4] = { 50, 42, 37, 33 }, PT[3] = { 105, 102, 101 };
+        for (int i = 0; i < 4; i++)
+            ok &= rq_seq_checkpoint_at(s, PS[i]) == RQ_OK;
+        for (int i = 0; i < 3; i++)
+            ok &= rq_seq_checkpoint_at(t, PT[i]) == RQ_OK;
+        ok &= rq_seq_checkpoint_at(w, 41) == RQ_OK;
+        RqSegment three[3] = { { s, u + 30, 20, RQ_LOGITS_NONE }, { t, u + 100, 5, RQ_LOGITS_LAST }, { w, u + 40, 1, RQ_LOGITS_LAST } };
+        ok &= rq_forward_batch(c, three, 3, out, NULL) == RQ_OK && same(out, refC + (size_t)104 * V, V) &&
+              same(out + V, refC + (size_t)40 * V, V);
+        for (int i = 0; i < 4; i++)
+            ok &= ck_cont(c, s, PS[i], u, refC, out);
+        for (int i = 0; i < 3; i++)
+            ok &= ck_cont(c, t, PT[i], u, refC, out);
+        ok &= rq_decode(c, w, u[41], NULL) == RQ_OK && ck_cont(c, w, 41, u, refC, out);
+        // rq_seq_checkpoint_rows, as a speculative loop uses it: the prompt's checkpoint (at 40) + a verify segment of 4
+        // rows per pass (5 slots), truncated to accepted lengths; each segment's rows == the reference, the checkpoint at
+        // 40 stays; then a draft's 3 decode steps (one checkpoint each)
+        ok &= rq_seq_set_checkpoints(s, 5) == RQ_OK;
+        rq_seq_reset(s);
+        ok &= rq_seq_checkpoint_at(s, 40) == RQ_OK && rq_prefill(c, s, u, 60, RQ_LOGITS_NONE, NULL, NULL) == RQ_OK;
+        static const int acc[5] = { 0, 2, 3, 1, 3 }; // drafts accepted per segment
+        for (int i = 0, L = 60; i < 5 && ok; i++) {
+            ok &= rq_seq_checkpoint_rows(s, L, 4) == RQ_OK;
+            ok &= rq_prefill(c, s, u + L, 4, RQ_LOGITS_ALL, out, NULL) == RQ_OK && same(out, refC + (size_t)L * V, (size_t)4 * V);
+            for (int j = 1; j <= 4; j++)
+                ok &= rq_seq_keep(s, L + j) == L + j;
+            ok &= rq_seq_keep(s, L) == 40; // (the previous segment's checkpoints: replaced)
+            L += acc[i] + 1;
+            ok &= rq_seq_truncate(s, L) == RQ_OK && rq_seq_len(s) == L;
+        }
+        int L = rq_seq_len(s);
+        ok &= rq_seq_checkpoint_rows(s, L, 3) == RQ_OK;
+        for (int i = 0; i < 3; i++)
+            ok &= rq_decode(c, s, u[L + i], NULL) == RQ_OK;
+        ok &= rq_seq_keep(s, L + 1) == L + 1 && rq_seq_keep(s, L + 2) == L + 2 && ck_cont(c, s, L + 1, u, refC, out);
+        ok &= rq_seq_checkpoint_rows(s, rq_seq_len(s) - 1, 2) == RQ_ERR_ARG && rq_seq_checkpoint_rows(s, rq_seq_len(s), 0) == RQ_ERR_ARG;
+        ok &= rq_seq_checkpoint_rows(s, rq_seq_len(s), RQ_CHECKPOINTS_MAX + 1) == RQ_ERR_ARG;
+        ok &= rq_seq_checkpoint_rows(s, rq_seq_capacity(s) - 1, 2) == RQ_ERR_ARG;
+        ok &= ck_cont(c, s, 40, u, refC, out);
+        report(ok, "checkpoint_sets", "3 pending in one prefill chunk (2 slots: the highest 2), 6 across chunks, eviction, fewer "
+               "slots, a batched pass of 3 sequences, rq_seq_checkpoint_rows (verify segments, decode steps): each "
+               "truncation continues == a fresh run");
+        free(u);
+        free(out);
+        rq_seq_free(s);
+        rq_seq_free(t);
+        rq_seq_free(w);
     }
 
     // 4. rq_generate (greedy) == a hand-written sample / decode loop; stats; the reply limit

@@ -49,8 +49,10 @@ extern int GS;
 // within noise of 512. The chunk buffers take ~58 KB per row (~30 MB at 512)
 #define B_MAX RQ_BATCH_MAX
 
-// Qwen3.5: recurrent-state checkpoints per sequence (rq_seq_checkpoint_at)
+// Qwen3.5: recurrent-state checkpoint slots per sequence (rq_seq_checkpoint_at): the default count and the most
+// (rq_seq_set_checkpoints); also the most pending positions
 #define RQ_SEQ_CK 2
+#define RQ_SEQ_CK_MAX RQ_CHECKPOINTS_MAX
 
 // KV cache element type: fp32, bf16 or f16 (16-bit: half the bytes; layouts in kernels_avx512.h)
 enum { KV_F32 = RQ_KV_F32, KV_BF16 = RQ_KV_BF16, KV_F16 = RQ_KV_F16 };
@@ -260,6 +262,14 @@ int forward_model_init(RqModel *m); // the derived shape parameters; 0 if the sh
 
 // ------------------------------------------------------------------------------------- a sequence
 
+// Qwen3.5: the checkpoints a forward pass takes for one sequence (ck_plan, forward.c), ascending: the length at[i]
+// (the state after the pass's row row[i] = at[i] - 1 - its first position) into slot slot[i], whose buffer is st[i]
+typedef struct {
+    int n;
+    int at[RQ_SEQ_CK_MAX], row[RQ_SEQ_CK_MAX], slot[RQ_SEQ_CK_MAX];
+    float *st[RQ_SEQ_CK_MAX];
+} CkPass;
+
 struct RqSeq {
     const RqModel *m;
     int cap;            // positions
@@ -276,13 +286,18 @@ struct RqSeq {
     int *tokens;        // [cap]: the token at each position
     // Qwen3.5: the recurrent state of the linear-attention layers after position len - 1 (it cannot be rewound),
     // per linear layer RqModel.ssm_layer floats: the last conv - 1 inputs of the conv (per channel group (conv - 1, n) rows, as ssm_conv), then
-    // per value head S (dk, dv); and a few checkpoints of it (position + copy), for truncate / copy to an
+    // per value head S (dk, dv); and a set of checkpoints of it (position + copy), for truncate / copy to an
     // earlier length (forward.c, rq_seq_checkpoint_at)
     float *ssm;
     size_t ssm_bytes;
-    struct { int pos; float *st; } ck[RQ_SEQ_CK];
-    int ck_at;          // a checkpoint to take when the sequence reaches this length (0: none)
-    int ck_slot;        // the checkpoint slot being written by the pass in progress (-1: none)
+    int nck;            // checkpoint slots in use: ck[0..nck-1] (rq_seq_set_checkpoints; default RQ_SEQ_CK)
+    // pos: the length it holds the state of (-1: free); rows: taken for rq_seq_checkpoint_rows (its next call
+    // frees it); wr: being written by the pass in progress (pos: its length; not usable yet); st: the buffer
+    // (ssm_bytes, allocated at first use)
+    struct { int pos, rows, wr; float *st; } ck[RQ_SEQ_CK_MAX];
+    int npend;          // checkpoints to take when the sequence reaches these lengths, ascending (rows: as above)
+    struct { int pos, rows; } pend[RQ_SEQ_CK_MAX];
+    CkPass ckw;         // the checkpoints the pass in progress takes (n 0: none)
     unsigned long long rng; // sampling (xorshift)
 };
 

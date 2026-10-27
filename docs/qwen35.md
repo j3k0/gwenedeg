@@ -186,11 +186,32 @@ the f16 / bf16 cache types apply to K / V only.
 (`rq_seq_common_prefix` + truncate, `src/cli.c`), and the server's prefix cache and slot copy
 (`src/engine.c`). For the DeltaNet layers this is false: the state at position n is gone once n + 1 is
 processed. Implemented (llama.cpp handles hybrid and SWA models the same way, "context checkpoints"):
-- A sequence keeps `RQ_SEQ_CK` = 2 **state checkpoints** (position + a copy of the conv + S state, 18.9 MB each,
-  allocated at first use). `rq_seq_checkpoint_at(s, pos)` asks for one at a position >= the length: the forward
-  pass that reaches it takes it (each (layer, head) work item copies its part right after that token, so a
-  checkpoint can sit inside a prefill chunk), or it is taken at once if the sequence is there. A new one replaces
-  the one at the lowest position.
+- A sequence keeps a **set of state checkpoints** (position + a copy of the conv + S state, 18.9 MB each for the
+  0.8B, ~150 MiB for the 27B, allocated at first use): `rq_seq_set_checkpoints(s, n)` slots, 1..32, default 2
+  (`RQ_SEQ_CK`; fewer than in use: the highest positions stay, the other buffers are freed). The setting is per
+  sequence, not per context: the slots belong to the sequence, and `rq_seq_checkpoint_at` / truncate / copy run
+  without a context. `rq_seq_checkpoint_at(s, pos)` asks for one at a position >= the length: the forward pass that
+  reaches it takes it, or it is taken at once if the sequence is there. Several can be pending (a sorted list, in
+  one pass or later ones): before a pass, `ck_plan` gives each pending position the pass reaches a slot (a
+  `CkPass` per sequence: length, row, buffer, ascending), and each work item copies its part right after each of
+  those rows (`dn_prep_part` its channel group's conv state, looked up by position; `dn_rec_run` its block of S, a
+  cursor over the rows in the loop), so checkpoints can sit anywhere inside a prefill chunk, a batched pass of
+  several sequences or a decode step. A new checkpoint takes a free slot, else the one at the lowest position;
+  with more pending in one pass than slots, the pass's own lowest ones give way (the highest stay). With nothing
+  pending the loops test one counter, as before one pointer: the speed is unchanged (0.8B Q8_0, 8 threads,
+  `scripts/bench_models.py`, 3 interleaved ABBA rounds vs the commit before, the box at load ~20: best of 6,
+  prefill of 448 / 1,492 tokens 936 / 960 vs 853 / 965 tok/s, decode short / after 1,500 72.8 / 75.8 vs 69.6 /
+  74.6 tok/s; the medians within the noise as well), and the outputs are byte-identical (`tests/compare_bins.sh`:
+  792 jobs, every family).
+- `rq_seq_checkpoint_rows(s, pos, n)` (for speculative decoding, TODO S3): checkpoints after each of rows
+  pos..pos+n-1 of the next pass(es), flagged as rows: the next call frees them (taken or pending) before adding its
+  own, so a verify segment of k + 1 rows per pass needs k + 2 slots to keep the prompt's checkpoint as well (the
+  lowest, which plain lowest-first replacement would evict first). Truncating to any accepted length inside the
+  segment lands exactly. A draft's decode steps work the same way (one pending per pass).
+  Pending positions are forgotten by `rq_seq_truncate` (any n), `rq_seq_copy` (dst) and `rq_seq_reset`: they were
+  for the tokens that were to follow (before, a new `rq_seq_checkpoint_at` replaced the one pending position: the
+  callers, the CLI chat and the engine, ask for one right after truncating or copying, so nothing changes for
+  them). Tests: `api_test`'s `checkpoint_sets`.
 - `rq_seq_truncate(s, n)` on a hybrid model, n < len, goes back to the largest checkpoint at a position <= n (its
   state copied back), else to 0; checkpoints past the new length are dropped. Callers read `rq_seq_len` afterwards
   and re-prefill the rest; `rq_seq_keep(s, n)` tells in advance what would be kept. `rq_seq_copy(dst, src, n)`

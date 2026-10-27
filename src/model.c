@@ -160,20 +160,24 @@ static void model_layers(RqModel *m, LoadErr *e) {
     }
 }
 
-static void gguf_map_weights(RqModel *m) {
-    // tensor names of llama.cpp's convert_hf_to_gguf.py for qwen3 / qwen35 (no Q/K row permutation: that
-    // is done for the llama architecture only; checked by the logits test against HF). ffn_gate /
-    // ffn_up / ffn_down are w1 / w3 / w2 (qwen35: the FFN norm is post_attention_norm). The F32 tensors
-    // (norms; qwen35's conv kernel, transposed to tap-major, and ssm_a / ssm_dt / ssm_norm) are copied into one
-    // buffer, attention ones per attention layer, the others per linear layer
+static size_t norm_floats(const RqModel *m) {
+    // the F32 tensors of gguf_copy_norms: floats
+    const Config *p = &m->config;
+    const Hybrid *hy = &m->hy;
+    return (size_t)2 * p->n_layers * p->dim + p->dim + (size_t)2 * m->n_attn * p->head_dim +
+           (size_t)hy->n_lin * (hy->conv * hy->conv_dim + 2 * hy->nv + hy->dv);
+}
+
+static void gguf_copy_norms(RqModel *m) {
+    // The F32 tensors (norms; qwen35's conv kernel, transposed to tap-major, and ssm_a / ssm_dt / ssm_norm) are
+    // copied into one buffer, attention ones per attention layer, the others per linear layer (after the memory
+    // check: the first tensor data read)
     Config *p = &m->config;
     TransformerWeights *w = &m->weights;
     const Gguf *g = &m->gguf;
     const Hybrid *hy = &m->hy;
-    int L = p->n_layers, dim = p->dim, hd = p->head_dim, qd = p->n_heads * hd, kvd = p->n_kv_heads * hd, NA = m->n_attn;
-    int NL = hy->n_lin;
-    size_t nn = (size_t)2 * L * dim + dim + (size_t)2 * NA * hd + (size_t)NL * (hy->conv * hy->conv_dim + 2 * hy->nv + hy->dv);
-    float *f = w->norms = malloc(nn * sizeof(float));
+    int L = p->n_layers, dim = p->dim, hd = p->head_dim, NL = hy->n_lin;
+    float *f = w->norms = malloc(norm_floats(m) * sizeof(float));
     if (!f) load_fail(g->err, "malloc failed!");
     // (n: layers, 1 for a plain name; sel: the layers with sel[l] >= 0, NULL all)
     struct { float **dst; const char *fmt; int n; const int *sel; int len; } nm[] = {
@@ -214,6 +218,17 @@ static void gguf_map_weights(RqModel *m) {
             f += (size_t)hy->conv * hy->conv_dim;
         }
     }
+}
+
+static void gguf_map_weights(RqModel *m) {
+    // the matrices (from the tensor directory: no tensor data read). Tensor names of llama.cpp's
+    // convert_hf_to_gguf.py for qwen3 / qwen35 (no Q/K row permutation: that is done for the llama architecture
+    // only; checked by the logits test against HF). ffn_gate / ffn_up / ffn_down are w1 / w3 / w2 (qwen35: the FFN
+    // norm is post_attention_norm; gguf_copy_norms)
+    Config *p = &m->config;
+    TransformerWeights *w = &m->weights;
+    const Hybrid *hy = &m->hy;
+    int L = p->n_layers, dim = p->dim, hd = p->head_dim, qd = p->n_heads * hd, kvd = p->n_kv_heads * hd, NL = hy->n_lin;
     gguf_matrices(m, &w->q_tokens, 1, NULL, "token_embd.weight", p->vocab_size, dim);
     gguf_matrices(m, &w->wq, L, m->kv_layer, "blk.%d.attn_q.weight", p->n_heads * m->qh, dim);
     gguf_matrices(m, &w->wk, L, m->kv_layer, "blk.%d.attn_k.weight", kvd, dim);
@@ -257,15 +272,89 @@ static void read_at(int fd, const void *base, void *dst, size_t n, const void *m
         memcpy((char *)dst + done, (const char *)mapped + done, n - done);
 }
 
+static void drop_cached(int fd, const void *base, const void *mapped, size_t n) {
+    // drops the page cache of n bytes of the file at the offset of `mapped` (the whole file if n == 0), after
+    // read_at copied them: clean, unmapped pages go now instead of competing with the repacked copy for the RAM
+    // (partial pages at the ends stay: the final whole-file call in load_model takes them). Per matrix, not per
+    // work item: each call costs (an LRU drain on every CPU; per 64 KB item: +1.1 s on the 8B's 6 s cold load)
+#if !defined _WIN32 && defined POSIX_FADV_DONTNEED
+    if (fd >= 0) posix_fadvise(fd, (off_t)((const char *)mapped - (const char *)base), (off_t)n, POSIX_FADV_DONTNEED);
+#else
+    (void)fd; (void)base; (void)mapped; (void)n;
+#endif
+}
+
+typedef struct { QuantizedTensor *t; int n, d, k; } PrepMat; // a role of prepare_weights: n matrices (d, k)
+
+static int prep_mats(const RqModel *m, PrepMat *mt) {
+    // the matmul weights prepare_weights converts (7 per layer, the classifier, Qwen3.5's linear layers): mt[13]
+    const Config *p = &m->config;
+    const TransformerWeights *w = &m->weights;
+    const Hybrid *hy = &m->hy;
+    int L = p->n_layers, dim = p->dim, hid = p->hidden_dim, NA = m->n_attn, NL = hy->n_lin;
+    int qd = p->n_heads * p->head_dim, kvd = p->n_kv_heads * p->head_dim;
+    PrepMat t[] = {
+        { w->wq, NA, p->n_heads * m->qh, dim }, { w->wk, NA, kvd, dim }, { w->wv, NA, kvd, dim }, { w->wo, NA, dim, qd },
+        { w->w1, L, hid, dim }, { w->w2, L, dim, hid }, { w->w3, L, hid, dim }, { w->wcls, 1, p->vocab_size, dim },
+        { w->wqkv, NL, hy->conv_dim, dim }, { w->wz, NL, hy->vdim, dim }, { w->wa, NL, hy->nv, dim },
+        { w->wb, NL, hy->nv, dim }, { w->wso, NL, dim, hy->vdim } };
+    memcpy(mt, t, sizeof(t));
+    return sizeof(t) / sizeof(t[0]);
+}
+
+static int prep_pack(const PrepMat *mt, int nm, char *warning, size_t wlen) {
+    // 1 if the Q8_0 matrices are repacked for the SIMD kernels (else a warning, if not NULL)
+    int pack = 0;
+    (void)mt; (void)nm; (void)warning; (void)wlen;
+#ifdef RUNQ_Q8X
+    pack = 1;
+    for (int i = 0; i < nm && pack; i++)
+        if (mt[i].n > 0 && !q8x_ok(mt[i].d, mt[i].k, GS)) {
+            if (warning)
+                snprintf(warning, wlen, "weights not packable for the SIMD Q8_0 kernels (GS %d, %d x %d), using the generic ones", GS, mt[i].d, mt[i].k);
+            pack = 0;
+        }
+#endif
+    return pack;
+}
+
+static size_t prep_bytes(const QuantizedTensor *t, int d, int k, int pack) {
+    // a matrix's place in the packed buffer (64-byte multiples)
+    size_t sz = (size_t)d * k + (size_t)d * (k / GS) * sizeof(float); // (generic kernels on GGUF Q8_0: q / s arrays)
+    if (t->type != GGML_Q8_0) // Q4_K / Q5_K / Q6_K (GGUF; d % 16 == 0, k % 256 == 0 checked)
+        sz = kq_size(t->type, d, k);
+#ifdef RUNQ_Q8X
+    else if (pack)
+        sz = q8x_size(d, k, GS);
+#endif
+    (void)pack;
+    return (sz + 63) / 64 * 64;
+}
+
 typedef struct { QuantizedTensor *t; int d, k, bpi; size_t off; long it0; } PrepItem; // a matrix of prepare_weights
 
 typedef struct {
     const PrepItem *job; long nit;
     uint8_t *packed; size_t total, pg_chunk; long npg;
     size_t rows_max; int kmax, gguf, pack, fd;
+    long *left;                   // drop: per matrix its items not done yet (the last one drops its page cache), else NULL
     const void *base;             // the file mapping (read_at)
     long next_pg, next_it; int bad; // shared: claim counters; bad: 1 a corrupt scale, 2 no memory
 } PrepJob;
+
+static void prep_item_done(PrepJob *P, int j) {
+    // drop: the page cache of matrix j's rows in the file once its last item is done
+    if (!P->left || __atomic_sub_fetch(&P->left[j], 1, __ATOMIC_ACQ_REL) != 0) return;
+    const PrepItem *it = &P->job[j];
+    const QuantizedTensor *t = it->t;
+    if (t->b) {
+        drop_cached(P->fd, P->base, t->b, t->type != GGML_Q8_0 ? (size_t)it->d * (it->k / QK_K) * kq_block_bytes(t->type)
+                                                               : (size_t)it->d * (it->k / 32) * Q8_0_BLOCK);
+    } else {
+        drop_cached(P->fd, P->base, t->q, (size_t)it->d * it->k);
+        drop_cached(P->fd, P->base, t->s, (size_t)it->d * (it->k / GS) * sizeof(float));
+    }
+}
 
 static void prepare_worker(void *arg, int tid, int nt) {
     // prepare_weights' parallel part: pre-fault the destination (2 MB per item), then convert the
@@ -309,6 +398,7 @@ static void prepare_worker(void *arg, int tid, int nt) {
             for (size_t i = 0; i < nr * (k / QK_K); i++)
                 bad |= !kq_block_ok(t->type, bb + i * kq_block_bytes(t->type));
             kq_pack_blocks(t->type, t->kp + (size_t)rb0 * (k / QK_K) * kq_sb_bytes(t->type), bb, nb, k);
+            prep_item_done(P, jj);
             continue;
         }
         int8_t *q = pack ? qb : t->q + r0 * k;
@@ -324,6 +414,7 @@ static void prepare_worker(void *arg, int tid, int nt) {
         if (pack)
             q8x_pack_blocks(t->p + (size_t)rb0 * ng * Q8X_GROUP(GS), qb, sb, nb, k, GS);
 #endif
+        prep_item_done(P, jj);
     }
     free(qb);
     free(sb);
@@ -332,7 +423,7 @@ static void prepare_worker(void *arg, int tid, int nt) {
         __atomic_fetch_or(&P->bad, 1, __ATOMIC_RELAXED);
 }
 
-static void prepare_weights(RqModel *m, int fd, LoadErr *e, char *warning, size_t wlen) {
+static int prepare_weights(RqModel *m, int fd, int drop, LoadErr *e, char *warning, size_t wlen) {
     // Converts every matmul weight (7 per layer + the classifier) once at load, into one allocation,
     // in one parallel loop over (matrix, block of rows) items:
     //   VNNI build: repacked into the Q8P layout of kernels_avx512.h (group size GS: 64 for .bin,
@@ -346,30 +437,14 @@ static void prepare_weights(RqModel *m, int fd, LoadErr *e, char *warning, size_
     // mapped. The destination is pre-faulted in parallel (MADV_POPULATE_WRITE, 2 MB per call).
     // (On the thread pool of threads.h, like the forward passes: no second set of threads)
     // Was: faults on both sides + one MADV_DONTNEED of the mapped source per tensor, ~90 ms; now
-    // ~25 ms (12 threads)
-    Config *p = &m->config;
+    // ~25 ms (12 threads). drop: the page cache of each matrix is dropped once it is converted (drop_cached).
+    // Returns 1 if the weights were converted (0: a .bin on the generic kernels, which run from the mapping)
     TransformerWeights *w = &m->weights;
-    const Hybrid *hy = &m->hy;
-    int L = p->n_layers, dim = p->dim, hid = p->hidden_dim, NA = m->n_attn, NL = hy->n_lin;
-    int qd = p->n_heads * p->head_dim, kvd = p->n_kv_heads * p->head_dim;
-    struct { QuantizedTensor *t; int n, d, k; } mt[] = {
-        { w->wq, NA, p->n_heads * m->qh, dim }, { w->wk, NA, kvd, dim }, { w->wv, NA, kvd, dim }, { w->wo, NA, dim, qd },
-        { w->w1, L, hid, dim }, { w->w2, L, dim, hid }, { w->w3, L, hid, dim }, { w->wcls, 1, p->vocab_size, dim },
-        { w->wqkv, NL, hy->conv_dim, dim }, { w->wz, NL, hy->vdim, dim }, { w->wa, NL, hy->nv, dim },
-        { w->wb, NL, hy->nv, dim }, { w->wso, NL, dim, hy->vdim } };
-    int nm = sizeof(mt) / sizeof(mt[0]);
-    int gguf = w->wq[0].b != NULL, pack = 0;
-    (void)warning; (void)wlen;
-#ifdef RUNQ_Q8X
-    pack = 1;
-    for (int i = 0; i < nm && pack; i++)
-        if (mt[i].n > 0 && !q8x_ok(mt[i].d, mt[i].k, GS)) {
-            snprintf(warning, wlen, "weights not packable for the SIMD Q8_0 kernels (GS %d, %d x %d), using the generic ones", GS, mt[i].d, mt[i].k);
-            pack = 0;
-        }
-#endif
+    PrepMat mt[16];
+    int nm = prep_mats(m, mt);
+    int gguf = w->wq[0].b != NULL, pack = prep_pack(mt, nm, warning, wlen);
     if (!pack && !gguf)
-        return;
+        return 0;
     int nt = 0, kmax = 0;
     for (int i = 0; i < nm; i++) {
         nt += mt[i].n;
@@ -389,20 +464,13 @@ static void prepare_weights(RqModel *m, int fd, LoadErr *e, char *warning, size_
             // items of 16-row blocks (the VNNI blocks; the generic conversion uses the same split)
             int bpi = 65536 / (16 * mt[i].k);
             QuantizedTensor *t = mt[i].t + l;
-            size_t nq = (size_t)mt[i].d * mt[i].k, sz = nq + (size_t)mt[i].d * (mt[i].k / GS) * sizeof(float);
             job[j].t = t;
             job[j].d = mt[i].d;
             job[j].k = mt[i].k;
             job[j].bpi = bpi > 0 ? bpi : 1;
             job[j].off = off;
             job[j].it0 = nit;
-            if (t->type != GGML_Q8_0) // Q4_K / Q5_K / Q6_K (GGUF; d % 16 == 0, k % 256 == 0 checked)
-                sz = kq_size(t->type, mt[i].d, mt[i].k);
-#ifdef RUNQ_Q8X
-            else if (pack)
-                sz = q8x_size(mt[i].d, mt[i].k, GS);
-#endif
-            off += (sz + 63) / 64 * 64;
+            off += prep_bytes(t, mt[i].d, mt[i].k, pack);
             nit += ((mt[i].d + 15) / 16 + job[j].bpi - 1) / job[j].bpi;
         }
     job[nt].it0 = nit;
@@ -430,13 +498,157 @@ static void prepare_weights(RqModel *m, int fd, LoadErr *e, char *warning, size_
     size_t rows_max = 65536 / kmax > 16 ? 65536 / kmax : 16;
     rows_max = rows_max / 16 * 16 + 16;
     size_t pg_chunk = (size_t)2 << 20;
+    long *left = drop ? malloc(nt * sizeof(long)) : NULL;
+    for (j = 0; left && j < nt; j++)
+        left[j] = job[j + 1].it0 - job[j].it0;
     PrepJob pj = { job, nit, w->packed, total, pg_chunk, (long)((total + pg_chunk - 1) / pg_chunk), rows_max, kmax,
-                   gguf, pack, fd, m->data, 0, 0, 0 };
+                   gguf, pack, fd, left, m->data, 0, 0, 0 };
     rq_parallel(prepare_worker, &pj);
     int bad = pj.bad;
     free(job);
+    free(left);
     if (bad & 2) load_fail(e, "malloc failed!");
     if (bad) load_fail(e, "Corrupt checkpoint: a weight scale (fp16 d / dmin) is inf or NaN");
+    return 1;
+}
+
+// ---------------------------------------------------------------------------- memory estimates
+
+static int seq_checkpoints(const RqModel *m) {
+    // the recurrent-state checkpoints a sequence keeps at most (rq_seq_checkpoint_at): read only here
+    return m->hy.on ? RQ_SEQ_CK : 0;
+}
+
+static size_t pages(size_t n) { return (n + 4095) / 4096 * 4096; }
+
+static void seq_mem(const RqModel *m, int cap, size_t esz, RqSeqMem *o) {
+    // rq_seq_new's buffers (KV cache of whole attention blocks, tokens, state) and its checkpoints (ck_slot)
+    size_t kv_len = ((size_t)cap + ATT_P - 1) / ATT_P * ATT_P;
+    o->kv = 2 * pages((size_t)m->n_attn * kv_len * m->kv_dim * esz) + (size_t)cap * sizeof(int);
+    o->state = m->hy.on ? pages((size_t)m->hy.n_lin * m->ssm_layer * sizeof(float)) : 0;
+    o->checkpoints = seq_checkpoints(m);
+    o->total = o->kv + (1 + (size_t)o->checkpoints) * o->state;
+}
+
+static size_t ctx_mem(const RqModel *m, int nb, int max_ctx, int nt) {
+    // rq_ctx_new's buffers for nb rows and max_ctx positions on nt threads (the large ones, all of them: what
+    // the passes touch at most)
+    const Config *p = &m->config;
+    const Hybrid *hy = &m->hy;
+    size_t xs = m->xs, hid = p->hidden_dim, hd = p->head_dim, V = p->vocab_size;
+    size_t lw = hy->on ? (size_t)hy->conv_dim + hy->vdim + 2 * hy->nv : 0, qd = (size_t)p->n_heads * m->qh;
+    size_t ng = xs / GS + hid / GS;
+    size_t row = 4 * (p->dim + xs + qd + lw + 2 * (size_t)m->kv_dim + 2 * hid + hd) + xs + hid + 8 * ng; // floats, int8, scales
+    if (m->kq) row += 4 * ng + 4 * (xs / 16 + hid / 16);
+    size_t att_nb = ((size_t)max_ctx + ATT_P - 1) / ATT_P, blk = (size_t)(ATT_P + ATT_PSTRIDE(hd)) * sizeof(float);
+    size_t n = row + 12 * V + (size_t)nt * 2 * ATT_P * hd * sizeof(float) + (size_t)p->n_heads * att_nb * blk;
+    if (nb > 1) {
+        n += (size_t)nb * row + (size_t)nt * m->att_rows * m->kv_mul * att_nb * blk;
+#ifdef RUNQ_KQX
+        size_t kmax = hid > xs ? hid : xs;
+        if (m->kq) n += (size_t)nt * ((KQX_SCRATCH(kmax) + 63) / 64 * 64);
+#endif
+    }
+    return n;
+}
+
+static void model_mem(RqModel *m, size_t esz) {
+    // the estimates (rq_model_mem) from the shapes and the tensor directory (no tensor data read)
+    RqModelMem *o = &m->mem;
+    PrepMat mt[16];
+    int nm = prep_mats(m, mt), pack = prep_pack(mt, nm, NULL, 0);
+    size_t wb = 0;
+    if (!pack && !m->is_gguf) // (the generic kernels on a .bin: the weights are the file's mapping)
+        wb = m->file_size;
+    else
+        for (int i = 0; i < nm; i++)
+            for (int l = 0; l < mt[i].n; l++)
+                wb += prep_bytes(mt[i].t + l, mt[i].d, mt[i].k, pack);
+    o->weights = wb + norm_floats(m) * sizeof(float);
+    // the tokenizer (vocab, lengths, scores, added; its hash table; the strings: within the metadata's size), the
+    // file's metadata (GGUF: mapped and read by the tokenizer; .bin: the .tokenizer file, about), a compute
+    // context, the process (code, thread stacks, heap: measured ~8 MiB)
+    size_t V = m->config.vocab_size, cap = 1;
+    while (cap < 2 * V) cap <<= 1;
+    size_t meta = m->is_gguf ? m->gguf.data_off : 16 * V;
+    o->runtime = V * (sizeof(char *) + 3 * sizeof(int)) + cap * 8 + 2 * meta +
+                 ctx_mem(m, RQ_BATCH_MAX, m->config.seq_len, rq_threads()) + ((size_t)8 << 20);
+    seq_mem(m, m->config.seq_len, esz, &o->seq);
+    o->total = o->weights + o->runtime + o->seq.total;
+}
+
+double rq_mem_available(void) {
+#ifdef __linux__
+    FILE *f = fopen("/proc/meminfo", "r");
+    char line[256];
+    long long kb = -1;
+    while (f && fgets(line, sizeof(line), f))
+        if (sscanf(line, "MemAvailable: %lld kB", &kb) == 1) break;
+    if (f) fclose(f);
+    return kb >= 0 ? kb * 1024.0 : -1;
+#else
+    return -1;
+#endif
+}
+
+#define GIB(x) ((double)(x) / 1073741824.0)
+
+static void mem_check(RqModel *m, const RqModelOpts *o, const char *path, LoadErr *e) {
+    // the estimate against the budget (RqModelOpts.mem), before any weight is read: a refusal if it does not fit
+    RqModelMem *mm = &m->mem;
+    model_mem(m, o->kv_bytes == 4 ? 4 : 2);
+    double avail = o->mem < 0 ? -1 : o->mem > 0 ? o->mem * 1073741824.0 : rq_mem_available();
+    if (avail < 0) return;
+    mm->budget = avail;
+    mm->budget_src = o->mem > 0 ? 2 : 1;
+    char what[96];
+    snprintf(what, sizeof(what), o->mem > 0 ? "the budget of %.2f GiB (--mem)" : "MemAvailable (%.2f GiB)", GIB(avail));
+    char seq[128] = "";
+    if (mm->seq.state)
+        snprintf(seq, sizeof(seq), " + recurrent state %.0f MiB x (1 + %d checkpoints)", mm->seq.state / 1048576.0, mm->seq.checkpoints);
+    if ((double)mm->total > avail)
+        load_fail(e, "%s: needs ~%.2f GiB (weights %.2f, runtime %.2f, a sequence of %d positions: KV cache %.2f%s), more "
+                  "than %s: not loaded (a smaller -c lowers it; --mem 0 loads anyway)", path, GIB(mm->total), GIB(mm->weights),
+                  GIB(mm->runtime), m->config.seq_len, GIB(mm->seq.kv), seq, what);
+}
+
+static void mem_warn(RqModel *m) {
+    // a warning past 3/4 of the budget (after prepare_weights, which may set one too)
+    const RqModelMem *mm = &m->mem;
+    if (mm->budget > 0 && (double)mm->total > 0.75 * mm->budget) {
+        size_t l = strlen(m->warning);
+        snprintf(m->warning + l, sizeof(m->warning) - l, "%smemory: needs ~%.2f GiB, %.0f%% of %s %.2f GiB", l ? "; " : "",
+                 GIB(mm->total), 100.0 * mm->total / mm->budget, mm->budget_src == 2 ? "--mem" : "MemAvailable", GIB(mm->budget));
+    }
+}
+
+int rq_model_mem(const RqModel *m, RqModelMem *mem) {
+    memset(mem, 0, sizeof(*mem));
+    if (!m->has_weights) return RQ_ERR_STATE;
+    *mem = m->mem;
+    return RQ_OK;
+}
+
+int rq_seq_mem(const RqModel *m, int capacity, int kv_type, RqSeqMem *mem) {
+    memset(mem, 0, sizeof(*mem));
+    if (!m->has_weights) return RQ_ERR_STATE;
+    if (capacity <= 0) capacity = m->config.seq_len;
+    if (capacity > m->config.seq_len || kv_type < KV_F32 || kv_type > KV_F16) return RQ_ERR_ARG;
+    seq_mem(m, capacity, kv_type == KV_F32 ? 4 : 2, mem);
+    return RQ_OK;
+}
+
+static int drop_page_cache(const RqModel *m, const RqModelOpts *o) {
+    // RqModelOpts.page_cache: 0 = if the file is >= 1/4 of the RAM (a big model: its cached file would take as
+    // much RAM again as the repacked copy), 1 = always, -1 = never
+    if (o->page_cache) return o->page_cache > 0;
+#ifndef _WIN32
+    long pg = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGESIZE);
+    return pg > 0 && psz > 0 && (double)m->file_size >= 0.25 * (double)pg * psz;
+#else
+    (void)m;
+    return 0;
+#endif
 }
 
 // ---------------------------------------------------------------------------- chat templates
@@ -641,7 +853,13 @@ static void load_model(RqModel *m, const char *path, const RqModelOpts *o, Loade
         gguf_map_weights(m);
     else
         bin_map_weights(m, path, e);
-    prepare_weights(m, fileno(file), e, warning, wlen);
+    mem_check(m, o, path, e); // (nothing of the tensor data read yet)
+    if (m->is_gguf)
+        gguf_copy_norms(m);
+    int drop = drop_page_cache(m, o);
+    if (prepare_weights(m, fileno(file), drop, e, warning, wlen) && drop)
+        drop_cached(fileno(file), map, map, 0); // (the rest: partial pages, readahead; mapped pages stay)
+    mem_warn(m);
     m->has_weights = 1;
     fclose(file);
     ld->file = NULL;
@@ -676,7 +894,7 @@ static int load_guarded(RqModel *m0, Loader *ld0, const char *path0, const RqMod
 }
 
 RqModel *rq_model_load(const char *path, const RqModelOpts *opts, char *err, size_t errlen) {
-    static const RqModelOpts defaults = { 0, 0, 0 };
+    static const RqModelOpts defaults = { 0, 0, 0, 0, 0, 0 };
     char dummy[8];
     if (!err || errlen == 0) {
         err = dummy;

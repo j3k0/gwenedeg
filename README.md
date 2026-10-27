@@ -63,7 +63,20 @@ CLI options (`./runq` without arguments prints them all):
 | `-m MODE` | `chat` (default), `generate` (raw completion), `tokenize`; test hooks `logits`, `dequant`, `render` |
 | `-k f16\|bf16\|f32` | KV cache type, default f16 (half the memory of f32, as accurate) |
 | `-b N` | prefill chunk size, default 512 (`-b 1`: token by token) |
+| `--mem GiB` | memory budget of the load check (below), default MemAvailable; `0` or `force`: no check. Given, prints the estimate (a `[memory]` line) |
+| `--page-cache auto\|drop\|keep` | the model file's page cache after the load; `auto` (default) drops it if the file is >= 1/4 of the RAM |
 | `OMP_NUM_THREADS` | threads; default nproc - nproc/8 (Apple Silicon: the performance cores) |
+
+**Memory.** Before reading any weight, the loader estimates what the run needs from the file's tensor directory:
+the repacked weights, the runtime (tokenizer, metadata, a compute context of 512 rows) and one sequence of `-c`
+positions (its whole KV cache, and for Qwen3.5 the recurrent state with its 2 checkpoints). It refuses the file
+with a one-line message and exit status 1 when that exceeds MemAvailable (Linux, the host's: a cgroup limit is not read; no check elsewhere
+unless `--mem` gives a budget): a smaller `-c` lowers it, `--mem 0` loads anyway. The estimate is within 3% of the peak RSS
+of a run that fills the context (Qwen3-0.6B to 8B, Qwen3.5-0.8B and 4B, [tests/README.md](tests/README.md#memory)).
+The weights are read with `pread`, so the file also passes through the page cache: for a big file (>= 1/4 of the
+RAM, e.g. Qwen3.8-27B) the loader drops it matrix by matrix as they are repacked (`posix_fadvise` DONTNEED;
++0.35 s on the 8B's cold load, +0.6 s warm, when forced with `--page-cache drop`), for smaller ones it stays to make the next load fast
+(~1 s warm vs ~6 s cold for the 8B here).
 
 Chat keeps the whole conversation in the KV cache, so each turn prefills only the new tokens. Earlier
 answers drop their `<think>` block, as Qwen3's template does. When the context is full, the oldest turns
@@ -233,7 +246,8 @@ The forward passes are `rq_decode` (one token), `rq_prefill` (a sequence's token
 next to decode rows). On top of them sit `rq_sample` / `rq_sample_batch` (temperature, top-p, an optional
 token mask), `rq_generate` (the chat loop with per-token callbacks), `rq_tokenize`, `rq_detok_push`
 (incremental, UTF-8 safe) and `rq_chat_render`. Errors come back as `RQ_ERR_*` codes and messages; the
-library never prints or exits.
+library never prints or exits. `RqModelOpts.mem` / `.page_cache` set the load's memory check and page-cache policy
+(Memory, above); `rq_model_mem` and `rq_seq_mem` return the estimates (the server sizes its slot pool with the latter).
 
 ```c
 rq_threads_init(0);

@@ -472,6 +472,20 @@ static void dump_dequant(const RqModel *m, const char *spec, const char *out_pat
     free(packed);
 }
 
+static void print_memory(const RqModel *m, int seq_len) {
+    // --mem: the load's estimate (rq_model_mem) and what it was checked against
+    RqModelMem mm;
+    if (rq_model_mem(m, &mm) != RQ_OK) return;
+    const double G = 1073741824.0;
+    char st[96] = "";
+    if (mm.seq.state)
+        snprintf(st, sizeof(st), " + recurrent state %.1f MiB x (1 + %d checkpoints)", mm.seq.state / 1048576.0, mm.seq.checkpoints);
+    fprintf(stderr, "[memory] estimate %.2f GiB: weights %.2f + runtime %.2f + a sequence of %d positions %.2f (KV cache %.2f%s); ",
+            mm.total / G, mm.weights / G, mm.runtime / G, seq_len, mm.seq.total / G, mm.seq.kv / G, st);
+    if (mm.budget_src) fprintf(stderr, "%s %.2f GiB\n", mm.budget_src == 2 ? "--mem" : "MemAvailable", mm.budget / G);
+    else fprintf(stderr, "not checked\n");
+}
+
 // ----------------------------------------------------------------------------
 // CLI
 
@@ -501,6 +515,10 @@ static void error_usage(void) {
     fprintf(stderr, "  -b <int>    prefill chunk size (batched prompt processing), default %d, max %d;\n", RQ_BATCH_MAX, RQ_BATCH_MAX);
     fprintf(stderr, "              0 or 1 = one token at a time\n");
     fprintf(stderr, "  -k <string> KV cache type: f32|bf16|f16, default %s (16-bit: half the memory and bandwidth)\n", rq_kv_name(RQ_KV_DEFAULT));
+    fprintf(stderr, "  --mem <GiB> refuse the load (before reading the weights) if its estimate (weights + runtime + the KV cache of -c\n");
+    fprintf(stderr, "              positions) does not fit, default MemAvailable; 0 or force = no check; given: prints it ([memory])\n");
+    fprintf(stderr, "  --page-cache auto|drop|keep  the model file's page cache after the load: auto (default) drops it if the file\n");
+    fprintf(stderr, "              is >= 1/4 of the RAM\n");
     fprintf(stderr, "Threads: OMP_NUM_THREADS, default nproc - nproc/8 (Apple Silicon: the performance cores)\n");
     exit(EXIT_FAILURE);
 }
@@ -523,6 +541,8 @@ int main(int argc, char *argv[]) {
     char *out_path = NULL;      // output file for -m logits
     int prefill_chunk = RQ_BATCH_MAX; // -b: rows per batched prefill chunk (0 / 1: token by token)
     int kv_type = RQ_KV_DEFAULT;
+    double mem = 0;             // --mem: GiB, < 0 no check, 0 MemAvailable
+    int mem_given = 0, page_cache = 0;
 
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
@@ -530,6 +550,21 @@ int main(int argc, char *argv[]) {
         // do some basic validation
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
+        if (!strcmp(argv[i], "--mem")) {
+            char *end;
+            mem = strtod(argv[i + 1], &end);
+            if (!strcmp(argv[i + 1], "force") || !strcmp(argv[i + 1], "off")) mem = -1;
+            else if (end == argv[i + 1] || *end || !(mem >= 0)) error_usage();
+            else if (mem == 0) mem = -1;
+            mem_given = 1;
+            continue;
+        }
+        if (!strcmp(argv[i], "--page-cache")) {
+            const char *v = argv[i + 1];
+            page_cache = !strcmp(v, "drop") ? 1 : !strcmp(v, "keep") ? -1 : !strcmp(v, "auto") ? 0 : 2;
+            if (page_cache == 2) error_usage();
+            continue;
+        }
         if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
         // read in the args
         if (argv[i][1] == 't') { temperature = atof(argv[i + 1]); }
@@ -590,12 +625,13 @@ int main(int argc, char *argv[]) {
 
     // the model (weights, tokenizer, templates); -m dequant: the weights only
     int dequant = strcmp(mode, "dequant") == 0;
-    RqModelOpts o = { ctx_length, 0, dequant };
+    RqModelOpts o = { ctx_length, 0, dequant, mem, kv_type == RQ_KV_F32 ? 4 : 2, page_cache };
     RqModel *m = rq_model_load(checkpoint_path, &o, err, sizeof(err));
     if (!m) die(err);
     RqModelInfo info;
     rq_model_info(m, &info);
     if (info.warning) fprintf(stderr, "warning: %s\n", info.warning);
+    if (mem_given) print_memory(m, info.seq_len);
     if (dequant) {
         dump_dequant(m, prompt, out_path);
         rq_model_free(m);

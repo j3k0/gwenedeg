@@ -11,8 +11,9 @@
  * thread count (runq.h), and each job has its own sequence (slot) with its own RNG, so a request gives
  * the same output whatever it is batched with (tests/server_test.py, group batch).
  *
- * KV memory: a pool of sequences (slots, --slots, bounded by --kv-mem) of -c positions each (address
- * space, touched as used). A running job owns one; idle ones keep their tokens as prefix caches. A new
+ * KV memory: a pool of sequences (slots, --slots, bounded by --kv-mem, each counted with its KV cache and, for
+ * Qwen3.5, its recurrent state and checkpoints: rq_seq_mem) of -c positions each (address space, touched as
+ * used). A running job owns one; idle ones keep their tokens as prefix caches. A new
  * job takes the idle slot sharing the longest token prefix with its prompt if that is a real reuse
  * (>= 32 tokens or half the prompt), truncates it to that prefix and prefills only the rest; if a busy
  * slot (another running job) shares a longer prefix, it is copied (rq_seq_copy: the same bits) into the
@@ -60,7 +61,8 @@ struct Engine {
     Slot *slot;
     int nslot, parallel, maxb;
     EngineOpts o;
-    size_t kv_pos;        // KV bytes per position
+    RqSeqMem sm;          // the memory of one slot (rq_seq_mem: KV cache of ctx positions, recurrent state, checkpoints)
+    const char *mem_src;  // where the pool's budget came from (engine_describe)
     ConVocab *vocab;
     int V, eos, think_start, think_end, chat; // chat: the template variant (RQ_CHAT_*)
     int hybrid;                               // Qwen3.5's linear layers: a copy keeps only a checkpointed length
@@ -844,19 +846,32 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
     e->hybrid = info.linear_layers > 0;
     e->think_start = single_token(m, "<think>");
     e->think_end = single_token(m, "</think>");
-    // the pool: --slots sequences of -c positions (default --parallel + 4), within --kv-mem (default: half the RAM)
-    e->kv_pos = (size_t)info.n_layers * info.n_kv_heads * info.head_dim * 2 * (o->kv_type == RQ_KV_F32 ? 4 : 2);
-    double per_slot = (double)e->kv_pos * o->ctx, mem = o->kv_mem > 0 ? o->kv_mem * 1073741824.0 : 0;
+    // the pool: --slots sequences of -c positions (default --parallel + 4), within --kv-mem (default: half the RAM, at
+    // most MemAvailable now, after the load), each counted with its KV cache, recurrent state and checkpoints
+    int rc = rq_seq_mem(m, o->ctx, o->kv_type, &e->sm);
+    if (rc != RQ_OK) {
+        snprintf(err, errlen, "cannot create a sequence of %d positions: %s", o->ctx, rq_strerror(rc));
+        engine_free(e);
+        return NULL;
+    }
+    double per_slot = (double)e->sm.total, mem = o->kv_mem > 0 ? o->kv_mem * 1073741824.0 : 0;
+    e->mem_src = "--kv-mem";
     if (mem <= 0) {
         long pages = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGESIZE);
+        double avail = rq_mem_available();
         mem = pages > 0 && psz > 0 ? 0.5 * (double)pages * psz : 8.0 * 1073741824.0;
+        e->mem_src = "half the RAM";
+        if (avail > 0 && avail < mem) {
+            mem = avail;
+            e->mem_src = "MemAvailable";
+        }
     }
     e->parallel = o->parallel > 0 ? o->parallel : 16;
     e->nslot = o->slots > 0 ? o->slots : e->parallel + 4;
     if (e->nslot * per_slot > mem) e->nslot = (int)(mem / per_slot);
     if (e->nslot < 1) {
-        snprintf(err, errlen, "-c %d needs %.2f GiB of KV cache per sequence, more than --kv-mem %.2f GiB", o->ctx, per_slot / 1073741824.0,
-                 mem / 1073741824.0);
+        snprintf(err, errlen, "-c %d needs %.2f GiB per sequence (KV cache and recurrent state), more than the pool's %.2f GiB (%s)", o->ctx,
+                 per_slot / 1073741824.0, mem / 1073741824.0, e->mem_src);
         engine_free(e);
         return NULL;
     }
@@ -865,7 +880,6 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
     e->maxb = e->o.batch > e->o.chunk + e->parallel ? e->o.batch : e->o.chunk + e->parallel;
     if (e->maxb > RQ_BATCH_MAX) e->maxb = RQ_BATCH_MAX;
     if (e->maxb < 2) e->maxb = 2;
-    int rc;
     e->c = rq_ctx_new(m, e->maxb, o->ctx, &rc);
     e->slot = calloc(e->nslot, sizeof(Slot));
     e->q = calloc(e->o.queue + e->parallel, sizeof(Job *));
@@ -901,10 +915,14 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
 }
 
 void engine_describe(Engine *e, char *buf, size_t n) {
-    snprintf(buf, n, "%d running at most, %d slot(s) of %d positions (KV %.0f KB per position, %.2f GiB per slot, %.1f GiB at most, "
-             "touched as used; --kv-mem %.1f GiB), prefill chunks %d / %d tokens per pass (others decoding / not)",
-             e->parallel, e->nslot, e->o.ctx, e->kv_pos / 1000.0, (double)e->kv_pos * e->o.ctx / 1073741824.0,
-             (double)e->kv_pos * e->o.ctx * e->nslot / 1073741824.0, e->o.kv_mem, e->o.chunk, e->o.batch);
+    const double G = 1073741824.0;
+    char st[96] = "";
+    if (e->sm.state)
+        snprintf(st, sizeof(st), " + recurrent state %.1f MiB x (1 + %d checkpoints)", e->sm.state / 1048576.0, e->sm.checkpoints);
+    snprintf(buf, n, "%d running at most, %d slot(s) of %d positions (per slot %.1f MiB: KV %.0f KB per position%s; %.2f GiB at most, "
+             "touched as used; pool budget %.2f GiB, %s), prefill chunks %d / %d tokens per pass (others decoding / not)",
+             e->parallel, e->nslot, e->o.ctx, e->sm.total / 1048576.0, (double)e->sm.kv / e->o.ctx / 1000.0, st,
+             (double)e->sm.total * e->nslot / G, e->o.kv_mem, e->mem_src, e->o.chunk, e->o.batch);
 }
 
 int engine_submit(Engine *e, Job *j) {

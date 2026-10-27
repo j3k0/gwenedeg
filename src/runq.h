@@ -63,10 +63,16 @@ typedef struct {
                         // values up to the model's maximum are taken as given): the default sequence capacity
     int tokenizer_only; // only the header / metadata and the tokenizer (no weights, no forward passes)
     int no_tokenizer;   // only the weights (rq_dequant_rows)
+    double mem;         // the memory check, before any weight is read (rq_model_mem): the estimate must fit in this many
+                        // GiB; 0 = in MemAvailable (Linux /proc/meminfo; no check where it is unknown), < 0 = no check
+    int kv_bytes;       // bytes per KV cache value of the sequence the check counts (0: 2, f16 / bf16; 4: f32)
+    int page_cache;     // the file's page cache after the repack (the loader reads it with pread): 0 = dropped
+                        // if the file is >= 1/4 of the RAM, 1 = dropped, -1 = kept
 } RqModelOpts;
 
 // A qwen3.c .bin (with its .tokenizer / .template* side files) or a GGUF file (Q8_0, Q4_K_M), by
-// magic. NULL on failure, with the reason in err (e.g. "GGUF <path>: tensor ... not found")
+// magic. NULL on failure, with the reason in err (e.g. "GGUF <path>: tensor ... not found"; a model whose
+// estimate does not fit: "... needs ~N GiB ...", RqModelOpts.mem)
 RqModel *rq_model_load(const char *path, const RqModelOpts *opts, char *err, size_t errlen);
 void rq_model_free(RqModel *m);
 
@@ -85,6 +91,30 @@ typedef struct {
                            // rq_seq_checkpoint_at); 0 for Qwen3
 } RqModelInfo;
 void rq_model_info(const RqModel *m, RqModelInfo *info);
+
+// Memory estimates, in bytes (README.md, Memory). rq_model_load computes them from the tensor directory before
+// reading any weight, and checks total against the budget (RqModelOpts.mem); a model loaded without weights
+// has none (RQ_ERR_STATE)
+typedef struct {
+    size_t kv;          // KV cache (both halves, whole attention blocks) and the token array: address space, touched as used
+    size_t state;       // Qwen3.5: the recurrent state of the linear-attention layers (0 for Qwen3)
+    int checkpoints;    // copies of the state a sequence keeps at most (rq_seq_checkpoint_at; each allocated at its first use)
+    size_t total;       // kv + (1 + checkpoints) x state
+} RqSeqMem;
+typedef struct {
+    size_t weights;     // the weights in memory: repacked (or the mapped file a .bin on the generic kernels runs from), norms
+    size_t runtime;     // the tokenizer, the file's metadata, a compute context of RQ_BATCH_MAX rows (rq_ctx_new)
+    RqSeqMem seq;       // one sequence of the context length (RqModelOpts.ctx_len / kv_bytes)
+    size_t total;       // weights + runtime + seq.total: what the check counts
+    double budget;      // what it was checked against (bytes; 0: no check)
+    int budget_src;     // 0 none, 1 MemAvailable, 2 RqModelOpts.mem
+} RqModelMem;
+int rq_model_mem(const RqModel *m, RqModelMem *mem);
+// the memory of one sequence (as rq_seq_new(m, capacity, kv_type) allocates it, checkpoints included); RQ_ERR_ARG
+// as rq_seq_new
+int rq_seq_mem(const RqModel *m, int capacity, int kv_type, RqSeqMem *mem);
+// MemAvailable of /proc/meminfo in bytes (Linux), or -1 where unknown
+double rq_mem_available(void);
 
 // --------------------------------------------------------------------------------------- sequence
 typedef struct RqSeq RqSeq;

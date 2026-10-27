@@ -95,7 +95,7 @@ typedef struct {
     int chunk;                  // prompt tokens per pass while other jobs decode (--chunk)
     int parallel;               // running jobs at most (--parallel; 0: 16)
     int slots;                  // sequences in the pool (running jobs + prefix caches; 0: parallel + 4)
-    double kv_mem;              // GiB of KV cache for the pool at most (slots x ctx; 0: half the RAM)
+    double kv_mem;              // GiB for the pool at most (slots x rq_seq_mem of ctx positions; 0: half the RAM, at most MemAvailable)
     int copy_min;               // copy a running job's prefix if that saves >= this many tokens (0: never)
     int queue;                  // queued jobs at most (waiting, not running)
     int verbose;

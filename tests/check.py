@@ -1108,6 +1108,24 @@ def test_gguf(a, res, tmp, tmpl):
         ok = ib == ig and text == want
         res.report(ok, f"gguf_template/{name}", f"{len(ig)} prompt tokens, " + (f"same ids as the .bin ({os.path.basename(a.model + sfx)})"
                    if ok else f"DIFFER: gguf {text!r} vs side file {want!r} (ids equal: {ib == ig})"))
+    test_mem(a, res)
+
+
+def test_mem(a, res):
+    """--mem: the load-time memory estimate and the refusal (before any weight is read) on the GGUF Q8_0 file"""
+    p = run([a.runq, a.gguf, "--mem", "0.1", "-i", "hi", "-n", "1"], 1)
+    err = p.stderr.decode(errors="replace")
+    ok = p.returncode == 1 and not p.stdout and err.count("\n") == 1 and "needs ~" in err and \
+        "more than the budget of 0.10 GiB (--mem): not loaded" in err
+    res.report(ok, "gguf_mem/refused", f"--mem 0.1: exit status {p.returncode}, {err.strip()[-160:]!r}")
+    p = run([a.runq, a.gguf, "--mem", "64", "-c", "1024", "-m", "generate", "-t", "0", "-i", "hi", "-n", "1"], 1)
+    err = p.stderr.decode(errors="replace")
+    line = next((l for l in err.splitlines() if l.startswith("[memory] ")), "")
+    # (28 layers x 1024 positions x 1024 values x 2 (K, V) x 2 bytes = 112 MiB = 0.11 GiB)
+    ok = p.returncode == 0 and "a sequence of 1024 positions 0.11 (KV cache 0.11); --mem 64.00 GiB" in line
+    res.report(ok, "gguf_mem/estimate", f"--mem 64 -c 1024: exit status {p.returncode}, {line!r}")
+    p = run([a.runq, a.gguf, "--mem", "lots", "-i", "hi"], 1)
+    res.report(p.returncode == 1 and b"Usage:" in p.stderr, "gguf_mem/bad_value", f"--mem lots: exit status {p.returncode}")
 
 
 # ----------------------------------------------------------------------------- Q4_K_M

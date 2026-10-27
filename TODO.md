@@ -15,7 +15,7 @@ Decode Qwen3.8-27B (`qwen35`, 64 layers, r = 3, untied, an MTP block) at ~13-18 
 Qwen3.5-0.8B as the draft, the output **exactly** plain decoding's (tokens, greedy and seeded, and each emitted
 token's logits bits). Facts, measurements and decisions: [docs/qwen38-speculative.md](docs/qwen38-speculative.md).
 Added rule for this section: speculative output == plain output (tokens + a hash of each emitted token's logits).
-Order: the preparation items (P4, P5) first, each a no-behaviour-change step checked by the regression net
+Order: the preparation item P5 first, a no-behaviour-change step checked by the regression net
 (`tests/compare_bins.sh REF_DIR NEW_DIR`: every model family, Qwen3.5 and the synthetic r = 2 / 3 models too), then
 the steps (S). **Disk and RAM:** ~40 GB free with the 27B Q4_K_M downloaded (`models/Qwen3.8-27B-GGUF`, sha256 checked),
 `models/` 45 GB; `/tmp` is a 16 GB tmpfs (RAM: no models or venvs there); check `df` / `MemAvailable` before every
@@ -25,13 +25,6 @@ committed goldens, re-download their pinned sets), and use
 
 Preparation (no output changes; `make test` and `tests/compare_bins.sh` byte-identical after each):
 
-- [ ] **P4. Memory accounting and the page cache.** (a) `runq serve`'s per-slot budget (`src/engine.c`) counts only
-  the KV cache: add the recurrent state and its checkpoints (~0.45 GB per 27B slot). (b) Print a load-time estimate
-  (repacked weights, KV reserve, state + checkpoints per sequence) and refuse to load past `MemAvailable` unless
-  forced (`--mem`), so a 27B run cannot OOM the box's other services. (c) After the repack, drop the file's page
-  cache (`posix_fadvise(POSIX_FADV_DONTNEED)`; the loader `pread`s). (d) Record load peak RSS for the 8B Q4_K_M and
-  the 4B Q8_0 as the baseline (tests/README or BENCHMARKS). Done when the estimates are within ~5% of the measured
-  RSS and outputs are unchanged.
 - [ ] **P5. Sampling as a reusable step, then top-k.** Factor `rq_generate`'s per-token body (sample with the
   sequence's RNG, the stop / limit checks, the `on_logits` hook) into one function that the speculative loop calls
   too, so its RNG pattern (one draw per prefilled token but the last, one per emitted token) is shared by
@@ -78,8 +71,9 @@ Steps:
   default, the effort's system line merged with the system / developer message, `-r` plus an effort option, the server's
   `reasoning_effort`; the template in `tests/golden/templates/` (license noted). Done when `-m render` equals HF's
   `apply_chat_template` for thinking off / on x each effort, with and without a system message.
-- [ ] **S7. 27B bring-up** (after P4; Q4_K_M). Download the pinned file with `hf` (into
-  `models/`, sha256 checked); load: peak RSS, page cache dropped. Logits vs `tests/ref_qwen35.py` on the dequantized
+- [ ] **S7. 27B bring-up** (Q4_K_M). Download the pinned file with `hf` (into
+  `models/`, sha256 checked); load: peak RSS vs the load-time estimate (`build/mem_probe`, ~18.6 GiB at `-c` 40,960),
+  page cache dropped (`auto`: the file is > 1/4 of the RAM). Logits vs `tests/ref_qwen35.py` on the dequantized
   weights (layer by layer, a few GB; a classifier subset); teacher-forced top-1 vs the API's model on the saved outputs
   (a sanity check). Speed: plain decode (~120 ms per token), then with the 0.8B Q4_K_M draft (thinking on: ~13-14 tok/s;
   off: ~17). Not in `make test` (an opt-in group, like `models`). Done when the

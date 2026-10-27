@@ -23,7 +23,9 @@ curl -s localhost:8080/v1/chat/completions -d '{"messages": [{"role": "user", "c
 | `-c`, `--ctx N` | 8192 | positions per sequence (the context limit of a request) |
 | `--parallel N` | 16 | requests running at once (their rows batched in each forward pass); more wait in the queue |
 | `--slots N` | parallel + 4 | sequences in the pool: one per running request, the idle ones keep their tokens as prefix caches |
-| `--kv-mem GiB` | half the RAM | bound for slots x ctx x KV bytes per position (115 KB f16): `--slots` (and `--parallel`) are lowered to fit; the memory is touched only as used |
+| `--kv-mem GiB` | half the RAM, at most MemAvailable after the load | bound for the pool: slots x (the KV cache of ctx positions + for Qwen3.5 the recurrent state and its 2 checkpoints); `--slots` (and `--parallel`) are lowered to fit; the memory is touched only as used. The startup line shows the size of a slot (e.g. Qwen3-0.6B f16: 115 KB per position, 0.9 GiB at 8192; Qwen3.5-0.8B at 2048 positions: 12 KB per position + 19.3 MiB of state x 3 = 81.8 MiB; Qwen3.8-27B at 8192: 0.5 GiB + 150 MiB x 3 = 0.94 GiB) |
+| `--mem GiB` | MemAvailable | the load check (README, Memory): refuse to load if the weights, the runtime and one sequence of `-c` positions do not fit; `0` or `force`: no check |
+| `--page-cache auto\|drop\|keep` | auto | the model file's page cache after the load (auto: dropped if the file is >= 1/4 of the RAM) |
 | `-b N`, `--chunk N` | 512, 64 | prompt tokens per forward pass when no request is decoding / while others decode |
 | `--prefix-copy N` | 32 | copy a running request's cached prompt prefix into a new request's slot if that saves N tokens (0: never) |
 | `-k` | f16 | KV cache type (as for the CLI) |

@@ -24,11 +24,6 @@ removing the 4B / 1.7B HF checkpoints, which only regenerate committed goldens: 
 
 Preparation (no output changes; `make test` and `tests/compare_bins.sh` byte-identical after each):
 
-- [ ] **P2. Two models in one process, tested.** The pool, the group size `GS` and `rq_nt` are process-wide
-  (`src/threads.c`, `src/model.c`); a draft and a target will alternate passes on one pool. An `api_test` case:
-  load two models (Qwen3-0.6B + 1.7B; Qwen3.5-0.8B + a synthetic r = 3 model), interleave their prefills, decodes and
-  batched passes: each context's logits bitwise == the model alone. Also check the error paths (a second model with
-  another GS, freeing one while the other runs). Done when it passes on both builds.
 - [ ] **P3. Checkpoints as a set, not two fixed slots.** `RQ_SEQ_CK` = 2 and one pending `ck_at` per pass
   (`src/internal.h`, `ck_plan` / `ck_done` in `src/forward.c`). Refactor to a per-sequence set of n slots (a context
   setting, default 2: today's behaviour) with a sorted list of pending positions per pass, each (layer, head) item

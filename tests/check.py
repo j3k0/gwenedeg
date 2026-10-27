@@ -44,7 +44,9 @@ Tests (see tests/README.md):
              interleaved / batched / truncated == alone, batched decode of N sequences (1..17, 65) ==
              each alone incl. past 256 positions and mixed passes, rq_sample_batch, errors, chat
              rendering, detokenization; the batched passes' digests at 1 / 8 / 16 threads and on the
-             generic build == the main runs
+             generic build == the main runs; two models in one process (api_test --two: the GGUF Q8_0 and
+             Q4_K_M files interleaved == each alone, one freed while the other goes on, the .bin's group
+             size refused while they are loaded)
 
 Logits metrics, per position, over U = (fixed 4096-id vocab subset) + (HF top-64 ids):
   cos   cosine similarity of runq vs HF logits on U
@@ -382,7 +384,7 @@ def prefetch_all(a, tmp, only, fg, bg):
             sub(fg, q4, qt, n, c, THREADS_LONG if nd != THREADS_LONG else 8)
 
 
-API_THREADS = {"bin": 3, "gguf": 4, "q4": 4}  # the API test's runs (in the background from the start)
+API_THREADS = {"bin": 3, "gguf": 4, "q4": 4, "pair": 4}  # the API test's runs (in the background from the start)
 # the batched passes again (api_test --digest: their logits hashes only) at other thread counts (Q4_K_M, else
 # the .bin; 8 and 16 threads: the short passes) and on the generic build (--digest-small, 3 threads: the short
 # passes of the .bin and Q4_K_M; the long ones' generic attention: chat/long_context_generic): the same DIGEST
@@ -401,6 +403,8 @@ def api_runs(a, ex, gx):
     n65 = {"q4": ["--n65"]} if a.q4 else {"bin": ["--n65"]}
     main = {tag: ex.submit(run, [a.api_test, m] + n65.get(tag, []) + (["--kv"] if tag == "bin" else []), API_THREADS[tag])
             for tag, m in models if m}
+    if a.gguf and a.q4:  # two models in one process (Q8_0 + Q4_K_M; the .bin: another group size, refused)
+        main["pair"] = ex.submit(run, [a.api_test, "--two", a.gguf, a.q4, "--gs", a.model], API_THREADS["pair"])
     dg = {}
     gen = a.api_test + "-generic"
     if os.path.exists(gen):
@@ -424,10 +428,12 @@ def test_api(a, res, runs):
     re-prefilled give bit-identical logits, rq_generate == a hand-written loop, error codes, chat
     rendering, incremental detokenization, the sampler's token mask; batched decode rows == each
     sequence alone, mixed passes, batched sampling; the batched passes' digests equal at other thread
-    counts and on the generic build"""
+    counts and on the generic build; two models in one process (pair: api_test --two)"""
     futs, dfuts = runs
     if not futs:
         print("   (skipped: no --api-test binary)")
+    elif "pair" not in futs:
+        print("   (two models in one process: skipped, needs the GGUF Q8_0 and Q4_K_M files)")
     ref = {}
     for tag, fut in futs.items():
         p = fut.result()

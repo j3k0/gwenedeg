@@ -224,7 +224,8 @@ has three kinds of objects:
 - **RqSeq** (`rq_seq_new`): one sequence with its own KV cache (capacity and type per sequence), tokens
   and sampling RNG. `rq_seq_truncate`, `rq_seq_common_prefix` and `rq_seq_copy` handle prefix reuse.
 - **RqCtx** (`rq_ctx_new`): a compute context (activation buffers for up to `max_batch` rows, logits).
-  The threads are one process-wide pool (`rq_threads_init`).
+  The threads are one process-wide pool (`rq_threads_init`) running one pass at a time: the passes of
+  several contexts (e.g. two models with the same activation group size) alternate on one calling thread.
 
 The forward passes are `rq_decode` (one token), `rq_prefill` (a sequence's tokens in chunks) and
 `rq_forward_batch` (one pass over rows of several sequences, each at its own position: prefill chunks
@@ -315,7 +316,8 @@ mynah-slm, an optional reference engine for comparison (not part of this reposit
   not been re-run on the Mac yet (docs/DEVELOPMENT.md).
 - `runq serve`: no TLS, no tools / function calling, no images, `n` = 1, no `json_object` or free-form
   string constraints; the KV memory is a fixed pool of slots (no paging).
-- CPU only; one model per process.
+- CPU only; the CLI and the server run one model per process (the library can hold several with the same
+  activation group size, tested by `api_test --two`).
 
 ## Credits and license
 

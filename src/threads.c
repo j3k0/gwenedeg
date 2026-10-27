@@ -8,8 +8,10 @@ int rq_static = 0;
 // ----------------------------------------------------------------------------------- parallel region
 
 static int rq_nt = 0; // threads per job (rq_set_threads); 0: OMP_NUM_THREADS, else 1
+static int rq_fixed = 0; // rq_threads_fix was called: the count no longer changes
 
 void rq_set_threads(int n) {
+    if (rq_fixed) return; // (a compute context's per-thread scratch is sized for it: rq_threads_fix)
     rq_nt = n < 1 ? 1 : n > 256 ? 256 : n;
 #ifdef _OPENMP
     omp_set_num_threads(rq_nt); // (the OpenMP parallel region of -DRUNQ_NO_POOL / Windows)
@@ -195,3 +197,15 @@ const char *rq_threads_init(int n) {
 }
 
 int rq_threads(void) { return rq_nthreads(); }
+
+int rq_threads_fix(void) {
+    // the threads of every later job, fixed from now on (rq_ctx_new sizes a context's per-thread scratch by it;
+    // the pool's size cannot change once started anyway). Was: a context made before the pool started (a .bin
+    // model on the generic build loads without a parallel job) or in an OpenMP-region build, then
+    // rq_threads_init with more threads (e.g. before loading a second model): jobs with tids past its scratch
+    if (!rq_fixed) {
+        rq_set_threads(rq_threads_cfg()); // (OpenMP: its thread count = ours, also when rq_threads_init was not called)
+        rq_fixed = 1;
+    }
+    return rq_nthreads();
+}

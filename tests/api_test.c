@@ -9,11 +9,23 @@
  * thread count and build (check.py compares runs at other thread counts and of the generic build);
  * --digest: only those passes (no references, no PASS / FAIL lines); --digest-small: only the short
  * ones (for the slow generic build; --long: and the long ones); --n65: also 65 sequences in one pass
- * (references for 48 more sequences: one model is enough); --kv: also a bf16 KV cache. */
+ * (references for 48 more sequences: one model is enough); --kv: also a bf16 KV cache.
+ *   tests/api_test --two MODEL_A MODEL_B [--gs MODEL_GS]
+ * Two models in one process (a draft and a target of speculative decoding: one thread pool, one activation
+ * group size): their prefills, decode steps, batched passes (several sequences, a prefill chunk next to decode
+ * rows), truncations to checkpoints (Qwen3.5), copies, batched sampling and rq_generate, interleaved step by
+ * step, give the logits hashes of each model alone (each run in a fresh process first: fork); then A is freed
+ * and B goes on (== alone). Also: a sequence of one model on the other's context is refused, and with --gs a
+ * model of another group size (the .bin: 64) is refused cleanly while A or B is loaded (they go on unchanged),
+ * and loads once both are freed. DIGEST lines (a hash of each model's work) to compare builds. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#ifndef _WIN32
+#include <unistd.h>
+#include <sys/wait.h>
+#endif
 #include "../src/runq.h"
 
 static int failed = 0;
@@ -140,9 +152,11 @@ static int on_tok(void *u, int t) {
 }
 
 static void batch_tests(RqCtx *c, RqTokens A, RqTokens B, RqTokens C, const float *refB, int only_digest);
+static int two_main(int argc, char **argv);
 
 int main(int argc, char **argv) {
     int only_digest = 0;
+    if (argc > 1 && !strcmp(argv[1], "--two")) return two_main(argc, argv);
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--digest")) only_digest = 1;
         else if (!strcmp(argv[i], "--digest-small")) only_digest = 2;
@@ -152,7 +166,8 @@ int main(int argc, char **argv) {
         else argc = 0;
     }
     if (argc < 2) {
-        fprintf(stderr, "usage: api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv]\n");
+        fprintf(stderr, "usage: api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv]\n"
+                        "       api_test --two MODEL_A MODEL_B [--gs MODEL_OTHER_GROUP_SIZE]\n");
         return 2;
     }
     char err[512];
@@ -631,4 +646,376 @@ static void batch_tests(RqCtx *c, RqTokens A, RqTokens B, RqTokens C, const floa
     for (int i = 0; i < BD_SEQS; i++) rq_seq_free(sq[i]);
     rq_seq_free(bs);
     rq_seq_free(bl);
+}
+
+// ------------------------------------------------------------------------------------------- two models
+// api_test --two: a script of steps per model (TwoM), run interleaved with the other model's and alone. Each step
+// hashes the logits it produces (and the tokens / lengths / RNG states where it has them)
+
+#define TW_MAIN 10 // steps run while both models are loaded
+#define TW_ALL 13  // + the steps B runs after A is freed
+static const char *tw_name[TW_ALL] = { "prefill_all", "prefill_chunks", "decode", "batch_mixed", "batch_decode", "truncate",
+                                       "truncate_batch", "copy", "sample_batch", "generate", "decode_after",
+                                       "batch_after", "generate_after" };
+static const int tw_tk[8] = { 279, 6722, 13, 198, 262, 470, 1000, 1037 };
+
+typedef struct {
+    RqModel *m;
+    RqModelInfo info;
+    RqCtx *c;
+    RqSeq *s[4];
+    RqTokens P, Q, R, U; // prompts: P ~33 tokens, Q ~73 (2 chunks of 64), R ~57, U a chat user turn
+    float *out;          // max(64, P.n) rows of logits
+    uint64_t h[TW_ALL];
+    int bad;             // the first step that returned an error + 1 (0: none)
+} TwoM;
+
+typedef struct { uint64_t h; int V; } TwGen;
+
+static uint64_t tw_mix(uint64_t h, uint64_t x) { return h * 31 + x; }
+
+static uint64_t tw_rows(const TwoM *w, const float *x, int n) {
+    uint64_t h = 0;
+    for (int i = 0; i < n; i++)
+        h = tw_mix(h, hash_f(x + (size_t)i * w->info.vocab_size, w->info.vocab_size));
+    return h;
+}
+
+static void tw_on_logits(void *u, int pos, const float *lg) {
+    TwGen *g = u;
+    g->h = tw_mix(tw_mix(g->h, (uint64_t)pos), hash_f(lg, g->V));
+}
+
+static int tw_on_token(void *u, int t) {
+    TwGen *g = u;
+    g->h = tw_mix(g->h, (uint64_t)t);
+    return 0;
+}
+
+static void tw_free(TwoM *w) {
+    for (int j = 0; j < 4; j++) rq_seq_free(w->s[j]);
+    rq_ctx_free(w->c);
+    rq_model_free(w->m);
+    rq_tokens_free(&w->P);
+    rq_tokens_free(&w->Q);
+    rq_tokens_free(&w->R);
+    rq_tokens_free(&w->U);
+    free(w->out);
+    memset(w->s, 0, sizeof(w->s));
+    w->c = NULL;
+    w->m = NULL;
+    w->out = NULL;
+}
+
+static int tw_load(TwoM *w, const char *path, char *err, size_t errlen) {
+    // the model, a context (64 rows per pass), 4 sequences of 512 positions and the prompts; 0 on failure (err)
+    int e = RQ_OK;
+    memset(w, 0, sizeof(*w));
+    if (!(w->m = rq_model_load(path, NULL, err, errlen))) return 0;
+    rq_model_info(w->m, &w->info);
+    if (!(w->c = rq_ctx_new(w->m, 64, 512, &e))) goto fail;
+    for (int j = 0; j < 4; j++)
+        if (!(w->s[j] = rq_seq_new(w->m, 512, RQ_KV_DEFAULT, &e))) goto fail;
+    e = rq_tokenize(w->m, "The capital of France is Paris, and the capital of Germany is Berlin. Rivers: the Seine, "
+                    "the Rhine and the Danube flow through famous cities.", -1, &w->P);
+    if (e == RQ_OK)
+        e = rq_tokenize(w->m, "def fib(n):\n    return n if n < 2 else fib(n - 1) + fib(n - 2)\n\n# Print the first ten "
+                        "Fibonacci numbers, one per line, then their sum, and explain why the recursion is slow for "
+                        "large n and how memoization fixes it.\nfor i in range(10):\n    print(fib(i))\n", -1, &w->Q);
+    for (int r = 0; r < 3 && e == RQ_OK; r++)
+        e = rq_tokenize(w->m, "A lighthouse keeper trims the wicks, polishes the lens and writes the weather into the log. ",
+                        -1, &w->R);
+    if (e == RQ_OK) e = rq_chat_user(w->m, "Name three colours.", 0, &w->U);
+    if (e != RQ_OK) goto fail;
+    if (w->Q.n < 66 || w->R.n < 40 || w->P.n < 8) {
+        snprintf(err, errlen, "%s: prompts too short (%d, %d, %d tokens)", path, w->P.n, w->Q.n, w->R.n);
+        return 0;
+    }
+    if (!(w->out = malloc((size_t)(w->P.n > 64 ? w->P.n : 64) * w->info.vocab_size * sizeof(float)))) { e = RQ_ERR_NOMEM; goto fail; }
+    return 1;
+fail:
+    snprintf(err, errlen, "%s: setup: %s", path, rq_strerror(e));
+    return 0;
+}
+
+static void tw_step(TwoM *w, int i) {
+    RqCtx *c = w->c;
+    RqSeq **s = w->s;
+    int V = w->info.vocab_size, e = RQ_OK;
+    uint64_t h = 0;
+    float *lg = NULL;
+    switch (i) {
+    case 0: // s0: P, every row's logits
+        e = rq_prefill(c, s[0], w->P.v, w->P.n, RQ_LOGITS_ALL, w->out, NULL);
+        h = tw_rows(w, w->out, w->P.n);
+        break;
+    case 1: // s1: Q in 2 chunks, the last row; Qwen3.5: a checkpoint at 40 (taken inside the first chunk)
+        e = rq_seq_checkpoint_at(s[1], 40);
+        if (e == RQ_OK) e = rq_prefill(c, s[1], w->Q.v, w->Q.n, RQ_LOGITS_LAST, NULL, &lg);
+        break;
+    case 2: // s0: a decode step
+        e = rq_decode(c, s[0], tw_tk[0], &lg);
+        break;
+    case 3: { // a prefill chunk of s2 (R[0..19], every row; Qwen3.5: a checkpoint at 12) between decode rows of s0, s1
+        RqSegment sg[3] = { { s[0], &tw_tk[1], 1, RQ_LOGITS_LAST }, { s[2], w->R.v, 20, RQ_LOGITS_ALL },
+                            { s[1], &tw_tk[2], 1, RQ_LOGITS_LAST } };
+        e = rq_seq_checkpoint_at(s[2], 12);
+        if (e == RQ_OK) e = rq_forward_batch(c, sg, 3, w->out, NULL);
+        h = tw_rows(w, w->out, 22);
+        break;
+    }
+    case 4: { // decode rows of s2, s0, s1 in one pass
+        RqSegment sg[3] = { { s[2], w->R.v + 20, 1, RQ_LOGITS_LAST }, { s[0], &tw_tk[3], 1, RQ_LOGITS_LAST },
+                            { s[1], &tw_tk[4], 1, RQ_LOGITS_LAST } };
+        e = rq_forward_batch(c, sg, 3, w->out, NULL);
+        h = tw_rows(w, w->out, 3);
+        break;
+    }
+    case 5: { // s1 back to 41 (Qwen3.5: to its checkpoint at 40), Q's rest prefilled again
+        e = rq_seq_truncate(s[1], 41);
+        int L = rq_seq_len(s[1]);
+        if (e == RQ_OK && L != (w->info.linear_layers ? 40 : 41)) e = RQ_ERR_STATE; // (not where expected)
+        if (e == RQ_OK) e = rq_prefill(c, s[1], w->Q.v + L, w->Q.n - L, RQ_LOGITS_LAST, NULL, &lg);
+        h = (uint64_t)L;
+        break;
+    }
+    case 6: { // s2 back to 15 (Qwen3.5: 12), R[L..29] again (every row) next to a decode row of s0
+        e = rq_seq_truncate(s[2], 15);
+        int L = rq_seq_len(s[2]);
+        if (e == RQ_OK && L != (w->info.linear_layers ? 12 : 15)) e = RQ_ERR_STATE;
+        RqSegment sg[2] = { { s[0], &tw_tk[5], 1, RQ_LOGITS_LAST }, { s[2], w->R.v + L, 30 - L, RQ_LOGITS_ALL } };
+        if (e == RQ_OK) e = rq_forward_batch(c, sg, 2, w->out, NULL);
+        h = tw_mix((uint64_t)L, tw_rows(w, w->out, 31 - L));
+        break;
+    }
+    case 7: // s3 := s0 (rq_seq_copy, whole), a decode step on the copy
+        e = rq_seq_copy(s[3], s[0], rq_seq_len(s[0]));
+        if (e == RQ_OK) e = rq_decode(c, s[3], tw_tk[6], &lg);
+        h = (uint64_t)rq_seq_len(s[3]);
+        break;
+    case 8: { // a decode row of each sequence in one pass, then rq_sample_batch (seeded top-p / greedy per row)
+        RqSegment sg[4];
+        RqSampling cf[2] = { { 0.8f, 0.9f, NULL }, { 0, 0, NULL } }, cfg[4];
+        int tok[4] = { tw_tk[7], tw_tk[0], tw_tk[1], tw_tk[2] }, got[4] = { 0 };
+        for (int j = 0; j < 4; j++) {
+            sg[j] = (RqSegment) { s[j], &tok[j], 1, RQ_LOGITS_LAST };
+            cfg[j] = cf[j % 2];
+            rq_seq_seed(s[j], 11 + j);
+        }
+        e = rq_forward_batch(c, sg, 4, w->out, NULL);
+        h = tw_rows(w, w->out, 4);
+        if (e == RQ_OK) e = rq_sample_batch(c, s, w->out, 4, cfg, 4, got);
+        for (int j = 0; j < 4; j++) h = tw_mix(tw_mix(h, (uint64_t)got[j]), *rq_seq_rng(s[j]));
+        break;
+    }
+    case 9: case 12: { // rq_generate on s3 (reset) from a chat turn: greedy 5 tokens; after: seeded 6 tokens
+        TwGen g = { 0, V };
+        RqCallbacks cb = { tw_on_token, tw_on_logits, &g };
+        RqSampling cfg = { i == 9 ? 0 : 0.8f, 0.9f, NULL };
+        RqGenStats st;
+        rq_seq_reset(s[3]);
+        rq_seq_seed(s[3], 3);
+        e = rq_generate(c, s[3], w->U.v, w->U.n, &cfg, i == 9 ? 5 : 6, &cb, &st);
+        h = tw_mix(tw_mix(g.h, (uint64_t)st.n_gen), (uint64_t)st.stop);
+        break;
+    }
+    case 10: // s1: a decode step
+        e = rq_decode(c, s[1], tw_tk[3], &lg);
+        break;
+    case 11: { // a prefill chunk of s2 (R's next tokens, every row) between decode rows of s0 and s1
+        int L = rq_seq_len(s[2]), n = w->R.n - L < 24 ? w->R.n - L : 24;
+        RqSegment sg[3] = { { s[0], &tw_tk[4], 1, RQ_LOGITS_LAST }, { s[2], w->R.v + L, n, RQ_LOGITS_ALL },
+                            { s[1], &tw_tk[5], 1, RQ_LOGITS_LAST } };
+        e = n > 0 ? rq_forward_batch(c, sg, 3, w->out, NULL) : RQ_ERR_ARG;
+        h = tw_rows(w, w->out, n + 2);
+        break;
+    }
+    }
+    if (lg) h = tw_mix(h, hash_f(lg, V));
+    w->h[i] = e == RQ_OK ? h : 0;
+    if (e != RQ_OK && !w->bad) w->bad = i + 1;
+}
+
+static int tw_alone(const char *path, uint64_t *h, char *err, size_t errlen) {
+    // every step of one model, alone: 0, -1 (setup failed: err) or the first failing step + 1
+    TwoM w;
+    int ok = tw_load(&w, path, err, errlen);
+    for (int i = 0; i < TW_ALL && ok; i++)
+        tw_step(&w, i);
+    memcpy(h, w.h, sizeof(w.h));
+    tw_free(&w);
+    return ok ? w.bad : -1;
+}
+
+static int tw_alone_proc(const char *path, uint64_t *h, char *err, size_t errlen) {
+    // tw_alone in a fresh process (fork: nothing is loaded and the pool not started yet), else in this one
+#ifndef _WIN32
+    struct { int bad; uint64_t h[TW_ALL]; char err[400]; } r;
+    int fd[2], st = 0;
+    if (pipe(fd)) { snprintf(err, errlen, "pipe failed"); return -1; }
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(fd[0]);
+        memset(&r, 0, sizeof(r));
+        r.bad = tw_alone(path, r.h, r.err, sizeof(r.err));
+        _exit(write(fd[1], &r, sizeof(r)) == (ssize_t)sizeof(r) ? 0 : 1);
+    }
+    close(fd[1]);
+    size_t got = 0;
+    while (pid > 0 && got < sizeof(r)) {
+        ssize_t k = read(fd[0], (char *)&r + got, sizeof(r) - got);
+        if (k <= 0) break;
+        got += (size_t)k;
+    }
+    close(fd[0]);
+    if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) || got != sizeof(r)) {
+        snprintf(err, errlen, "%s alone: the child process failed (status %d)", path, st);
+        return -1;
+    }
+    memcpy(h, r.h, sizeof(r.h));
+    snprintf(err, errlen, "%s", r.err);
+    return r.bad;
+#else
+    return tw_alone(path, h, err, errlen);
+#endif
+}
+
+static int tw_gs_refused(const char *path, char *d, size_t dn) {
+    // loading path (another activation group size than the loaded models') fails with the group size error
+    char err[512];
+    RqModelOpts o = { 0, 0, 1 };
+    RqModel *g = rq_model_load(path, &o, err, sizeof(err));
+    if (g) {
+        RqModelInfo gi;
+        rq_model_info(g, &gi);
+        snprintf(d, dn, "%s loaded (group size %d): expected a group size error", path, gi.group_size);
+        rq_model_free(g);
+        return 0;
+    }
+    snprintf(d, dn, "%s", err);
+    return strstr(err, "group size") != NULL;
+}
+
+static int tw_compare(const TwoM *w, const uint64_t *ref, int i0, int i1, char *d, size_t dn) {
+    // steps i0..i1-1 of w == ref (the model alone); d: the differing ones
+    int ok = !w->bad || w->bad > i1;
+    size_t k = strlen(d);
+    for (int i = i0; i < i1; i++)
+        if (w->h[i] != ref[i] && k + 32 < dn) {
+            k += snprintf(d + k, dn - k, "%s%s", ok ? "; differ: " : ", ", tw_name[i]);
+            ok = 0;
+        }
+    if (w->bad && w->bad <= i1) snprintf(d + k, dn - k, "; step %s failed", tw_name[w->bad - 1]);
+    return ok;
+}
+
+static int two_main(int argc, char **argv) {
+    const char *path[2] = { NULL, NULL }, *pg = NULL;
+    int bad_args = 0;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--gs") && i + 1 < argc) pg = argv[++i];
+        else if (argv[i][0] == '-') bad_args = 1;
+        else if (!path[0]) path[0] = argv[i];
+        else if (!path[1]) path[1] = argv[i];
+        else bad_args = 1;
+    }
+    if (bad_args || !path[1]) {
+        fprintf(stderr, "usage: api_test --two MODEL_A MODEL_B [--gs MODEL_OTHER_GROUP_SIZE]\n");
+        return 2;
+    }
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    rq_threads_init(0);
+    char err[512], d[1024], gsd[600] = "";
+    uint64_t ref[2][TW_ALL];
+    for (int k = 0; k < 2; k++) {
+        int r = tw_alone_proc(path[k], ref[k], err, sizeof(err));
+        if (r) {
+            if (r > 0) snprintf(err, sizeof(err), "%s alone: step %s failed", path[k], tw_name[r - 1]);
+            printf("FAIL setup  %s\n", err);
+            return 1;
+        }
+    }
+    // A, then (--gs) the other group size refused, B
+    TwoM w[2];
+    int gs_ok = 1, gs_n = 0, gs_a = 0;
+    if (!tw_load(&w[0], path[0], err, sizeof(err))) {
+        printf("FAIL setup  %s\n", err);
+        return 1;
+    }
+    gs_a = w[0].info.group_size;
+    if (pg) gs_ok &= tw_gs_refused(pg, gsd, sizeof(gsd)), gs_n++;
+    if (!tw_load(&w[1], path[1], err, sizeof(err))) {
+        printf("FAIL setup  %s\n", err);
+        return 1;
+    }
+    // a sequence of one model on the other's context: refused, nothing run
+    {
+        float *lg;
+        RqSegment sg[2] = { { w[0].s[0], tw_tk, 1, RQ_LOGITS_LAST }, { w[1].s[0], tw_tk, 1, RQ_LOGITS_LAST } };
+        int ok = rq_decode(w[0].c, w[1].s[0], tw_tk[0], &lg) == RQ_ERR_ARG;
+        ok &= rq_prefill(w[1].c, w[0].s[1], w[0].P.v, 4, RQ_LOGITS_NONE, NULL, NULL) == RQ_ERR_ARG;
+        ok &= rq_forward_batch(w[0].c, sg, 2, w[0].out, NULL) == RQ_ERR_ARG;
+        ok &= rq_seq_copy(w[0].s[3], w[1].s[0], 0) == RQ_ERR_ARG;
+        for (int k = 0; k < 2; k++)
+            for (int j = 0; j < 4; j++) ok &= rq_seq_len(w[k].s[j]) == 0;
+        report(ok, "two_cross_model", rq_ctx_error(w[0].c));
+    }
+    // the steps of A and B interleaved (A first on even steps, B on odd ones); the other group size again
+    for (int i = 0; i < TW_MAIN; i++) {
+        tw_step(&w[i & 1], i);
+        tw_step(&w[!(i & 1)], i);
+        if (pg && i == 4) gs_ok &= tw_gs_refused(pg, gsd, sizeof(gsd)), gs_n++;
+    }
+    // A freed, B goes on
+    tw_free(&w[0]); // (its hashes kept)
+    if (pg) gs_ok &= tw_gs_refused(pg, gsd, sizeof(gsd)), gs_n++;
+    for (int i = TW_MAIN; i < TW_ALL; i++)
+        tw_step(&w[1], i);
+    for (int k = 0; k < 2; k++) {
+        d[0] = 0;
+        int ok = tw_compare(&w[k], ref[k], 0, TW_MAIN, d, sizeof(d));
+        char head[600];
+        snprintf(head, sizeof(head), "%d steps interleaved with %s's == %s alone (another process)%s", TW_MAIN,
+                 k ? "A" : "B", path[k], d);
+        report(ok, k ? "two_interleaved_b" : "two_interleaved_a", head);
+    }
+    d[0] = 0;
+    int ok = tw_compare(&w[1], ref[1], TW_MAIN, TW_ALL, d, sizeof(d));
+    char head[600];
+    snprintf(head, sizeof(head), "B's %d steps after A was freed (decode, a mixed pass, seeded rq_generate) == alone%s",
+             TW_ALL - TW_MAIN, d);
+    report(ok, "two_free_other", head);
+    for (int k = 0; k < 2; k++) {
+        uint64_t dg = 0;
+        for (int i = 0; i < (k ? TW_ALL : TW_MAIN); i++) dg = tw_mix(dg, w[k].h[i]);
+        printf("DIGEST two_%c %016llx\n", k ? 'b' : 'a', (unsigned long long)dg);
+    }
+    if (pg) {
+        snprintf(head, sizeof(head), "%d loads refused (A loaded; A and B mid-run; B after A freed), both went on: %s", gs_n, gsd);
+        report(gs_ok, "two_gs_refused", head);
+    }
+    tw_free(&w[1]);
+    // nothing loaded: the other group size loads now, and runs
+    if (pg) {
+        RqModelOpts o = { 0, 0, 1 };
+        RqModel *g = rq_model_load(pg, &o, err, sizeof(err));
+        RqModelInfo gi = { 0 };
+        int e = RQ_ERR_LOAD;
+        if (g) {
+            rq_model_info(g, &gi);
+            RqCtx *c = rq_ctx_new(g, 0, 64, &e);
+            RqSeq *s = c ? rq_seq_new(g, 64, RQ_KV_DEFAULT, &e) : NULL;
+            float *lg = NULL;
+            if (s) e = rq_decode(c, s, tw_tk[0], &lg);
+            ok = e == RQ_OK && lg && lg[0] == lg[0];
+            rq_seq_free(s);
+            rq_ctx_free(c);
+            rq_model_free(g);
+        }
+        snprintf(head, sizeof(head), "group size %d after %d's models were freed: a decode step (%s)", gi.group_size, gs_a,
+                 g ? rq_strerror(e) : err);
+        report(g && ok && gi.group_size != gs_a, "two_gs_after_free", head);
+    }
+    return failed;
 }

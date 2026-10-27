@@ -157,6 +157,7 @@ void job_release(Job *j) {
     pthread_cond_destroy(&s->cv);
     free(s);
     rq_tokens_free(&j->prompt);
+    rq_tokens_free(&j->force);
     for (int i = 0; i < j->nstop; i++) free(j->stop[i]);
     free(j->stop);
     jb_free(&j->content);
@@ -364,6 +365,7 @@ struct Run {
     int seg;              // rows in this pass (0: none)
     int row;              // its logits row in this pass, or -1
     int nallow;           // allowed tokens set in the slot's mask
+    int forcing;          // force_reply: 0 not yet fed, 1 fed whole, 2 fed but cut (max tokens / context)
     int done;             // finished: the slot is free, reaped after the step
     ConState cs;
     Out o;
@@ -434,6 +436,26 @@ static int prep(Engine *e, Run *r) {
         return 0;
     }
     return 1;
+}
+
+static void force_feed(Engine *e, Run *r) {
+    // force_reply, after the prefill: its tokens are the reply (output as if sampled, fed as one decode segment, in passes
+    // of several rows), then the reply ends at the segment's logits row (step) as if the end token had been sampled
+    Job *j = r->j;
+    RqSeq *s = e->slot[r->si].seq;
+    int k = j->force.n, room = rq_seq_capacity(s) - rq_seq_len(s);
+    if (k > j->max_new) k = j->max_new;
+    if (k > room) k = room;
+    job_lock(j);
+    for (int i = 0; i < k; i++) out_token(&r->o, j->force.v[i]);
+    j->n_gen += k;
+    job_notify(j);
+    job_unlock(j);
+    r->forcing = k < j->force.n ? 2 : 1;
+    r->feed.n = r->fed = 0;
+    int err = rq_tokens_push(&r->feed, j->force.v, k);
+    if (err != RQ_OK) end_run(e, r, 0, 0, err, NULL);
+    else if (k == 0) end_run(e, r, r->forcing == 2 ? FINISH_LENGTH : FINISH_STOP, 0, RQ_OK, NULL);
 }
 
 static void take_token(Engine *e, Run *r, int tok) {
@@ -516,6 +538,11 @@ static void start_run(Engine *e, Job *j, int si, int src, int L) {
     sl->run = r;
     e->run[e->nrun++] = r;
     if (L >= n) L = n - 1; // (the last prompt token is prefilled again: its logits)
+    const RqSeq *from = src >= 0 ? e->slot[src].seq : s; // (the stats: what the prompt met there)
+    j->n_slot = rq_seq_len(from);
+    j->n_common = rq_seq_common_prefix(from, j->prompt.v, n);
+    if (j->n_common >= n) j->n_common = n - 1;
+    j->copied = src >= 0;
     if (src < 0 || rq_seq_copy(s, e->slot[src].seq, L) != RQ_OK) {
         if (src >= 0) L = 0;
         rq_seq_truncate(s, L);
@@ -526,9 +553,26 @@ static void start_run(Engine *e, Job *j, int si, int src, int L) {
     int ckp = rq_chat_checkpoint_pos(m, j->prompt.v, n);
     if (ckp >= L) rq_seq_checkpoint_at(s, ckp);
     if (e->o.verbose) {
-        char from[48] = "";
-        if (src >= 0) snprintf(from, sizeof(from), " (copied from slot %d)", src);
-        fprintf(stderr, "[engine] job -> slot %d: %d of %d prompt tokens cached%s, %d running\n", si, L, n, from, e->nrun);
+        char cp[48] = "";
+        if (src >= 0) snprintf(cp, sizeof(cp), " (copied from slot %d)", src);
+        fprintf(stderr, "[engine] job -> slot %d: %d of %d prompt tokens cached%s, %d running\n", si, L, n, cp, e->nrun);
+        if (j->n_common < j->n_slot && j->n_common < n - 1) { // (where the prompt left the cached tokens: a few tokens of each side)
+            const int *ct = rq_seq_tokens(from);
+            fprintf(stderr, "[engine]   diverged at %d of %d cached tokens:", j->n_common, j->n_slot);
+            for (int side = 0; side < 2; side++) {
+                fprintf(stderr, side ? " | prompt" : " cache");
+                for (int k = j->n_common - 2 < 0 ? 0 : j->n_common - 2; k < j->n_common + 4 && k < (side ? n : j->n_slot); k++) {
+                    int len;
+                    const char *b = rq_token_bytes(m, side ? j->prompt.v[k] : ct[k], &len);
+                    fprintf(stderr, " %d:", side ? j->prompt.v[k] : ct[k]);
+                    for (int c = 0; c < len && c < 24; c++) {
+                        if (b[c] == '\n') fputs("\\n", stderr);
+                        else fputc(b[c], stderr);
+                    }
+                }
+            }
+            fprintf(stderr, "\n");
+        }
     }
     job_lock(j);
     j->n_prompt = n;
@@ -723,6 +767,14 @@ static void step(Engine *e, int stopping) {
             job_unlock(j);
             r->feed.n = r->fed = 0;
             if (!prep(e, r) || r->feed.n > 0) continue; // (forced tokens right after the prompt: fed first)
+            if (j->force.n > 0) { // (force_reply: its tokens next)
+                force_feed(e, r);
+                continue;
+            }
+        }
+        if (r->forcing) { // (force_reply fed: the reply ends here)
+            end_run(e, r, r->forcing == 2 ? FINISH_LENGTH : FINISH_STOP, 0, RQ_OK, NULL);
+            continue;
         }
         if (j->top_logprobs >= 0 && slot_scratch(e, sl, 1) != RQ_OK) {
             end_run(e, r, 0, 0, RQ_ERR_NOMEM, NULL);

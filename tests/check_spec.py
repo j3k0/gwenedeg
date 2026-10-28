@@ -11,6 +11,10 @@
              that copies its prompt (lookup: >= 3 tokens per pass); -G 0 with -D is plain decoding byte for byte
              (stderr included); a draft of another vocabulary, -G without -D and a bad --lookup / --lookup-min are
              refused; one generate and one chat case on the generic build
+  server     runq serve with speculation (tests/server_test.py --spec: the Qwen3-0.6B pair, Qwen3.5-0.8B Q8_0 + Q4_K_M, the
+             0.8B with the prompt lookup alone): every request with "speculative": false and with fixed settings / auto,
+             outputs identical (content, reasoning, tool calls, finish, usage, logprobs; streamed and not; concurrent
+             requests; a conversation's next turn reuses what plain decoding's would)
 """
 import concurrent.futures as cf
 import os
@@ -161,6 +165,14 @@ def spec_start(a, tmp, ex):
         if a.q35 and os.path.exists(q35d):
             futs.append(("api", "spec_api/qwen35", ex.submit(run, [a.api_test, "--spec", a.q35, q35d, "--quick", "--other", a.gguf],
                                                              SPEC_THREADS)))
+    # runq serve with speculation (server_test.py --spec): the Qwen3 pair, the Qwen3.5 pair, the lookup alone
+    srv = [sys.executable, "-I", os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_test.py"), "--runq", a.runq,
+           "--threads", str(SPEC_THREADS)]
+    futs.append(("api", "spec_server/qwen3", ex.submit(run, srv + ["--model", a.gguf, "--spec", a.q4], SPEC_THREADS)))
+    if a.q35 and os.path.exists(q35d):
+        futs.append(("api", "spec_server/qwen35", ex.submit(run, srv + ["--model", a.q35, "--spec", q35d], SPEC_THREADS)))
+    if a.q35:
+        futs.append(("api", "spec_server/lookup", ex.submit(run, srv + ["--model", a.q35, "--spec", "none"], SPEC_THREADS)))
     for i, case in enumerate(CLI_CASES):
         futs.append(("cli", "spec_cli", ex.submit(cli_case, a.runq, a.gguf, a.q4, case, d, f"c{i}")))
     if a.generic:

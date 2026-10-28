@@ -1774,6 +1774,64 @@ static int spec_main(int argc, char **argv) {
     }
     // Qwen3.5: every rollback on a checkpoint (both sequences)
     if (I.linear_layers) report(refed == 0, "spec_rollback_exact", refed ? "positions fed again after a rollback" : "no position fed again");
+    // a verify row's checkpoint kept (rq_seq_checkpoint_at below the length: the server's </think> inside a verify pass),
+    // the rows' dropped (rq_seq_checkpoint_rows_drop: the end of a job's speculation); a truncation there == a fresh prefill
+    {
+        RqTokens u = toks("The quick brown fox jumps over the lazy dog. The quick brown fox");
+        int P = u.n - 4, held[RQ_CHECKPOINTS_MAX], nh, ok = 1;
+        float *ref = logits_alone(c, u.v, u.n, NULL, 0), *lg;
+        RqSeq *s = seq_new(0);
+        rq_seq_set_checkpoints(s, 6);
+        ok &= rq_prefill(c, s, u.v, P, RQ_LOGITS_NONE, NULL, NULL) == RQ_OK && rq_seq_checkpoint_rows(s, P, 3) == RQ_OK;
+        ok &= rq_prefill(c, s, u.v + P, 4, RQ_LOGITS_ALL, NULL, NULL) == RQ_ERR_ARG; // (all rows need an output buffer)
+        float *out = malloc((size_t)4 * V * sizeof(float));
+        ok &= rq_prefill(c, s, u.v + P, 4, RQ_LOGITS_ALL, out, NULL) == RQ_OK;
+        ok &= rq_seq_checkpoint_at(s, P + 2) == RQ_OK && (rq_seq_checkpoint_at(s, P - 1) == RQ_ERR_ARG) == (I.linear_layers > 0);
+        rq_seq_checkpoint_rows_drop(s);
+        nh = rq_seq_checkpoints(s, held, RQ_CHECKPOINTS_MAX);
+        ok &= I.linear_layers ? nh == 1 && held[0] == P + 2 : nh == 0;
+        ok &= rq_seq_truncate(s, P + 2) == RQ_OK && rq_seq_len(s) == P + 2;
+        ok &= rq_prefill(c, s, u.v + P + 2, 2, RQ_LOGITS_LAST, NULL, &lg) == RQ_OK && same(lg, ref + (size_t)(u.n - 1) * V, V);
+        ok &= rq_seq_checkpoint_rows(s, rq_seq_len(s), 2) == RQ_OK; // (a later rows call keeps it)
+        rq_seq_checkpoint_rows_drop(s);
+        nh = rq_seq_checkpoints(s, held, RQ_CHECKPOINTS_MAX);
+        ok &= I.linear_layers ? nh == 1 && held[0] == P + 2 : nh == 0;
+        report(ok, "spec_checkpoint_keep", I.linear_layers ? "a verify row's checkpoint kept, the others dropped; truncated there "
+               "== a fresh prefill" : "no-ops (Qwen3)");
+        free(out);
+        free(ref);
+        rq_seq_free(s);
+        rq_tokens_free(&u);
+    }
+    // the cost model (G7): a calibration on an empty sequence (emptied again), its shape; the choice by the costs
+    {
+        RqPassCost t, dd;
+        RqSeq *s = seq_new(0);
+        double t0 = rq_now();
+        int ok = rq_pass_cost_measure(c, s, 600, 2, &t) == RQ_OK && rq_seq_len(s) == 0 && t.calibrated && t.t_w > 0 && t.att >= 0 &&
+                 t.n >= 2 && t.r[0] == 1 && t.f[0] == 1;
+        for (int i = 1; i < t.n; i++) ok &= t.f[i] >= t.f[i - 1] && t.r[i] > t.r[i - 1];
+        ok &= rq_pass_cost(&t, 0, 0) == 0 && rq_pass_cost(&t, 1, 0) == t.t_w && rq_pass_cost(&t, 64, 0) > rq_pass_cost(&t, 16, 0);
+        ok &= rq_pass_cost_measure(c, s, 20, 1, &dd) == RQ_ERR_ARG; // (too short)
+        snprintf(d, sizeof(d), "decode %.2f ms + %.3f us per row and position, f(4) %.2f, f(16) %.2f (%.1f s)", t.t_w * 1e3, t.att * 1e6,
+                 rq_pass_cost(&t, 4, 0) / t.t_w, rq_pass_cost(&t, 16, 0) / t.t_w, rq_now() - t0);
+        // a free draft that is always right: the model; no draft and a long match: the lookup; a huge attention: plain
+        dd = t;
+        dd.t_w = 1e-9;
+        dd.att = 0;
+        RqSpecChoice x = rq_spec_choose(&t, &dd, 100, 3, 0.99, 3, 0.5);
+        ok &= x.src == RQ_SPEC_MODEL && x.n == 3 && x.gain > 1;
+        x = rq_spec_choose(&t, NULL, 100, 3, 0.99, 3, 0.94);
+        ok &= x.src == RQ_SPEC_LOOKUP && x.gain > 1;
+        RqPassCost h = t;
+        h.att = 1e-3;
+        h.t_w = 1e-6;
+        x = rq_spec_choose(&h, &dd, 100000, 3, 0.6, 3, 0.6);
+        ok &= x.src == RQ_SPEC_PLAIN && x.n == 0 && x.gain == 1;
+        ok &= rq_spec_expect(0.5, 3) > 0.875 - 1e-12 && rq_spec_expect(0.5, 3) < 0.875 + 1e-12 && rq_spec_expect(0.7, 0) == 0 && rq_lookup_prior(16) > rq_lookup_prior(2);
+        report(ok, "spec_cost_model", d);
+        rq_seq_free(s);
+    }
     for (int i = 0; i < 4; i++) rq_tokens_free(&sp_prompt[i]);
     rq_tokens_free(&sp_turn2);
     rq_ctx_free(dc);

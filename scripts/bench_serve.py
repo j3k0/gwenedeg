@@ -7,7 +7,9 @@ Two loads, each against a fresh `runq serve` started here (on a free port, `-c 4
          with a short distinct prompt and a 128-token reply (--max-tokens; temperature 0): aggregate completion
          tok/s (all tokens / wall time), per-request latency p50 / p95, time to first token (the first content
          delta) p50 / p95, per-request decode speed after the first token. Each client sends --rounds requests
-         (default 2 for N <= 4, else 1)
+         (default 2 for N <= 4, else 1). --prompts: story (the default), code (write a function), edit (return a given
+         function with a change: replies that copy their prompt, the prompt lookup's case). With speculation (--serve-args
+         "-D DRAFT" / "--lookup N", --spec): the guesses accepted / drafted per source and the tokens per decode pass
   judge  first a cold burst (max(--judge-clients) classifications at once on the fresh server: the rubric is
          prefilled once and copied / waited for, see --prefix-copy), then a LiteLLM-judge-like load: --judge-requests short classification requests (the legacy rubric as the
          system message, `\\nClassify this message:\\n` + a prompt of scripts/router_eval.jsonl, LiteLLM's
@@ -69,14 +71,14 @@ def start_server(a, log):
 
 
 def stream_req(port, body, times=None):
-    """one streamed request on a new connection: (t_start, t_first_content or None, t_end, completion tokens);
+    """one streamed request on a new connection: (t_start, t_first_content or None, t_end, completion tokens, timings);
     times: a list to append the arrival time of each content delta to"""
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=600)
     t0 = time.time()
     c.request("POST", "/v1/chat/completions", json.dumps(dict(body, stream=True, stream_options={"include_usage": True})),
               {"Content-Type": "application/json"})
     r = c.getresponse()
-    first, ntok, buf = None, 0, b""
+    first, ntok, buf, tim = None, 0, b"", {}
     while True:
         line = r.fp.readline()
         if not line:
@@ -91,6 +93,7 @@ def stream_req(port, body, times=None):
             raise RuntimeError(d["error"])
         if d.get("usage"):
             ntok = d["usage"]["completion_tokens"]
+            tim = d.get("timings") or {}
         for ch in d.get("choices", []):
             if ch["delta"].get("content"):
                 now = time.time()
@@ -98,7 +101,31 @@ def stream_req(port, body, times=None):
                 if times is not None:
                     times.append(now)
     c.close()
-    return t0, first, time.time(), ntok
+    return t0, first, time.time(), ntok, tim
+
+
+EDIT_SRC = [
+    "def moving_average(xs, n):\n    out = []\n    for i in range(len(xs)):\n        if i < n - 1:\n            out.append(None)\n"
+    "        else:\n            out.append(sum(xs[i - n + 1:i + 1]) / n)\n    return out\n",
+    "def parse_pairs(text):\n    result = {}\n    for line in text.splitlines():\n        line = line.strip()\n        if not line or "
+    "line.startswith('#'):\n            continue\n        key, _, value = line.partition('=')\n        result[key.strip()] = "
+    "value.strip()\n    return result\n",
+    "def find_longest_word(words):\n    best = None\n    for word in words:\n        if best is None or len(word) > len(best):\n"
+    "            best = word\n    return best\n",
+    "def count_vowels(text):\n    total = 0\n    for ch in text.lower():\n        if ch in 'aeiou':\n            total += 1\n"
+    "    return total\n",
+]
+
+
+def gen_prompt(kind, k):
+    topic = TOPICS[k % len(TOPICS)]
+    if kind == "code":
+        return f"Write a Python function about {topic} (a small simulation), with comments."
+    if kind == "edit":
+        src = EDIT_SRC[k % len(EDIT_SRC)]
+        return (f"Here is a function:\n\n{src}\nAdd a docstring and type hints, rename the loop variable, and return the full "
+                f"function.")
+    return f"Write a long, detailed story about {topic}."
 
 
 def plain_req(port, body):
@@ -130,9 +157,11 @@ def run_clients(n, work):
 
 
 def bench_gen(a, port, res):
-    print(f"\n{a.label} gen: {os.path.basename(a.model)}, {a.threads} threads, max_tokens {a.max_tokens}")
-    print(f"| clients | requests | tokens | wall s | aggregate tok/s | latency p50 / p95 s | TTFT p50 / p95 ms | per-request tok/s |")
-    print("|---|---|---|---|---|---|---|---|")
+    print(f"\n{a.label} gen: {os.path.basename(a.model)}, {a.threads} threads, max_tokens {a.max_tokens}, prompts {a.prompts}, "
+          f"serve args '{a.serve_args}'")
+    print(f"| clients | requests | tokens | wall s | aggregate tok/s | latency p50 / p95 s | TTFT p50 / p95 ms | per-request tok/s | "
+          f"model / lookup accepted, tok/pass |")
+    print("|---|---|---|---|---|---|---|---|---|")
     k = 0
     for n in a.clients:
         rounds = a.rounds or (2 if n <= 4 else 1)
@@ -141,8 +170,7 @@ def bench_gen(a, port, res):
         def work(i):
             rs = []
             for r in range(rounds):
-                topic = TOPICS[(base + i * rounds + r) % len(TOPICS)]
-                body = {"messages": [{"role": "user", "content": f"Write a long, detailed story about {topic}."}],
+                body = {"messages": [{"role": "user", "content": gen_prompt(a.prompts, base + i * rounds + r)}],
                         "max_tokens": a.max_tokens, "temperature": 0}
                 rs.append(stream_req(port, body))
             return rs
@@ -151,11 +179,16 @@ def bench_gen(a, port, res):
         lat = [x[2] - x[0] for x in rs]
         ttft = [(x[1] - x[0]) * 1000 for x in rs if x[1]]
         dec = [(x[3] - 1) / (x[2] - x[1]) for x in rs if x[1] and x[3] > 1 and x[2] > x[1]]
+        sp = [x[4].get("speculative") for x in rs if x[4].get("speculative")]
+        spec = {src: [sum(s[src][k] for s in sp) for k in ("passes", "drafted", "accepted")] for src in ("model", "lookup")}
+        passes = sum(s["passes"] for s in sp)
         row = dict(clients=n, requests=len(rs), tokens=toks, wall=wall, tps=toks / wall, lat50=pct(lat, 50), lat95=pct(lat, 95),
-                   ttft50=pct(ttft, 50), ttft95=pct(ttft, 95), per_req=sum(dec) / len(dec) if dec else 0)
+                   ttft50=pct(ttft, 50), ttft95=pct(ttft, 95), per_req=sum(dec) / len(dec) if dec else 0, spec=spec, passes=passes)
         res.setdefault("gen", []).append(row)
+        st = (f"{spec['model'][2]}/{spec['model'][1]}, {spec['lookup'][2]}/{spec['lookup'][1]}, "
+              f"{(toks - len(rs)) / passes:.2f}" if passes else "")
         print(f"| {n} | {len(rs)} | {toks} | {wall:.2f} | **{row['tps']:.0f}** | {row['lat50']:.2f} / {row['lat95']:.2f} | "
-              f"{row['ttft50']:.0f} / {row['ttft95']:.0f} | {row['per_req']:.0f} |", flush=True)
+              f"{row['ttft50']:.0f} / {row['ttft95']:.0f} | {row['per_req']:.0f} | {st} |", flush=True)
 
 
 def bench_judge(a, port, res):
@@ -213,7 +246,7 @@ def bench_mix(a, port, res):
     for k in range(a.mix_long):
         body = {"messages": [{"role": "user", "content": f"Report {k}: " + para * 40 + " Summarize the report in one sentence."}],
                 "max_tokens": 16, "temperature": 0}
-        t0, first, t1, ntok = stream_req(port, body)
+        t0, first, t1, ntok, _ = stream_req(port, body)
         firsts.append(((first or t1) - t0) * 1000)
         time.sleep(0.5)
     t_long1 = time.time()
@@ -243,6 +276,7 @@ def main():
     ap.add_argument("--clients", default="1,2,4,8,16,32")
     ap.add_argument("--rounds", type=int, default=0, help="requests per client (0: 2 for <= 4 clients, else 1)")
     ap.add_argument("--max-tokens", type=int, default=128)
+    ap.add_argument("--prompts", default="story", choices=["story", "code", "edit"], help="the gen load's prompts")
     ap.add_argument("--judge-clients", default="1,4,8,16")
     ap.add_argument("--judge-requests", type=int, default=64)
     ap.add_argument("--mix-streams", type=int, default=8)

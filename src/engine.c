@@ -108,6 +108,7 @@ struct Engine {
     double pm[2], pl[RQ_LOOKUP_LMAX + 1][2];
     unsigned long long sp_passes, sp_rows, sp_guess[3], sp_acc[3], d_passes, d_rows;
     double t_draft, t_cal;
+    int since_model;      // passes since the policy last chose the model for a job (its drafts are kept in sync while recent)
     // the queue (shared with the connection threads, under mu)
     pthread_t th;
     int started;
@@ -1016,29 +1017,31 @@ static double plan_cost(const Engine *e, const Cand *c, int nc, int rbase, doubl
     // the pass's time in the cost model: the target's rows (the decode rows and prompt chunks: rbase, sbase; plus each
     // choice's guesses), the draft's passes (the first one: the catch-up rows d0 of other jobs, each model job's lag + t;
     // pass p: the jobs guessing at least p tokens, one row each)
+    // (positions: each segment's first row's, sbase for the decode rows, and its further rows', the guesses)
     int R = rbase, kmax = 0;
-    double S = sbase, T;
+    double S2 = 0, T;
     for (int i = 0; i < nc; i++) {
         if (c[i].src == RQ_SPEC_PLAIN) continue;
         R += c[i].n;
-        S += c[i].n * (double)c[i].L + c[i].n * (c[i].n + 1) / 2.0;
+        S2 += c[i].n * (double)c[i].L + c[i].n * (c[i].n + 1) / 2.0;
         if (c[i].src == RQ_SPEC_MODEL && c[i].n > kmax) kmax = c[i].n;
     }
-    T = rq_pass_cost(&e->tcost, R, S);
+    T = rq_pass_cost(&e->tcost, R, sbase, S2);
     for (int p = 1; p <= kmax || (p == 1 && d0 > 0); p++) {
         int rows = p == 1 ? d0 : 0;
-        double sp = p == 1 ? ds0 : 0;
+        double s1 = p == 1 ? ds0 : 0, s2 = 0;
         for (int i = 0; i < nc; i++) {
             if (c[i].src != RQ_SPEC_MODEL || c[i].n < p) continue;
-            if (p == 1) {
+            if (p == 1) { // (its catch-up rows and t: one segment)
                 rows += c[i].lag + 1;
-                sp += (c[i].lag + 1.0) * c[i].L - c[i].lag * (c[i].lag + 1) / 2.0;
+                s1 += c[i].L - c[i].lag;
+                s2 += c[i].lag * (double)c[i].L - c[i].lag * (c[i].lag - 1) / 2.0;
             } else {
                 rows++;
-                sp += c[i].L + p - 1;
+                s1 += c[i].L + p - 1;
             }
         }
-        T += rq_pass_cost(&e->dcost, rows, sp);
+        T += rq_pass_cost(&e->dcost, rows, s1, s2);
     }
     return T;
 }
@@ -1054,7 +1057,7 @@ static void spec_plan(Engine *e, Cand *c, int nc, int ndec, double sdec, int rp,
     // raises the rate, so a choice is made only if its expected gain is > 1 (never slower than plain, as far as the model
     // knows) and the batch's own efficiency is the bar: the fuller the batch, the less speculation pays
     int rbase = ndec + rp, guesses = 0;
-    double tdec = rq_pass_cost(&e->tcost, ndec, sdec), y = ndec;
+    double tdec = rq_pass_cost(&e->tcost, ndec, sdec, 0), y = ndec;
     for (int i = 0; i < nc; i++) // (the fixed jobs' choices as they are, within the pass's guesses at most)
         if (c[i].src != RQ_SPEC_PLAIN) {
             int room = e->gmax - guesses < e->maxb - 1 - ndec - guesses ? e->gmax - guesses : e->maxb - 1 - ndec - guesses;
@@ -1103,12 +1106,18 @@ static void spec_plan(Engine *e, Cand *c, int nc, int ndec, double sdec, int rp,
     }
 }
 
-static int draft_wanted(const Engine *e, const Run *r, int L) {
-    // the draft model may guess for this job at position L (so its sequence follows the target's): fixed, if the job has
-    // a model k; auto, if a model pass beats plain decoding for the job alone there (the cost model, its acceptance)
+static int draft_wanted(const Engine *e, const Run *r, int L, int lag) {
+    // the draft model may guess for this job at position L, so its sequence follows the target's (lag positions behind):
+    // fixed, if the job has a model k; auto, if a model pass beats plain decoding for the job alone there (the cost model,
+    // its acceptance) and the time it saves over the reply's remaining tokens is worth catching up (twice the cost of
+    // the lag's rows: e.g. a long prompt for a short reply is not)
     if (!e->dm || r->spec == SPEC_OFF || r->sk <= 0) return 0;
     if (r->spec == SPEC_FIXED) return 1;
-    return rq_spec_choose(&e->tcost, &e->dcost, L, r->sk, acc_p(r->pm, e->pm, 0.6), 0, 0).src == RQ_SPEC_MODEL;
+    RqSpecChoice x = rq_spec_choose(&e->tcost, &e->dcost, L, r->sk, acc_p(r->pm, e->pm, 0.6), 0, 0);
+    if (x.src != RQ_SPEC_MODEL) return 0;
+    if (lag <= 2 * SPEC_GUESS_MAX) return 1;
+    double left = r->j->max_new - r->j->n_gen, save = left * x.t_plain * (1 - 1 / x.gain);
+    return save > 2 * rq_pass_cost(&e->dcost, lag, L - lag, (lag - 1) * (L - lag / 2.0));
 }
 
 static void spec_cands(Engine *e, Cand *c, int nc, int dbud) {
@@ -1128,7 +1137,9 @@ static void spec_cands(Engine *e, Cand *c, int nc, int dbud) {
         c[i].nl = c[i].mk = c[i].lag = c[i].n = 0;
         c[i].src = RQ_SPEC_PLAIN;
         c[i].fixed = r->spec == SPEC_FIXED;
-        r->dwant = draft_wanted(e, r, P);
+        int dl = sl->dseq && r->sk > 0 ? rq_seq_keep(sl->dseq, rq_seq_common_prefix(sl->dseq, toks, P)) : 0;
+        r->dwant = draft_wanted(e, r, P, P - dl);
+        r->dlag = P - dl;
         if (lim <= 0) continue;
         if (r->sl > 0) {
             int ml = 0, lmin = r->slmin > 0 ? r->slmin : r->spec == SPEC_FIXED ? RQ_LOOKUP_MIN_DEFAULT : 2;
@@ -1142,7 +1153,7 @@ static void spec_cands(Engine *e, Cand *c, int nc, int dbud) {
         }
         if (r->dwant) {
             RqSeq *d = sl->dseq;
-            int dl = rq_seq_keep(d, rq_seq_common_prefix(d, toks, P)), mk = r->sk < lim ? r->sk : lim;
+            int mk = r->sk < lim ? r->sk : lim;
             if (mk > rq_seq_capacity(d) - P) mk = rq_seq_capacity(d) - P;
             if (dl >= 0 && P - dl + 1 <= dbud && mk > 0) {
                 c[i].mk = mk;
@@ -1179,7 +1190,7 @@ static int draft_pass(Engine *e, int nds, int drows, int nsel, float **lg) {
     return err;
 }
 
-static void spec_draft(Engine *e, int dbud) {
+static void spec_draft(Engine *e, int dbud, int ndec) {
     // the draft model's passes of this step: the first one with each model job's catch-up rows + t (the last row's
     // logits: its first guess), then the catch-up rows of the jobs whose draft follows the target (decode jobs that
     // want it, prompts being prefilled: this pass's chunk too), within dbud rows; then one pass per further guess with
@@ -1210,8 +1221,12 @@ static void spec_draft(Engine *e, int dbud) {
         drows += m;
         nsel++;
     }
-    int room = dbud - drows;
-    for (int i = 0; i < e->nrun && room > 0; i++) { // (the catch-up rows)
+    // the catch-up rows: in a pass that runs anyway (a model job's), else only a lag of half the budget or more (a prompt;
+    // a lookup or plain spell) while the model is in use (chosen in the last 32 passes, or a job alone): a pass of the
+    // draft for a token or two per step would cost more than its guesses save, and so do drafts that a full batch
+    // does not use
+    int room = dbud - drows, standalone = nds == 0, idle = e->since_model > 32 && ndec > 1;
+    for (int i = 0; i < e->nrun && room > 0; i++) {
         Run *r = e->run[i];
         if (r->done || r->src == RQ_SPEC_MODEL || r->spec == SPEC_OFF || r->sk <= 0 || !e->dm) continue;
         Slot *sl = &e->slot[r->si];
@@ -1219,12 +1234,13 @@ static void spec_draft(Engine *e, int dbud) {
         const int *ref;
         int nref, nfull;
         if (r->phase == R_PREFILL) {
-            if (!draft_wanted(e, r, r->j->prompt.n)) continue;
             ref = r->j->prompt.v;
             nfull = r->j->prompt.n;
             nref = rq_seq_len(s) + r->seg; // (the prompt up to this pass's chunk)
+            if ((standalone && idle && ndec > 0) || !draft_wanted(e, r, nfull, nfull - rq_seq_keep(d, rq_seq_common_prefix(d, ref, nfull))))
+                continue;
         } else {
-            if (!r->dwant) continue;
+            if (!r->dwant || (standalone && (r->dlag < dbud / 2 || idle))) continue;
             ref = rq_seq_tokens(s);
             nfull = nref = rq_seq_len(s);
         }
@@ -1347,7 +1363,12 @@ static void step(Engine *e, int stopping) {
             budget -= k;
         }
     // the draft model's passes (its guesses; its sequences following the targets'), then the guesses into the segments
-    if (e->dm) spec_draft(e, ndec ? e->o.chunk : e->o.batch);
+    if (e->dm) {
+        int used = 0;
+        for (int i = 0; i < e->nrun; i++) used |= !e->run[i]->done && e->run[i]->src == RQ_SPEC_MODEL;
+        e->since_model = used ? 0 : e->since_model + 1;
+        spec_draft(e, ndec ? e->o.chunk : e->o.batch, ndec);
+    }
     int nspec = 0;
     for (int i = 0; i < e->nrun; i++) {
         Run *r = e->run[i];
@@ -1769,9 +1790,9 @@ void engine_describe(Engine *e, char *buf, size_t n) {
 }
 
 static void cost_text(char *b, size_t n, const RqPassCost *c) {
-    snprintf(b, n, "%.2f ms + %.3f us x position per row (%s), f(2/4/8/16) %.2f / %.2f / %.2f / %.2f", c->t_w * 1e3, c->att * 1e6,
-             c->calibrated ? "measured" : "estimated", rq_pass_cost(c, 2, 0) / c->t_w, rq_pass_cost(c, 4, 0) / c->t_w,
-             rq_pass_cost(c, 8, 0) / c->t_w, rq_pass_cost(c, 16, 0) / c->t_w);
+    snprintf(b, n, "%.2f ms + %.3f / %.3f us x position (a segment's first / further rows; %s), f(2/4/8/16) %.2f / %.2f / %.2f / %.2f",
+             c->t_w * 1e3, c->att * 1e6, c->att_x * 1e6, c->calibrated ? "measured" : "estimated", rq_pass_cost(c, 2, 0, 0) / c->t_w,
+             rq_pass_cost(c, 4, 0, 0) / c->t_w, rq_pass_cost(c, 8, 0, 0) / c->t_w, rq_pass_cost(c, 16, 0, 0) / c->t_w);
 }
 
 void engine_describe_spec(Engine *e, char *buf, size_t n) {

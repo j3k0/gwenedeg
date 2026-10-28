@@ -366,14 +366,15 @@ int rq_generate_spec(RqCtx *c, RqSeq *s, RqCtx *dc, RqSeq *ds, const int *tokens
 }
 
 // ------------------------------------------------------------------------------------ the cost model (TODO G7)
-// A pass of R rows whose context lengths sum to S: t_w f(R) + att S (runq.h). Calibrated on an empty sequence filled
+// A pass of R rows: t_w f(R) + att S1 + att_x S2 (runq.h: S1 the segments' first positions, S2 the others'). Calibrated
+// on an empty sequence filled
 // with synthetic values (rq_seq_fill_synthetic: the passes' time does not depend on them): every configuration once
 // per rep in turn, the median per configuration; R = 1 is a decode step, R > 1 a segment of R rows with every row's
 // logits (a verify pass); at a short context L0 for f(R), at L for the attention's slope
 static const int cost_rows[] = { 1, 2, 3, 4, 5, 6, 8, 12, 16 };
 #define COST_NR ((int)(sizeof(cost_rows) / sizeof(cost_rows[0])))
 
-double rq_pass_cost(const RqPassCost *pc, int rows, double pos_sum) {
+double rq_pass_cost(const RqPassCost *pc, int rows, double pos_first, double pos_more) {
     if (rows <= 0) return 0;
     double f;
     int n = pc->n;
@@ -390,7 +391,7 @@ double rq_pass_cost(const RqPassCost *pc, int rows, double pos_sum) {
             f = pc->f[i - 1] + s * (rows - pc->r[i - 1]);
         }
     }
-    return pc->t_w * f + pc->att * pos_sum;
+    return pc->t_w * f + pc->att * pos_first + pc->att_x * pos_more;
 }
 
 void rq_pass_cost_default(const RqModel *m, RqPassCost *pc) {
@@ -405,7 +406,8 @@ void rq_pass_cost_default(const RqModel *m, RqPassCost *pc) {
     const Config *p = &m->config;
     double kvb = rq_seq_mem(m, 4096, RQ_KV_F16, &sm) == RQ_OK ? (double)sm.kv / 4096 : 1e5;
     pc->t_w = w / 60e9 + 1e-3;
-    pc->att = kvb / 60e9 + 4.0 * m->n_attn * p->n_heads * p->head_dim / 0.3e12;
+    pc->att_x = 4.0 * m->n_attn * p->n_heads * p->head_dim / 0.3e12; // (a row's arithmetic)
+    pc->att = kvb / 60e9 + pc->att_x;                                  // (+ the read of the KV entries)
     pc->n = COST_NR;
     for (int i = 0; i < COST_NR; i++) {
         pc->r[i] = cost_rows[i];
@@ -463,19 +465,21 @@ int rq_pass_cost_measure(RqCtx *c, RqSeq *s, int L, int reps, RqPassCost *pc) {
         med[k] = t[k * reps + reps / 2];
     }
     free(t);
-    // the attention: the rows' growth from L0 to L (1 and 4 rows), per row and position
-    double a1 = (med[COST_NR] - med[0]) / (L - L0), a4 = (med[COST_NR + 1] - med[3]) / (4.0 * (L - L0));
+    // the attention: the growth from L0 to L of a decode step (the first row) and of a 4-row segment (+ 3 further rows)
+    double a1 = (med[COST_NR] - med[0]) / (L - L0), ax = (med[COST_NR + 1] - med[3] - (med[COST_NR] - med[0])) / (3.0 * (L - L0));
     RqPassCost est;
     rq_pass_cost_default(m, &est);
     memset(pc, 0, sizeof(*pc));
-    pc->att = (a1 + a4) / 2; // (lost in the noise, e.g. a short L on a small model: the estimate's)
+    pc->att = a1; // (lost in the noise, e.g. a short L on a small model: the estimate's)
     if (!(pc->att > 0.1 * est.att)) pc->att = est.att;
+    pc->att_x = ax < 0 ? 0 : ax > pc->att ? pc->att : ax;
     pc->t_w = med[0] - pc->att * L0;
     if (pc->t_w < 0.5 * med[0]) pc->t_w = 0.5 * med[0];
     pc->n = COST_NR;
     for (int k = 0; k < COST_NR; k++) {
         pc->r[k] = cost_rows[k];
-        pc->f[k] = (med[k] - pc->att * cost_rows[k] * L0) / pc->t_w;
+        int R = cost_rows[k];
+        pc->f[k] = (med[k] - pc->att * L0 - pc->att_x * (R - 1) * (L0 + R / 2.0)) / pc->t_w;
         if (k == 0) pc->f[k] = 1;
         if (k > 0 && pc->f[k] < pc->f[k - 1]) pc->f[k] = pc->f[k - 1]; // (noise: never cheaper with more rows)
     }
@@ -505,16 +509,16 @@ RqSpecChoice rq_spec_choose(const RqPassCost *t, const RqPassCost *d, int L, int
     // one sequence alone at position L (its rows at L, L + 1, ...): plain = 1 token per decode step; lookup n = 1 +
     // E(p_lookup, n) per pass of n + 1 rows; model k = 1 + E(p_model, k) per pass of k + 1 rows + k draft steps
     RqSpecChoice best = { RQ_SPEC_PLAIN, 0, 1.0, 0, 0 };
-    double plain = rq_pass_cost(t, 1, L);
+    double plain = rq_pass_cost(t, 1, L, 0);
     best.t_plain = best.t_pass = plain;
     for (int src = RQ_SPEC_LOOKUP; src <= RQ_SPEC_MODEL; src++) {
         int nmax = src == RQ_SPEC_LOOKUP ? lmax : d ? kmax : 0;
         double p = src == RQ_SPEC_LOOKUP ? p_lookup : p_model;
         for (int n = 1; n <= nmax; n++) {
-            double T = rq_pass_cost(t, n + 1, (n + 1) * (double)L + n * (n + 1) / 2.0);
+            double T = rq_pass_cost(t, n + 1, L, n * (double)L + n * (n + 1) / 2.0);
             if (src == RQ_SPEC_MODEL)
                 for (int i = 0; i < n; i++)
-                    T += rq_pass_cost(d, 1, L + i);
+                    T += rq_pass_cost(d, 1, L + i, 0);
             double g = (1 + rq_spec_expect(p, n)) / T * plain;
             if (g > best.gain) best = (RqSpecChoice) { src, n, g, plain, T };
         }

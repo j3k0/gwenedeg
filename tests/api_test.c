@@ -1809,22 +1809,22 @@ static int spec_main(int argc, char **argv) {
         RqSeq *s = seq_new(0);
         double t0 = rq_now();
         int ok = rq_pass_cost_measure(c, s, 600, 2, &t) == RQ_OK && rq_seq_len(s) == 0 && t.calibrated && t.t_w > 0 && t.att >= 0 &&
-                 t.n >= 2 && t.r[0] == 1 && t.f[0] == 1;
+                 t.att_x >= 0 && t.att_x <= t.att && t.n >= 2 && t.r[0] == 1 && t.f[0] == 1;
         for (int i = 1; i < t.n; i++) ok &= t.f[i] >= t.f[i - 1] && t.r[i] > t.r[i - 1];
-        ok &= rq_pass_cost(&t, 0, 0) == 0 && rq_pass_cost(&t, 1, 0) == t.t_w && rq_pass_cost(&t, 64, 0) > rq_pass_cost(&t, 16, 0);
+        ok &= rq_pass_cost(&t, 0, 0, 0) == 0 && rq_pass_cost(&t, 1, 0, 0) == t.t_w && rq_pass_cost(&t, 64, 0, 0) > rq_pass_cost(&t, 16, 0, 0);
         ok &= rq_pass_cost_measure(c, s, 20, 1, &dd) == RQ_ERR_ARG; // (too short)
-        snprintf(d, sizeof(d), "decode %.2f ms + %.3f us per row and position, f(4) %.2f, f(16) %.2f (%.1f s)", t.t_w * 1e3, t.att * 1e6,
-                 rq_pass_cost(&t, 4, 0) / t.t_w, rq_pass_cost(&t, 16, 0) / t.t_w, rq_now() - t0);
+        snprintf(d, sizeof(d), "decode %.2f ms + %.3f / %.3f us per position (first / further rows), f(4) %.2f, f(16) %.2f (%.1f s)",
+                 t.t_w * 1e3, t.att * 1e6, t.att_x * 1e6, rq_pass_cost(&t, 4, 0, 0) / t.t_w, rq_pass_cost(&t, 16, 0, 0) / t.t_w, rq_now() - t0);
         // a free draft that is always right: the model; no draft and a long match: the lookup; a huge attention: plain
         dd = t;
         dd.t_w = 1e-9;
-        dd.att = 0;
+        dd.att = dd.att_x = 0;
         RqSpecChoice x = rq_spec_choose(&t, &dd, 100, 3, 0.99, 3, 0.5);
         ok &= x.src == RQ_SPEC_MODEL && x.n == 3 && x.gain > 1;
         x = rq_spec_choose(&t, NULL, 100, 3, 0.99, 3, 0.94);
         ok &= x.src == RQ_SPEC_LOOKUP && x.gain > 1;
         RqPassCost h = t;
-        h.att = 1e-3;
+        h.att = h.att_x = 1e-3;
         h.t_w = 1e-6;
         x = rq_spec_choose(&h, &dd, 100000, 3, 0.6, 3, 0.6);
         ok &= x.src == RQ_SPEC_PLAIN && x.n == 0 && x.gain == 1;

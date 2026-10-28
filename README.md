@@ -64,7 +64,7 @@ CLI options (`./runq` without arguments prints them all):
 | `-r 0\|1` | thinking off (default; Qwen3.8: on) / on |
 | `-e xhigh\|high\|medium\|low` | reasoning effort with thinking (Qwen3.8's template; default xhigh, high = xhigh) |
 | `-m MODE` | `chat` (default), `generate` (raw completion), `tokenize`; test hooks `logits`, `dequant`, `render` |
-| `-k f16\|bf16\|f32` | KV cache type, default f16 (half the memory of f32, as accurate) |
+| `-k f16\|bf16\|f32\|bf16-dot\|f16-dot` | KV cache type, default f16 (half the memory of f32, as accurate); `bf16-dot`: a bf16 cache with the bf16 dot-product attention, ~1.7x faster attention at long context, opt-in (below) |
 | `-b N` | prefill chunk size, default 512 (`-b 1`: token by token) |
 | `--mem GiB` | memory budget of the load check (below), default MemAvailable; `0` or `force`: no check. Given, prints the estimate (a `[memory]` line) |
 | `--page-cache auto\|drop\|keep` | the model file's page cache after the load; `auto` (default) drops it if the file is >= 1/4 of the RAM |
@@ -218,6 +218,20 @@ not comparable with each other:
 
 Quality (0.6B, perplexity relative to HF transformers fp32): Q8_0 GGUF +0.19%, Q8_0 `.bin` +0.85%,
 Q4_K_M +4.9% (llama.cpp-based mynah-slm on the same Q4_K_M file: +4.7%).
+
+**Long context: `-k bf16-dot`** (opt-in; `runq serve -k bf16-dot` too). The attention's two dot products as the
+`vdpbf16ps` instruction computes them, on q, K, the softmax weights and V rounded to bf16: twice the dot-product rate
+on CPUs with AVX512_BF16 (AMD Zen 4, Intel Sapphire Rapids; elsewhere the same results at the fp32 rate; the
+instruction's exact rounding was verified on Zen 4, `make bf16dp-test` checks another CPU). On the EPYC VM, a
+2,560-token chunk prefilled at 98k positions, 8 threads: its attention ~1.72x faster (the 27B-shaped synthetic model
+8.99 -> 5.22 s, Qwen3.5-0.8B 18.3 -> 10.7 s), verify passes of speculative decoding ~20-30% cheaper, decode ~10-15%;
+for Qwen3.8-27B that is ~200 -> ~140 s per such chunk (estimated,
+[docs/qwen38-speculative.md](docs/qwen38-speculative.md#long-context-costs-todo-g0-b-measured-2026-10-27), G4 (b)).
+Bit-exactness is kept: the same results for any batch, chunk size, thread count and build. The price is accuracy: KL
+divergence from HF fp32 (28-45k tokens of prose and code) +0.3% on Qwen3.5-0.8B (within the noise of the default
+cache: f16 -0.7%), but +5.4% on Qwen3-0.6B and +2.9% on Qwen3-1.7B (about a bf16 cache's +3.9% / +2.8%; f16 +2.1% /
++0.5%): Qwen3 has attention in every layer, Qwen3.5 / 3.8 in one of four. `f16-dot` keeps the f16 cache and rounds it
+again when read (~1.5x: slower, and no more accurate than `bf16-dot`).
 
 ## Server
 

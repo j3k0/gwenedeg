@@ -607,7 +607,8 @@ static size_t ctx_mem(const RqModel *m, int nb, int max_ctx, int nt) {
     size_t att_nb = ((size_t)max_ctx + ATT_P - 1) / ATT_P, blk = (size_t)(ATT_P + ATT_PSTRIDE(hd)) * sizeof(float);
     size_t n = row + 12 * V + (size_t)nt * 2 * ATT_P * hd * sizeof(float) + (size_t)p->n_heads * att_nb * blk;
     if (nb > 1) {
-        n += (size_t)nb * row + (size_t)nt * m->att_rows * m->kv_mul * att_nb * blk;
+        size_t vr = (size_t)m->att_rows * m->kv_mul; // (per thread: the scores, the partial results)
+        n += (size_t)nb * row + (size_t)nt * (att_scores_floats(vr, att_nb) + vr * att_nb * ATT_PSTRIDE(hd)) * sizeof(float);
 #ifdef RUNQ_KQX
         size_t kmax = hid > xs ? hid : xs;
         if (m->kq) n += (size_t)nt * ((KQX_SCRATCH(kmax) + 63) / 64 * 64);

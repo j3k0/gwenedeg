@@ -58,7 +58,7 @@ struct RqCtx {
     int att_nb;
     float *att;         // decode: per (kv head, block) the scores of its kv_mul query heads (n_heads, att_nb * ATT_P)
     float *att_part;    // decode: per (kv head, query head, block) partial results (ATT_PSTRIDE floats)
-    float *att_b;       // prefill: per thread att_rows * kv_mul * att_nb * ATT_P scores
+    float *att_b;       // prefill: per thread att_scores_floats(att_rows * kv_mul, att_nb) scores
     float *att_pb;      // prefill: per thread the partial results of att_rows * kv_mul vectors
     float *att_conv;    // per thread 2 * ATT_P * head_dim floats (the generic attention's fp32 block copy)
     // batched passes (rq_forward_batch), nb_max rows each; not allocated if nb_max <= 1
@@ -449,7 +449,7 @@ static int ctx_alloc_att(RqCtx *c, int att_nb) {
     float *part = calloc((size_t)p->n_heads * att_nb * pst, sizeof(float));
     float *att_b = NULL, *att_pb = NULL;
     if (c->nb_max > 1) {
-        att_b = calloc((size_t)c->nt * vr * att_nb * ATT_P, sizeof(float));
+        att_b = calloc((size_t)c->nt * att_scores_floats(vr, att_nb), sizeof(float));
         att_pb = calloc((size_t)c->nt * vr * att_nb * pst, sizeof(float));
     }
     if (!att || !part || (c->nb_max > 1 && (!att_b || !att_pb))) {
@@ -1305,8 +1305,8 @@ static void attention_part(int kvt, int nv, const float *const *q, float *const 
     // positions 0..np[r]-1. part NULL: the whole attention into out[r] (all np <= ATT_P). Else the
     // partial results of the blocks b0..b1-1 of ATT_P positions that vector r reaches, block b at
     // part[r] + b * ATT_PSTRIDE(hd): o (unnormalized), m (max score), l (sum of exponentials).
-    // S: scratch of nv * (b1 - b0) * ATT_P floats; conv: 2 * ATT_P * hd floats (the generic C version's
-    // fp32 copy of a 16-bit cache block; this thread's)
+    // S: scratch of att_scores_floats(nv, b1 - b0) floats (internal.h); conv: 2 * ATT_P * hd floats (the
+    // generic C version's fp32 copy of a 16-bit cache block; this thread's)
 #ifdef RUNQ_ATT512
     if (att512_ok(hd)) { att512_kv(kvt, nv, q, out, part, np, b0, b1, kt, vt, bs, hd, scale, S); return; }
 #endif
@@ -1351,8 +1351,8 @@ static void attention_kv(int kvt, int nv, const float *const *q, float *const *o
                          const void *vt, size_t bs, int hd, float scale, float *S, float *part, float *conv) {
     // nv query vectors q[r] sharing one kv head, vector r over positions 0..np[r]-1, into out[r]:
     // per block of ATT_P positions the partial results, then their combination (one block: the
-    // attention directly). S: scratch of nv * (blocks of max np) * ATT_P floats; part: nv * (blocks of
-    // max np) * ATT_PSTRIDE(hd) floats. Each vector's result does not depend on the others
+    // attention directly). S: scratch of att_scores_floats(nv, blocks of max np) floats; part: nv * (blocks
+    // of max np) * ATT_PSTRIDE(hd) floats. Each vector's result does not depend on the others
     int nmax = 0;
     for (int r = 0; r < nv; r++)
         nmax = np[r] > nmax ? np[r] : nmax;
@@ -2225,7 +2225,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
     const PfSeg *seg = c->seg;
     size_t bs = (size_t)nkv * ATT_P * hd;
     uint8_t *scr = c->kq_scr ? c->kq_scr + (size_t)tid * c->kq_scr_bytes : NULL;
-    float *att = c->att_b + (size_t)tid * m->att_rows * kv_mul * c->att_nb * ATT_P;
+    float *att = c->att_b + (size_t)tid * att_scores_floats((size_t)m->att_rows * kv_mul, c->att_nb);
     float *part = c->att_pb + (size_t)tid * m->att_rows * kv_mul * c->att_nb * ATT_PSTRIDE(hd);
     float *conv = c->att_conv + (size_t)tid * 2 * ATT_P * hd;
     Gemm G;
@@ -2676,7 +2676,7 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
     int ncl = bd_counters(nkv, n, hy->nv); // dependency counters per layer (bd_counters)
     int nrb = job->nrb, nat = job->split ? c->row_it0[nrb] : nrb; // attention items per kv head
     size_t bs = (size_t)nkv * ATT_P * hd, pst = ATT_PSTRIDE(hd);
-    float *att = c->att_b + (size_t)tid * m->att_rows * kv_mul * c->att_nb * ATT_P;
+    float *att = c->att_b + (size_t)tid * att_scores_floats((size_t)m->att_rows * kv_mul, c->att_nb);
     float *part = c->att_pb + (size_t)tid * m->att_rows * kv_mul * c->att_nb * pst;
     float *conv = c->att_conv + (size_t)tid * 2 * ATT_P * hd;
 

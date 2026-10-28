@@ -1105,11 +1105,17 @@ static void smb512_rows(int type, float *out, size_t ldo, const int8_t *xq, size
  * Scores: register tile of NV vectors x NT tiles (NV * NT <= 24 accumulators), the K tile loaded
  * once per dim for all NV vectors (q broadcast; no horizontal sums); scores stored per tile as
  * [NV][16]. Softmax per vector and block. V: register tile NV vectors x DW zmm of dims, the score
- * of each vector broadcast per position, V streamed once per group (each pass of DW * 16 dims runs
- * over all the blocks, the accumulators restarting at each block: one long stream; with one call
- * per block, prefill attention at 3,000 tokens was ~27% slower, now ~10%); a vector's positions
- * beyond its own n (causal rows of a block) are skipped, so the fma chain is exactly that of the
- * decode path.
+ * of each vector broadcast per position (each pass of DW * 16 dims runs over the call's blocks, the
+ * accumulators restarting at each block); a vector's positions beyond its own n (causal rows of a
+ * block) are skipped, so the fma chain is exactly that of the decode path.
+ * att512_kv splits a call's vectors into groups of at most ATT512_G = 6 (near-equal sizes): NV 6
+ * runs NT = 4 / DW = 4 (6 broadcasts per 24 FMAs instead of 12 at NV 12), ~108 vs ~99 GFLOPS on one
+ * Zen 4 core with the K / V in L2 (peak 111: one zmm FMA per cycle); and it sweeps a long range
+ * ATT512_BC = 2 blocks at a time, all the groups over those blocks before the next ones, so a
+ * block's K / V come from memory once per call instead of once per group (TODO G4: a 2,560-token
+ * chunk at 98k positions on the 27B-shaped model, 8 threads, read ~3 x 100 MB per item before).
+ * Neither changes a bit: the vectors are independent and each block's partial result is computed
+ * whole by one call.
  */
 #if defined(__AVX512F__) && !defined(RUNQ_GENERIC)
 #define RUNQ_ATT512 1
@@ -1118,6 +1124,12 @@ static void smb512_rows(int type, float *out, size_t ldo, const int8_t *xq, size
 
 #define ATT512_NV 12    // max query vectors per group
 #define ATT512_HDMAX 256
+#ifndef ATT512_BC
+#define ATT512_BC 2     // blocks per step of a long range's sweep (att512_kv)
+#endif
+#ifndef ATT512_G
+#define ATT512_G 6      // query vectors per group, at most (att512_kv: ceil(nv / 6) groups)
+#endif
 #define ATT512_RND (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)
 
 static inline __m512 att512_exp(__m512 x) {
@@ -1377,12 +1389,22 @@ static inline int att512_ok(int hd) { return hd % 128 == 0 && hd <= ATT512_HDMAX
 
 static void att512_kv(int kvt, int nv, const float *const *q, float *const *out, float *const *part, const int *np, int b0,
                       int b1, const void *kt, const void *vt, size_t bs, int hd, float scale, float *s) {
-    // nv query vectors of one kv head (any nv), in groups of ATT512_NV (att512_group_t); kvt: cache type;
-    // s: ATT512_NV * ATT_P floats per block
-    for (int g = 0; g < nv; g += ATT512_NV) {
-        int gn = nv - g < ATT512_NV ? nv - g : ATT512_NV;
-        (kvt == 2 ? att512_group_f16 : kvt ? att512_group_bf16 : att512_group_f32)(gn, q + g, out + g, part ? part + g : NULL, np + g, b0, b1, kt, vt, bs,
-                                                     hd, scale, s);
+    // nv query vectors of one kv head (any nv), in ceil(nv / ATT512_G) groups of near-equal size (att512_group_t);
+    // kvt: cache type. A range of more than ATT512_BC blocks (prefill against a long cache) is swept ATT512_BC
+    // blocks at a time, every group over those blocks before the next ones: their K / V (256 KB per block and kv
+    // head in f16 / bf16) come from memory once and stay in L2 for the other groups. (The blocks' results do not
+    // depend on the range a call covers.) s: att_scores_floats (internal.h), at least ATT512_NV * ATT512_BC * ATT_P
+    if (part && b1 - b0 > ATT512_BC) {
+        for (int c0 = b0; c0 < b1; c0 += ATT512_BC)
+            att512_kv(kvt, nv, q, out, part, np, c0, c0 + ATT512_BC < b1 ? c0 + ATT512_BC : b1, kt, vt, bs, hd, scale, s);
+        return;
+    }
+    int ng = (nv + ATT512_G - 1) / ATT512_G;
+    for (int i = 0, g = 0; i < ng; i++) {
+        int gn = (nv - g) / (ng - i);
+        (kvt == 2 ? att512_group_f16 : kvt ? att512_group_bf16 : att512_group_f32)(gn, q + g, out + g, part ? part + g : NULL, np + g, b0, b1,
+                                                                                   kt, vt, bs, hd, scale, s);
+        g += gn;
     }
 }
 

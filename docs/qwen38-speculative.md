@@ -612,6 +612,162 @@ threads) + 2 checkpoints (0.3): ~22.7 GiB; runq's load-time check refuses it if 
 estimate (`-m GiB` overrides; with less memory, `-L ...,90112`). ~15 min per thread count (one 2.5k chunk at 98k is
 ~2.5-4 min).
 
+## Prompt lookup (TODO G6, G0 (c), measured 2026-10-27)
+
+Agentic replies copy from their context: an edit's old text, paths, identifiers, a tool result echoed. Prompt lookup
+drafts without a model: at a pass whose last sampled token is t, find the latest earlier occurrence of the sequence's
+last tokens (t included) and guess the tokens that followed it. Exact as any draft (the verify loop is unchanged).
+
+**Acceptance, offline** (`scripts/lookup_accept.py`, teacher-forced; the loop simulated as `spec_accept.py` does,
+the same cost model: a 27B step 120 ms, verify(k) = 1.14 ... 2.52 for k = 1..8 (S2), a 0.8B Q4_K_M draft step 5.1 ms;
+`--cost long`: the 98k-position extrapolation of "Long-context costs", a step 207 ms, verify(1 / 3 / 7) = 1.41 / 2.16 /
+4.04, interpolated, a draft step 19 ms; a lookup guess costs no draft step). Data: pi's recorded sessions
+(`~/.pi/agent/sessions`, local, nothing committed but these aggregates): 202 sessions, each one's main branch
+rendered as runq serve renders Qwen3.8 (`tmpl_38.jinja`: the effort line, the tools' block (pi's four core tools,
+approximated: the sessions do not record the schemas), every assistant message with its reasoning, tool calls in the
+XML form, a non-string argument as JSON, e.g. edit's `edits` array; checked against the jinja template on 40
+sessions: identical) and tokenized with the Qwen3.5 tokenizer: 206 streams (a compaction starts a new one), 16.5 M
+tokens, 9,079 replies. Kept: the 4,508 replies that end before position 98,304 (the 27B's window), 2.01 M reply
+tokens, labeled by kind: reasoning 512k, prose 289k, the template's and the XML's syntax 168k, tool-call arguments
+648k, edits' old text 42k and new text 124k, write's content 224k. **A proxy:** these are other models' replies
+(DeepSeek, GLM, Kimi, Claude, ... through pi), not the 27B's; their copying is the task's, so it should carry over,
+their wording not. The lookup rule is src/spec.c's (below): `build/teacher_force -l` runs `rq_lookup_draft` at every
+position, identical to the simulation's numpy rule at 98.5% of the 2.0 M positions (the rest: the 64-candidate
+chain limit).
+
+Tokens per target pass / est. tok/s (short-context cost model; plain 1.00 / 8.3), the lookup alone (`>= m`: the
+longest match of up to 16 tokens, used when it has >= m; `n only`: the latest occurrence of the last n tokens):
+
+| lookup, all 2.01 M tokens | all | reasoning | prose | syntax | args | old text | new text | write |
+|---|---|---|---|---|---|---|---|---|
+| n = 1 only, k = 4 | 1.50 / 9.1 | 1.31 / 7.9 | 1.28 / 7.8 | 1.90 / 11.5 | 1.68 / 10.2 | 1.82 / 10.8 | 1.66 / 10.0 | 1.49 / 9.0 |
+| n = 3 only, k = 4 | 1.46 / 10.8 | 1.20 / 9.1 | 1.19 / 9.1 | 3.05 / 19.6 | 1.62 / 11.8 | 2.44 / 16.2 | 1.59 / 11.5 | 1.41 / 10.4 |
+| >= 2, k = 1 | 1.33 / 10.2 | 1.19 / 9.2 | 1.18 / 9.2 | 1.78 / 13.1 | 1.41 / 10.8 | 1.70 / 12.6 | 1.41 / 10.7 | 1.31 / 10.1 |
+| **>= 2, k = 3** | **1.56 / 11.4** | 1.29 / 9.5 | 1.28 / 9.5 | 2.91 / 19.9 | 1.73 / 12.6 | 2.57 / 17.8 | 1.72 / 12.3 | 1.52 / 11.1 |
+| >= 2, k = 8 | 1.69 / 7.9 | 1.33 / 6.4 | 1.31 / 6.5 | 4.30 / 16.0 | 1.95 / 9.1 | 3.54 / 14.1 | 1.92 / 8.4 | 1.63 / 7.5 |
+| >= 2, k = 16 | 1.73 / 4.5 | 1.33 / 3.5 | 1.32 / 3.7 | 5.09 / 9.5 | 2.02 / 5.3 | 4.09 / 8.5 | 1.98 / 4.6 | 1.67 / 4.2 |
+| >= 4, k = 3 | 1.35 / 10.7 | 1.13 / 9.1 | 1.12 / 9.1 | 2.54 / 18.3 | 1.48 / 11.5 | 2.19 / 16.2 | 1.45 / 11.3 | 1.30 / 10.3 |
+| >= 8, k = 8 | 1.23 / 9.5 | 1.05 / 8.5 | 1.05 / 8.5 | 2.25 / 13.7 | 1.34 / 10.0 | 1.97 / 12.9 | 1.30 / 9.8 | 1.18 / 9.2 |
+
+A match exists at 71% of the positions (>= 2 tokens; 55% of the passes at k = 3), but most are short and wrong: at k
+= 3, 34% of the lookup's guesses are accepted. By the match's length (the longest-first rule up to 16, all
+positions): 2 tokens, 0.99 tokens accepted on average out of what it can guess; 4: 2.8; 8: 5.9; >= 16 (12% of the
+positions): 15.6 (most of them long copies). Choosing k from the match length (the best k per length under the cost
+model: 2-5) gains only 0.3 tok/s over a fixed k = 3: the verify cost of long passes (2.52x a step at k = 8, the
+K-quant kernels' compute-bound rows) caps what a long copy is worth.
+
+The 0.8B Q4_K_M teacher-forced on the same contexts (`lookup_accept.py draft`, `build/teacher_force`: the argmax at
+every reply position after the whole context; 40 random streams' replies up to position 32,768, 700k positions fed,
+95k reply tokens, 40 min at 6 threads), and both combined (the lookup's guesses when its match has >= m tokens, else
+the model's); tokens per pass / est. tok/s, short context then 98k positions:
+
+| 95k tokens of the sessions | all | reasoning | prose | syntax | args | old text | new text | all, 98k |
+|---|---|---|---|---|---|---|---|---|
+| plain | 1.00 / 8.3 | | | | | | | 1.00 / 4.8 |
+| lookup >= 2, k = 3 | 1.50 / 11.2 | 1.30 / 9.8 | 1.26 / 9.5 | 2.74 / 18.9 | 1.61 / 12.0 | 2.18 / 15.4 | 1.62 / 11.8 | 1.50 / 4.7 |
+| lookup >= 3, k = 3 | 1.39 / 10.8 | | | | | | | 1.39 / **5.2** |
+| lookup >= 4, k = 3 | 1.31 / 10.4 | | | | | | | 1.31 / **5.2** |
+| model k = 3 | 2.40 / 14.1 | 2.07 / 12.2 | 2.04 / 12.0 | 3.52 / 20.7 | 2.59 / 15.2 | 3.25 / 19.1 | 2.88 / 16.9 | 2.40 / 4.6 |
+| model k = 6, tau 0.4 | 2.56 / 14.2 | 2.02 / 12.4 | 1.98 / 12.2 | 5.28 / 22.3 | 2.95 / 15.0 | 4.86 / 20.3 | 3.56 / 17.1 | 2.56 / 5.0 |
+| lookup >= 2, k 3 + model k 3 | 2.16 / 13.4 | | | | | | | 2.16 / 4.4 |
+| lookup >= 4, k 3 + model k 3 | 2.32 / 14.1 | | | | | | | 2.32 / 4.6 |
+| lookup >= 8, k 3 + model k 3 | 2.38 / 14.2 | 2.05 / 12.1 | 2.03 / 12.0 | 3.55 / 22.4 | 2.56 / 15.4 | 3.17 / 19.3 | 2.81 / 16.8 | 2.38 / 4.6 |
+| lookup >= 8, k 8 + model k 6, tau 0.4 | 2.57 / 13.9 | 2.01 / 12.0 | 1.97 / 12.0 | 5.94 / 21.9 | 2.97 / 14.5 | 4.59 / 18.0 | 3.52 / 16.5 | 2.57 / 4.9 |
+
+On the 27B's own answers (`logs/specmeas-2026-10-27`, the 0.8B Q4_K_M's teacher-forced guesses of `spec_accept.py
+measure`; short prompts, nothing agentic; `lookup_accept.py report --answers GEN:MEAS`): thinking off (6,524 tokens)
+lookup >= 2, k = 3 1.20 per pass (9.5 tok/s; code 1.29, the edits of the prompt's code 1.24, extraction 1.40),
+model k = 3 2.94 (17.3),
+combined >= 8 / k 3 2.93 (17.3), >= 2 2.67 (16.1); thinking on (9,265) 1.27 (10.0), 2.38 (13.9), 2.36 (14.0), 2.23 (13.5);
+the 3 long reasonings (3,522) 1.30 (9.9), 2.35 (13.8), 2.33 (13.8).
+
+- **The lookup alone: ~1.5 tokens per pass on agentic replies** (1.2-1.3 on the 27B's chat-style answers), ~+35% at
+  short context (11.4 vs 8.3 tok/s in the cost model), half of the 0.8B draft's gain (14.1). Where it shines: the
+  template's and the XML's syntax (2.9 per pass), edits' old text (2.6), tool arguments (1.7); reasoning and prose
+  1.3, new code (write) 1.5. k = 3 with matches of >= 2 tokens is the best fixed setting; a unigram match is worse
+  than none past k = 1.
+- **Combined, it does not beat the draft at short context:** the 0.8B guesses copies as well (old text 3.25 per pass
+  vs the lookup's 2.18; it reads the same context), so a lookup pass replaces a better model pass; with long matches
+  only (>= 8) the combination equals the model alone (14.2 vs 14.1). Lookup's value with a draft is its cost: none.
+- **At long context it is the best speculation measured:** at 98k (a verify row ~80-90% of a step's attention, a
+  draft step 19 ms) the model draft at k = 3 is slower than plain (4.6 vs 4.8 tok/s; tau 0.4: 5.0), the lookup alone
+  (>= 3-4 tokens, k = 3) 5.2 (+8%), with no draft model in memory (2 GiB at 96k: G3). A per-position choice (G7)
+  should use the lookup there, the model at short context.
+- **Edits' arguments are JSON:** pi's `edit` takes an `edits` array, so its old / new text is a JSON string (escaped
+  newlines and quotes) inside `<parameter=edits>`, while the file's text in the tool results is raw: the lookup
+  matches the old text line by line, not across lines (2.6 per pass). A tool schema with string parameters
+  (`old_text` / `new_text`, written raw in the XML) would let whole blocks match.
+
+**In the loop** (`src/spec.c`, `RqSpecOpts.lookup` / `.lookup_min`; CLI `--lookup N [--lookup-min M]`, with or
+without `-D`): the index is a hash table of chains over the pairs of consecutive tokens of the target's sequence
+(`RqLookup`: `head[hash]` the latest position, `prev[i]` the previous one with the same hash; 1.4 MiB at 100k
+positions, built over the prompt when `rq_spec_run` starts, then extended by the accepted tokens: O(1) per token). A
+lookup walks the chain of (last token, t) from the most recent, at most 64 candidates, and keeps the longest match
+backwards (up to 16 tokens; the most recent among equals), which is the choice of trying the longest n-gram first (n
+= 16 .. 2) while the chain reaches it; it guesses up to N of the tokens after it if the match has >= M tokens
+(default 2), stopping at a token the sampling mask forbids. Else the draft model guesses (with `-D`), else the pass
+is a plain step. The model's sequence is not fed during lookup passes: it catches up by common prefix on its next
+round (one prefill). The verify / accept / rollback steps are unchanged; the target gets kmax + 2 checkpoint slots
+(kmax = max(k, N)). `RqSpecStats` counts the lookup's passes, guesses and accepted ones; the CLI's `[timing]
+speculative` line adds them. `rq_lookup_*` are in the API for tools that replay the loop (`tests/teacher_force.c
+-l`).
+
+**Equivalence** (`make test`'s `spec` group): `api_test --spec` runs every case with the lookup alone (4 guesses;
+30 with matches of >= 4) and combined (lookup 8 with >= 3 + k 3; lookup 3 + k 8 tau 0.5) besides the model settings:
+tokens, RNG states, every sampled logits vector's hash, stops and the cache == `rq_generate`, on the 0.6B Q8_0 + Q4_K_M
+pair (and the generic build, `--quick`) and the Qwen3.5-0.8B pair (hybrid rollbacks: every one on its checkpoint);
+two new cases copy a block of their prompt (greedy; seeded T 0.6 top-k 20 over two calls): the lookup alone guesses
+4.2 / 4.8 tokens per pass there (`spec_lookup_copy`, >= 3 required); `spec_lookup_index`: `rq_lookup_draft` ==
+a brute-force scan at 71,814 positions of synthetic sequences. The CLI cases run `--lookup 4` (no `-D`) and `-G 3
+--lookup 8 --lookup-min 3` against plain (stdout, stderr but timing, chat dumps), and a generation that copies its
+prompt (`gen_copy`: 7.8 tokens per pass with either setting, all 40 guesses accepted).
+
+**Speed** (2026-10-28, `scripts/bench_lookup.py`, `runq -m chat -t 0 -n 384 -c 4096`, 8 threads, under the bench lock,
+**load 18-25 from other jobs**: the plain rates are ~40% below their usual, the ratios are what to read; 2 reps,
+median [min-max]; accepted / guessed, tokens per pass, lookup passes / passes; every output == plain's). Prompts:
+`edit_py` (rewrite a 19-line Python function with a parameter renamed and None -> 0.0, "return the full function"),
+`edit_c` (rename a field in a 36-line C ring buffer and change one function, "return the complete code"), `chat`
+("What are the main differences between TCP and UDP?", nothing to copy).
+
+| Qwen3-1.7B Q8_0, draft 0.6B Q4_K_M | edit_py | edit_c | chat | mean |
+|---|---|---|---|---|
+| plain | 46.4 [40-53] | 36.3 [35-38] | 50.5 [43-58] | 44.4 |
+| `-G 3` | 63.4 [53-73] (91%, 3.73) | 57.7 [57-59] (93%, 3.79) | 58.9 [55-63] (55%, 2.67) | 60.0 |
+| `--lookup 3` | 108.6 [85-132] (95%, 3.50) | 97.1 [83-112] (84%, 3.24) | 63.6 [56-71] (42%, 1.22) | 89.8 |
+| `--lookup 8` | 129.5 [122-137] (89%, 6.46) | 132.3 [125-139] (71%, 5.54) | 57.6 [53-62] (22%, 1.25) | 106.4 |
+| `-G 3 --lookup 3` | 102.3 [92-113] (94%, 3.82, 40/44) | 92.8 [81-105] (84%, 3.51, 75/82) | 55.4 [51-60] (50%, 2.49, 36/154) | 83.5 |
+| `-G 3 --lookup 8 --lookup-min 4` | 136.0 [125-147] (88%, 7.30, 19/23) | 134.6 [111-158] (88%, 6.86, 31/42) | 51.1 [45-57] (53%, 2.74, 8/140) | 107.2 |
+
+| Qwen3.5-0.8B Q8_0 (no draft) | edit_py | edit_c | chat | mean |
+|---|---|---|---|---|
+| plain | 86.6 [82-91] | 73.9 [65-83] | 84.1 [77-91] | 81.5 |
+| `--lookup 3` | 233.3 [218-249] (98%, 3.93) | 198.1 [194-202] (100%, 4.00) | 95.3 [79-111] (35%, 1.20) | 175.6 |
+| `--lookup 8` | 336.9 [298-376] (95%, 8.62) | 271.8 [245-298] (97%, 8.75) | 86.7 [78-95] (16%, 1.22) | 231.8 |
+| `--lookup 8 --lookup-min 4` | 268.7 [239-299] (99%, 8.23) | 324.6 [287-362] (100%, 8.48) | 88.3 [82-95] (15%, 1.07) | 227.2 |
+
+- **Edits that return the code: 2.8-3.9x** with the lookup alone at k = 8 (5.5-8.8 tokens per pass), against 1.4-1.6x
+  for the 0.6B draft at `-G 3`: the copy runs longer than any draft's k, and a lookup guess costs nothing (the 0.6B's
+  step is a third of the 1.7B's). Combined (`-G 3 --lookup 8 --lookup-min 4`) is the best on the 1.7B's edits (the
+  model fills in where the copy breaks off), below it on chat (51 vs 59 tok/s; the runs' spread is ~±12%).
+- **Nothing to copy (chat):** the lookup alone is within the noise of plain (1.2 tokens per pass; its guesses there
+  cost verify rows, not draft steps); with the draft, lookups with short matches (min 2) take passes from the model
+  (`-G 3 --lookup 3`: 55 vs 59 tok/s): with `-D`, give the lookup a longer minimum match (4-8), as the offline
+  numbers say.
+- These replies are mostly copies (the prompts ask for the full code), so they are the lookup's best case; the
+  agentic sessions above have ~1.5 tokens per pass from it.
+
+Rerun:
+
+```sh
+P=".venv/bin/python -I scripts/lookup_accept.py"; S=/var/tmp/streams.pkl   # (local data: not in the repo)
+$P sessions $S --check-template logs/specmeas-2026-10-27/tmpl_38.jinja                       # ~30 s
+$P report $S --by-kind --engine [--cost long]                                              # ~1 min
+make teacher-force && $P draft $S models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf -o /var/tmp/draft.npz \
+    --max-pos 32768 --budget 700000 --threads 6                                            # ~40 min
+$P report $S --draft /var/tmp/draft.npz --by-kind [--cost long]
+L=logs/specmeas-2026-10-27; $P report --by-kind --answers $L/out_nothink.json:$L/meas_Qwen3.5-0.8B-Q4_K_M_out_nothink.json
+```
+
 ## Not now
 
 DFlash 2 (a 2B block-diffusion drafter: a new architecture, a 4 GB BF16 download); multi-VM splits (~10-30% over

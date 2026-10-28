@@ -112,7 +112,13 @@ more than its new tokens plus the last reply.
   has the numbers and a turn-latency model extrapolated to the 27B (decode ~4.8 / 5.6 tok/s at 98k with 8 / 16
   threads, a 2.5k-chunk prefill ~250 / ~145 s; a verify row at 98k adds ~80-90% of a step's attention, so k = 3
   passes cost ~2.2x a step there). Left of (b): the 27B run itself, alone on the box (the command is in that section);
-  (a) and (c) not started.
+  (a) not started. (c) done on proxies (2026-10-27, `scripts/lookup_accept.py`, docs/qwen38-speculative.md, "Prompt
+  lookup"): pi's sessions rendered as Qwen3.8 (4,508 replies, 2.0 M tokens before position 98k: other models'
+  replies, the 27B's are not recorded), teacher-forced: the prompt lookup alone 1.56 tokens per pass (k 3; syntax 2.9,
+  edits' old text 2.6, reasoning / prose 1.3), the 0.8B draft 2.40 (k 3; on a 95k-token subset up to 32k positions),
+  combined 2.38 (lookup only for matches >= 8 tokens: no gain over the model); in the cost model at 98k positions the
+  lookup alone is the only setting faster than plain (5.2 vs 4.8 tok/s; the 0.8B at k 3 4.6). Left: the same on the
+  27B's own agentic replies (G0 (a)'s replay records them).
 - [ ] **G2. Correctness at long context** (the 27B's retrieval left). Done on Qwen3.5 (2026-10-27, docs/qwen35.md,
   "Long context"): the opt-in `long` group (`tests/run_tests.sh --long-context`, `tests/check_long.py`,
   `build/long_ctx`) checks the 0.8B Q8_0 at 14 positions up to 98,303 and the 4B Q8_0 at 6 up to 32,767 against
@@ -172,6 +178,16 @@ more than its new tokens plus the last reply.
   finding the last n-gram earlier in the context (no model, no memory), verified in the same loop as the model draft
   (`rq_spec_run`; exact by construction). Combine them: the lookup when it finds a match, else the 0.8B. Measure the
   acceptance on the recorded sessions first (G0); in the server as part of S8.
+  Status (2026-10-27): in the loop and the CLI (`RqSpecOpts.lookup` / `lookup_min`, `--lookup N [--lookup-min M]`,
+  with or without `-D`; `RqLookup`: chains over token pairs, the longest match of up to 16 tokens among the 64
+  latest; per-source stats), exact (the spec group: lookup alone and combined, Qwen3 and Qwen3.5 incl. the hybrid
+  rollbacks, == plain bitwise; a copy case), measured (G0 (c) above; speed in docs/qwen38-speculative.md, "Prompt
+  lookup"). Findings: alone ~1.5 tokens per pass on agentic replies (est. +35% for the 27B), 2.8-3.9x measured on
+  edits that return the prompt's code (Qwen3-1.7B, Qwen3.5-0.8B; the 0.6B draft 1.4-1.6x there); with the 0.8B
+  draft at short context it adds nothing (the draft guesses copies as well); at long context it is the cheap one
+  (G7 should pick it there). Left: the server (S8); G7's per-position choice between lookup and model; tool schemas
+  whose old / new text are string parameters (pi's `edits` array is JSON-escaped, so multi-line old text does not
+  match the raw file text in the context).
 - [ ] **G7. Speculation at long context.** A verify segment of k + 1 rows shares the KV read but multiplies the
   attention work (k = 3: 4x), so the best k falls as the context grows. Choose k (and tau) per pass from the
   position and the measured costs (G0), in the CLI and the server. Done when speculation is never slower than plain

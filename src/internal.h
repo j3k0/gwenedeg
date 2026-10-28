@@ -249,6 +249,22 @@ struct RqModel {
     char tmpl_missing[2][TMPL_MAX + 64];
 };
 
+// floats of a thread's attention score scratch for the batched passes (forward.c's attention_kv / attention_part,
+// S) whose items hold up to vr query vectors over att_nb blocks of ATT_P positions: the AVX-512 kernel sweeps a long
+// range ATT512_BC blocks at a time in groups of at most ATT512_NV vectors, the generic C one block and vector at a
+// time; the NEON kernel scores a group over its whole range
+static inline size_t att_scores_floats(size_t vr, size_t att_nb) {
+#if defined(RUNQ_ATTNEON)
+    return vr * att_nb * ATT_P;
+#elif defined(RUNQ_ATT512)
+    (void)vr; (void)att_nb;
+    return (size_t)ATT512_NV * ATT512_BC * ATT_P;
+#else
+    (void)vr; (void)att_nb;
+    return ATT_P;
+#endif
+}
+
 // gguf.c
 RQ_NORETURN void gguf_fail(const Gguf *g, const char *fmt, const char *arg);
 uint64_t gguf_str(const Gguf *g, uint64_t *pos, const char **s, const char *what);

@@ -110,9 +110,9 @@ more than its new tokens plus the last reply.
   Status (2026-10-27): (b)'s tool is there, `build/bench_long` on `rq_seq_fill_synthetic` (a library test hook), run
   on the 0.8B, the 4B (to 32k) and the 27B-shaped synthetic model; docs/qwen38-speculative.md, "Long-context costs",
   has the numbers and a turn-latency model extrapolated to the 27B (decode ~4.8 / 5.6 tok/s at 98k with 8 / 16
-  threads, a 2.5k-chunk prefill ~250 / ~145 s; a verify row at 98k adds ~80-90% of a step's attention, so k = 3
-  passes cost ~2.2x a step there). Left of (b): the 27B run itself, alone on the box (the command is in that section);
-  (a) and (c) not started.
+  threads, a 2.5k-chunk prefill ~250 / ~145 s, ~200 / ~111 s since G4; a verify row at 98k adds ~80-90% of a step's
+  attention, so k = 3 passes cost ~2.2x a step there, ~2.0x since G4). Left of (b): the 27B run itself, alone on the
+  box (the command is in that section); (a) and (c) not started.
 - [ ] **G2. Correctness at long context** (the 27B's retrieval left). Done on Qwen3.5 (2026-10-27, docs/qwen35.md,
   "Long context"): the opt-in `long` group (`tests/run_tests.sh --long-context`, `tests/check_long.py`,
   `build/long_ctx`) checks the 0.8B Q8_0 at 14 positions up to 98,303 and the 4B Q8_0 at 6 up to 32,767 against
@@ -158,6 +158,17 @@ more than its new tokens plus the last reply.
   measurement decide; the instruction's exact rounding (two FMAs per pair, DAZ / FTZ, the odd element first) needs
   a C twin for the generic build, verified per CPU. Done when G0's 2.5k-chunk-at-90k prefill is ~2x faster, the
   thresholds hold, and the paths stay bitwise.
+  Status (2026-10-28, `082511f`, docs/qwen38-speculative.md, "G4"): **~1.3x, bit-identical**. The loss was the
+  memory traffic per item, not the balance (threads 98% busy at 8, 95% at 16 on synth-27b) nor the inner loop (99 of
+  111 GFLOPS per core from L2): `att512_kv` now sweeps a long range 2 blocks at a time (K / V once per item, from L2
+  for every group) in groups of <= 6 vectors (~108 GFLOPS per core). synth-27b, 2,560-token chunk at 98k: 12.56 ->
+  9.49 s at 8 threads (attention 12.0 -> 9.0 s, ~520 -> ~700 GFLOPS of a measured ~880 FMA peak), 7.01 -> 5.20 s at
+  16; the 0.8B at 98k 26.0 -> 20.3 s; verify segments at 98k -5-9%; the 27B estimate for the chunk at 98k ~250 ->
+  ~200 s (8 threads), ~143 -> ~111 s (16). (a) as written (items per block range with a shared combine) not done:
+  ~2-5% of balance to win at 512-row passes, and its partial results would have to live across threads (~60 MB per
+  split row block of the 27B at 98k); short passes (a turn's last few hundred rows) would gain more. Left: (b), the
+  only way to 2x (fp32 has ~20% left; `vdpbf16ps` measured at 1 per cycle, ~1.74 TFLOPS at 8 threads: twice the
+  FMA peak), with its KL measurement and C twin.
 - [ ] **G5. No re-prefill between turns, and cheaper compaction.** (Folds in "Checkpoints, measured", Qwen3.5.) A
   turn appends to the cache, unless the harness sends the history differently from what was generated (reasoning
   dropped, a reply re-serialized, a stop string): then the hybrid state rolls back to the last checkpoint at or
@@ -220,9 +231,12 @@ more than its new tokens plus the last reply.
   within the noise of f16, and the bitwise invariants hold for the new type (add it to the `kv` group).
 - [ ] **Prefill attention balance.** Prefill runs all blocks of a query vector in one work item (one item per
   (row block, kv head)); only single-row blocks are split per 256 positions. Items per (row block, kv head, block
-  range) would balance long prompts better. Separately, the blocks still cost ~4-5% of the attention at 3,000
-  tokens (against a scratch build with 4,096-position blocks: 1.69 vs 1.62-1.64 s). The arithmetic, including the
-  combine order of `att_combine`, must stay as it is.
+  range) would balance long prompts better. (Measured for G4, a 512-row pass at 98k on synth-27b: the threads are
+  busy 98.3% of the attention phase at 8 threads, 94.8% at 16; the passes that would gain are short ones, e.g. a
+  turn's last few hundred rows: 100 rows = 17 row blocks x 4 kv heads on the 27B, 68 items for 16 threads.)
+  Separately, the blocks still cost ~4-5% of the attention at 3,000 tokens (against a scratch build with
+  4,096-position blocks: 1.69 vs 1.62-1.64 s). The arithmetic, including the combine order of `att_combine`, must
+  stay as it is.
 
 ## Server (`runq serve`)
 

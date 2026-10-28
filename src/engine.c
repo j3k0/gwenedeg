@@ -99,7 +99,9 @@ struct Engine {
     int dhybrid;
     RqSeqMem dsm;         // the memory of a slot's draft sequence
     double spec_res;      // bytes kept out of the pool for the verify rows' transient checkpoints
-    RqPassCost tcost, dcost;
+    RqPassCost tcost, dcost; // as the planner uses them: the calibrated ones (tcal, dcal) x the measured / predicted ratio
+    RqPassCost tcal, dcal;
+    double tlr, dlr;      // log of that ratio, a moving average over the passes (target, draft)
     int gmax, dmaxb;
     float *slg, *dlogits;
     RqSegment *dseg;
@@ -1168,13 +1170,41 @@ static void spec_cands(Engine *e, Cand *c, int nc, int dbud) {
     }
 }
 
+static double seg_cost(const RqPassCost *pc, const RqSegment *sg, int n, int rows) {
+    // the cost model's time for a pass over these segments (before it: their sequences' lengths are the positions)
+    double s1 = 0, s2 = 0;
+    for (int i = 0; i < n; i++) {
+        double p = rq_seq_len(sg[i].seq);
+        s1 += p;
+        s2 += (sg[i].n - 1) * p + (sg[i].n - 1) * sg[i].n / 2.0;
+    }
+    return rq_pass_cost(pc, rows, s1, s2);
+}
+
+static void cost_learn(RqPassCost *eff, const RqPassCost *cal, double *lr, double pred, double took) {
+    // the measured time against the calibrated model's (pred, from cal): a moving average of the log ratio (the last
+    // ~20 passes), clamped to 0.5-4x; eff = cal scaled by it (the load, the thread count, what the calibration missed)
+    if (!(pred > 0) || !(took > 0)) return;
+    double x = log(took / pred);
+    *lr = 0.95 * *lr + 0.05 * x;
+    if (*lr < -0.69) *lr = -0.69;
+    if (*lr > 1.39) *lr = 1.39;
+    double r = exp(*lr);
+    *eff = *cal;
+    eff->t_w *= r;
+    eff->att *= r;
+    eff->att_x *= r;
+}
+
 static int draft_pass(Engine *e, int nds, int drows, int nsel, float **lg) {
     // one pass of the draft model over e->dseg (the decode path for a single row); on failure the segments' draft
     // sequences are emptied (a draft only ever guesses: the jobs go on without it)
-    double t0 = rq_now();
+    double pred = seg_cost(&e->dcal, e->dseg, nds, drows), t0 = rq_now();
     int err = nds == 1 && drows == 1 && nsel == 1 ? rq_decode(e->dc, e->dseg[0].seq, e->dseg[0].tokens[0], lg)
                                                   : rq_forward_batch(e->dc, e->dseg, nds, nsel > 1 ? e->dlogits : NULL, lg);
-    e->t_draft += rq_now() - t0;
+    double took = rq_now() - t0;
+    e->t_draft += took;
+    if (err == RQ_OK && nsel == nds && drows == nds) cost_learn(&e->dcost, &e->dcal, &e->dlr, pred, took); // (guess rows only)
     e->d_passes++;
     e->d_rows += drows;
     for (int i = 0; i < nds; i++) e->dsegrun[i]->j->sp_draft_rows += e->dseg[i].n;
@@ -1406,10 +1436,15 @@ static void step(Engine *e, int stopping) {
     int nsel = 0, err;
     for (int i = 0; i < nseg; i++) nsel += e->seg[i].logits == RQ_LOGITS_ALL ? e->seg[i].n : e->seg[i].logits == RQ_LOGITS_LAST;
     float *lg = NULL;
+    int dec_like = e->o.spec_used; // (the passes the cost model describes: decode rows and verify segments, every row's logits)
+    for (int i = 0; i < nseg && dec_like; i++)
+        dec_like = e->seg[i].logits == RQ_LOGITS_ALL || (e->seg[i].logits == RQ_LOGITS_LAST && e->seg[i].n == 1);
+    double pred = dec_like ? seg_cost(&e->tcal, e->seg, nseg, rows) : 0, t0 = rq_now();
     if (nseg == 1 && rows == 1 && nsel == 1) // (one decode row: the decode path)
         err = rq_decode(e->c, e->seg[0].seq, e->seg[0].tokens[0], &lg);
     else
         err = rq_forward_batch(e->c, e->seg, nseg, nsel > 1 ? e->logits : NULL, &lg);
+    if (err == RQ_OK && pred > 0) cost_learn(&e->tcost, &e->tcal, &e->tlr, pred, rq_now() - t0); // (decode-like passes)
     if (err == RQ_OK) {
         for (int i = 0, sel = 0; i < nseg; i++)
             if (e->seg[i].logits != RQ_LOGITS_NONE) {
@@ -1574,9 +1609,9 @@ static void *engine_main(void *arg) {
         fprintf(stderr, "[engine] %llu passes, %llu rows\n", e->passes, e->rows);
         if (e->sp_passes || e->d_passes)
             fprintf(stderr, "[engine] speculation: %llu passes with guesses (%llu rows); model %llu / %llu guesses accepted, lookup "
-                    "%llu / %llu; draft %llu passes, %llu rows, %.3f s\n", e->sp_passes, e->sp_rows, e->sp_acc[RQ_SPEC_MODEL],
-                    e->sp_guess[RQ_SPEC_MODEL], e->sp_acc[RQ_SPEC_LOOKUP], e->sp_guess[RQ_SPEC_LOOKUP], e->d_passes, e->d_rows,
-                    e->t_draft);
+                    "%llu / %llu; draft %llu passes, %llu rows, %.3f s; measured / calibrated costs x%.2f (target), x%.2f (draft)\n",
+                    e->sp_passes, e->sp_rows, e->sp_acc[RQ_SPEC_MODEL], e->sp_guess[RQ_SPEC_MODEL], e->sp_acc[RQ_SPEC_LOOKUP],
+                    e->sp_guess[RQ_SPEC_LOOKUP], e->d_passes, e->d_rows, e->t_draft, exp(e->tlr), exp(e->dlr));
     }
     return NULL;
 }
@@ -1769,6 +1804,8 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
         if (e->dhybrid) rq_seq_set_checkpoints(e->slot[0].dseq, e->ckn);
         e->t_cal = rq_now() - t0;
     }
+    e->tcal = e->tcost;
+    e->dcal = e->dcost;
     if (pthread_create(&e->th, NULL, engine_main, e)) {
         snprintf(err, errlen, "cannot start the engine thread");
         engine_free(e);
@@ -1783,10 +1820,17 @@ void engine_describe(Engine *e, char *buf, size_t n) {
     char st[96] = "";
     if (e->sm.state)
         snprintf(st, sizeof(st), " + recurrent state %.1f MiB x (1 + %d checkpoints)", e->sm.state / 1048576.0, e->sm.checkpoints);
-    snprintf(buf, n, "%d running at most, %d slot(s) of %d positions (per slot %.1f MiB: KV %.0f KB per position%s; %.2f GiB at most, "
+    char dr[160] = "";
+    if (e->dm)
+        snprintf(dr, sizeof(dr), "; the draft's sequence %.1f MiB", e->dsm.total / 1048576.0);
+    if (e->spec_res > 0) {
+        size_t l = strlen(dr);
+        snprintf(dr + l, sizeof(dr) - l, "; %.0f MiB kept for the verify rows' checkpoints", e->spec_res / 1048576.0);
+    }
+    snprintf(buf, n, "%d running at most, %d slot(s) of %d positions (per slot %.1f MiB: KV %.0f KB per position%s%s; %.2f GiB at most, "
              "touched as used; pool budget %.2f GiB, %s), prefill chunks %d / %d tokens per pass (others decoding / not)",
-             e->parallel, e->nslot, e->o.ctx, e->sm.total / 1048576.0, (double)e->sm.kv / e->o.ctx / 1000.0, st,
-             (double)e->sm.total * e->nslot / G, e->o.kv_mem, e->mem_src, e->o.chunk, e->o.batch);
+             e->parallel, e->nslot, e->o.ctx, (e->sm.total + e->dsm.total) / 1048576.0, (double)e->sm.kv / e->o.ctx / 1000.0, st, dr,
+             ((double)e->sm.total + e->dsm.total) * e->nslot / G, e->o.kv_mem, e->mem_src, e->o.chunk, e->o.batch);
 }
 
 static void cost_text(char *b, size_t n, const RqPassCost *c) {

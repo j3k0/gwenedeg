@@ -36,6 +36,11 @@ curl -s localhost:8080/v1/chat/completions -d '{"messages": [{"role": "user", "c
 | `-t`, `-p`, `-n` | 1.0, 1.0, 0 | defaults for requests without temperature / top_p / max_tokens (0: up to the context) |
 | `--top-k N` | 0 (off) | default for requests without top_k. `-t` / `-p` / `--top-k` not given: the model's recommended values if its GGUF has them (`general.sampling.temp` / `top_p` / `top_k`, e.g. Qwen3.8-27B 1.0 / 0.95 / 20) |
 | `--threads N` | `OMP_NUM_THREADS`, else nproc - nproc/8 | threads per forward pass |
+| `-D`, `--draft FILE` | none | speculative decoding with a draft model of the same vocabulary (e.g. Qwen3-0.6B Q4_K_M for Qwen3-1.7B, Qwen3.5-0.8B Q4_K_M for Qwen3.5 / 3.8; refused otherwise, or if its context is shorter than `-c`): its guesses are verified in the batched passes, the output is exactly plain decoding's (below, Speculative decoding) |
+| `-G N`, `--tau T` | 3, 0 | with `--draft`: the draft model's guesses per pass at most (0..16); stop guessing at a draft top-1 probability < T (0: off) |
+| `--lookup N`, `--lookup-min M` | 3 with `--draft` in auto mode, else 0; auto: by length, fixed: 2 | prompt lookup: up to N guesses copied after the latest longest match of the last tokens earlier in the context (no model, no memory; 0: off); the shortest match used (2..16) |
+| `--spec auto\|fixed\|off` | auto with `--draft` / `--lookup`, else off | the default of requests: **auto** chooses the source and the guess count per pass from the cost model, the position and the batch (plain steps when no guess pays off); **fixed** speculates as the CLI's `-G` / `--lookup` (the lookup when it matches, else the model); off: plain decoding. Requests may override (`speculative`) |
+| `--spec-calibrate N` | 8192 | the cost model's calibration at the start (both models, on slot 0's empty sequences: decode steps and 2-16-row verify segments at 16 and min(N, -c) positions, ~1-5 s; 0: estimates from the models' sizes); the startup line shows it |
 | `-v`, `--verbose` | off | log request bodies and responses |
 
 Endpoints: `POST /v1/chat/completions` (also `/chat/completions`), `GET /v1/models`, `GET /v1/models/{id}`,
@@ -54,12 +59,14 @@ and `force_reply` (a benchmark hook, `scripts/replay_sessions.py`: the reply is 
 model's raw text or, with the Qwen3.5 / 3.8 templates, as an assistant message `{content, reasoning_content,
 tool_calls}` rendered as the template renders an earlier reply; its tokens are output and parsed as if sampled and
 fed after the prompt in passes of several rows, then the reply ends as on the end token; not with `json_schema` or
-`logprobs`). `usage` counts
+`logprobs`), `speculative` (an extension, below: `false`, `true`, `"off"` / `"auto"` / `"fixed"` or
+`{"mode", "k", "tau", "lookup", "lookup_min"}`; the fields not given are the server's). `usage` counts
 prompt, completion and cached prompt tokens (`prompt_tokens_details.cached_tokens`); responses (and the stream's
 usage chunk) also carry llama.cpp's `timings` (`prompt_n`: tokens prefilled, `prompt_ms`, `predicted_n` /
 `predicted_ms`, `cache_n`) and runq's: `slot`, `slot_tokens` (its length when the request took it), `common_tokens`
 (its common prefix with the prompt: below `slot_tokens`, the history was sent differently from what was generated;
-above `cache_n`, the recurrent state rolled back to a checkpoint), `copied`, `queue_ms`; `finish_reason` is
+above `cache_n`, the recurrent state rolled back to a checkpoint), `copied`, `queue_ms`, and with speculation
+llama.cpp's `draft_n` / `draft_n_accepted` (guesses verified / accepted) and `speculative` (below); `finish_reason` is
 `stop`, `length` or `tool_calls`. Errors are OpenAI error objects: 400 (invalid request; a prompt longer than the context
 has `code: context_length_exceeded`), 401, 404, 405, 411 (chunked uploads), 413, 503 (queue full / shutting
 down), 504. Not supported: tools with Qwen3's templates (400), `tool_choice` required / a named function, the legacy
@@ -200,6 +207,90 @@ almost never says REASONING); Qwen3-1.7B Q8_0 79-88% at ~55 ms per classificatio
 79-92% at ~150 ms. Later, with the bigger models (Step 11): 1.7B Q8_0 88% at ~50 ms, Qwen3-4B-Instruct-2507
 Q4_K_M 88-92% at ~130 ms, Qwen3-8B Q4_K_M 92% at ~260 ms.
 
+## Speculative decoding (TODO S8, G7)
+
+`runq serve MODEL --draft DRAFT` (or `--lookup N` alone): the decoding requests' next tokens are guessed (by the draft
+model, or copied from the context by the prompt lookup) and verified in the same batched passes as the other requests'
+rows; every output is exactly plain decoding's: the tokens, seeded sampling (each request's RNG draws as plain decoding's),
+logprobs (the verify rows' logits are bitwise the decode steps'), streaming, stop strings, `max_tokens`, the end of the
+context, reasoning and tool calls, a request batched or alone, speculating or not. Only the speed changes.
+
+**In the engine** (`src/engine.c`, header comment): a decoding request's segment in the pass is `[t, g1..gn]` (t its
+sampled token, n guesses) with every row's logits; the rows are sampled in rounds over the requests (one row per
+request and round, `rq_sample_batch`), each token through the plain path (output, stops, limits, tool-call scanning);
+while the token equals the next row's guess that row is valid, else the sequence is cut after the row it came from
+(Qwen3.5 / 3.8: on the row's checkpoint, `rq_seq_checkpoint_rows`). The draft model has a sequence per slot that follows
+the slot's tokens (prefix reuse and copies included) and its own context; its passes are batched too: the first one
+with each guessing request's catch-up rows and `t` (its first guess from the last row), the next ones with one row per
+request still guessing. Its catch-up rows ride along those passes; a pass of its own only for a lag of half the prompt
+budget (a prompt, a spell of lookup or plain steps), while the model is in use. Qwen3.5 / 3.8: the slot's
+`--checkpoints` stay as G5 plans them; a speculating request gets k + 1 transient checkpoint slots for its verify rows
+(dropped at its end, so the next request of the conversation finds what plain decoding leaves; a `</think>` inside a
+verify keeps that row's checkpoint as the reasoning's end); the draft mirrors the slot's planned checkpoints. Not for
+constrained (`json_schema`) or `force_reply` requests (plain).
+
+**The cost model** (G7, `RqPassCost` in `src/runq.h`): a pass of R rows costs `t_w f(R) + att S1 + att_x S2` (t_w: a
+decode step's weights part; f(R): its growth with the rows, f(1) = 1; att: per position of context for the first row of
+a segment; att_x: per position for each further row, which shares the first one's read of the KV cache), for the target
+and for the draft, calibrated at the start (`--spec-calibrate`, the fastest of 5 runs per configuration) or estimated
+from the models' sizes, then corrected online: every decode / verify pass and every draft guess pass is timed against
+the calibrated model's prediction, and a moving average of the ratio (per model, the last ~20 passes, 0.5-4x) scales
+the costs the policy uses (the load of a shared machine, what the calibration missed). Acceptance: per guess, per request, shrunk to the server's recent counts, shrunk to priors (the
+model's 0.6; the lookup's by match length, 0.45 for 2 tokens to 0.94 for 16, from pi's sessions).
+
+**The auto policy** (per pass): the choices (plain, lookup n, model k for each decoding request) that maximize the
+decoding requests' expected tokens per second of the pass, greedily: a choice is taken only while it raises the rate,
+i.e. its expected gain is > 1 against the batch's own efficiency (a plain batched pass of N requests is already N
+tokens for little more than one step). So: at short context the draft model (k 2-3 when its guesses are accepted, the
+lookup instead when it matches long enough), at long context the lookup and few or no model guesses (each verify row
+pays the attention again), as the batch fills less and then no speculation, and plain steps whenever nothing pays.
+A request's draft is kept in sync only if a model pass beats plain for it alone and the time it would save over the
+reply's remaining tokens is worth twice the catch-up (a long prompt for a short reply is not). The startup line shows
+the cost model and the choice for one sequence alone by position. `--spec fixed` (or a request's `"mode": "fixed"`)
+speculates as asked (the CLI's semantics), whatever the batch.
+
+**Per request**: `"speculative": false` (plain), `true` / `"auto"`, `"fixed"`, or an object: `{"mode": "auto"|"fixed"|"off",
+"k": 0..16, "tau": 0..1, "lookup": 0..16, "lookup_min": 0 or 2..16}` (k > 0 needs `--draft`: else a 400; without any
+source configured, `true` gets the lookup at 3). `timings.speculative`: `{"mode", "passes" (decode passes), "model":
+{"passes", "drafted", "accepted"}, "lookup": {...}, "draft_rows" (the draft's rows for this request, catch-up included),
+"refed" (positions fed again after a rollback: 0, every rollback lands on its row's checkpoint)}`.
+
+**Tests** (`tests/server_test.py --spec DRAFT|none`, in `make test`'s spec group: the Qwen3-0.6B Q8_0 + Q4_K_M pair,
+Qwen3.5-0.8B Q8_0 + Q4_K_M, the 0.8B with the lookup alone; 19 / 22 / 22 checks): every request with speculation off
+and with fixed settings (k 1 / 3 / 8 with tau, the lookup at 1 / 4 / 16, both) and auto, compared: content, reasoning,
+tool calls, finish_reason, usage and logprobs, streamed and not; greedy, seeded (top-p, top-k), thinking cut inside a
+verify pass, `max_tokens` 1 / 2 / 5, stop strings, the end of the context inside a pass, a reply that copies its prompt;
+four requests at once; a conversation's next turn reuses the first prompt + its reply (and == a fresh prefill); tool
+calls streamed and with thinking (Qwen3.5); no position fed again.
+
+**Measured** (`scripts/bench_serve.py --only gen`, streamed 128-token greedy replies, 2 per client, `--parallel 4`, 8
+threads, the bench lock; the shared box at load 5-15 from other jobs: the runs' spread is ~±15%; tok/s in aggregate):
+
+| target + draft, prompts | clients | plain | lookup 3, fixed | draft k 3, fixed | **auto** (draft + lookup 3) |
+|---|---|---|---|---|---|
+| Qwen3-1.7B Q8_0 + 0.6B Q4_K_M, code | 1 | 62-66 | 82-84 (1.09 tok/pass) | 69-81 (2.49) | **84** (1.8-2.1) |
+| | 4 | 190-214 | 203-210 (1.06) | 163-164 (2.56) | **187-208** (1.06: 3-4 model guesses, ~50 / 150 lookup) |
+| the same, edit (before the online correction) | 1 | 70-74 | 68-69 (1.05) | 80-96 (3.10) | **84-86** (2.4-3.1) |
+| | 4 | 195-213 | 181-199 (1.15) | 202-206 (3.30) | **194-201** (1.12-1.14) |
+| Qwen3.5-4B Q8_0 + 0.8B Q4_K_M, code | 1 | 28-31 | 30 (1.03) | 36 (2.70) | **35-37** (2.4) |
+| | 4 | 75-78 | 70-71 (1.06) | 63-64 (2.63) | **71-76** (1.02-1.04) |
+
+One client: auto 1.2-1.35x plain, with the draft's guesses where they pay (k 1-3 by the costs) and the lookup's when it
+matches; the fixed draft at k 3 is as good on the 4B (the draft costs 0.19 of a step there) and worse on the 1.7B (0.32).
+Four clients: a batched pass of 4 requests is already ~3x a step's tokens for ~1.3x its time, so a draft's guesses cost
+more than they save (the fixed draft is 15-20% slower there): auto keeps to plain steps and the lookup's occasional
+guesses, within the runs' noise of plain (4B, 3 more alternating runs at 4 clients: plain 72-77, auto 73-75). Before the
+online correction a noisy start-up calibration once made auto choose the draft in the full batch on the 4B (70 vs 78
+tok/s); the passes' measured times now correct the model (`[engine]` summary with `-v`: the measured / calibrated ratio).
+`"edit"` asks for a function back with changes: the replies rewrite more than they copy (the lookup's guesses are mostly
+wrong; on verbatim copies it is 2.8-3.9x, docs/qwen38-speculative.md, Prompt lookup).
+
+At long context (TODO G7, `build/bench_long -D`, the choice from the measured passes; the 27B extrapolated from
+synth-27b: its short-context costs + 16 x the synth's attention): the 27B with the 0.8B Q4_K_M draft (its guesses accepted at p 0.6):
+the model at k 2 up to 32k (x1.56 at 512 down to x1.23), k 1 at 64-98k (x1.17 -> x1.13; nothing for p < ~0.45), and
+with a 4-token lookup match the lookup, 4 guesses at 512 down to 2 at 98k (x2.15 -> x1.38)
+([qwen38-speculative.md](qwen38-speculative.md#in-the-server-s8-and-the-choice-by-position-g7)).
+
 ## Agent sessions (pi): the replay benchmark, checkpoints, compaction
 
 **The tool** (TODO G0 (a)): `scripts/replay_sessions.py --model GGUF --ctx N --session FILE | --pick N` replays pi's
@@ -277,5 +368,6 @@ reply's end; Qwen3.5's turn checkpoint is not needed there). pi's compaction set
   while decoding; no images, `n > 1`; penalties are ignored.
 - No TLS: bind it to localhost or a trusted network (`--api-key` is a shared secret over plain HTTP).
 - The KV memory is a fixed pool (`--slots` x `-c`, no paging or preemption): a request keeps its slot until it ends.
-- One model per process. POSIX only (on Windows the server reports that it is not available).
+  With `--draft`, each slot also holds a draft sequence of `-c` positions (counted in the pool).
+- One model per process (and its draft). POSIX only (on Windows the server reports that it is not available).
 

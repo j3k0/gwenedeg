@@ -101,7 +101,9 @@ thinking, 87 on code at temperature 1, against 70-78 plain (1.15-1.5x; 45-80% of
 guesses the same but its step is slower (5.6 vs 4.2 ms). Qwen3.5 targets and drafts work too (rolled back through
 state checkpoints). **Qwen3.8-27B Q4_K_M** with Qwen3.5-0.8B Q4_K_M as the draft, 8 threads, 256 tokens, the mean of
 chat, code, math and summary prompts: 8.7 tok/s plain; thinking on 13.2 at `-G 3`, 14.1 at `-G 6 --tau 0.4` (1.6x),
-thinking off 16.6 / 17.2 (2.0x; code and math 19-22); 12 threads: up to 15.3 / 20.6. Not in `runq serve` yet.
+thinking off 16.6 / 17.2 (2.0x; code and math 19-22); 12 threads: up to 15.3 / 20.6. In `runq serve` too (below).
+`--spec auto` (opt-in in the CLI) chooses the source and the guess count per pass from a cost model calibrated at the
+start (TODO G7).
 Measurements: [docs/qwen38-speculative.md](docs/qwen38-speculative.md#the-27b-bring-up-s7).
 
 **Prompt lookup** (`--lookup N`, no model needed): replies that copy from their context (code being edited, paths,
@@ -238,6 +240,13 @@ trusted network.
 - **Continuous batching**: every running request (up to `--parallel` 16) contributes its next token or a
   prompt chunk to one batched forward pass per step. Streams keep flowing while long prompts prefill,
   and each request's output is bit-identical to running it alone.
+- **Speculative decoding** (`--draft FILE`, `--lookup N`): the guesses of a draft model of the same vocabulary, or
+  copied from the context, verified in the same batched passes; the draft's steps in its own batched passes. Every
+  output is plain decoding's (seeded, streamed, with logprobs, tool calls and stop strings; tested request by request).
+  By default (`--spec auto`) the source and the guess count are chosen per pass from a cost model calibrated at the
+  start, the position and the batch: the draft model at short context, the lookup at long context, less as the batch
+  fills, plain steps when no guess pays off; per request `speculative`, counters in `timings`
+  ([docs/server.md](docs/server.md#speculative-decoding-todo-s8-g7)).
 - **Prefix reuse**: a new request takes the idle KV slot with the longest common prefix and prefills
   only the rest, or copies the prefix from a running request. A second chat turn, or a fixed system
   prompt, is not prefilled again.
@@ -357,7 +366,7 @@ than key heads), 686 with its Q4_K_M file too (`3.5-0.8b-q4km`; ~70-80 s), 27 mo
 tokenizer ids against HF; logits against HF fp32 (cosine, top-1 / top-5); batched against sequential,
 thread-count and generic-against-SIMD bit-identity; Q4_K_M, Q5_K and Q3_K dequantization against gguf-py; the KV cache
 types; greedy-output goldens; chat-template rendering against HF's `apply_chat_template`; the library
-API; speculative decoding against plain decoding (tokens and logits bits); the server over HTTP; synthetic GGUF models with the bigger models' shapes; and Qwen3.5-0.8B (its tokenizer,
+API; speculative decoding against plain decoding (tokens and logits bits; in the server, request by request); the server over HTTP; synthetic GGUF models with the bigger models' shapes; and Qwen3.5-0.8B (its tokenizer,
 logits against HF fp32, the same invariants, chats that roll back to a state checkpoint) and synthetic Qwen3.5 models
 with the 4B / 27B head layout. Golden references
 come from HF transformers and are committed under `tests/golden/`. See [tests/README.md](tests/README.md).
@@ -387,8 +396,8 @@ and builds mynah-slm, an optional reference engine for comparison (not part of t
 - `runq serve`: no TLS, no images, `n` = 1, no `json_object` or free-form string constraints; tool calls only
   with the Qwen3.5 / Qwen3.8 templates (not Qwen3's), `tool_choice` auto / none only; the KV memory is a fixed
   pool of slots (no paging).
-- CPU only; the CLI and the server run one model per process (the library can hold several with the same
-  activation group size, tested by `api_test --two`).
+- CPU only; the CLI and the server run one model per process, and its draft model for speculative decoding (the library
+  can hold several with the same activation group size, tested by `api_test --two`).
 
 ## Credits and license
 

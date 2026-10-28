@@ -285,6 +285,8 @@ typedef struct {
     Msg *msgs;
     ConSet *con;
     ToolSet *tools;
+    int has_force, force_raw; // force_reply: given; a raw text (force.text) rather than a message
+    Msg force;
 } Chat;
 
 static void chat_free(Chat *ch) {
@@ -298,6 +300,13 @@ static void chat_free(Chat *ch) {
         free(ch->msgs[i].calls);
     }
     free(ch->msgs);
+    free(ch->force.text);
+    free(ch->force.reasoning);
+    for (int k = 0; k < ch->force.ncalls; k++) {
+        free(ch->force.calls[k].name);
+        json_free(ch->force.calls[k].doc);
+    }
+    free(ch->force.calls);
     con_free(ch->con);
     tools_free(ch->tools);
 }
@@ -332,6 +341,66 @@ static int get_int(const Js *root, const char *key, long long lo, long long hi, 
         return bad(e, key, "%s", m);
     }
     *out = x;
+    return 0;
+}
+
+static int parse_calls(const Js *tc, Msg *x, ReqErr *e) {
+    // an assistant message's tool_calls (an array or absent) into x->calls
+    if (!tc || tc->t != JS_ARR || tc->n == 0) return 0;
+    if (!(x->calls = calloc(tc->n, sizeof(MsgCall)))) return bad(e, NULL, "out of memory%s", NULL);
+    for (int k = 0; k < tc->n; k++) {
+        const Js *c = tc->v[k], *ty = json_get(c, "type"), *f = json_get(c, "function");
+        const Js *nm = json_get(f, "name"), *ar = json_get(f, "arguments");
+        if (c->t != JS_OBJ || (ty && ty->t != JS_NULL && !json_str_eq(ty, "function")) || !f || f->t != JS_OBJ)
+            return bad(e, "messages", "each tool call must be {\"type\": \"function\", \"function\": {\"name\": ..., \"arguments\": ...}}%s", NULL);
+        if (!nm || nm->t != JS_STR || nm->n == 0 || (int)strlen(nm->s) != nm->n)
+            return bad(e, "messages", "a tool call's function.name must be a non-empty string%s", NULL);
+        MsgCall *mc = &x->calls[x->ncalls++];
+        if (!(mc->name = strdup(nm->s))) return bad(e, NULL, "out of memory%s", NULL);
+        if (ar && ar->t == JS_STR) { // (OpenAI's form: a JSON text; "" or blank: none)
+            char perr[200];
+            size_t bl = strspn(ar->s, " \t\r\n");
+            if ((int)bl < ar->n) {
+                if (!(mc->doc = json_parse(ar->s, ar->n, perr, sizeof(perr))) || json_root(mc->doc)->t != JS_OBJ)
+                    return bad(e, "messages", "a tool call's function.arguments must be a JSON object (or its text)%s", NULL);
+                mc->args = json_root(mc->doc);
+            }
+        } else if (ar && ar->t == JS_OBJ) mc->args = ar;
+        else if (ar && ar->t != JS_NULL)
+            return bad(e, "messages", "a tool call's function.arguments must be a JSON object (or its text)%s", NULL);
+    }
+    return 0;
+}
+
+static int parse_force(App *a, const Js *root, Chat *ch, ReqErr *e) {
+    // force_reply (a benchmark hook: scripts/replay_sessions.py): the reply as the model's raw text (a string), or an
+    // assistant message (content, reasoning_content, tool_calls; Qwen3.5 / 3.8) that the reply is to be as the template
+    // renders it; tokenized in render_req
+    const Js *fr = json_get(root, "force_reply");
+    if (!fr || fr->t == JS_NULL) return 0;
+    ch->has_force = 1;
+    if (fr->t == JS_STR) {
+        if ((int)strlen(fr->s) != fr->n) return bad(e, "force_reply", "'force_reply' must not contain NUL characters%s", NULL);
+        if (!(ch->force.text = strdup(fr->s))) return bad(e, NULL, "out of memory%s", NULL);
+        ch->force_raw = 1;
+        return 0;
+    }
+    if (fr->t != JS_OBJ) return bad(e, "force_reply", "'force_reply' must be a string or an assistant message object%s", NULL);
+    if (a->info.chat != RQ_CHAT_QWEN35 && a->info.chat != RQ_CHAT_QWEN38)
+        return bad(e, "force_reply", "'force_reply' as a message needs the Qwen3.5 / Qwen3.8 templates (a string works with any)%s", NULL);
+    const Js *tc = json_get(fr, "tool_calls");
+    if (tc && tc->t != JS_NULL && tc->t != JS_ARR) return bad(e, "force_reply", "'tool_calls' must be an array%s", NULL);
+    if (parse_calls(tc, &ch->force, e)) return -1;
+    if (!(ch->force.text = content_text(json_get(fr, "content"), "", e))) return -1;
+    size_t tl;
+    const char *t0 = rq_chat_trim(a->m, ch->force.text, &tl);
+    memmove(ch->force.text, t0, tl);
+    ch->force.text[tl] = 0;
+    const Js *rc = json_get(fr, "reasoning_content");
+    if (rc && rc->t == JS_STR && !(ch->force.reasoning = content_text(rc, "", e))) return -1;
+    if ((ch->force.reasoning && strstr(ch->force.reasoning, "</think>")) || (ch->force.reasoning && strstr(ch->force.text, "</think>")))
+        return bad(e, "force_reply", "a reply with reasoning_content must not contain </think>%s", NULL);
+    ch->force.role = MSG_ASSISTANT;
     return 0;
 }
 
@@ -373,31 +442,7 @@ static int parse_chat(App *a, const Js *root, Chat *ch, Job *j, ReqErr *e) {
                               : "unsupported message role '%.40s' (system, developer, user, assistant)", role->s);
         const Js *tc = json_get(m, "tool_calls");
         if (tc && tc->t != JS_NULL && (r != 2 || tc->t != JS_ARR)) return bad(e, "messages", "'tool_calls' must be an array, on an assistant message%s", NULL);
-        if (tc && tc->t == JS_ARR && tc->n > 0) {
-            Msg *x = &ch->msgs[i];
-            if (!(x->calls = calloc(tc->n, sizeof(MsgCall)))) return bad(e, NULL, "out of memory%s", NULL);
-            for (int k = 0; k < tc->n; k++) {
-                const Js *c = tc->v[k], *ty = json_get(c, "type"), *f = json_get(c, "function");
-                const Js *nm = json_get(f, "name"), *ar = json_get(f, "arguments");
-                if (c->t != JS_OBJ || (ty && ty->t != JS_NULL && !json_str_eq(ty, "function")) || !f || f->t != JS_OBJ)
-                    return bad(e, "messages", "each tool call must be {\"type\": \"function\", \"function\": {\"name\": ..., \"arguments\": ...}}%s", NULL);
-                if (!nm || nm->t != JS_STR || nm->n == 0 || (int)strlen(nm->s) != nm->n)
-                    return bad(e, "messages", "a tool call's function.name must be a non-empty string%s", NULL);
-                MsgCall *mc = &x->calls[x->ncalls++];
-                if (!(mc->name = strdup(nm->s))) return bad(e, NULL, "out of memory%s", NULL);
-                if (ar && ar->t == JS_STR) { // (OpenAI's form: a JSON text; "" or blank: none)
-                    char perr[200];
-                    size_t bl = strspn(ar->s, " \t\r\n");
-                    if ((int)bl < ar->n) {
-                        if (!(mc->doc = json_parse(ar->s, ar->n, perr, sizeof(perr))) || json_root(mc->doc)->t != JS_OBJ)
-                            return bad(e, "messages", "a tool call's function.arguments must be a JSON object (or its text)%s", NULL);
-                        mc->args = json_root(mc->doc);
-                    }
-                } else if (ar && ar->t == JS_OBJ) mc->args = ar;
-                else if (ar && ar->t != JS_NULL)
-                    return bad(e, "messages", "a tool call's function.arguments must be a JSON object (or its text)%s", NULL);
-            }
-        }
+        if (parse_calls(tc, &ch->msgs[i], e)) return -1;
         const Js *c = json_get(m, "content");
         if (r != 2 && (!c || c->t == JS_NULL)) return bad(e, "messages", "a %s message needs 'content'", role->s);
         if (!(ch->msgs[i].text = content_text(c, sep, e))) return -1;
@@ -418,6 +463,7 @@ static int parse_chat(App *a, const Js *root, Chat *ch, Job *j, ReqErr *e) {
             }
         }
     }
+    if (parse_force(a, root, ch, e)) return -1;
     long long n = 1;
     if (get_int(root, "n", 1, 1000000, &n, e)) return -1;
     if (n != 1) return bad(e, "n", "only n = 1 is supported%s", NULL);
@@ -554,6 +600,16 @@ static void usage_json(JBuf *b, const Job *j) {
               "\"prompt_tokens_details\": {\"cached_tokens\": %d}}", j->n_prompt, j->n_gen, j->n_prompt + j->n_gen, j->n_cached);
 }
 
+static void timings_json(JBuf *b, const Job *j) {
+    // llama.cpp's "timings" (prompt_n: the tokens prefilled, cache_n: reused) and runq's: the slot, its length at
+    // admission and its common prefix with the prompt (so a rollback to a checkpoint shows as common_tokens > cache_n)
+    double pre = j->t_first > 0 ? j->t_first - j->t_start : 0, gen = j->t_first > 0 && j->t_end > j->t_first ? j->t_end - j->t_first : 0;
+    jb_printf(b, "{\"prompt_n\": %d, \"prompt_ms\": %.3f, \"predicted_n\": %d, \"predicted_ms\": %.3f, \"cache_n\": %d, \"slot\": %d, "
+              "\"slot_tokens\": %d, \"common_tokens\": %d, \"copied\": %s, \"queue_ms\": %.3f}", j->n_prompt - j->n_cached, pre * 1e3, j->n_gen,
+              gen * 1e3, j->n_cached, j->slot, j->n_slot, j->n_common, j->copied ? "true" : "false",
+              j->t_start > 0 ? (j->t_start - j->t_submit) * 1e3 : 0.0);
+}
+
 static const char *finish_name(const Job *j) {
     return j->finish == FINISH_LENGTH ? "length" : j->calls.n > 0 ? "tool_calls" : "stop";
 }
@@ -583,6 +639,8 @@ static void wait_job(HttpConn *c, Job *j, double *next_check) {
     if (gone) __atomic_store_n(&j->cancel, 1, __ATOMIC_RELEASE);
 }
 
+static double sse_keepalive = 15; // seconds without a chunk before an SSE comment line (": keep-alive"; env RUNQ_SSE_KEEPALIVE)
+
 static void run_stream(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const char *id) {
     JBuf b = { 0 };
     size_t sent_c = 0, sent_r = 0;
@@ -594,9 +652,17 @@ static void run_stream(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const 
     if (ch->include_usage) jb_cstr(&b, ", \"usage\": null");
     jb_cstr(&b, "}\n\n");
     if (http_stream_write(c, b.p, b.n)) __atomic_store_n(&j->cancel, 1, __ATOMIC_RELEASE);
+    double last = rq_now();
     job_lock(j);
     for (;;) {
         int done = j->state == JOB_DONE;
+        if (!done && rq_now() - last > sse_keepalive) { // (a long queue wait or prefill: an SSE comment, so that clients'
+            job_unlock(j);                               // idle timeouts, e.g. pi's 300 s, do not end the stream)
+            if (http_stream_write(c, ": keep-alive\n\n", 14)) __atomic_store_n(&j->cancel, 1, __ATOMIC_RELEASE);
+            last = rq_now();
+            job_lock(j);
+            continue;
+        }
         if (j->content.n > sent_c || j->reasoning.n > sent_r) {
             jb_reset(&b);
             chunk_head(a, &b, id, ch);
@@ -617,6 +683,7 @@ static void run_stream(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const 
             jb_cstr(&b, "}\n\n");
             job_unlock(j);
             if (http_stream_write(c, b.p, b.n)) __atomic_store_n(&j->cancel, 1, __ATOMIC_RELEASE);
+            last = rq_now();
             job_lock(j);
             continue;
         }
@@ -631,6 +698,7 @@ static void run_stream(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const 
             jb_cstr(&b, "}\n\n");
             job_unlock(j);
             if (http_stream_write(c, b.p, b.n)) __atomic_store_n(&j->cancel, 1, __ATOMIC_RELEASE);
+            last = rq_now();
             job_lock(j);
             continue;
         }
@@ -652,6 +720,8 @@ static void run_stream(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const 
             chunk_head(a, &b, id, ch);
             jb_cstr(&b, "], \"usage\": ");
             usage_json(&b, j);
+            jb_cstr(&b, ", \"timings\": ");
+            timings_json(&b, j);
             jb_cstr(&b, "}\n\n");
         }
     }
@@ -703,6 +773,8 @@ static void run_once(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const ch
         jb_cstr(&b, "null");
     jb_printf(&b, ", \"finish_reason\": \"%s\"}], \"usage\": ", finish_name(j));
     usage_json(&b, j);
+    jb_cstr(&b, ", \"timings\": ");
+    timings_json(&b, j);
     jb_cstr(&b, "}");
     if (b.oom) {
         jb_free(&b);
@@ -720,6 +792,15 @@ static int render_req(App *a, Chat *ch, Job *j, ReqErr *e) {
     char msg[400] = "";
     int rc = ch->tmode ? tools_render(a->m, a->info.chat, ch->tools, ch->msgs, ch->n_msgs, j->thinking, &j->prompt, msg, sizeof(msg))
                        : render(a->m, a->info.chat, ch->msgs, ch->n_msgs, j->thinking, &j->prompt);
+    if (rc == RQ_OK && ch->has_force) { // (force_reply: its tokens, as one text after the prompt)
+        if (j->con || j->top_logprobs >= 0) return bad(e, "force_reply", "'force_reply' cannot be combined with json_schema or logprobs%s", NULL);
+        JBuf t = { 0 };
+        if (ch->force_raw) jb_cstr(&t, ch->force.text);
+        else rc = tools_reply_text(a->m, a->info.chat, &ch->force, j->thinking, &t);
+        if (rc == RQ_OK && t.oom) rc = RQ_ERR_NOMEM;
+        if (rc == RQ_OK && t.n > 0) rc = rq_tokenize(a->m, t.p, (long)t.n, &j->force);
+        jb_free(&t);
+    }
     if (rc == RQ_OK) return 0;
     e->status = rc == RQ_ERR_NOMEM ? 500 : 400;
     if (msg[0]) snprintf(e->msg, sizeof(e->msg), "%s", msg);
@@ -876,7 +957,10 @@ static void usage(void) {
             "                      file is >= 1/4 of the RAM)\n"
             "  -b <int>            prompt tokens per pass when no request is decoding, default 512\n"
             "  --chunk <int>       prompt tokens per pass while others decode, default 64\n"
-            "  --prefix-copy <int> copy a running request's prompt prefix if that saves this many tokens, default 32 (0: never)\n"
+            "  --prefix-copy <int> copy a cached prompt prefix into another slot if that saves this many tokens, default 32\n"
+            "                      (0: never)\n"
+            "  --checkpoints <int> Qwen3.5 / 3.8: recurrent-state checkpoints per slot (the end of the system prompt, the\n"
+            "                      assistant header, the turn's first reply, the reply's end), 1..32, default 4\n"
             "  --queue <int>       requests waiting at most (more: 503), default 64\n"
             "  --max-conns <int>   connections at most (more: 503), default 128\n"
             "  --max-body <bytes>  request body limit (more: 413), default 4194304\n"
@@ -894,9 +978,11 @@ static void usage(void) {
 int serve_main(int argc, char **argv) {
     // argv[0] = "serve"
     if (argc < 2 || argv[1][0] == '-') usage();
+    const char *ka = getenv("RUNQ_SSE_KEEPALIVE"); // (seconds; tests use a short one)
+    if (ka && atof(ka) > 0) sse_keepalive = atof(ka);
     const char *path = argv[1], *name = NULL, *host = "127.0.0.1", *key = NULL;
     int port = 8080, ctx = 8192, kv = RQ_KV_DEFAULT, batch = RQ_BATCH_MAX, slots = 0, queue = 64, conns = 128, threads = 0, verbose = 0, maxtok = 0;
-    int parallel = 16, chunk = 64, copy_min = 32;
+    int parallel = 16, chunk = 64, copy_min = 32, ckpts = 4;
     long long maxbody = 4 << 20;
     double timeout = 600, temp = 1.0, topp = 1.0, kv_mem = 0, mem = 0;
     int page_cache = 0;
@@ -929,6 +1015,7 @@ int serve_main(int argc, char **argv) {
         }
         else if (!strcmp(f, "--chunk")) chunk = atoi(v);
         else if (!strcmp(f, "--prefix-copy")) copy_min = atoi(v);
+        else if (!strcmp(f, "--checkpoints")) ckpts = atoi(v);
         else if (!strcmp(f, "--queue")) queue = atoi(v);
         else if (!strcmp(f, "--max-conns")) conns = atoi(v);
         else if (!strcmp(f, "--max-body")) maxbody = atoll(v);
@@ -941,7 +1028,7 @@ int serve_main(int argc, char **argv) {
         else usage();
     }
     if (port < 0 || port > 65535 || ctx < 16 || slots < 0 || slots > 1024 || parallel < 1 || parallel > 256 || kv_mem < 0 || chunk < 1 ||
-        copy_min < 0 || queue < 1 || conns < 1 || maxbody < 1024 || temp < 0 || temp > 2 || topp <= 0 || topp > 1 || topk < 0 || maxtok < 0 || batch < 1)
+        copy_min < 0 || ckpts < 1 || ckpts > RQ_CHECKPOINTS_MAX || queue < 1 || conns < 1 || maxbody < 1024 || temp < 0 || temp > 2 || topp <= 0 || topp > 1 || topk < 0 || maxtok < 0 || batch < 1)
         usage();
     if (batch > RQ_BATCH_MAX) batch = RQ_BATCH_MAX;
 
@@ -952,7 +1039,7 @@ int serve_main(int argc, char **argv) {
     char err[512];
     // (positions up to -c: the default cap of 40,960 would clamp a larger -c; the memory check counts one sequence of -c
     // positions, the pool is bounded by --kv-mem)
-    RqModelOpts mo = { ctx, 0, 0, mem, kv == RQ_KV_F32 ? 4 : 2, page_cache };
+    RqModelOpts mo = { ctx, 0, 0, mem, kv == RQ_KV_F32 ? 4 : 2, page_cache, ckpts };
     RqModel *m = rq_model_load(path, &mo, err, sizeof(err));
     if (!m) { fprintf(stderr, "%s\n", err); return 1; }
     App a;
@@ -986,7 +1073,7 @@ int serve_main(int argc, char **argv) {
         else if (n > 4 && !strcmp(b + n - 4, ".bin")) n -= 4;
         snprintf(a.model_id, sizeof(a.model_id), "%.*s", (int)n, b);
     }
-    EngineOpts eo = { path, ctx, kv, batch, chunk, parallel, slots, kv_mem, copy_min, queue, verbose };
+    EngineOpts eo = { path, ctx, kv, batch, chunk, parallel, slots, kv_mem, copy_min, queue, verbose, ckpts };
     double t0 = rq_now();
     a.eng = engine_start(m, &eo, err, sizeof(err));
     if (!a.eng) { fprintf(stderr, "runq serve: %s\n", err); return 1; }

@@ -755,8 +755,8 @@ def q35_server38(a, d):
 
 def q35_serve_slots(a):
     """runq serve's slot budget on the 0.8B (engine.c): a slot counts its KV cache, its recurrent state and the state's
-    checkpoints (2), as computed here from the file's metadata; --kv-mem 0.25 GiB at -c 2048 holds 3 slots of ~82 MiB
-    (the KV cache alone, 24 MiB, would allow 10): [(ok, name, detail)]"""
+    checkpoints (--checkpoints, default 4), as computed here from the file's metadata; --kv-mem 0.25 GiB at -c 2048
+    holds 2 slots of ~121 MiB (the KV cache alone, 24 MiB, would allow 10): [(ok, name, detail)]"""
     import re
     f = G.GgufFile(a.q35)
     kv = lambda k: int(f.kv[f"qwen35.{k}"])
@@ -768,7 +768,7 @@ def q35_serve_slots(a):
     pg = lambda n: -(-n // 4096) * 4096
     kv_b = 2 * pg(n_attn * ctx * kv("attention.head_count_kv") * kv("attention.key_length") * 2) + 4 * ctx  # (+ the token array)
     state = pg((L - n_attn) * (((conv - 1) * conv_dim + 15) // 16 * 16 + nv * dk * dv) * 4)
-    per = kv_b + 3 * state
+    per = kv_b + 5 * state
     want = int(budget // per)
     p = subprocess.Popen([a.runq, "serve", a.q35, "--port", "0", "-c", str(ctx), "--slots", "8", "--parallel", "2", "--kv-mem", "0.25",
                           "--threads", "2"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
@@ -785,11 +785,11 @@ def q35_serve_slots(a):
         except subprocess.TimeoutExpired:
             p.kill()
     m = re.search(r"(\d+) slot\(s\) of 2048 positions \(per slot ([\d.]+) MiB: KV \d+ KB per position \+ recurrent state ([\d.]+) MiB "
-                  r"x \(1 \+ 2 checkpoints\)", "".join(lines))
+                  r"x \(1 \+ 4 checkpoints\)", "".join(lines))
     got = (int(m.group(1)), float(m.group(2)), float(m.group(3))) if m else None
     ok = bool(m) and got[0] == want and abs(got[1] - per / 2**20) < 0.06 and abs(got[2] - state / 2**20) < 0.06 and want < budget // kv_b
     return [(ok, "q35/serve_slots", f"--kv-mem 0.25 -c 2048: {got[0] if m else '?'} slot(s) of {got[1] if m else '?'} MiB "
-             f"(want {want} of {per / 2**20:.1f} MiB: KV {kv_b / 2**20:.1f} + 3 x state {state / 2**20:.1f}; KV alone: {int(budget // kv_b)})"
+             f"(want {want} of {per / 2**20:.1f} MiB: KV {kv_b / 2**20:.1f} + 5 x state {state / 2**20:.1f}; KV alone: {int(budget // kv_b)})"
              + ("" if m else f"; no info line in {''.join(lines)[-300:]!r}"))]
 
 

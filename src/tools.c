@@ -366,6 +366,42 @@ static char *trimmed_copy(const RqModel *m, const char *s, size_t n) {
     return t;
 }
 
+static int assistant_body(JBuf *b, const RqModel *m, int chat, const Msg *x, int think) {
+    // an assistant message after its header (render_assistant), its reasoning R and content C from reasoning_content|trim;
+    // else from a content with </think>: Qwen3.5's template (R: before the first </think>, after the last <think> there; C:
+    // after the last </think>, lstrip('\n')), runq's Qwen3.8 form (R: before the last </think>, after the last <think>
+    // there; C: after it; both trimmed). RQ_OK or RQ_ERR_NOMEM
+    int q38 = chat == RQ_CHAT_QWEN38, e = RQ_OK;
+    const char *t = x->text, *last = strstr(t, "</think>"), *p, *c = t;
+    char *rt = NULL, *ct = NULL;
+    if (x->reasoning) rt = trimmed_copy(m, x->reasoning, strlen(x->reasoning));
+    else if (last) {
+        const char *e1 = last, *rs = t;
+        while ((p = strstr(last + 8, "</think>"))) last = p;
+        const char *re = q38 ? last : e1;
+        for (const char *q = t; (p = strstr(q, "<think>")) && p + 7 <= re; q = p + 7) rs = p + 7;
+        rt = trimmed_copy(m, rs, (size_t)(re - rs));
+        if (q38) c = ct = trimmed_copy(m, last + 8, strlen(last + 8));
+        else c = last + 8 + strspn(last + 8, "\n");
+    } else rt = trimmed_copy(m, "", 0);
+    if (!rt || (q38 && last && !x->reasoning && !ct)) e = RQ_ERR_NOMEM;
+    else if (render_assistant(b, m, chat, rt, c, x->calls, x->ncalls, think) < 0) e = RQ_ERR_NOMEM;
+    free(rt);
+    free(ct);
+    return e;
+}
+
+int tools_reply_text(const RqModel *m, int chat, const Msg *x, int thinking, JBuf *out) {
+    // (the generation prompt ends with "<think>\n" (thinking) or the empty think block: what follows is the reply)
+    JBuf b = { 0 };
+    int e = assistant_body(&b, m, chat, x, thinking);
+    size_t skip = thinking ? 8 : 0, end = b.n >= 11 ? b.n - 11 : b.n; // ("<think>\n", "<|im_end|>\n")
+    if (e == RQ_OK && end > skip) jb_raw(out, b.p + skip, end - skip);
+    if (e == RQ_OK && out->oom) e = RQ_ERR_NOMEM;
+    jb_free(&b);
+    return e;
+}
+
 int tools_render(const RqModel *m, int chat, const ToolSet *ts, const Msg *msg, int n, int thinking, RqTokens *out,
                  char *err, size_t errlen) {
     // the conversation as the template renders it (the header comment); the texts in msg are already trimmed
@@ -431,25 +467,7 @@ int tools_render(const RqModel *m, int chat, const ToolSet *ts, const Msg *msg, 
             jb_cstr(&b, "<|im_end|>\n");
         } else if (x->role == MSG_ASSISTANT) {
             jb_cstr(&b, "<|im_start|>assistant\n");
-            // reasoning R and content C: reasoning_content|trim; else from a content with </think>: Qwen3.5's template
-            // (R: before the first </think>, after the last <think> there; C: after the last </think>, lstrip('\n')),
-            // runq's Qwen3.8 form (R: before the last </think>, after the last <think> there; C: after it; both trimmed)
-            const char *t = x->text, *last = strstr(t, "</think>"), *p, *c = t;
-            char *rt = NULL, *ct = NULL;
-            if (x->reasoning) rt = trimmed_copy(m, x->reasoning, strlen(x->reasoning));
-            else if (last) {
-                const char *e1 = last, *rs = t;
-                while ((p = strstr(last + 8, "</think>"))) last = p;
-                const char *re = q38 ? last : e1;
-                for (const char *q = t; (p = strstr(q, "<think>")) && p + 7 <= re; q = p + 7) rs = p + 7;
-                rt = trimmed_copy(m, rs, (size_t)(re - rs));
-                if (q38) c = ct = trimmed_copy(m, last + 8, strlen(last + 8));
-                else c = last + 8 + strspn(last + 8, "\n");
-            } else rt = trimmed_copy(m, "", 0);
-            if (!rt || (q38 && last && !x->reasoning && !ct)) e = RQ_ERR_NOMEM;
-            else if (render_assistant(&b, m, chat, rt, c, x->calls, x->ncalls, q38 || i > lq) < 0) e = RQ_ERR_NOMEM;
-            free(rt);
-            free(ct);
+            e = assistant_body(&b, m, chat, x, q38 || i > lq);
         } else { // tool
             if (i > 0 && msg[i - 1].role != MSG_TOOL) jb_cstr(&b, "<|im_start|>user");
             jb_cstr(&b, "\n<tool_response>\n");

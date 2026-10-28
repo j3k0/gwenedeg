@@ -248,7 +248,10 @@ processed. Implemented (llama.cpp handles hybrid and SWA models the same way, "c
   (the history drops `<think>\n` and the reasoning), as does a reply cut at a stop string or re-tokenized
   differently from its text. A non-thinking chat's next turn usually starts exactly at the cache's length (no
   rollback). The engine scores slots by what they can keep (`rq_seq_keep`) and does not wait for another job's
-  prefix being prefilled (its state is gone by then).
+  prefix being prefilled (its state is gone by then). Since G5 the server asks for more per request (`--checkpoints`,
+  default 4: the header, the end of the system block, the turn's first reply, the reply's `</think>` and its end) and
+  drops a slot's other checkpoints first (`rq_seq_checkpoints` / `rq_seq_checkpoint_drop`), so that an agent's next
+  turn prefills only its new tokens ([server.md](server.md#agent-sessions-pi-the-replay-benchmark-checkpoints-compaction)).
 
 **4. Batched decode across sequences:** the matmuls stay row-batched as now. The recurrence items are
 (sequence, head) over each sequence's own state, so a sequence alone and in a batch run the same per-head

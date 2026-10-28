@@ -88,8 +88,9 @@ threads; G0 replaces them):
 - **Decode at ~90k:** each token reads ~17 GB of weights + ~6 GB of KV and does ~35 GFLOP of attention: ~4-5 tok/s
   plain (8.5 at short context). Speculation's gain shrinks there: a verify segment shares the KV read, but its
   attention work grows with its rows.
-- **Compaction:** the summary request prefills the serialized history from scratch (20-60k tokens: tens of
-  minutes), then the next request re-prefills the kept ~20k after the system prompt.
+- **Compaction:** the summary request prefills the serialized history from scratch (measured at 96k: ~18k tokens,
+  ~32% of the summarized context), then the next request re-prefills the summary and the kept ~20k after the system
+  block (its checkpoint since G5): ~28-33 min on the 27B at 8 threads, ~17-21 at 16 (G5 below).
 - **Tools:** done (G1, docs/server.md): `runq serve` renders tools and tool history as the Qwen3.5 / 3.8 templates do and
   returns the XML calls as OpenAI `tool_calls`; pi's agent loop (read / bash, thinking on) ran against the 0.8B. Not yet
   run against the 27B (its first pi session belongs to G0's replay).
@@ -112,7 +113,13 @@ more than its new tokens plus the last reply.
   has the numbers and a turn-latency model extrapolated to the 27B (decode ~4.8 / 5.6 tok/s at 98k with 8 / 16
   threads, a 2.5k-chunk prefill ~250 / ~145 s, ~200 / ~111 s since G4; a verify row at 98k adds ~80-90% of a step's
   attention, so k = 3 passes cost ~2.2x a step there, ~2.0x since G4). Left of (b): the 27B run itself, alone on the
-  box (the command is in that section); (a) not started. (c) done on proxies (2026-10-27, `scripts/lookup_accept.py`, docs/qwen38-speculative.md, "Prompt
+  box (the command is in that section).
+  (a) **done** (2026-10-28): `scripts/replay_sessions.py` (+ `scripts/replay_pi.mjs`: pi's own code builds each
+  request from the session, pi's compaction runs at the server's window, replies forced to the recorded ones through
+  `force_reply` or generated with `--mode live`; per request the reused prefix, prefilled / new tokens, divergences
+  and rollbacks from the response's `timings`, times; docs/server.md, "Agent sessions"), run on the 0.8B at 32k and
+  96k on two sessions (G5's numbers). Left of (a): the speculation stats per turn (S8: the server has no draft yet)
+  and the 27B's own run.. (c) done on proxies (2026-10-27, `scripts/lookup_accept.py`, docs/qwen38-speculative.md, "Prompt
   lookup"): pi's sessions rendered as Qwen3.8 (4,508 replies, 2.0 M tokens before position 98k: other models'
   replies, the 27B's are not recorded), teacher-forced: the prompt lookup alone 1.56 tokens per pass (k 3; syntax 2.9,
   edits' old text 2.6, reasoning / prose 1.3), the 0.8B draft 2.40 (k 3; on a 95k-token subset up to 32k positions),
@@ -154,7 +161,9 @@ more than its new tokens plus the last reply.
     generic, AVX-512 and NEON kernels on one definition. Halves the KV (3 GiB at 96k) and its read per token.
   - The draft's own cost: its KV cache at 96k (~1.1 GiB) and its attention there. Its guesses never change the
     output, so it can run on a shorter recent window (measure the acceptance lost, G0).
-  - The checkpoint budget: 150 MiB each for the 27B (the prompt's, the speculative ones, a reply's end: G5).
+  - The checkpoint budget: 150 MiB each for the 27B (the prompt's, the speculative ones, a reply's end: G5). Since G5
+    `runq serve` keeps `--checkpoints` (default 4: 0.59 GiB per slot on the 27B) and counts them; Qwen3.8 needs 3
+    (the header, the system block, the `</think>` / the reply's end; the turn checkpoint is Qwen3.5's).
   Done when runq's estimate for a 96k session with the draft and speculation leaves >= 2 GiB of the available memory.
 - [ ] **G4. Prefill attention against a long cache** (from `IDEAS.md`, "bf16 dot products in prefill attention").
   A turn's chunk is ~2.5k queries against a ~90k-position cache: ~2.5x the matrix multiplies' time. (a) Spread the
@@ -175,30 +184,22 @@ more than its new tokens plus the last reply.
   split row block of the 27B at 98k); short passes (a turn's last few hundred rows) would gain more. Left: (b), the
   only way to 2x (fp32 has ~20% left; `vdpbf16ps` measured at 1 per cycle, ~1.74 TFLOPS at 8 threads: twice the
   FMA peak), with its KL measurement and C twin.
-- [ ] **G5. No re-prefill between turns, and cheaper compaction.** (Folds in "Checkpoints, measured", Qwen3.5.) A
-  turn appends to the cache, unless the harness sends the history differently from what was generated (reasoning
-  dropped, a reply re-serialized, a stop string): then the hybrid state rolls back to the last checkpoint at or
-  before the divergence. Take checkpoints at the end of the system prompt + tools (shared by every request, and kept
-  through compaction) and at each reply's end, besides the prompt's assistant header; the server keeps a session's
-  slot between turns (G0's replay shows the reused prefix per turn). Compaction: measure its two big prefills, then
-  the cheapest fix: e.g. pi's summary request served by a smaller model, or compaction settings
-  (`keepRecentTokens`, `reserveTokens`) that keep the re-prefill short. Done when the replay shows every non-compaction
-  turn prefilling only its new tokens (plus the last reply when the harness changed it).
-- [ ] **G6. Prompt-lookup drafting** (from `IDEAS.md`, "Speculative decoding by prompt lookup"). Agentic replies copy
-  from the context (an edit's old text, paths, identifiers, JSON echoing a tool result): draft the next tokens by
-  finding the last n-gram earlier in the context (no model, no memory), verified in the same loop as the model draft
-  (`rq_spec_run`; exact by construction). Combine them: the lookup when it finds a match, else the 0.8B. Measure the
-  acceptance on the recorded sessions first (G0); in the server as part of S8.
-  Status (2026-10-27): in the loop and the CLI (`RqSpecOpts.lookup` / `lookup_min`, `--lookup N [--lookup-min M]`,
-  with or without `-D`; `RqLookup`: chains over token pairs, the longest match of up to 16 tokens among the 64
-  latest; per-source stats), exact (the spec group: lookup alone and combined, Qwen3 and Qwen3.5 incl. the hybrid
-  rollbacks, == plain bitwise; a copy case), measured (G0 (c) above; speed in docs/qwen38-speculative.md, "Prompt
-  lookup"). Findings: alone ~1.5 tokens per pass on agentic replies (est. +35% for the 27B), 2.8-3.9x measured on
-  edits that return the prompt's code (Qwen3-1.7B, Qwen3.5-0.8B; the 0.6B draft 1.4-1.6x there); with the 0.8B
-  draft at short context it adds nothing (the draft guesses copies as well); at long context it is the cheap one
-  (G7 should pick it there). Left: the server (S8); G7's per-position choice between lookup and model; tool schemas
-  whose old / new text are string parameters (pi's `edits` array is JSON-escaped, so multi-line old text does not
-  match the raw file text in the context).
+- [ ] **G5 leftovers: re-prefill and compaction.** G5 is done (docs/server.md and docs/qwen38-speculative.md,
+  "Agent sessions": checkpoints at the system block's end, the assistant header, Qwen3.5's turn start, `</think>` and the
+  reply's end, `--checkpoints`, slot affinity, SSE keep-alive; on the 0.8B replay every tool turn prefills its new
+  tokens, or those plus the previous reply). Left: (a) the reply's own tokens for its span of the next prompt when the
+  text matches (no re-prefill after a non-canonical sampled token or an empty reasoning; but the prompt is then not the
+  canonical tokenization and the output depends on what was cached: opt-in only, if at all); (b) a pinned system-block
+  cache outside the slot pool for one-slot setups (the 27B at 96k: the summary request takes the only slot; ~0.7 GiB for
+  8k tokens); (c) pi-side, documented for users: `keepRecentTokens` ~8k (~7 min less per compaction on the 27B) and a
+  `session_before_compact` extension summarizing without reasoning or with a smaller model (pi has no per-task model
+  setting). A compaction costs ~28-33 min on the 27B at 8 threads (~6 normal turns): measure it on the 27B (G0).
+- [ ] **G6 leftovers: prompt lookup.** Prompt-lookup drafting is in (`--lookup N [--lookup-min M]`, with or without
+  `-D`; exact; docs/qwen38-speculative.md, "Prompt lookup": ~1.5 tokens per pass on agentic replies, 2.8-3.9x on edits
+  that return the prompt's code; with the 0.8B draft at short context it adds nothing; at long context it is the
+  cheap one). Left: in the server (S8); G7's per-position choice between the lookup and the model; tool schemas whose
+  old / new text are plain string parameters (pi's `edits` array is JSON-escaped, so multi-line old text does not match
+  the raw file text in the context: a pi-side change or a custom edit tool).
 - [ ] **G7. Speculation at long context.** A verify segment of k + 1 rows shares the KV read but multiplies the
   attention work (k = 3: 4x), so the best k falls as the context grows. Choose k (and tau) per pass from the
   position and the measured costs (G0), in the CLI and the server. Done when speculation is never slower than plain

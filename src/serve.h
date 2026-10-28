@@ -69,6 +69,9 @@ int tools_count(const ToolSet *ts);
 // else an error with a message in err (RQ_ERR_ARG: the request's fault)
 int tools_render(const RqModel *m, int chat, const ToolSet *ts, const Msg *msg, int n, int thinking, RqTokens *out,
                  char *err, size_t errlen);
+// an assistant message as the template renders it after the generation prompt (the reply the model would have
+// written: [R "\n</think>\n\n"] C, the calls; no <|im_end|>), appended to out as text
+int tools_reply_text(const RqModel *m, int chat, const Msg *x, int thinking, JBuf *out);
 
 typedef struct { char **v; int n, cap; } StrList;
 void strlist_free(StrList *l);
@@ -118,6 +121,8 @@ struct Job {
     int single_call;            // parallel_tool_calls: false (stop after the first call)
     unsigned long long call_seed; // the calls' ids
     double deadline;            // rq_now() time limit, 0 = none
+    RqTokens force;             // force_reply (a benchmark hook, scripts/replay_sessions.py): the reply's tokens, fed as if
+                                // sampled (in passes of several rows), then the end token; empty: generate
 
     // output (written by the engine under mu; serve.c reads it under mu)
     void *mu, *cv;              // pthread mutex / condition (engine.c)
@@ -129,6 +134,8 @@ struct Job {
     int status;                 // 0, or an HTTP error status (with errmsg / errcode)
     char errmsg[300], errcode[48];
     int n_prompt, n_cached, n_gen;
+    int n_slot, n_common;       // the slot's (or the copy source's) length at admission, its common prefix with the prompt
+    int copied;                 // the prefix was copied from another slot (rq_seq_copy)
     double t_submit, t_start, t_first, t_end; // rq_now()
     int cancel;                 // set by the connection (client gone): the engine stops at the next step
     int refs;                   // the submitter and the engine
@@ -144,9 +151,10 @@ typedef struct {
     int parallel;               // running jobs at most (--parallel; 0: 16)
     int slots;                  // sequences in the pool (running jobs + prefix caches; 0: parallel + 4)
     double kv_mem;              // GiB for the pool at most (slots x rq_seq_mem of ctx positions; 0: half the RAM, at most MemAvailable)
-    int copy_min;               // copy a running job's prefix if that saves >= this many tokens (0: never)
+    int copy_min;               // copy a cached prefix into another slot if that saves >= this many tokens (0: never)
     int queue;                  // queued jobs at most (waiting, not running)
     int verbose;
+    int checkpoints;            // Qwen3.5: recurrent-state checkpoints per slot (0: 4; engine.c, ck_plan_job)
 } EngineOpts;
 
 typedef struct Engine Engine;

@@ -67,6 +67,14 @@ static inline uint16_t f32_bf16(float f) {
     return (uint16_t)((u & 0x7fffffffu) > 0x7f800000u ? (u >> 16) | 0x40 : r);
 }
 
+static inline uint16_t f32_bf16_daz(float f) {
+    // vcvtneps2bf16 exactly: f32_bf16 after a denormal input is flushed to a zero of its sign (the bf16 dot-product
+    // attention's rounding of q and the softmax weights, the same in every build)
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    return (u & 0x7f800000u) ? f32_bf16(f) : (uint16_t)((u >> 16) & 0x8000u);
+}
+
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && !defined(RUNQ_GENERIC)
 #define RUNQ_VNNI 1
 #include <immintrin.h>
@@ -1434,17 +1442,18 @@ static void att512_kv(int kvt, int nv, const float *const *q, float *const *out,
  * accurate than the fp32 attention (README, docs/qwen38-speculative.md "G4"). A sequence's every path (prefill,
  * decode, verify, batched decode) uses its type, so the invariants (batched == sequential, threads, builds) hold.
  * Definition, per query vector and kv head, as the fp32 attention above except:
- *   bf16(x) = f32_bf16(x): round to nearest even (vcvtneps2bf16 on every non-denormal input; a denormal stays a bf16
- *        denormal, which the products below read as zero);
- *   q' = bf16(q[i]); K', V': a bf16-dot cache stores bf16(k), bf16(v) (f32_bf16, as -k bf16); an f16-dot cache stores
- *        f16 (as -k f16) and is read as bf16(the f16 value as fp32), i.e. rounded again (11 -> 8 significant bits);
+ *   bf16(x) = f32_bf16_daz(x) = vcvtneps2bf16: round to nearest even, a denormal input flushed to a zero of its sign;
+ *   q' = bf16(q[i]); K', V': a bf16-dot cache stores f32_bf16(k), f32_bf16(v) (as -k bf16: a bf16 denormal is read as
+ *        zero by the products below); an f16-dot cache stores f16 (as -k f16) and is read as bf16(the f16 value as
+ *        fp32), i.e. rounded again (11 -> 8 significant bits; never a denormal);
  *   dot(c, a, b) over a pair (a0, a1), (b0, b1): vdpbf16ps's lane, two FMAs, the odd element first:
  *        c = fma(a1, b1, c); c = fma(a0, b0, c), each rounded to nearest even, with DAZ on all inputs and FTZ on the
  *        results (flush when tiny after rounding, the sign kept: x86's MXCSR FTZ / DAZ rules; checked against the
  *        instruction on this CPU by build/bf16dp_test, tests/bf16dp_test.c);
  *   s[t] = (sum over chunks of ATT_DC = 32 dims, in order, of (the dot chain over the chunk's 16 dim pairs (2p,
  *        2p + 1), in order, from 0, of (q'[2p], q'[2p + 1]) x (k'[t][2p], k'[t][2p + 1]))) * scale;
- *   the softmax per block as before (m_b, e[t] = exp_att(s[t] - m_b)), then w[t] = bf16(e[t]) and l_b = the 16-lane
+ *   the softmax per block as before (m_b, e[t] = exp_att(s[t] - m_b) >= ~2^-125.1: no denormal), then w[t] = bf16(e[t])
+ *        and l_b = the 16-lane
  *        sum (+ tree) of the w[t] (the rounded weights, so that they are what the o_b chain multiplies);
  *   o_b[i] = the dot chain over the block's position pairs (t, t + 1), t = its first position + 2 j, in order, from 0,
  *        of (w[t], w[t + 1]) x (v'[t][i], v'[t + 1][i]); a position t + 1 the vector does not reach (its last
@@ -1464,7 +1473,7 @@ static void att512_kv(int kvt, int nv, const float *const *q, float *const *out,
 #ifdef __AVX512BF16__
 #define ATT512_DP_HW 1 // (bf16dp_test: the instruction is used)
 static inline __m512 att512_dp(__m512 c, __m512i a, __m512i b) { return _mm512_dpbf16_ps(c, (__m512bh)a, (__m512bh)b); }
-static inline __m256i att512_cvt_bf16(__m512 x) { return (__m256i)_mm512_cvtneps_pbh(x); } // = f32_bf16 (non-denormal)
+static inline __m256i att512_cvt_bf16(__m512 x) { return (__m256i)_mm512_cvtneps_pbh(x); } // = f32_bf16_daz
 #else
 #define ATT512_DP_HW 0
 static inline __m512 att512_dp(__m512 c, __m512i a, __m512i b) {
@@ -1473,12 +1482,14 @@ static inline __m512 att512_dp(__m512 c, __m512i a, __m512i b) {
     return _mm512_fmadd_ps(att512_bf_lo(a), att512_bf_lo(b), c);
 }
 static inline __m256i att512_cvt_bf16(__m512 x) {
-    // f32_bf16 of 16 values
+    // f32_bf16_daz of 16 values (vcvtneps2bf16)
     __m512i u = _mm512_castps_si512(x);
     __m512i r = _mm512_srli_epi32(_mm512_add_epi32(_mm512_add_epi32(u, _mm512_set1_epi32(0x7fff)),
                                                    _mm512_and_si512(_mm512_srli_epi32(u, 16), _mm512_set1_epi32(1))), 16);
     __mmask16 nan = _mm512_cmpgt_epu32_mask(_mm512_and_si512(u, _mm512_set1_epi32(0x7fffffff)), _mm512_set1_epi32(0x7f800000));
+    __mmask16 den = _mm512_testn_epi32_mask(u, _mm512_set1_epi32(0x7f800000));
     r = _mm512_mask_or_epi32(r, nan, _mm512_srli_epi32(u, 16), _mm512_set1_epi32(0x40));
+    r = _mm512_mask_and_epi32(r, den, _mm512_srli_epi32(u, 16), _mm512_set1_epi32(0x8000));
     return _mm512_cvtepi32_epi16(r);
 }
 #endif
@@ -1489,7 +1500,11 @@ static inline __m512i att512_f16_pairs(const uint16_t *a, const uint16_t *b) {
     // 16 f16 values at a and 16 at b -> 16 dwords bf16(a[l]) | bf16(b[l]) << 16 (fp32 exactly, then f32_bf16)
     __m512 fa = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)a));
     __m512 fb = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)b));
+#ifdef __AVX512BF16__
+    __m512i w = (__m512i)_mm512_cvtne2ps_pbh(fb, fa); // (fa's 16 below fb's; an f16 value is never an fp32 denormal)
+#else
     __m512i w = _mm512_inserti64x4(_mm512_castsi256_si512(att512_cvt_bf16(fa)), att512_cvt_bf16(fb), 1);
+#endif
     const __m512i il = _mm512_set_epi16(31, 15, 30, 14, 29, 13, 28, 12, 27, 11, 26, 10, 25, 9, 24, 8,
                                         23, 7, 22, 6, 21, 5, 20, 4, 19, 3, 18, 2, 17, 1, 16, 0);
     return _mm512_permutexvar_epi16(il, w); // words a0 b0 a1 b1 ...
@@ -1532,7 +1547,7 @@ static inline const char *att512_pf_take(Att512Pf *f, int *n) {
 static inline __attribute__((always_inline))
 void att512_qk_dot(const int NV, const int NT, const uint32_t *qp, const uint16_t *kt, size_t ts, int hd, __m512 scale, float *s,
                    const char *pf, int npf) {
-    // att512_qk on bf16 pairs: qp[p * NV + r] = vector r's dims 2p, 2p + 1 (q'), tile u at kt + u * ts; per ATT_DC dims
+    // att512_qk on bf16 pairs: qp[r * hd / 2 + p] = vector r's dims 2p, 2p + 1 (q'), tile u at kt + u * ts; per ATT_DC dims
     // a dot chain over its 16 pairs, the chunks added in order, times scale -> s[(u * NV + r) * 16 + j]. Meanwhile npf
     // (<= hd) cache lines from pf are prefetched into L2, two per dim pair (the next range of a sweep: att512_kv_dot)
     for (int i0 = 0; i0 < hd; i0 += ATT_DC) {
@@ -1549,7 +1564,7 @@ void att512_qk_dot(const int NV, const int NT, const uint32_t *qp, const uint16_
             for (int u = 0; u < NT; u++)
                 k[u] = _mm512_loadu_si512((const void *)(kt + u * ts + (size_t)p * 2 * ATT_T));
             for (int r = 0; r < NV; r++) {
-                __m512i qb = _mm512_set1_epi32((int)qp[p * NV + r]);
+                __m512i qb = _mm512_set1_epi32((int)qp[(size_t)r * (hd / 2) + p]);
                 for (int u = 0; u < NT; u++)
                     acc[r][u] = att512_dp(acc[r][u], k[u], qb);
             }
@@ -1636,10 +1651,10 @@ static void att512_group_dot(int nv, const float *const *q, float *const *out, f
         nmax = npr[r] > nmax ? npr[r] : nmax;
     }
     int ntl = (nmax + ATT_T - 1) / ATT_T, nbk = part ? (nmax + ATT_P - 1) / ATT_P : 1;
-    uint32_t qp[ATT512_HDMAX / 2 * ATT512_NV] __attribute__((aligned(64)));
-    for (int p = 0; p < hd / 2; p++)
-        for (int r = 0; r < nv; r++)
-            qp[p * nv + r] = (uint32_t)f32_bf16(q[r][2 * p]) | (uint32_t)f32_bf16(q[r][2 * p + 1]) << 16;
+    uint32_t qp[ATT512_HDMAX / 2 * ATT512_NV] __attribute__((aligned(64))); // vector r's dim pairs at r * hd / 2
+    for (int r = 0; r < nv; r++)
+        for (int i = 0; i < hd; i += 16) // (bf16 of 16 dims at a time)
+            _mm256_storeu_si256((__m256i *)(qp + (size_t)r * (hd / 2) + i / 2), att512_cvt_bf16(_mm512_loadu_ps(q[r] + i)));
     __m512 sc = _mm512_set1_ps(scale);
 
     #define ATT512_QKD(V, T) case (V) * 8 + (T): att512_qk_dot(V, T, qp, kt + (size_t)(tb / ATT_PT) * bs + (size_t)(tb % ATT_PT) * ts, ts, hd, sc, s + (size_t)tb * nv * ATT_T, pfp, npf); break;

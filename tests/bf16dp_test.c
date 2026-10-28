@@ -13,10 +13,9 @@
  *      the emulation in the -emu build), the C twin of the generic build (two fmaf under MXCSR FTZ / DAZ, as
  *      forward.c's attention_vec_dot) and an exact reference independent of MXCSR (double FMA + explicit DAZ / FTZ),
  *      all bit-identical (NaN results: NaN in each; the payloads of the twin and the instruction agree here too);
- *   3. the conversions: att512_cvt_bf16 (vcvtneps2bf16, or its integer emulation) == f32_bf16 on all 2^32 fp32 inputs
- *      except denormals (the instruction flushes them to signed zero, f32_bf16 keeps bf16 denormals: the products read
- *      both as zero; the attention's weights are never denormal), and att512_f16_pairs == f32_bf16(f16 -> fp32) on all
- *      2^16 f16 values in both halves.
+ *   3. the conversions: att512_cvt_bf16 (vcvtneps2bf16, or its integer emulation) == f32_bf16_daz (round to nearest
+ *      even after flushing a denormal to a zero of its sign) on all 2^32 fp32 inputs, and att512_f16_pairs ==
+ *      f32_bf16(f16 -> fp32) on all 2^16 f16 values in both halves.
  * Exit status 0 if all equal. Measured on the dev box (AMD EPYC Genoa, Zen 4): all equal, 2^24 lanes x 6 in ~3 s. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -208,7 +207,7 @@ int main(int argc, char **argv) {
         check(!mh && !mk && !mt && !mx, "bf16dp/random", d);
     }
 
-    // 3. conversions: att512_cvt_bf16 == f32_bf16 (all fp32 but denormals), att512_f16_pairs == f32_bf16(f16 as fp32)
+    // 3. conversions: att512_cvt_bf16 == f32_bf16_daz (all 2^32 inputs), att512_f16_pairs == f32_bf16(f16 as fp32)
     long cbad = 0, cden = 0;
     for (uint64_t u0 = 0; u0 < (1ull << 32); u0 += 16) {
         uint32_t in[16];
@@ -216,14 +215,13 @@ int main(int argc, char **argv) {
         for (int l = 0; l < 16; l++) in[l] = (uint32_t)(u0 + l);
         _mm256_storeu_si256((__m256i *)out, att512_cvt_bf16(_mm512_castsi512_ps(_mm512_loadu_si512(in))));
         for (int l = 0; l < 16; l++) {
-            if (out[l] == f32_bf16(fb(in[l]))) continue;
-            if (!(in[l] & 0x7f800000u) && (in[l] & 0x7fffffu)) cden++; // (a denormal: the instruction flushes)
-            else cbad++;
+            cbad += out[l] != f32_bf16_daz(fb(in[l]));
+            cden += out[l] != f32_bf16(fb(in[l])); // (the denormals f32_bf16 rounds: why q uses f32_bf16_daz)
         }
     }
-    snprintf(d, sizeof(d), "att512_cvt_bf16 vs f32_bf16 on all 2^32 inputs: %ld differ (+ %ld denormals, the instruction's flush%s)",
-             cbad, cden, ATT512_DP_HW ? "" : ": none with the emulation");
-    check(!cbad && (ATT512_DP_HW || !cden), "bf16dp/cvt", d);
+    snprintf(d, sizeof(d), "att512_cvt_bf16 vs f32_bf16_daz on all 2^32 inputs: %ld differ (vs f32_bf16: %ld, the denormals)",
+             cbad, cden);
+    check(!cbad, "bf16dp/cvt", d);
     long pbad = 0;
     for (int h0 = 0; h0 < 65536; h0 += 16) {
         uint16_t va[16], vb[16];

@@ -1341,7 +1341,7 @@ ATT_EXACT static inline float att_dot2(float c, float a1, float b1, float a0, fl
     return ATT_FMA(a0, b0, c);
 }
 
-static inline float bf16_round(float x) { return bf16_f32(f32_bf16(x)); }
+static inline float bf16_round(float x) { return bf16_f32(f32_bf16_daz(x)); } // (the definition's bf16(x), as fp32)
 
 ATT_EXACT static void attention_vec_dot(const float *qb, float *out, float *ml, int n, const float *kt, const float *vt,
                                         size_t ts, int hd, float scale, float *S) { RQ_FP_EXACT
@@ -1412,9 +1412,9 @@ static void kv_block_dot(int kvt, float *kf, float *vf, const uint16_t *kh, cons
     // tile layout (kv_block_f32 for the dot products: an f16 element rounded to bf16, the bf16-dot V in position pairs)
     size_t ne = (size_t)ntl * ATT_T * hd;
     if (kvt == KV_F16) {
-        for (size_t e = 0; e < ne; e++) {
-            kf[e] = bf16_round(fp16_to_f32(kh[e]));
-            vf[e] = bf16_round(fp16_to_f32(vh[e]));
+        for (size_t e = 0; e < ne; e++) { // (an f16 value is never an fp32 denormal: f32_bf16 = f32_bf16_daz)
+            kf[e] = bf16_f32(f32_bf16(fp16_to_f32(kh[e])));
+            vf[e] = bf16_f32(f32_bf16(fp16_to_f32(vh[e])));
         }
         return;
     }

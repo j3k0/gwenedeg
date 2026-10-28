@@ -142,8 +142,8 @@ checkpoints))", the script's estimate below.
   for the 27B runs; they used ~7.5 GB, 6.2 of it a uvicorn) ~24 GB is available: **Q4_K_M** it is, no Q3_K. Disk:
   58 GB free, `models/` 29 GB; `/tmp` is a 16 GB tmpfs (RAM): never put model files or venvs there.
 - `runq serve`'s slot budget (`--kv-mem`, default half the RAM and at most MemAvailable after the load) counts a slot's
-  KV cache, recurrent state and its 2 checkpoints: 0.94 GiB per 27B slot at `-c 8192` (0.5 GiB KV + 0.44 GiB), shown
-  in the startup line.
+  KV cache, recurrent state and its checkpoints (`--checkpoints`, default 4 since G5: 1.23 GiB per 27B slot at `-c
+  8192`, 0.5 GiB KV + 5 x 150 MiB; with 2, as before G5, 0.94 GiB), shown in the startup line.
 
 ## Chat template (`tmpl_38.jinja`, differs from Qwen3.5's)
 
@@ -611,6 +611,59 @@ Its memory: weights 15.3 GiB + KV of 100,865 positions (6.2 GiB, 64 KiB each) + 
 threads) + 2 checkpoints (0.3): ~22.7 GiB; runq's load-time check refuses it if MemAvailable does not cover its
 estimate (`-m GiB` overrides; with less memory, `-L ...,90112`). ~15 min per thread count (one 2.5k chunk at 98k is
 ~2.5-4 min).
+
+## Agent sessions: replay and compaction (G0 (a), G5)
+
+The replay benchmark (`scripts/replay_sessions.py`, [server.md](server.md#agent-sessions-pi-the-replay-benchmark-checkpoints-compaction):
+pi's recorded sessions replayed through pi's own code against `runq serve`) on the 0.8B: with this work's checkpoints
+(the system block, the header, Qwen3.5's turn start, `</think>`, the reply's end) and slot affinity, every tool turn
+prefills its new tokens only, or those plus the previous reply when it comes back tokenized differently (an empty
+reasoning, a non-canonical sampled token); what is left is compaction and pi's own system-prompt changes.
+
+**What pi sends at a compaction** (measured, 23 compactions at 32k: S1 and S2, `keepRecentTokens` 8,192,
+`reserveTokens` 8,192): (1) the summary request: pi's summarization system prompt + one user message, the
+conversation before the kept part serialized as text (`[User]:` / `[Assistant]:` / `[Assistant tool calls]:` /
+`[Tool result]:`, reasoning omitted, tool results cut to 2,000 characters) and the instructions; with the session's
+thinking level (Qwen3.8: reasoning first). It shares nothing with the session (`<|im_start|>system\n`). Its prompt was
+~4-5k tokens for ~9-17k tokens of context summarized (2.3-10.4k), ~45%; at 96k with pi's defaults (S1's compaction
+past ~82k tokens, 20,000 kept): 17,537 tokens for ~55k summarized, **~32%**; a split turn adds a second, shorter one
+(turn prefix). (2) The next request: the system block (7-10k tokens with pi's prompt and tools) + the summary as a
+user message + the kept messages (~19-22k tokens at 32k; 32,838 at 96k, its system block 7,478); with the system
+block's checkpoint it prefills the summary and the kept part (~130k of 215k tokens over S1's 11 compactions at 32k,
+134k of 219k on S2's 12; before: everything).
+
+**On the 27B at 96k** (as measured on S1: an ~18k-token summary request; the next request 33k tokens, 7.5k of them
+the system block), with the turn-latency model above (prefill P tokens after L0 cached: P / R_mm + 16 x 0.048 us x
+(P L0 + P^2 / 2) at 8 threads, R_mm = 45 tok/s; decode t_w + 16 x 0.057 us x L per token, t_w = 118 ms; at 16 threads
+R_mm = 76, t_w = 97 ms, ~0.027 / 0.051 us):
+
+| step | 8 threads | 16 threads |
+|---|---|---|
+| summary request, 18k tokens from 0 | 400 + 124 = ~520 s | 237 + 70 = ~310 s |
+| its reply: the summary (~1.5k tokens at ~19k) | ~200 s | ~170 s |
+| + its reasoning (thinking on, say 2k tokens) | ~270 s | ~225 s |
+| next request: 25k new tokens after the 7.5k-token system block (the checkpoint) | 562 + 392 = ~950 s | 333 + 220 = ~550 s |
+| (the same without it: 33k from 0) | (729 + 413 = ~1,140 s) | (432 + 232 = ~660 s) |
+| **a compaction** | **~28-33 min** (~31-36 before) | **~17-21 min** (~19-23 before) |
+
+(A normal turn at ~80k, 2.5k new tokens and a 500-token reply: ~210 + ~95 s = ~5 min: a compaction costs ~6 turns.)
+The cheapest mitigations, in order:
+- **Done (runq):** the system block's checkpoint and slot affinity: the next request reuses the ~8k-token system block
+  (~200 s at 8 threads) if the summary request ran on another slot (`--slots 2`, if the memory allows it; with one slot
+  the summary takes the session's slot). Proposed: a pinned copy of the system block's KV and state outside the pool
+  (~0.7 GiB on the 27B for 8k tokens) for the one-slot case.
+- **pi's `keepRecentTokens`** (`~/.pi/agent/settings.json` `compaction.keepRecentTokens`, or per model in
+  `compaction.modelOverrides["provider/model"]`): 8,000 instead of 20,000 makes the next request ~11k new tokens (~350 s
+  instead of ~950 at 8 threads) for a summary request ~4.5k tokens longer (~+170 s): **~7 min less per compaction**, and
+  ~20% fewer compactions (the context restarts at ~18k tokens instead of ~33k), for less verbatim context.
+  `reserveTokens` only moves the trigger (a larger reserve: cheaper turns, more compactions; about even).
+- **The summary without reasoning**: pi sends the session's thinking level with it (the 27B reasons before the
+  summary); pi has no setting for it, but a `session_before_compact` extension that calls pi's `compact()` with thinking level
+  `off` saves its reasoning (~2-7 min).
+- **A smaller summarization model**: pi has no per-task model setting (`modelOverrides` only sets the token budgets);
+  an extension can summarize with another model (pi's `examples/extensions/custom-compaction.ts`), e.g. a second
+  `runq serve` with Qwen3.5-4B Q8_0 (~290 tok/s of prefill at 8 threads: an 18k-token request in ~1-2 min, its reply in
+  ~1 min, instead of ~12-17 min), memory permitting: not next to the 27B Q4_K_M at 96k (G3).
 
 ## Not now
 

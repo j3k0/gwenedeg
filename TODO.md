@@ -88,8 +88,9 @@ threads; G0 replaces them):
 - **Decode at ~90k:** each token reads ~17 GB of weights + ~6 GB of KV and does ~35 GFLOP of attention: ~4-5 tok/s
   plain (8.5 at short context). Speculation's gain shrinks there: a verify segment shares the KV read, but its
   attention work grows with its rows.
-- **Compaction:** the summary request prefills the serialized history from scratch (20-60k tokens: tens of
-  minutes), then the next request re-prefills the kept ~20k after the system prompt.
+- **Compaction:** the summary request prefills the serialized history from scratch (measured at 96k: ~18k tokens,
+  ~32% of the summarized context), then the next request re-prefills the summary and the kept ~20k after the system
+  block (its checkpoint since G5): ~28-33 min on the 27B at 8 threads, ~17-21 at 16 (G5 below).
 - **Tools:** done (G1, docs/server.md): `runq serve` renders tools and tool history as the Qwen3.5 / 3.8 templates do and
   returns the XML calls as OpenAI `tool_calls`; pi's agent loop (read / bash, thinking on) ran against the 0.8B. Not yet
   run against the 27B (its first pi session belongs to G0's replay).
@@ -111,8 +112,13 @@ more than its new tokens plus the last reply.
   on the 0.8B, the 4B (to 32k) and the 27B-shaped synthetic model; docs/qwen38-speculative.md, "Long-context costs",
   has the numbers and a turn-latency model extrapolated to the 27B (decode ~4.8 / 5.6 tok/s at 98k with 8 / 16
   threads, a 2.5k-chunk prefill ~250 / ~145 s; a verify row at 98k adds ~80-90% of a step's attention, so k = 3
-  passes cost ~2.2x a step there). Left of (b): the 27B run itself, alone on the box (the command is in that section);
-  (a) and (c) not started.
+  passes cost ~2.2x a step there). Left of (b): the 27B run itself, alone on the box (the command is in that section).
+  (a) **done** (2026-10-28): `scripts/replay_sessions.py` (+ `scripts/replay_pi.mjs`: pi's own code builds each
+  request from the session, pi's compaction runs at the server's window, replies forced to the recorded ones through
+  `force_reply` or generated with `--mode live`; per request the reused prefix, prefilled / new tokens, divergences
+  and rollbacks from the response's `timings`, times; docs/server.md, "Agent sessions"), run on the 0.8B at 32k and
+  96k on two sessions (G5's numbers). Left of (a): the speculation stats per turn (S8: the server has no draft yet)
+  and the 27B's own run. (c) not started.
 - [ ] **G2. Correctness at long context** (the 27B's retrieval left). Done on Qwen3.5 (2026-10-27, docs/qwen35.md,
   "Long context"): the opt-in `long` group (`tests/run_tests.sh --long-context`, `tests/check_long.py`,
   `build/long_ctx`) checks the 0.8B Q8_0 at 14 positions up to 98,303 and the 4B Q8_0 at 6 up to 32,767 against
@@ -148,7 +154,9 @@ more than its new tokens plus the last reply.
     generic, AVX-512 and NEON kernels on one definition. Halves the KV (3 GiB at 96k) and its read per token.
   - The draft's own cost: its KV cache at 96k (~1.1 GiB) and its attention there. Its guesses never change the
     output, so it can run on a shorter recent window (measure the acceptance lost, G0).
-  - The checkpoint budget: 150 MiB each for the 27B (the prompt's, the speculative ones, a reply's end: G5).
+  - The checkpoint budget: 150 MiB each for the 27B (the prompt's, the speculative ones, a reply's end: G5). Since G5
+    `runq serve` keeps `--checkpoints` (default 4: 0.59 GiB per slot on the 27B) and counts them; Qwen3.8 needs 3
+    (the header, the system block, the `</think>` / the reply's end; the turn checkpoint is Qwen3.5's).
   Done when runq's estimate for a 96k session with the draft and speculation leaves >= 2 GiB of the available memory.
 - [ ] **G4. Prefill attention against a long cache** (from `IDEAS.md`, "bf16 dot products in prefill attention").
   A turn's chunk is ~2.5k queries against a ~90k-position cache: ~2.5x the matrix multiplies' time. (a) Spread the
@@ -158,7 +166,7 @@ more than its new tokens plus the last reply.
   measurement decide; the instruction's exact rounding (two FMAs per pair, DAZ / FTZ, the odd element first) needs
   a C twin for the generic build, verified per CPU. Done when G0's 2.5k-chunk-at-90k prefill is ~2x faster, the
   thresholds hold, and the paths stay bitwise.
-- [ ] **G5. No re-prefill between turns, and cheaper compaction.** (Folds in "Checkpoints, measured", Qwen3.5.) A
+- [x] **G5. No re-prefill between turns, and cheaper compaction.** (Folds in "Checkpoints, measured", Qwen3.5.) A
   turn appends to the cache, unless the harness sends the history differently from what was generated (reasoning
   dropped, a reply re-serialized, a stop string): then the hybrid state rolls back to the last checkpoint at or
   before the divergence. Take checkpoints at the end of the system prompt + tools (shared by every request, and kept
@@ -167,6 +175,23 @@ more than its new tokens plus the last reply.
   the cheapest fix: e.g. pi's summary request served by a smaller model, or compaction settings
   (`keepRecentTokens`, `reserveTokens`) that keep the re-prefill short. Done when the replay shows every non-compaction
   turn prefilling only its new tokens (plus the last reply when the harness changed it).
+  Status (2026-10-28, docs/server.md "Agent sessions", docs/qwen38-speculative.md "Agent sessions"): **done** on the
+  0.8B replay. `runq serve` now asks per request for checkpoints at the assistant header, the end of the system
+  block, Qwen3.5's turn start, then the reply's `</think>` and its end (`--checkpoints`, default 4, counted in the
+  memory estimate; the slot's other checkpoints dropped first: `rq_seq_checkpoints` / `rq_seq_checkpoint_drop`), keeps
+  a conversation's slot from being cut by a request that shares only its prefix (the prefix copied elsewhere), and
+  streams SSE keep-alive comments (pi's 300 s HTTP idle timeout ended a 71k-token re-prefill). Replay (32k, two
+  sessions, 178 requests, 23 compactions): every tool turn prefills its new tokens, or those plus the previous reply
+  (an empty reasoning re-tokenized `\n\n`; a sampled non-canonical token: 4 of 21 turns in `--mode live`; never more);
+  Qwen3.5's user turns 165k -> 80k tokens (the turn checkpoint; its template drops the turn's reasoning); the
+  requests after a compaction 434k -> 265k (the system block reused); at 96k (one session, 74 requests) 519k -> 286k
+  tokens prefilled in all, the replay 1,951 -> 1,141 s. Left, proposals: (a) the reply's own tokens
+  for its span of the next prompt when the text matches (no re-prefill after a non-canonical sample, but the prompt
+  is no longer the canonical tokenization and a request's output then depends on what was cached: opt-in only); (b)
+  a pinned system-block cache outside the pool for one-slot setups (the 27B at 96k: the summary request takes the
+  only slot; ~0.7 GiB for 8k tokens); (c) pi-side: `keepRecentTokens` ~8k (~7 min less per compaction on the 27B)
+  and a `session_before_compact` extension summarizing without reasoning or with a smaller model (pi has no
+  per-task model setting).
 - [ ] **G6. Prompt-lookup drafting** (from `IDEAS.md`, "Speculative decoding by prompt lookup"). Agentic replies copy
   from the context (an edit's old text, paths, identifiers, JSON echoing a tool result): draft the next tokens by
   finding the last n-gram earlier in the context (no model, no memory), verified in the same loop as the model draft

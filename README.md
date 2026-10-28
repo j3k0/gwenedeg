@@ -74,7 +74,8 @@ CLI options (`./runq` without arguments prints them all):
 
 **Memory.** Before reading any weight, the loader estimates what the run needs from the file's tensor directory:
 the repacked weights, the runtime (tokenizer, metadata, a compute context of 512 rows) and one sequence of `-c`
-positions (its whole KV cache, and for Qwen3.5 the recurrent state with its 2 checkpoints). It refuses the file
+positions (its whole KV cache, and for Qwen3.5 the recurrent state with its 2 checkpoints; `runq serve`: its
+`--checkpoints`, default 4). It refuses the file
 with a one-line message and exit status 1 when that exceeds MemAvailable (Linux, the host's: a cgroup limit is not read; no check elsewhere
 unless `--mem` gives a budget): a smaller `-c` lowers it, `--mem 0` loads anyway. The estimate is within 3% of the peak RSS
 of a run that fills the context (Qwen3-0.6B to 8B, Qwen3.5-0.8B and 4B, [tests/README.md](tests/README.md#memory)).

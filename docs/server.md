@@ -23,11 +23,12 @@ curl -s localhost:8080/v1/chat/completions -d '{"messages": [{"role": "user", "c
 | `-c`, `--ctx N` | 8192 | positions per sequence (the context limit of a request) |
 | `--parallel N` | 16 | requests running at once (their rows batched in each forward pass); more wait in the queue |
 | `--slots N` | parallel + 4 | sequences in the pool: one per running request, the idle ones keep their tokens as prefix caches |
-| `--kv-mem GiB` | half the RAM, at most MemAvailable after the load | bound for the pool: slots x (the KV cache of ctx positions + for Qwen3.5 the recurrent state and its 2 checkpoints); `--slots` (and `--parallel`) are lowered to fit; the memory is touched only as used. The startup line shows the size of a slot (e.g. Qwen3-0.6B f16: 115 KB per position, 0.9 GiB at 8192; Qwen3.5-0.8B at 2048 positions: 12 KB per position + 19.3 MiB of state x 3 = 81.8 MiB; Qwen3.8-27B at 8192: 0.5 GiB + 150 MiB x 3 = 0.94 GiB) |
+| `--kv-mem GiB` | half the RAM, at most MemAvailable after the load | bound for the pool: slots x (the KV cache of ctx positions + for Qwen3.5 / 3.8 the recurrent state and its `--checkpoints` copies); `--slots` (and `--parallel`) are lowered to fit; the memory is touched only as used. The startup line shows the size of a slot (e.g. Qwen3-0.6B f16: 115 KB per position, 0.9 GiB at 8192; Qwen3.5-0.8B at 2048 positions: 12 KB per position + 19.3 MiB of state x (1 + 4) = 120.5 MiB; Qwen3.8-27B at 8192: 0.5 GiB + 150 MiB x 5 = 1.23 GiB) |
+| `--checkpoints N` | 4 | Qwen3.5 / 3.8: copies of the recurrent state a slot keeps (1..32; ~19 MiB each for the 0.8B, ~150 MiB for the 27B), where an agent's next requests leave the cache (below, Prefix reuse); counted in the slot's size and in the load check |
 | `--mem GiB` | MemAvailable | the load check (README, Memory): refuse to load if the weights, the runtime and one sequence of `-c` positions do not fit; `0` or `force`: no check |
 | `--page-cache auto\|drop\|keep` | auto | the model file's page cache after the load (auto: dropped if the file is >= 1/4 of the RAM) |
 | `-b N`, `--chunk N` | 512, 64 | prompt tokens per forward pass when no request is decoding / while others decode |
-| `--prefix-copy N` | 32 | copy a running request's cached prompt prefix into a new request's slot if that saves N tokens (0: never) |
+| `--prefix-copy N` | 32 | copy a cached prompt prefix into a new request's slot if that saves N tokens (a running request's; an idle slot's that would otherwise be cut, slot affinity below; 0: never) |
 | `-k` | f16 | KV cache type (as for the CLI) |
 | `--queue N` | 64 | requests waiting beyond the free running places at most (more: 503, `Retry-After: 1`) |
 | `--max-conns N`, `--max-body B` | 128, 4 MB | connections (more: 503), request body size (more: 413) |
@@ -44,11 +45,21 @@ array of `{"type": "text"}` parts), `tools` / `tool_choice` / `parallel_tool_cal
 `max_tokens` / `max_completion_tokens`, `temperature` (0 = greedy), `top_p`, `top_k` (an extension, as vLLM's
 and llama.cpp's: an integer, 0 or -1 = off; top-p then applies among the k), `seed`, `stop` (a string or
 up to 16), `n` (1 only), `stream` (SSE `data:` chunks, `data: [DONE]`, a final usage chunk with
-`stream_options.include_usage`), `logprobs` / `top_logprobs` (up to 20; not with `stream`), `response_format`
+`stream_options.include_usage`; a comment line `: keep-alive` after 15 s without a chunk, e.g. during a long prefill,
+so clients' idle timeouts do not end the stream: pi's `httpIdleTimeoutMs` is 300 s), `logprobs` / `top_logprobs` (up to 20; not with `stream`), `response_format`
 (`text`; `json_schema`, below; `json_object` is rejected with a message), thinking with `reasoning_effort`
 low / medium / high / xhigh (`none` / `minimal`: off) or `chat_template_kwargs.enable_thinking` (off by default,
-except Qwen3.8: below; the reasoning comes back as `reasoning_content`), and `cache_prompt: false` (llama.cpp's flag: prefill from scratch). `usage` counts
-prompt, completion and cached prompt tokens (`prompt_tokens_details.cached_tokens`); `finish_reason` is
+except Qwen3.8: below; the reasoning comes back as `reasoning_content`), `cache_prompt: false` (llama.cpp's flag: prefill from scratch)
+and `force_reply` (a benchmark hook, `scripts/replay_sessions.py`: the reply is not generated but given, as the
+model's raw text or, with the Qwen3.5 / 3.8 templates, as an assistant message `{content, reasoning_content,
+tool_calls}` rendered as the template renders an earlier reply; its tokens are output and parsed as if sampled and
+fed after the prompt in passes of several rows, then the reply ends as on the end token; not with `json_schema` or
+`logprobs`). `usage` counts
+prompt, completion and cached prompt tokens (`prompt_tokens_details.cached_tokens`); responses (and the stream's
+usage chunk) also carry llama.cpp's `timings` (`prompt_n`: tokens prefilled, `prompt_ms`, `predicted_n` /
+`predicted_ms`, `cache_n`) and runq's: `slot`, `slot_tokens` (its length when the request took it), `common_tokens`
+(its common prefix with the prompt: below `slot_tokens`, the history was sent differently from what was generated;
+above `cache_n`, the recurrent state rolled back to a checkpoint), `copied`, `queue_ms`; `finish_reason` is
 `stop`, `length` or `tool_calls`. Errors are OpenAI error objects: 400 (invalid request; a prompt longer than the context
 has `code: context_length_exceeded`), 401, 404, 405, 411 (chunked uploads), 413, 503 (queue full / shutting
 down), 504. Not supported: tools with Qwen3's templates (400), `tool_choice` required / a named function, the legacy
@@ -106,14 +117,26 @@ down), 504. Not supported: tools with Qwen3's templates (400), `tool_choice` req
   included) parsed, executed and answered, sessions of up to ~45 tool turns with thinking, each turn prefilling only its
   new tokens; the 0.8B itself is weak at the tasks (wrong paths, loops: it did not finish the edit task).
   `stream_options.include_usage`, `max_tokens` / `max_completion_tokens` (the latter wins) and `cache_prompt` work as
-  for other requests.
+  for other requests. Long sessions: below, Agent sessions.
 - **Prefix reuse**: a new request takes the idle slot with the longest common token prefix, truncated
   to it, and prefills only the rest (if that saves at least 32 tokens or half the prompt; else the least
   recently used idle slot). If a running request's slot shares a longer prefix, it is copied
   (`rq_seq_copy`, ~0.6-1.6 ms for LiteLLM's 253-token rubric vs ~110 ms to prefill it); if a request still
   being prefilled will share it, the new one waits for that part and copies it then (a burst of
   classifications prefills the rubric once). Logits are bit-identical to a fresh prefill (tested). A second
-  turn re-prefills only the new message; LiteLLM's classifier rubric stays cached.
+  turn re-prefills only the new message; LiteLLM's classifier rubric stays cached. **Slot affinity**: an idle slot
+  that would lose more tokens than it keeps (it shares only a prefix with the request, e.g. the system prompt with
+  another session or with the first request after a compaction) is not cut: the prefix is copied into the least
+  recently used other idle slot, so the conversation it holds finds it whole at its next request.
+  **Qwen3.5 / 3.8** (the recurrent state cannot be rewound: a slot can only go back to a checkpoint): each request
+  asks for checkpoints where its conversation's next requests leave the cache, in this order of priority within
+  `--checkpoints` (default 4): its assistant header (a reply sent back differently from what was generated), the
+  end of the system block (the system prompt and the tools: every request of the agent shares it, also the first
+  one after a compaction, and a new session), Qwen3.5's turn start (its template drops the reasoning of a turn's
+  replies at the next user query, so that request leaves the cache at the turn's first reply), then as the reply is
+  generated the position after its `</think>` (content or calls that come back tokenized differently roll back
+  there, not to the header) and its end (a retry or another branch after the reply). The slot's other checkpoints
+  are dropped first, so new ones never replace these. Measured with pi's sessions below (Agent sessions).
 - **Constrained decoding** (`response_format: json_schema`), for schemas with a finite set of outputs:
   `enum`, `const`, `boolean`, `null`, `integer` with `minimum` / `maximum` (up to 256 values), objects of
   those (nested; `required`, optional properties; property order as in the schema; no additional
@@ -176,6 +199,76 @@ prompts, `scripts/router_eval.jsonl`, written for this project; Step 9): Qwen3-0
 almost never says REASONING); Qwen3-1.7B Q8_0 79-88% at ~55 ms per classification; Qwen3-4B Q4_K_M
 79-92% at ~150 ms. Later, with the bigger models (Step 11): 1.7B Q8_0 88% at ~50 ms, Qwen3-4B-Instruct-2507
 Q4_K_M 88-92% at ~130 ms, Qwen3-8B Q4_K_M 92% at ~260 ms.
+
+## Agent sessions (pi): the replay benchmark, checkpoints, compaction
+
+**The tool** (TODO G0 (a)): `scripts/replay_sessions.py --model GGUF --ctx N --session FILE | --pick N` replays pi's
+recorded sessions (`~/.pi/agent/sessions/*/*.jsonl`: read locally, never copied; the results are numbers only, under
+`/var/tmp/runq-replay`) against a fresh `runq serve`, request by request, as pi sends them: `scripts/replay_pi.mjs` runs
+pi's own code from its install (pi-coding-agent's session context and `convertToLlm`, pi-ai's `openai-completions`
+provider: the same request body, the same SSE parsing into pi's assistant message), with the provider entry above and
+the server's context as the model's window, so pi's compaction triggers where it would (`shouldCompact`,
+`prepareCompaction`, `compact`: the summary requests go to the server too). `--mode force` (default): each reply is
+the recorded one, forced (`force_reply`: the recorded message as the template renders it, fed as if generated), and
+the next request carries the server's reply as pi parsed it: the cache sees what a model writing in the template's
+format would have generated, and the round trip (our parse, pi's message, pi's serialization, our rendering) is the
+real one. `--mode live`: the model generates and its own replies go on (the recorded tool results follow them). Per
+request: kind, prompt / cached / prefilled tokens, "new" (a tool turn's prompt minus the previous prompt and reply:
+what a perfect cache prefills), whether the prompt left the slot's tokens before their end (diverged) and where
+(`--server-verbose`: the tokens around it), rollbacks, times. Run on Qwen3.5-0.8B Q8_0, 8 threads, 3 slots, 2026-10-28,
+the box loaded (prefill seconds noisy, token counts exact), before = `54c2d20` (the replay's hooks only), after = this
+work:
+
+| session, context | requests | tool turns: prefilled / new tokens, exact | user turns prefilled | post-compaction prefilled | prefill s |
+|---|---|---|---|---|---|
+| S1 (71 replies, 46 with reasoning), 32k, before | 98 (11 compactions) | 33,690 / 29,759, 34 of 51 | 117,152 of 156,513 | 214,905 of 214,905 | 1,099 |
+| S1, 32k, after | 98 | the same (the 17 others: the last reply, below) | 50,875 | 130,508 | 587 |
+| S2 (138 replies, 136 with reasoning), 32k, before (80 requests) | 80 (12 compactions) | 34,040 / 34,035, 36 of 37 | 47,901 of 47,901 | 219,435 of 219,435 | 524 |
+| S2, 32k, after | 80 | the same | 28,973 | 134,499 | 370 |
+| S1, 96k, before | 74 (1 compaction) | 63,143 / 59,106, 42 of 60 | 354,771 of 498,002 | 32,838 of 32,838 | 1,773 |
+| S1, 96k, after | 74 | the same | 129,501 | 25,363 | 962 |
+
+(Tool turns: every one prefilled only its new tokens, or those plus the previous reply and its header: none more,
+before or after. Summary requests: the same before and after, ~4-5k tokens each at 32k, 17.5k at 96k, nothing to
+share. At 96k, all requests: 519k -> 286k tokens prefilled, the replay's wall time 1,951 -> 1,141 s; the user turns
+include a 71k-token re-prefill after pi added a tool, below.)
+
+**Where a turn re-prefilled, and why** (each case from the server's divergence lines):
+- **The reply came back tokenized differently** (the last reply re-prefilled, from the checkpoint before the
+  difference): (1) an empty reasoning: the generation prompt ends `<think>\n` (that `\n` alone), the model writes `\n`
+  `</think>`, and the history renders `<think>\n\n</think>`, whose `\n\n` is one token (14 of S1's 17 at 32k: its
+  replies recorded without reasoning; a real model rarely thinks for zero tokens; the 3 others: a reply pi dropped,
+  Qwen3.5's reasoning drop); (2) a sampled token where the text's canonical
+  tokenization has another (`--mode live` at the model's sampling defaults, 23 replies of a session: ` ren`+`ov` for
+  ` renov`, `/s`+`witch`, `Man`+`ual`: 4 of 21 tool turns, 824 extra tokens), in the reasoning or in a call. The
+  template cannot make either identical: the text is the same, and the prompt is the canonical tokenization of the
+  template's text (tested == HF's ids); reusing the generated tokens for that span would make a request's output
+  depend on what was cached (TODO, G5). The `</think>` checkpoint bounds case (2) to the content and calls when the
+  difference is after the reasoning (`tools/ckpt_think`). Not seen: reasoning or content re-serialized differently
+  (`reasoning_content` round-trips: pi sends back what it got, joined with `\n`; runq trims as the template does),
+  tool-call arguments formatted differently (the template renders the parsed values, not pi's JSON text).
+- **Qwen3.5's template drops a turn's reasoning at the next user query** (Qwen3.8 keeps it): that request leaves the
+  cache at the turn's first reply. Before: no checkpoint below it but the header's, so back to 0; after: the turn's
+  checkpoint (user turns 117k -> 51k tokens on S1).
+- **Compaction**: the summary request shares nothing (pi's summarization system prompt + the serialized
+  conversation); the next request is the system block + the summary + the kept messages: before, nothing reused (the
+  slot's checkpoints were above the system block); after, the system block (7-10k tokens with pi's prompt and tools),
+  from the session's slot, which the summary request did not take (slot affinity, >= 2 slots). Two of S2's 12 found a
+  different system block (pi rebuilds it from the compaction entry's checkpoint, without an update made since).
+- **pi changed its system prompt or tools mid-session** (a system message in the session: S1 added a tool after 36
+  turns): the system block is rendered at the top, so everything is prefilled again (71k tokens at 96k: ~5 min on the
+  0.8B, which pi's default HTTP idle timeout of 300 s ended before the keep-alive comments). Inherent to the template
+  (no system message after the first); the same with a thinking-level change on Qwen3.8 (its effort instruction
+  opens the system block).
+- **An aborted reply** (pi drops it from the history): back to that reply's header.
+
+**For the 27B agent setup**: `runq serve ... --timeout 0` (a compaction's next request prefills for ~16-19 min on the
+27B at 8 threads, past the default 600 s); the SSE keep-alive comments keep pi's `httpIdleTimeoutMs` (300 s) from
+ending long prefills; two slots if the memory allows them (`--kv-mem`: the summary request then does not take the
+session's slot, and the next request reuses the system block; with one slot it is prefilled again: ~8k tokens, ~3
+min); `--checkpoints 3` saves 150 MiB per slot on Qwen3.8 (its header, the system block and the `</think>` or the
+reply's end; Qwen3.5's turn checkpoint is not needed there). pi's compaction settings and a compaction's cost on the
+27B: [qwen38-speculative.md](qwen38-speculative.md#agent-sessions-replay-and-compaction-g0-a-g5).
 
 ## Limitations
 

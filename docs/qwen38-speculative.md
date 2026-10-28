@@ -571,32 +571,69 @@ matmuls; so `X(L) - X(512)` is the attention of 4 (layer, kv head) units, the 27
   attention (synth-27b, 8 threads: rows 2 / 4 / 8 add 10.2 / 18.7 / 36.4 ms of attention against 5.6 for one); only
   the weights' read is shared. So f(r) grows with L: synth-27b f(4) 1.50 at 512, 2.93 at 98k.
 - **Prefill attention** of a 2,560-token chunk runs at ~510 GFLOPS at 8 threads (synth-27b: 6.3 TFLOP in 12.1 s at
-  98k), ~1.8x that at 16 threads.
+  98k), ~1.8x that at 16 threads. After G4 (below): ~700 GFLOPS (9.0 s), ~1.3 TFLOPS at 16 threads.
+
+**G4: prefill attention against a long cache** (`082511f`, 2026-10-28). Where the time went, synth-27b at 98k, 8
+threads: the FMA peak of this VM is ~870-885 GFLOPS at 8 threads (one zmm FMA per cycle per Zen 4 core at ~3.45 GHz,
+measured), the attention ran at ~520. Not the balance: the items (one per row block of 6 rows and kv head, 172
+per layer and pass) kept the threads 98% busy (94.8% at 16; the 27B has twice the items). Not the kernel's inner
+loop either: one core with its K / V in L2 ran it at ~99 GFLOPS of 111. It was the memory traffic per item: each
+group of 12 query vectors swept the whole range, so an item (36 vectors: 3 groups) read the kv head's ~100 MB of K /
+V three times and streamed each group's scores (4.7 MB) through memory. Now `att512_kv` sweeps a long range 2 blocks
+at a time (512 KB of f16 K / V, in L2), every group over them before the next ones, and the groups hold at most 6
+vectors (register tiles of 6 x 4: ~108 GFLOPS on one core vs ~99 at 12 x 2). Bit-identical to before (the vectors
+are independent, each block's partial result is still computed whole; the combine unchanged): long_ctx's outputs
+equal f40246a's byte for byte on the 0.8B up to 65,535 and synth-27b up to 98,303, at other thread counts and chunk
+sizes too; compare_bins identical (798 of 799 jobs; the other differs by a transient load-time memory warning, which
+prints the estimate). The score scratch of the batched passes shrinks from 14 MB to 24 KB per thread
+at 98k: the load estimate drops by 0.10 / 0.21 GiB at 8 / 16 threads. Measured (bench lock, load ~9-15, medians;
+f40246a -> `082511f`):
+
+| model, threads | L | pre 2,560 (s) | its attention (s) | seg 2 / 4 / 8 (ms) |
+|---|---|---|---|---|
+| synth-27b, 8 | 65,536 | 8.24 -> 6.49 | 7.70 -> 5.97 (1.29x) | 8.72 / 14.94 / 28.02 -> 8.21 / 14.07 / 26.85 |
+| | 98,304 | 12.56 -> 9.49 | 12.02 -> 8.97 (1.34x) | 11.97 / 21.21 / 41.20 -> 11.12 / 19.55 / 37.54 |
+| synth-27b, 16 | 65,536 | 4.73 -> 3.59 | 4.38 -> 3.22 (1.36x) | |
+| | 98,304 | 7.01 -> 5.20 | 6.66 -> 4.83 (1.38x) | |
+| 0.8B Q8_0, 8 | 65,536 | 17.3 -> 14.0 | 15.4 -> 12.1 | 21.2 / 33.3 / 61.5 -> 19.5 / 31.3 / 59.0 |
+| | 98,304 | 26.0 -> 20.3 | 24.1 -> 18.4 | 27.5 / 45.2 / 86.0 -> 27.4 / 43.6 / 82.7 |
+| 4B Q8_0, 8 | 32,768 | 28.3 -> 24.6 | 19.5 -> 15.7 | 49.2 / 68.2 / 113.8 -> 52.0 / 68.7 / 109.7 |
+| Qwen3-0.6B Q8_0 (head 128), 8 | 16,384 | 19.1 -> 17.0 | 16.4 -> 14.4 | |
+
+("its attention": minus the same pass at L = 512; decode unchanged: its calls hold kv_mul <= 6 vectors, one group as
+before.) So ~1.3x on the attention, not G4's 2x: at ~700 GFLOPS of ~880 the fp32 attention has ~20% left (the
+first group of a block still waits on memory: 8 single-threaded copies of the kernel streaming their own K / V run
+at ~91 GFLOPS each vs ~99 from L2). 2x needs `vdpbf16ps` (G4 (b) in TODO.md): measured here at one instruction per
+cycle per core, 64 FLOP, i.e. ~1.74 TFLOPS at 8 threads, twice the fp32 FMA peak; it changes the arithmetic (q, the
+softmax weights, V in bf16), so the KL measurement and a C twin come first. Not done.
 
 **The 27B, extrapolated** (not measured: the 27B run is below). Per pass: the 27B's own short-context cost (S7: decode
 118 ms at 8 threads, 97 ms at 16; prefill 45 / 76 tok/s; verify f(2) / f(4) = 1.10 / 1.25, f(8) ~2.15 as the 8B
 Q4_K_M's) + 16 x synth-27b's attention, `X(L) - X(512)`. The attention part should be an upper bound: with 4 kv heads
 per layer instead of 2 the 27B's passes have twice the work items per phase (better balance), and its KV cache per
-position (64 KiB) is 16 x the synth's exactly.
+position (64 KiB) is 16 x the synth's exactly. Since G4 (`082511f`; the G0 values before it in brackets): the verify
+and prefill columns from the run of the G4 table above, the decode columns G0's (that path did not change).
 
 | L | decode ms (tok/s), 8 thr | 16 thr | verify pass 2 / 4 / 8 rows, 8 thr (x decode) | prefill 2,560 tokens, 8 thr | 16 thr |
 |---|---|---|---|---|---|
 | 512 | 118 (8.5) | 97 (10.3) | 130 / 148 / 254 (1.10 / 1.25 / 2.15) | 57 s | 34 s |
-| 16,384 | 133 (7.5) | 113 (8.8) | 155 / 195 / 342 (1.17 / 1.47 / 2.57) | 84 s | 49 s |
-| 32,768 | 146 (6.8) | 109 (9.2) | 183 / 244 / 440 (1.25 / 1.67 / 3.01) | 116 s | 66 s |
-| 65,536 | 178 (5.6) | 133 (7.5) | 241 / 345 / 642 (1.36 / 1.95 / 3.62) | 182 s | 103 s |
-| 98,304 | 207 (4.8) | 177 (5.6) | 292 / 447 / 837 (1.41 / 2.16 / 4.04) | 251 s | 143 s |
+| 16,384 | 133 (7.5) | 113 (8.8) | 154 / 192 / 337 (1.16 / 1.44 / 2.53) | 79 s [84] | 46 s [49] |
+| 32,768 | 146 (6.8) | 109 (9.2) | 183 / 243 / 459 (1.25 / 1.66 / 3.14) | 104 s [116] | 59 s [66] |
+| 65,536 | 178 (5.6) | 133 (7.5) | 228 / 332 / 619 (1.28 / 1.87 / 3.48) [1.36 / 1.95 / 3.62] | 152 s [182] | 85 s [103] |
+| 98,304 | 207 (4.8) | 177 (5.6) | 275 / 420 / 790 (1.33 / 2.03 / 3.82) [1.41 / 2.16 / 4.04] | 200 s [251] | 111 s [143] |
 
-(16 threads, decode: synth-27b's medians are noisy at 16k-32k, hence 32k below 16k.) **Turn-latency model**, a turn
-at position L with P new tokens and a reply of G tokens, plain decoding: T(L) = P / R_mm + 16 A_pre(P, L) + G x
-(t_w + 16 A_dec(L)), with R_mm the 27B's prefill matmul rate (45 / 76 tok/s), A_pre / A_dec the synth's attention
-times above (both about linear in L: at 8 threads A_dec ~0.057 us per position, A_pre ~0.048 us per (query, key)
-pair) and t_w = 118 / 97 ms. A turn of 2,500 tokens + a 500-token reply at ~90k: **~5.6 min at 8 threads (~235 s +
-~100 s), ~3.6 min at 16 (~133 s + ~83 s)**; at 32k: ~3.2 / ~2.0 min. With
-speculation at 98k (k = 3: a 4-row pass of ~447 ms + the 0.8B draft's 3 steps at 98k, ~60 ms; 2.0-3.7 tokens per
-pass as at S7): ~4-7 tok/s against 4.8 plain, k = 1 about the same: the goal's ">= 8 tok/s at 90k with
-speculation" needs cheaper attention per row first (G4's bf16 dot products for prefill and verify, an 8-bit KV for
-the decode read; G7's k by position). To be checked against the 27B itself and the replay (G0 (a)).
+(16 threads, decode: synth-27b's medians are noisy at 16k-32k, hence 32k below 16k. Verify at 32k: the G4 run's
+8-row median is noisy, 16.8 ms for a best of 15.1.) **Turn-latency model**, a turn at position L with P new tokens
+and a reply of G tokens, plain decoding: T(L) = P / R_mm + 16 A_pre(P, L) + G x (t_w + 16 A_dec(L)), with R_mm the
+27B's prefill matmul rate (45 / 76 tok/s), A_pre / A_dec the synth's attention times above (both about linear in L:
+at 8 threads A_dec ~0.057 us per position, A_pre ~0.035 us per (query, key) pair since G4, ~0.019 at 16 threads;
+0.048 / 0.026 before) and t_w = 118 / 97 ms. A turn of 2,500 tokens + a 500-token reply at ~90k: **~4.7 min at 8
+threads (~184 s + ~100 s), ~3.1 min at 16 (~102 s + ~83 s)** (G0: ~5.6 / ~3.6 min, prefill ~235 / ~133 s); at 32k:
+~2.9 / ~1.9 min (G0: ~3.2 / ~2.0). With speculation at 98k (k = 3: a 4-row pass of ~420 ms + the 0.8B draft's 3
+steps at 98k, ~60 ms; 2.0-3.7 tokens per pass as at S7): ~4-7 tok/s against 4.8 plain, k = 1 about the same: the
+goal's ">= 8 tok/s at 90k with speculation" needs cheaper attention per row first (bf16 dot products for prefill and
+verify, an 8-bit KV for the decode read; G7's k by position). To be checked against the 27B itself and the replay
+(G0 (a)).
 
 **The 27B run (later, alone on the box: the other services stopped, MemAvailable >= ~23.5 GiB):**
 

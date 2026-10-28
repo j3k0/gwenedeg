@@ -311,11 +311,15 @@ FAMILY = [
     # untied, F32 ssm_alpha / ssm_beta, Qwen3.8's template: thinking on by default). ~16.3 GiB of RSS: run only when
     # MemAvailable allows it (BIG); its golden is tests/ref_qwen35.py on the file (make_model_ref.py: 214 s, ~2 GB)
     ("3.8-27b-q4km", "Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf", "qwen3.8", [("3.8-27b-q4km", "ref")]),
+    # its Q3_K_M (TODO G3: the agentic file at 96k): Q3_K ffn_gate / ffn_up, attn_gate, attention q / k and token_embd (the
+    # only test file with a Q3_K token_embd: its rows through kq_dequant_row), Q4_K / Q5_K / Q6_K for the rest. ~13.4 GiB
+    # of RSS (BIG); golden: make_model_ref.py on the file (189 s)
+    ("3.8-27b-q3km", "Qwen3.8-27B-GGUF/Qwen3.8-27B-Q3_K_M.gguf", "qwen3.8", [("3.8-27b-q3km", "ref")]),
 ]
 # files checked against MemAvailable first (runq's own estimate at the default context, api_test's, + BIG_MARGIN GiB
 # for the logits files in TMPDIR and the server's slots): skipped with a note if it does not fit. Their runs go one
 # at a time (the models group runs its files in turn); GWENEDEG_TEST_MEM (GiB) stands in for MemAvailable
-BIG = {"3.8-27b-q4km"}
+BIG = {"3.8-27b-q4km", "3.8-27b-q3km"}
 BIG_MARGIN = 1.5
 # dequantized rows vs gguf-py (tests/golden/dequant, tests/make_dequant_golden.py --q5 / --q3), bitwise, per FAMILY tag:
 # from the file's blocks and from the repacked layouts (`runq -m dequant`)

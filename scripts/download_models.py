@@ -152,6 +152,12 @@ SETS = {
     "3.8-27b-q4km": ("unsloth/Qwen3.8-27B-GGUF", "4a03c640833598c0fb5ddd11e846135e906eb764", "Qwen3.8-27B-GGUF", [
         ("Qwen3.8-27B-Q4_K_M.gguf", 17106775008, "sha256", "7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169"),
     ]),
+    # Unsloth's Q3_K_M of the same commit (TODO G3: the agentic file at 96k context): Q3_K ffn_gate / ffn_up, attn_gate,
+    # attention q / k and token_embd, Q4_K / Q5_K for the rest, Q6_K output, F32 ssm_alpha / ssm_beta; ~12.4 GiB of
+    # weights in RAM (Q4_K_M: 15.3)
+    "3.8-27b-q3km": ("unsloth/Qwen3.8-27B-GGUF", "4a03c640833598c0fb5ddd11e846135e906eb764", "Qwen3.8-27B-GGUF", [
+        ("Qwen3.8-27B-Q3_K_M.gguf", 13818690528, "sha256", "7f3b845b563888ec3abc269474cf744bf703a7ce8766dbb7f696c63975facfd7"),
+    ]),
 }
 DEFAULT_SETS = ["hf", "q4km", "q8gguf"]
 # names that stand for several sets

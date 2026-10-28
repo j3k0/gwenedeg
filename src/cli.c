@@ -633,7 +633,10 @@ static void error_usage(void) {
     fprintf(stderr, "  -n <int>    max new tokens per response, 0 (default) = unlimited\n");
     fprintf(stderr, "  -b <int>    prefill chunk size (batched prompt processing), default %d, max %d;\n", RQ_BATCH_MAX, RQ_BATCH_MAX);
     fprintf(stderr, "              0 or 1 = one token at a time\n");
-    fprintf(stderr, "  -k <string> KV cache type: f32|bf16|f16, default %s (16-bit: half the memory and bandwidth)\n", rq_kv_name(RQ_KV_DEFAULT));
+    fprintf(stderr, "  -k <string> KV cache type: f32|bf16|f16|bf16-dot|f16-dot, default %s (16-bit: half the memory and bandwidth);\n", rq_kv_name(RQ_KV_DEFAULT));
+    fprintf(stderr, "              bf16-dot / f16-dot: that cache with the bf16 dot-product attention (q, K, V and the softmax weights\n");
+    fprintf(stderr, "              rounded to bf16, the products as vdpbf16ps: ~1.7x the prefill attention at long context on AVX512_BF16\n");
+    fprintf(stderr, "              CPUs; less accurate, see the README; bf16-dot is the faster one)\n");
     fprintf(stderr, "  --mem <GiB> refuse the load (before reading the weights) if its estimate (weights + runtime + the KV cache of -c\n");
     fprintf(stderr, "              positions) does not fit, default MemAvailable; 0 or force = no check; given: prints it ([memory])\n");
     fprintf(stderr, "  --page-cache auto|drop|keep  the model file's page cache after the load: auto (default) drops it if the file\n");

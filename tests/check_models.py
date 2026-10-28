@@ -461,9 +461,13 @@ def greedy_text(stdout):
     return stdout.decode(errors="replace").rstrip("\n")
 
 
-def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", path=None, lean=False):
+def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", path=None, lean=False, extra=None):
     """the checks of every downloaded FAMILY file (tags: only those; path: the file of the one tag; lean: the weights'
-    checks only, without render / greedy / api / server, whose code paths another file of the run covers)"""
+    checks only, without render / greedy / api / server, whose code paths another file of the run covers; extra: more
+    options of the logits runs, e.g. -k bf16-dot; default check.py's --models-kv, lean with it)"""
+    if extra is None and getattr(a, "models_kv", ""):
+        extra, lean = ["-k", a.models_kv], True
+    extra = list(extra or [])
     gdir = os.path.join(GOLDEN, "models")
     fam = [x for x in FAMILY if tags is None or x[0] in tags]
     where = lambda f: path or os.path.join(ROOT, "models", f)
@@ -484,7 +488,7 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
         def lf(name, chunk, threads=nd, runq=a.runq, sfx=""):
             path = os.path.join(d, f"{name}_b{chunk}_t{threads}{sfx}.bin")
             if not os.path.exists(path):
-                logits_run(runq, model, texts[name], path, chunk, threads)
+                logits_run(runq, model, texts[name], path, chunk, threads, extra)
             return path
         # template variant and renderings (tokenizer only)
         if not lean:
@@ -554,8 +558,9 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
             gen_api = (a.api_test or "") + "-generic"
             if tag in EXTRA_KERNELS and a.api_test and os.path.exists(gen_api):
                 dg = []
+                kvx = ["--kv-type", extra[extra.index("-k") + 1]] if "-k" in extra else []
                 for exe in (a.api_test, gen_api):
-                    q = run([exe, model, "--digest-small"], 4)
+                    q = run([exe, model, "--digest-small"] + kvx, 4)
                     dg.append(dict(l.split()[1:3] for l in q.stdout.decode(errors="replace").splitlines() if l.startswith("DIGEST ")))
                 diff = [k for k in dg[0] if dg[1].get(k) != dg[0][k]]
                 res.report(len(dg[0]) >= 1 and not diff and set(dg[0]) == set(dg[1]), f"{prefix}/{tag}/api_digest_generic",
@@ -816,13 +821,38 @@ def q35_two_run(a, d):
     return out
 
 
-def q35_synth_run(a, tmp, model, texts, full_api):
+def q35_api_dot(a):
+    """api_test on the 0.8B file with the bf16 dot-product attention (--kv-type bf16-dot: every sequence of its
+    tests), and its batched passes' digests on the generic build"""
+    p = run([a.api_test, a.q35, "--kv-type", "bf16-dot"], SYNTH_THREADS)
+    out = q35_api_lines(p, "q35_dot/api")
+    gen = a.api_test + "-generic"
+    if os.path.exists(gen):
+        dg = [dict(l.split()[1:3] for l in q.stdout.decode(errors="replace").splitlines() if l.startswith("DIGEST "))
+              for q in (p, run([gen, a.q35, "--digest-small", "--kv-type", "bf16-dot"], 3))]
+        common = [k for k in dg[1] if k in dg[0]]
+        diff = [k for k in common if dg[1][k] != dg[0][k]]
+        out.append((len(common) >= 2 and not diff, "q35_dot/api_digest_generic",
+                    f"{len(common)} batched passes: AVX-512 ({SYNTH_THREADS} threads) == generic (3)" + (f"; differ: {diff}" if diff else "")))
+    return out
+
+
+def q35_api_lines(p, name):
+    lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
+    bad = [l[5:].split("  ")[0] for l in lines if l.startswith("FAIL ")]
+    return [(p.returncode == 0 and bool(lines) and not bad, name, f"api_test --kv-type bf16-dot (every path of the API): "
+             f"{len(lines) - len(bad)}/{len(lines)} passed" + (f"; failed: {', '.join(bad)}" if bad else ""))]
+
+
+def q35_synth_run(a, tmp, model, texts, full_api, kv=""):
     """the checks of one synthetic model, run in the background: [(ok, name, detail)]. The logits files (248k ids per
-    position: long2 is 0.3 GB) are reduced to a sha256 and the reference's classifier rows, then removed"""
+    position: long2 is 0.3 GB) are reduced to a sha256 and the reference's classifier rows, then removed. kv: a KV cache
+    type (-k; e.g. bf16-dot, the bf16 dot-product attention: the same checks, the same thresholds)"""
     import hashlib
     import ref_qwen35 as R35
     tag = os.path.basename(model)[:-5]
-    pre = f"q35/{tag}"
+    pre = f"q35/{tag}" + (f"_{kv}" if kv else "")
+    extra, kvx = (["-k", kv], ["--kv-type", kv]) if kv else ([], [])
     th = TH_Q35_SYNTH_KQ.get(tag, TH_Q35_SYNTH)
     out = []
     f = G.GgufFile(model)
@@ -835,8 +865,8 @@ def q35_synth_run(a, tmp, model, texts, full_api):
             name, chunk = key[:2]
             gen = len(key) > 2 and key[2] == "gen"
             th = 3 if len(key) > 2 else SYNTH_THREADS
-            path = os.path.join(tmp, f"{tag}_{name}_b{chunk}_{th}{'_gen' if gen else ''}.bin")
-            logits_run(a.generic if gen else a.runq, model, texts[name], path, chunk, th)
+            path = os.path.join(tmp, f"{tag}{kv}_{name}_b{chunk}_{th}{'_gen' if gen else ''}.bin")
+            logits_run(a.generic if gen else a.runq, model, texts[name], path, chunk, th, extra)
             with open(path, "rb") as fh:
                 h = hashlib.sha256(fh.read()).hexdigest()
             ids, lg = read_logits(path)
@@ -877,7 +907,7 @@ def q35_synth_run(a, tmp, model, texts, full_api):
     # the file's sampling defaults (TODO P5; general.sampling.temp / top_p / top_k = 1.0 / 0.95 / 20 as in the 27B's
     # file, written by make_synth_q35.py): applied to the options not given, silently. Seeded generate without -p / -K
     # == with -p 0.95 -K 20 (stdout, stderr without the numbers), != with the CLI's own defaults -p 0.9 -K 0
-    if tag == "synth-q35-27b":
+    if tag == "synth-q35-27b" and not kv:
         import re
         base = [a.runq, model, "-c", "256", "-t", "0.8", "-s", "7", "-n", "24", "-m", "generate", "-i", texts["en"][:60]]
         ps = [run(base + x, SYNTH_THREADS) for x in ([], ["-p", "0.95", "-K", "20"], ["-p", "0.9", "-K", "0"])]
@@ -889,7 +919,7 @@ def q35_synth_run(a, tmp, model, texts, full_api):
     # the library API: batched decode rows == alone, checkpoints (full run), the batched passes' digests vs generic
     if a.api_test:
         if full_api:
-            p = run([a.api_test, model], SYNTH_THREADS)
+            p = run([a.api_test, model] + kvx, SYNTH_THREADS)
             lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
             bad = [l[5:].split("  ")[0] for l in lines if l.startswith("FAIL ")]
             out.append((p.returncode == 0 and bool(lines) and not bad, f"{pre}/api", f"api_test (batched decode rows == alone, "
@@ -898,7 +928,7 @@ def q35_synth_run(a, tmp, model, texts, full_api):
         if os.path.exists(gen_api):
             dg = []
             for exe, th in ((a.api_test, SYNTH_THREADS), (gen_api, 3)):
-                q = run([exe, model, "--digest-small"], th)
+                q = run([exe, model, "--digest-small"] + kvx, th)
                 dg.append(dict(l.split()[1:3] for l in q.stdout.decode(errors="replace").splitlines() if l.startswith("DIGEST ")))
             diff = [k for k in dg[0] if dg[1].get(k) != dg[0][k]]
             out.append((len(dg[0]) >= 1 and not diff and set(dg[0]) == set(dg[1]), f"{pre}/api_digest_generic",
@@ -924,9 +954,10 @@ def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
     a2 = argparse.Namespace(**{**vars(a), "model": a.q35, "vocab_model": a.q35})
     vocab = load_vocab(a.q35)
     d = os.path.join(GOLDEN, "greedy")
-    rec, rec4, rec3 = Recorded(), Recorded(), Recorded()
+    rec, rec4, rec3, recd = Recorded(), Recorded(), Recorded(), Recorded()
     t = os.path.join(tmp, "q35")
     os.makedirs(os.path.join(t, "q4"), exist_ok=True)
+    os.makedirs(os.path.join(t, "dot"), exist_ok=True)
     os.makedirs(os.path.join(t, "q3"), exist_ok=True)
     q4 = os.path.join(os.path.dirname(a.q35), "Qwen3.5-0.8B-Q4_K_M.gguf")
     q4 = q4 if os.path.exists(q4) else None
@@ -945,16 +976,26 @@ def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
         ([ex.submit(q35_two_run, a, sd)] if a.api_test else []) if sd else []
     synth.append(ex.submit(q35_serve_slots, a))
     synth.append(ex.submit(q35_server_tools, a))
+    # the bf16 dot-product attention (KV bf16-dot, TODO G4 (b)): synth-q35-27b (the 27B's attention shape) and every API
+    # path on the 0.8B (the logits / bitwise checks of the 0.8B: test_models below, prefix q35_dot)
+    s27 = os.path.join(sd, "synth-q35-27b.gguf") if sd else ""
+    if s27 and os.path.exists(s27):
+        os.makedirs(os.path.join(t, "synth_dot"), exist_ok=True)
+        synth.append(ex.submit(q35_synth_run, a, os.path.join(t, "synth_dot"), s27, texts, True, "bf16-dot"))
+    if a.api_test:
+        synth.append(ex.submit(q35_api_dot, a))
     # the Q3_K_M file (lean) on a worker of its own from the start: on mx, after the other two, it made the suite's
     # tail (that chain) ~35 s longer; next to them the suite took as long as without it (185.4 / 186.5 s vs 181.0 /
     # 187.1 s, interleaved, load ~25)
     q3x = cf.ThreadPoolExecutor(max_workers=1) if q3 else None
     return {"a": a2, "tok_test": tok_test, "synth": synth, "synth_err": serr, "q3x": q3x,
             "chats": [ex.submit(chat_case, a2, tmp, vocab, d, *c) for c in Q35_CHAT_CASES],
-            "rec": rec, "models": [mx.submit(test_models, a, rec, t, texts, False, {Q35_TAG}, "q35", a.q35)] + (
+            "rec": rec, "models": [mx.submit(test_models, a, rec, t, texts, False, {Q35_TAG}, "q35", a.q35),
+                                   mx.submit(test_models, a, recd, os.path.join(t, "dot"), texts, False, {Q35_TAG}, "q35_dot",
+                                             a.q35, True, ["-k", "bf16-dot"])] + (
                 [mx.submit(test_models, a, rec4, os.path.join(t, "q4"), texts, False, {Q35_Q4_TAG}, "q35", q4)] if q4 else []) + (
                 [q3x.submit(test_models, a, rec3, os.path.join(t, "q3"), texts, False, {Q35_Q3_TAG}, "q35", q3, True)] if q3 else []),
-            "rec4": rec4, "rec3": rec3}
+            "rec4": rec4, "rec3": rec3, "recd": recd}
 
 
 def test_q35(a, res, tmp, texts, S):
@@ -974,5 +1015,5 @@ def test_q35(a, res, tmp, texts, S):
         f.result()
     if S["q3x"]:
         S["q3x"].shutdown()
-    for ok, n, detail, xfail in S["rec"].reports + S["rec4"].reports + S["rec3"].reports:
+    for ok, n, detail, xfail in S["rec"].reports + S["recd"].reports + S["rec4"].reports + S["rec3"].reports:
         res.report(ok, n, detail, xfail)

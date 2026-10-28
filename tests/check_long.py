@@ -125,10 +125,12 @@ def metrics(g, j, row):
     return cos, a == t0, margin, float(np.abs(got - ref).max())
 
 
-def test_long(a, res, tmp, tags=None):
+def test_long(a, res, tmp, tags=None, kv=""):
+    """kv: a KV cache type (-k of build/long_ctx, e.g. bf16-dot: the bf16 dot-product attention; the same thresholds)"""
     tool = os.path.join(ROOT, "build", "long_ctx")
     gtool = os.path.join(ROOT, "build", "long_ctx-generic")
     th = int(os.environ.get("OMP_NUM_THREADS", "8"))
+    kx = ["-k", kv] if kv else []
     for tag, rel in MODELS.items():
         if tags and tag not in tags:
             continue
@@ -138,7 +140,7 @@ def test_long(a, res, tmp, tags=None):
             print(f"   (long/{tag}: skipped, {'no golden ' + gp if os.path.exists(model) else rel + ' missing'})")
             continue
         g = np.load(gp)
-        pre = f"long/{tag}"
+        pre = f"long/{tag}" + (f"_{kv}" if kv else "")
         ids = corpus_ids(tool, model, tmp)[:int(g["n"])]
         ok = len(ids) == int(g["n"]) and ids_hash(ids) == str(g["ids_hash"])
         res.report(ok, f"{pre}/ids", f"{len(ids)} tokens of the corpus at {CORPUS_REV[:7]}, hash {ids_hash(ids)} "
@@ -150,7 +152,7 @@ def test_long(a, res, tmp, tags=None):
         pos = [int(p) for p in g["positions"]]
         out, log = os.path.join(tmp, f"{tag}.rows"), []
         vp = [p for p in pos if p >= 64]
-        o = run_tool([tool, model, "-I", idf, "-n", str(pos[-1] + 1), "-P", ",".join(map(str, pos)), "-o", out, "-V"],
+        o = run_tool([tool, model, "-I", idf, "-n", str(pos[-1] + 1), "-P", ",".join(map(str, pos)), "-o", out, "-V"] + kx,
                      th, log)
         for line in o.splitlines():
             f = line.split()
@@ -172,23 +174,23 @@ def test_long(a, res, tmp, tags=None):
         if os.path.exists(gtool):
             gpos = [p for p in pos if p <= GENERIC_MAX]
             gout = os.path.join(tmp, f"{tag}.grows")
-            run_tool([gtool, model, "-I", idf, "-n", str(gpos[-1] + 1), "-P", ",".join(map(str, gpos)), "-o", gout],
+            run_tool([gtool, model, "-I", idf, "-n", str(gpos[-1] + 1), "-P", ",".join(map(str, gpos)), "-o", gout] + kx,
                      th, log)
             _, grows = read_rows(gout)
             for j, p in enumerate(gpos):
                 same = np.array_equal(grows[j].view(np.uint32), rows[j].view(np.uint32))
                 res.report(same, f"{pre}/generic_p{p}", "generic build == native, bitwise" if same else
                            f"DIFFER (max |diff| {np.abs(grows[j] - rows[j]).max():.3g})")
-        retrieval(tool, model, tmp, res, pre, min(RETR_N, int(g["n"]) - 4000), th, log)
+        retrieval(tool, model, tmp, res, pre, min(RETR_N, int(g["n"]) - 4000), th, log, kv)
         print(f"   ({pre}: {', '.join(log)})")
 
 
-def retrieval(tool, model, tmp, res, pre, n, th, log):
+def retrieval(tool, model, tmp, res, pre, n, th, log, kv=""):
     """the retrieval check on any qwen35 file (no golden): the greedy reply to the question after n corpus tokens"""
     r = retrieval_ids(tool, model, tmp, n)
     rf = os.path.join(tmp, "retrieval.ids")
     r.astype(np.int32).tofile(rf)
-    o = run_tool([tool, model, "-I", rf, "-g", "24"], th, log)
+    o = run_tool([tool, model, "-I", rf, "-g", "24"] + (["-k", kv] if kv else []), th, log)
     text = o.split("\ntext ", 1)[1] if "\ntext " in o else ""
     res.report("PLUM-7316-HERON" in text, f"{pre}/retrieval",
                f"{len(r)}-token prompt, the fact at token ~{FACT_AT}: greedy reply {text.strip()[:80]!r}")
@@ -219,6 +221,8 @@ def main():
     ap.add_argument("--retrieval", default="", metavar="FILE", help="only the retrieval check, on this qwen35 file "
                     "(e.g. Qwen3.8-27B: no golden needed)")
     ap.add_argument("--retrieval-n", type=int, default=RETR_N, help=f"corpus tokens in its prompt (default {RETR_N})")
+    ap.add_argument("--kv", default="", help="the KV cache type (-k of build/long_ctx; e.g. bf16-dot: the bf16 dot-product "
+                    "attention, the same thresholds; default f16)")
     a = ap.parse_args()
     res = _Res()
     t = time.time()
@@ -226,10 +230,10 @@ def main():
         if a.retrieval:
             log = []
             retrieval(os.path.join(ROOT, "build", "long_ctx"), a.retrieval, tmp, res, "long/retrieval",
-                      a.retrieval_n, int(os.environ.get("OMP_NUM_THREADS", "8")), log)
+                      a.retrieval_n, int(os.environ.get("OMP_NUM_THREADS", "8")), log, a.kv)
             print(f"   ({', '.join(log)})")
         else:
-            test_long(a, res, tmp, set(a.tags.split(",")) if a.tags else None)
+            test_long(a, res, tmp, set(a.tags.split(",")) if a.tags else None, a.kv)
     print(f"\nSummary: {len(res.passed)} passed, {len(res.failed)} failed, {time.time() - t:.0f} s")
     return 1 if res.failed else 0
 

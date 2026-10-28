@@ -699,7 +699,7 @@ int rq_seq_mem(const RqModel *m, int capacity, int kv_type, RqSeqMem *mem) {
     memset(mem, 0, sizeof(*mem));
     if (!m->has_weights) return RQ_ERR_STATE;
     if (capacity <= 0) capacity = m->config.seq_len;
-    if (capacity > m->config.seq_len || kv_type < KV_F32 || kv_type > KV_F16) return RQ_ERR_ARG;
+    if (capacity > m->config.seq_len || !kv_type_ok(kv_type)) return RQ_ERR_ARG;
     seq_mem(m, capacity, kv_type == KV_F32 ? 4 : 2, 0, mem);
     return RQ_OK;
 }

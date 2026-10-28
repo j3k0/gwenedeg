@@ -48,6 +48,33 @@
 #define ATT_P4 1.6666665459e-1f
 #define ATT_P5 5.0000001201e-1f
 
+static inline float bf16_f32(uint16_t h) {
+    // bf16 -> fp32, exact
+    uint32_t u = (uint32_t)h << 16;
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+}
+
+static inline uint16_t f32_bf16(float f) {
+    // fp32 -> bf16, round to nearest even (the bf16 KV cache stores; the bf16 dot-product attention's roundings of
+    // q, the softmax weights and an f16 cache's K / V). Integer arithmetic, the same in every build; equal to
+    // vcvtneps2bf16 for every non-denormal input (it flushes denormals, which -Ofast's FTZ / DAZ never produce here,
+    // and which the dot products read as zero anyway); NaN stays a (quiet) NaN
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    uint32_t r = (u + 0x7fffu + ((u >> 16) & 1)) >> 16;
+    return (uint16_t)((u & 0x7fffffffu) > 0x7f800000u ? (u >> 16) | 0x40 : r);
+}
+
+static inline uint16_t f32_bf16_daz(float f) {
+    // vcvtneps2bf16 exactly: f32_bf16 after a denormal input is flushed to a zero of its sign (the bf16 dot-product
+    // attention's rounding of q and the softmax weights, the same in every build)
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    return (u & 0x7f800000u) ? f32_bf16(f) : (uint16_t)((u >> 16) & 0x8000u);
+}
+
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && !defined(RUNQ_GENERIC)
 #define RUNQ_VNNI 1
 #include <immintrin.h>
@@ -1405,6 +1432,346 @@ static void att512_kv(int kvt, int nv, const float *const *q, float *const *out,
         (kvt == 2 ? att512_group_f16 : kvt ? att512_group_bf16 : att512_group_f32)(gn, q + g, out + g, part ? part + g : NULL, np + g, b0, b1,
                                                                                    kt, vt, bs, hd, scale, s);
         g += gn;
+    }
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * bf16 dot-product attention (the sequence's KV type RQ_KV_BF16_DOT / RQ_KV_F16_DOT, runq --attn bf16; TODO G4 (b)):
+ * the two products of the attention as vdpbf16ps does them, on q, K, the softmax weights and V rounded to bf16, so
+ * twice the dot-product rate of the fp32 FMAs (Zen 4: one vdpbf16ps per cycle per core, 64 FLOP). Opt-in: it is less
+ * accurate than the fp32 attention (README, docs/qwen38-speculative.md "G4"). A sequence's every path (prefill,
+ * decode, verify, batched decode) uses its type, so the invariants (batched == sequential, threads, builds) hold.
+ * Definition, per query vector and kv head, as the fp32 attention above except:
+ *   bf16(x) = f32_bf16_daz(x) = vcvtneps2bf16: round to nearest even, a denormal input flushed to a zero of its sign;
+ *   q' = bf16(q[i]); K', V': a bf16-dot cache stores f32_bf16(k), f32_bf16(v) (as -k bf16: a bf16 denormal is read as
+ *        zero by the products below); an f16-dot cache stores f16 (as -k f16) and is read as bf16(the f16 value as
+ *        fp32), i.e. rounded again (11 -> 8 significant bits; never a denormal);
+ *   dot(c, a, b) over a pair (a0, a1), (b0, b1): vdpbf16ps's lane, two FMAs, the odd element first:
+ *        c = fma(a1, b1, c); c = fma(a0, b0, c), each rounded to nearest even, with DAZ on all inputs and FTZ on the
+ *        results (flush when tiny after rounding, the sign kept: x86's MXCSR FTZ / DAZ rules; checked against the
+ *        instruction on this CPU by build/bf16dp_test, tests/bf16dp_test.c);
+ *   s[t] = (sum over chunks of ATT_DC = 32 dims, in order, of (the dot chain over the chunk's 16 dim pairs (2p,
+ *        2p + 1), in order, from 0, of (q'[2p], q'[2p + 1]) x (k'[t][2p], k'[t][2p + 1]))) * scale;
+ *   the softmax per block as before (m_b, e[t] = exp_att(s[t] - m_b) >= ~2^-125.1: no denormal), then w[t] = bf16(e[t])
+ *        and l_b = the 16-lane
+ *        sum (+ tree) of the w[t] (the rounded weights, so that they are what the o_b chain multiplies);
+ *   o_b[i] = the dot chain over the block's position pairs (t, t + 1), t = its first position + 2 j, in order, from 0,
+ *        of (w[t], w[t + 1]) x (v'[t][i], v'[t + 1][i]); a position t + 1 the vector does not reach (its last
+ *        position t, an odd count in the block) enters as w = +0, v = +0 (whatever the cache holds there);
+ *   the combine of the blocks (att_combine) and the normalization unchanged (fp32).
+ * The whole call runs with FTZ / DAZ (forward.c's attention_part sets MXCSR for it on x86), so the fp32 parts round
+ * the same in every build and the C twin of the products (forward.c, attention_vec_dot: the two fmaf per pair) equals
+ * the instruction. Without AVX512_BF16 (an AVX-512 CPU before Zen 4 / Cooper Lake) att512_dp emulates the lane by
+ * the same two FMAs: the same results, at the fp32 rate.
+ * Layouts: K as the bf16 cache (dims 2p, 2p + 1 of position j at 32 p + 2 j, + 1: one 64-byte load = 16 positions x
+ * a dim pair, the q pair broadcast); V of a bf16-dot cache in position pairs (positions 2m, 2m + 1 of a tile, dim i at
+ * 2m * head_dim + 2 i, + 1: one 64-byte load = 16 dims x a position pair, the weight pair broadcast). An f16-dot
+ * cache keeps the f16 layout; each call converts its range (at most ATT512_BC blocks) into those two layouts in the
+ * thread's scratch (conv), once for all its groups. The softmax weights are stored as bf16 over their fp32 scores
+ * (the first 32 bytes of each [tile][vector] slot of s).
+ */
+#ifdef __AVX512BF16__
+#define ATT512_DP_HW 1 // (bf16dp_test: the instruction is used)
+static inline __m512 att512_dp(__m512 c, __m512i a, __m512i b) { return _mm512_dpbf16_ps(c, (__m512bh)a, (__m512bh)b); }
+static inline __m256i att512_cvt_bf16(__m512 x) { return (__m256i)_mm512_cvtneps_pbh(x); } // = f32_bf16_daz
+#else
+#define ATT512_DP_HW 0
+static inline __m512 att512_dp(__m512 c, __m512i a, __m512i b) {
+    // vdpbf16ps's lane without AVX512_BF16: the same two FMAs, the odd elements first (FTZ / DAZ: MXCSR, set by the caller)
+    c = _mm512_fmadd_ps(att512_bf_hi(a), att512_bf_hi(b), c);
+    return _mm512_fmadd_ps(att512_bf_lo(a), att512_bf_lo(b), c);
+}
+static inline __m256i att512_cvt_bf16(__m512 x) {
+    // f32_bf16_daz of 16 values (vcvtneps2bf16)
+    __m512i u = _mm512_castps_si512(x);
+    __m512i r = _mm512_srli_epi32(_mm512_add_epi32(_mm512_add_epi32(u, _mm512_set1_epi32(0x7fff)),
+                                                   _mm512_and_si512(_mm512_srli_epi32(u, 16), _mm512_set1_epi32(1))), 16);
+    __mmask16 nan = _mm512_cmpgt_epu32_mask(_mm512_and_si512(u, _mm512_set1_epi32(0x7fffffff)), _mm512_set1_epi32(0x7f800000));
+    __mmask16 den = _mm512_testn_epi32_mask(u, _mm512_set1_epi32(0x7f800000));
+    r = _mm512_mask_or_epi32(r, nan, _mm512_srli_epi32(u, 16), _mm512_set1_epi32(0x40));
+    r = _mm512_mask_and_epi32(r, den, _mm512_srli_epi32(u, 16), _mm512_set1_epi32(0x8000));
+    return _mm512_cvtepi32_epi16(r);
+}
+#endif
+
+static inline __m512 att512_bf16_ps(__m256i w) { return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(w), 16)); }
+
+static inline __m512i att512_f16_pairs(const uint16_t *a, const uint16_t *b) {
+    // 16 f16 values at a and 16 at b -> 16 dwords bf16(a[l]) | bf16(b[l]) << 16 (fp32 exactly, then f32_bf16)
+    __m512 fa = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)a));
+    __m512 fb = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)b));
+#ifdef __AVX512BF16__
+    __m512i w = (__m512i)_mm512_cvtne2ps_pbh(fb, fa); // (fa's 16 below fb's; an f16 value is never an fp32 denormal)
+#else
+    __m512i w = _mm512_inserti64x4(_mm512_castsi256_si512(att512_cvt_bf16(fa)), att512_cvt_bf16(fb), 1);
+#endif
+    const __m512i il = _mm512_set_epi16(31, 15, 30, 14, 29, 13, 28, 12, 27, 11, 26, 10, 25, 9, 24, 8,
+                                        23, 7, 22, 6, 21, 5, 20, 4, 19, 3, 18, 2, 17, 1, 16, 0);
+    return _mm512_permutexvar_epi16(il, w); // words a0 b0 a1 b1 ...
+}
+
+static void att512_dot_conv(uint16_t *kd, uint16_t *vd, const uint16_t *kt, const uint16_t *vt, int ntl, size_t bs, int hd) {
+    // the first ntl tiles of a range of an f16 cache (one kv head; bs: elements from a block to its next) as bf16 tiles
+    // in the dot layouts, blocks ATT_P * hd elements apart in kd / vd
+    size_t ts = (size_t)ATT_T * hd;
+    for (int tb = 0; tb < ntl; tb++) {
+        size_t o = (size_t)(tb / ATT_PT) * bs + (size_t)(tb % ATT_PT) * ts, od = (size_t)tb * ts;
+        const uint16_t *k = kt + o, *v = vt + o;
+        for (int p = 0; p < hd / 2; p++) // K: dims 2p, 2p + 1 (rows of 16 positions) -> per position a pair
+            _mm512_storeu_si512((void *)(kd + od + (size_t)p * 2 * ATT_T), att512_f16_pairs(k + (size_t)2 * p * ATT_T, k + (size_t)(2 * p + 1) * ATT_T));
+        for (int m = 0; m < ATT_T / 2; m++) // V: positions 2m, 2m + 1 (rows of hd dims) -> per dim a pair
+            for (int d = 0; d < hd; d += 16)
+                _mm512_storeu_si512((void *)(vd + od + (size_t)2 * m * hd + 2 * d),
+                                    att512_f16_pairs(v + (size_t)2 * m * hd + d, v + (size_t)(2 * m + 1) * hd + d));
+    }
+}
+
+typedef struct { const char *p[2 * ATT512_BC]; size_t n[2 * ATT512_BC]; int nr, k; } Att512Pf; // lines to prefetch
+
+static inline const char *att512_pf_take(Att512Pf *f, int *n) {
+    // up to *n lines of f's current region (*n: the lines taken, 0 if none left)
+    while (f && f->k < f->nr && !f->n[f->k])
+        f->k++;
+    if (!f || f->k >= f->nr) {
+        *n = 0;
+        return NULL;
+    }
+    size_t m = f->n[f->k] < (size_t)*n ? f->n[f->k] : (size_t)*n;
+    const char *p = f->p[f->k];
+    f->p[f->k] += m * 64;
+    f->n[f->k] -= m;
+    *n = (int)m;
+    return p;
+}
+
+static inline __attribute__((always_inline))
+void att512_qk_dot(const int NV, const int NT, const uint32_t *qp, const uint16_t *kt, size_t ts, int hd, __m512 scale, float *s,
+                   const char *pf, int npf) {
+    // att512_qk on bf16 pairs: qp[r * hd / 2 + p] = vector r's dims 2p, 2p + 1 (q'), tile u at kt + u * ts; per ATT_DC dims
+    // a dot chain over its 16 pairs, the chunks added in order, times scale -> s[(u * NV + r) * 16 + j]. Meanwhile npf
+    // (<= hd) cache lines from pf are prefetched into L2, two per dim pair (the next range of a sweep: att512_kv_dot)
+    for (int i0 = 0; i0 < hd; i0 += ATT_DC) {
+        __m512 acc[ATT512_NV][4];
+        for (int r = 0; r < NV; r++)
+            for (int u = 0; u < NT; u++)
+                acc[r][u] = _mm512_setzero_ps();
+        for (int p = i0 / 2; p < (i0 + ATT_DC) / 2; p++) {
+            if (2 * p < npf) {
+                _mm_prefetch(pf + (size_t)128 * p, _MM_HINT_T1);
+                _mm_prefetch(pf + (size_t)128 * p + 64, _MM_HINT_T1);
+            }
+            __m512i k[4];
+            for (int u = 0; u < NT; u++)
+                k[u] = _mm512_loadu_si512((const void *)(kt + u * ts + (size_t)p * 2 * ATT_T));
+            for (int r = 0; r < NV; r++) {
+                __m512i qb = _mm512_set1_epi32((int)qp[(size_t)r * (hd / 2) + p]);
+                for (int u = 0; u < NT; u++)
+                    acc[r][u] = att512_dp(acc[r][u], k[u], qb);
+            }
+        }
+        for (int u = 0; u < NT; u++)
+            for (int r = 0; r < NV; r++) {
+                float *o = s + (u * NV + r) * ATT_T;
+                __m512 a = acc[r][u];
+                if (i0 > 0)
+                    a = _mm512_add_round_ps(_mm512_loadu_ps(o), a, ATT512_RND);
+                if (i0 + ATT_DC == hd)
+                    a = _mm512_mul_round_ps(a, scale, ATT512_RND);
+                _mm512_storeu_ps(o, a);
+            }
+    }
+}
+
+#define ATT512_PVD_STEP(VSEL, COND) do { \
+        const uint32_t *p_ = (const uint32_t *)(s + (size_t)(t >> 4) * NV * ATT_T) + ((t & 15) >> 1); \
+        size_t vo_ = (size_t)(t / ATT_P) * bs + (size_t)((t % ATT_P) >> 4) * ts + (size_t)(t & 14) * hd + 2 * (size_t)d0; \
+        __m512i vv[8]; \
+        for (int u = 0; u < DW; u++) \
+            vv[u] = _mm512_loadu_si512((const void *)(vt + vo_ + u * 32)); \
+        for (int r = 0; r < NV; r++) \
+            if (COND) { \
+                __m512i pb = _mm512_set1_epi32((int)p_[r * ATT_T]); \
+                for (int u = 0; u < DW; u++) \
+                    acc[r][u] = att512_dp(acc[r][u], VSEL, pb); \
+            } \
+    } while (0)
+
+static inline __attribute__((always_inline))
+void att512_pv_dot(const int NV, const int DW, const float *s, int nbk, const int *np, const uint16_t *vt, size_t ts, size_t bs,
+                   int hd, const float *inv, float *const *out, int ob, size_t pst) {
+    // att512_pv on position pairs: the bf16 weights in s (the pair of positions 2m, 2m + 1 of tile tb for vector r: dword m
+    // of s + (tb * NV + r) * 16), V in the pair layout; per block the chain over its pairs, a vector's last pair with only
+    // its even position (np odd) as (w, +0) x (v, +0): the weight is 0 there (the softmax's mask), the V half cleared
+    const __m512i lo16 = _mm512_set1_epi32(0xffff);
+    for (int d0 = 0; d0 < hd; d0 += DW * 16) {
+        for (int j = 0; j < nbk; j++) {
+            int tb = j * ATT_P, nmin = tb + ATT_P, nmax = tb;
+            for (int r = 0; r < NV; r++) {
+                int e = np[r] < tb + ATT_P ? np[r] : tb + ATT_P;
+                nmin = e < nmin ? e : nmin;
+                nmax = e > nmax ? e : nmax;
+            }
+            if (inv) { nmin = np[0]; nmax = np[0]; for (int r = 1; r < NV; r++) { nmin = np[r] < nmin ? np[r] : nmin; nmax = np[r] > nmax ? np[r] : nmax; } }
+            __m512 acc[ATT512_NV][8];
+            for (int r = 0; r < NV; r++)
+                for (int u = 0; u < DW; u++)
+                    acc[r][u] = _mm512_setzero_ps();
+            int t = tb;
+            for (; t + 2 <= nmin; t += 2)
+                ATT512_PVD_STEP(vv[u], 1);
+            for (; t < nmax; t += 2) { // causal tail: the vectors that see position t, t + 1 or only t
+                ATT512_PVD_STEP(vv[u], np[r] > t + 1);
+                ATT512_PVD_STEP(_mm512_and_si512(vv[u], lo16), np[r] == t + 1);
+            }
+            for (int r = 0; r < NV; r++) {
+                if (!inv) { // a block's partial result: unnormalized
+                    if (np[r] > tb)
+                        for (int u = 0; u < DW; u++)
+                            _mm512_storeu_ps(out[r] + (size_t)(ob + j) * pst + d0 + u * 16, acc[r][u]);
+                    continue;
+                }
+                __m512 iv = _mm512_set1_ps(inv[r]);
+                for (int u = 0; u < DW; u++)
+                    _mm512_storeu_ps(out[r] + d0 + u * 16, _mm512_mul_round_ps(acc[r][u], iv, ATT512_RND));
+            }
+        }
+    }
+}
+#undef ATT512_PVD_STEP
+
+static void att512_group_dot(int nv, const float *const *q, float *const *out, float *const *part, const int *np, int b0, int b1,
+                             const uint16_t *kt, const uint16_t *vt, size_t bs, int hd, float scale, float *s, Att512Pf *pf) {
+    // att512_group_t for the bf16 dot products: kt / vt hold block b0 of the kv head (the dot layouts), blocks bs
+    // elements apart; the rest as att512_group_t. pf (or NULL): lines to prefetch meanwhile (in the scores' loop)
+    size_t pst = ATT_PSTRIDE(hd), ts = (size_t)ATT_T * hd;
+    int npr[ATT512_NV], nmax = 0;
+    for (int r = 0; r < nv; r++) {
+        int n = np[r] - b0 * ATT_P, e = (b1 - b0) * ATT_P;
+        npr[r] = n < 0 ? 0 : n < e ? n : e;
+        nmax = npr[r] > nmax ? npr[r] : nmax;
+    }
+    int ntl = (nmax + ATT_T - 1) / ATT_T, nbk = part ? (nmax + ATT_P - 1) / ATT_P : 1;
+    uint32_t qp[ATT512_HDMAX / 2 * ATT512_NV] __attribute__((aligned(64))); // vector r's dim pairs at r * hd / 2
+    for (int r = 0; r < nv; r++)
+        for (int i = 0; i < hd; i += 16) // (bf16 of 16 dims at a time)
+            _mm256_storeu_si256((__m256i *)(qp + (size_t)r * (hd / 2) + i / 2), att512_cvt_bf16(_mm512_loadu_ps(q[r] + i)));
+    __m512 sc = _mm512_set1_ps(scale);
+
+    #define ATT512_QKD(V, T) case (V) * 8 + (T): att512_qk_dot(V, T, qp, kt + (size_t)(tb / ATT_PT) * bs + (size_t)(tb % ATT_PT) * ts, ts, hd, sc, s + (size_t)tb * nv * ATT_T, pfp, npf); break;
+    #define ATT512_QKD_ANY(nt) npf = hd; pfp = att512_pf_take(pf, &npf); switch (nv * 8 + (nt)) { \
+        ATT512_QKD(1, 1) ATT512_QKD(2, 1) ATT512_QKD(3, 1) ATT512_QKD(4, 1) ATT512_QKD(5, 1) ATT512_QKD(6, 1) \
+        ATT512_QKD(7, 1) ATT512_QKD(8, 1) ATT512_QKD(9, 1) ATT512_QKD(10, 1) ATT512_QKD(11, 1) ATT512_QKD(12, 1) \
+        ATT512_QKD(1, 4) ATT512_QKD(2, 4) ATT512_QKD(3, 4) ATT512_QKD(4, 4) ATT512_QKD(5, 4) ATT512_QKD(6, 4) \
+        ATT512_QKD(7, 2) ATT512_QKD(8, 2) ATT512_QKD(9, 2) ATT512_QKD(10, 2) ATT512_QKD(11, 2) ATT512_QKD(12, 2) \
+        default: break; }
+    int ntw = nv <= 6 ? 4 : 2, tb = 0, npf;
+    const char *pfp;
+    for (; tb + ntw <= ntl; tb += ntw) {
+        ATT512_QKD_ANY(ntw)
+    }
+    for (; tb < ntl; tb++) {
+        ATT512_QKD_ANY(1)
+    }
+    #undef ATT512_QKD_ANY
+    #undef ATT512_QKD
+
+    // softmax per vector and block; the weights rounded to bf16 over their scores, l_b their sum
+    float inv[ATT512_NV];
+    size_t st = (size_t)nv * ATT_T;
+    for (int r = 0; r < nv; r++)
+        for (int j = 0; j < nbk; j++) {
+            int n = npr[r] - j * ATT_P;
+            if (n <= 0)
+                break;
+            n = n < ATT_P || !part ? n : ATT_P;
+            int nt = (n + ATT_T - 1) / ATT_T;
+            float *sr = s + r * ATT_T + (size_t)j * (ATT_P / ATT_T) * st;
+            __mmask16 last = (__mmask16)(0xffffu >> (nt * ATT_T - n));
+            __m512 mx = _mm512_set1_ps(-FLT_MAX);
+            for (int tb = 0; tb < nt - 1; tb++)
+                mx = _mm512_max_ps(mx, _mm512_loadu_ps(sr + tb * st));
+            mx = _mm512_mask_max_ps(mx, last, mx, _mm512_loadu_ps(sr + (nt - 1) * st));
+            __m512 m = _mm512_set1_ps(_mm512_reduce_max_ps(mx)), sum = _mm512_setzero_ps();
+            for (int tb = 0; tb < nt; tb++) {
+                __m512 e = att512_exp(_mm512_sub_round_ps(_mm512_loadu_ps(sr + tb * st), m, ATT512_RND));
+                if (tb == nt - 1)
+                    e = _mm512_maskz_mov_ps(last, e);
+                __m256i w = att512_cvt_bf16(e);
+                _mm256_storeu_si256((__m256i *)(sr + tb * st), w);
+                sum = _mm512_add_round_ps(sum, att512_bf16_ps(w), ATT512_RND);
+            }
+            float tot = att512_sum16(sum);
+            if (part) {
+                float *ml = part[r] + (size_t)(b0 + j) * pst + hd;
+                ml[0] = _mm_cvtss_f32(_mm512_castps512_ps128(m));
+                ml[1] = tot;
+            } else {
+                inv[r] = _mm_cvtss_f32(_mm_div_round_ss(_mm_set_ss(1.0f), _mm_set_ss(tot), ATT512_RND));
+            }
+        }
+
+    #define ATT512_PVD(V, D) case V: att512_pv_dot(V, D, s, nbk, npr, vt, ts, bs, hd, part ? NULL : inv, part ? part : out, b0, pst); break;
+    switch (nv) {
+        ATT512_PVD(1, 8) ATT512_PVD(2, 8) ATT512_PVD(3, 4) ATT512_PVD(4, 4) ATT512_PVD(5, 4) ATT512_PVD(6, 4)
+        ATT512_PVD(7, 2) ATT512_PVD(8, 2) ATT512_PVD(9, 2) ATT512_PVD(10, 2) ATT512_PVD(11, 2) ATT512_PVD(12, 2)
+        default: break;
+    }
+    #undef ATT512_PVD
+}
+
+static void att512_kv_dot1(int kvt, int nv, const float *const *q, float *const *out, float *const *part, const int *np, int b0,
+                           int b1, const void *kt, const void *vt, size_t bs, int hd, float scale, float *s, uint16_t *conv,
+                           Att512Pf *pf) {
+    // one range of att512_kv_dot (at most ATT512_BC blocks if part)
+    const uint16_t *kb = (const uint16_t *)kt + (size_t)b0 * bs, *vb = (const uint16_t *)vt + (size_t)b0 * bs;
+    size_t bsx = bs;
+    if (kvt == 2) {
+        int nmax = 0;
+        for (int r = 0; r < nv; r++) {
+            int n = np[r] - b0 * ATT_P, e = (b1 - b0) * ATT_P;
+            n = n < 0 ? 0 : n < e ? n : e;
+            nmax = n > nmax ? n : nmax;
+        }
+        if (nmax == 0)
+            return;
+        att512_dot_conv(conv, conv + (size_t)2 * ATT_P * hd, kb, vb, (nmax + ATT_T - 1) / ATT_T, bs, hd);
+        kb = conv;
+        vb = conv + (size_t)2 * ATT_P * hd;
+        bsx = (size_t)ATT_P * hd;
+    }
+    int ng = (nv + ATT512_G - 1) / ATT512_G;
+    for (int i = 0, g = 0; i < ng; i++) {
+        int gn = (nv - g) / (ng - i);
+        att512_group_dot(gn, q + g, out + g, part ? part + g : NULL, np + g, b0, b1, kb, vb, bsx, hd, scale, s, pf);
+        g += gn;
+    }
+}
+
+static void att512_kv_dot(int kvt, int nv, const float *const *q, float *const *out, float *const *part, const int *np, int b0,
+                          int b1, const void *kt, const void *vt, size_t bs, int hd, float scale, float *s, uint16_t *conv) {
+    // att512_kv for the bf16 dot products (kvt: the storage, KV_BF16 in the dot layouts or KV_F16, converted per range
+    // into conv: 4 * ATT_P * hd elements, the thread's); the same groups and sweep. While a range is computed, the
+    // next one's K / V (the positions some vector reaches) are prefetched into L2: at twice the fp32 rate the first
+    // group of a range waited on memory (synth-27b, 2,560-token chunk at 98k, 8 threads: ~5% of the attention)
+    if (!part || b1 - b0 <= ATT512_BC) {
+        att512_kv_dot1(kvt, nv, q, out, part, np, b0, b1, kt, vt, bs, hd, scale, s, conv, NULL);
+        return;
+    }
+    int nmax = 0;
+    for (int r = 0; r < nv; r++)
+        nmax = np[r] > nmax ? np[r] : nmax;
+    for (int c0 = b0; c0 < b1; c0 += ATT512_BC) {
+        int c1 = c0 + ATT512_BC < b1 ? c0 + ATT512_BC : b1;
+        Att512Pf pf = { .nr = 0, .k = 0 };
+        for (int b = c1; b < c1 + ATT512_BC && b < b1 && b * ATT_P < nmax; b++) {
+            int n = nmax - b * ATT_P < ATT_P ? nmax - b * ATT_P : ATT_P;
+            size_t lines = ((size_t)n * hd * 2 + 63) / 64; // (2-byte elements: positions < n of the block)
+            pf.p[pf.nr] = (const char *)kt + (size_t)b * bs * 2;
+            pf.n[pf.nr++] = lines;
+            pf.p[pf.nr] = (const char *)vt + (size_t)b * bs * 2;
+            pf.n[pf.nr++] = lines;
+        }
+        att512_kv_dot1(kvt, nv, q, out, part, np, c0, c1, kt, vt, bs, hd, scale, s, conv, &pf);
     }
 }
 

@@ -43,6 +43,7 @@ fi
 API_TEST=""
 if [[ -z "${RUNQ:-}" ]]; then
     make -s -j8 runq runq-generic api-test tools-test
+    if [[ "$(uname -m)" == x86_64 ]]; then make -s -j8 build/bf16dp_test build/bf16dp_test-emu; fi
     RUNQ="$ROOT/runq"
     RUNQ_GENERIC="${RUNQ_GENERIC:-$ROOT/runq-generic}"
     API_TEST="$ROOT/build/api_test"

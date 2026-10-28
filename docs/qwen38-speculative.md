@@ -608,7 +608,94 @@ before.) So ~1.3x on the attention, not G4's 2x: at ~700 GFLOPS of ~880 the fp32
 first group of a block still waits on memory: 8 single-threaded copies of the kernel streaming their own K / V run
 at ~91 GFLOPS each vs ~99 from L2). 2x needs `vdpbf16ps` (G4 (b) in TODO.md): measured here at one instruction per
 cycle per core, 64 FLOP, i.e. ~1.74 TFLOPS at 8 threads, twice the fp32 FMA peak; it changes the arithmetic (q, the
-softmax weights, V in bf16), so the KL measurement and a C twin come first. Not done.
+softmax weights, V in bf16), so the KL measurement and a C twin come first. Done as an option: G4 (b), next.
+
+**G4 (b): bf16 dot products** (opt-in KV types `bf16-dot` / `f16-dot`, `-k bf16-dot`; 2026-10-28). The attention's
+two products as `vdpbf16ps` computes them, on q, K, the softmax weights and V rounded to bf16: twice the dot-product
+rate of the fp32 FMAs. The definition is in `src/kernels_avx512.h` ("bf16 dot-product attention"); in short: q and the
+softmax weights rounded as `vcvtneps2bf16` does (round to nearest even, a denormal flushed), K / V as stored in a bf16
+cache (or an f16 cache's value rounded again), a lane of the instruction = two FMAs, the odd bf16 element first, each
+rounded, DAZ on the inputs and FTZ on the results (tiny after rounding); scores per 32-dim chunk over 16 dim pairs,
+the weighted sum over position pairs (a position the vector does not reach enters as +0 x +0), the denominator the sum
+of the rounded weights; the rest (exp, max, combine) is the fp32 attention's. Both products use it: each is half of the
+FLOPs, so one alone would give at most 1.33x (the weighted sum alone would also keep K in f16, the costly rounding of
+Step 7b: bf16 K +4.4% KL, bf16 V +0.7%; not measured as a mode). It is a property of the sequence like its
+cache type, so every path of a sequence (prefill, decode, verify segments, batched decode rows) runs the same arithmetic
+and the invariants hold as before (tests: `kv_bf16-dot_*`, `api_dot/*`, `q35_dot/*`, `q35/synth-q35-27b_bf16-dot/*`,
+the long group with `--long-kv`). The generic build's C twin is two `fmaf` per pair with MXCSR's FTZ / DAZ set for the
+call; `build/bf16dp_test` checks the instruction against it and against an exact reference independent of MXCSR (24
+edge cases with their expected results incl. FTZ after rounding: 2^-126 - 2^-151 kept, 2^-126 - 2^-150 flushed;
+6 x 2^24 random lanes over all bit patterns, cancellations, the underflow and overflow ranges, denormals): equal bit
+for bit on this Zen 4, NaN payloads included. Per-CPU caveat: that equality is what makes the AVX-512 build equal the
+generic one, so on another CPU run `make bf16dp-test` (it is in `make test`); an AVX-512 CPU without AVX512_BF16 runs
+the same kernel with the lane as two `vfmadd` (equal, at the fp32 rate); AArch64 runs the C twin under the platform's
+flush mode (its FTZ detects tininess before rounding: results there can differ from x86 in the products' underflow
+cases, NEON == generic still holds).
+
+Layouts: K keeps the bf16 cache's dim pairs (one 64-byte load = 16 positions x a dim pair, the q pair broadcast); V of
+a `bf16-dot` cache is stored in position pairs (one load = 16 dims x 2 positions, the weight pair broadcast), so the
+cache of a `bf16-dot` sequence is not interchangeable with a `bf16` one (`rq_seq_copy` refuses). An `f16-dot` cache
+keeps the f16 layout and each call converts its range into those layouts in the thread's scratch (`vcvtph2ps`,
+`vcvtne2ps2bf16`, `vpermw`). The kernel keeps att512_kv's groups (<= 6 vectors, register tiles 6 x 4) and 2-block
+sweep, and prefetches the next range's K / V into L2 during the scores (at twice the rate the first group of a range
+waited on memory: 6.49 -> 5.85 s for the chunk below at 98k before the other changes). One core, its K / V in L2, 36
+vectors (a 27B prefill item): fp32 100 GFLOPS, `bf16-dot` 189 (scores 200, weighted sum 229: the instruction's peak at
+the core's clock; the softmax's exp and the conversions stay fp32), `f16-dot` 168; streamed from memory 92 / 158-176 /
+155. Measured (bench lock, load ~3-8 besides the runs, medians; f16 = the fp32 attention, unchanged; `pre`: the
+2,560-token chunk in s, "its attention" = minus the same pass at L = 512):
+
+| model, threads | L | pre 2,560: f16 -> bf16-dot (f16-dot) | its attention | dec (ms) | seg 2 / 4 / 8 (ms) |
+|---|---|---|---|---|---|
+| synth-27b, 8 | 16,384 | 1.94 -> 1.30 (1.43) | 1.41 -> 0.81 (1.74x; f16-dot 1.50x) | 2.9 -> 2.6 | 3.6 / 5.4 / 9.3 -> 3.1 / 4.3 / 7.7 |
+| | 32,768 | 3.46 -> 2.18 (2.44) | 2.92 -> 1.70 (1.72x; 1.50x) | 3.5 -> 3.1 | 5.0 / 8.0 / 14.8 -> 4.0 / 6.0 / 11.1 |
+| | 65,536 | 6.49 -> 3.96 (4.47) | 5.96 -> 3.47 (1.72x; 1.50x) | 5.8 -> 4.6 | 8.4 / 14.1 / 27.1 -> 6.3 / 10.0 / 18.8 |
+| | 98,304 | 9.52 -> 5.70 (6.50) | 8.99 -> 5.22 (1.72x; 1.50x) | 7.3 -> 6.1 | 11.2 / 19.7 / 38.2 -> 8.5 / 13.7 / 25.9 |
+| synth-27b, 16 | 65,536 | 3.59 -> 2.21 (2.45) | 3.25 -> 1.91 (1.70x; 1.52x) | 4.5 -> 4.1 | 6.4 / 9.6 / 17.8 -> 5.5 / 7.8 / 12.5 |
+| | 98,304 | 5.24 -> 3.12 (3.14) | 4.89 -> 2.82 (1.73x; 1.73x) | 6.2 -> 5.5 | 8.5 / 13.2 / 23.1 -> 6.5 / 9.6 / 17.1 |
+| 0.8B Q8_0, 8 | 65,536 | 14.0 -> 8.87 (10.3) | 12.1 -> 7.13 (1.70x; 1.43x) | 15.1 -> 13.5 | 20.4 / 32.1 / 58.9 -> 17.1 / 25.4 / 44.5 |
+| | 98,304 | 20.2 -> 12.5 (14.7) | 18.3 -> 10.7 (1.70x; 1.42x) | 18.7 -> 17.1 | 26.9 / 43.7 / 82.4 -> 21.9 / 32.6 / 60.5 |
+| 0.8B Q8_0, 16 | 65,536 | 7.88 -> 5.03 (5.87) | 6.70 -> 3.84 (1.74x; 1.42x) | 12.4 -> 12.1 | 15.5 / 23.7 / 38.9 -> 13.3 / 18.0 / 29.4 |
+| | 98,304 | 11.3 -> 7.04 (8.32) | 10.2 -> 5.85 (1.73x; 1.42x) | 16.2 -> 14.0 | 21.1 / 31.7 / 54.9 -> 16.5 / 23.6 / 41.9 |
+
+(The same session's f16 runs, twice at 8 threads: 8.99 / 8.99 s at 98k. The 4B Q8_0 to 32k (its 98k does not fit this
+run's share of the box), 8 / 16 threads: the chunk's attention at 32,768 15.6 -> 9.12 s (1.71x) / 9.07 -> 5.12 s
+(1.77x), `f16-dot` 1.42x / 1.45x; at 16,384 1.67x / 1.73x.) So ~1.72x on the attention, not 2x: one core reaches 1.90x
+with its K / V in L2, and at 8 threads the attention runs at ~1.21 TFLOPS, 80% of 8 x 189 GFLOPS (the fp32 one 88% of 8
+x 100): K / V are streamed at twice the rate, and the prefetch of the next range hides most but not all of it. Measured
+and not kept (`bf16-dot`, the chunk at 98k, build / variant, s): sweeping 1 block at a time (`ATT512_BC` 1: the range
+and the next one's prefetch in half of L2) 5.71 / 5.59 at 8 threads, 3.14-3.26 / 3.18 at 16; 12 rows per item
+(`ATT_ROWS` 12: half the K / V traffic) 5.49 at 8, 3.18 at 16; 4 blocks: slower (the two ranges no longer fit L2).
+Decode gains little (it reads the same bytes; `f16-dot` decodes 4-12% slower than f16: each block converted for 2-6
+vectors); a verify row's attention gains most of the prefill's (4-row segments at 98k -30%).
+
+Accuracy (`scripts/kl_kv.py`, the measurement of Step 7b's KV types redone and kept: pieces of <= 3,500 tokens of Beagle
+ch. I and of check_long's corpus, this repository's docs, C and Python, each from position 0, every position scored;
+KL(HF fp32 || runq) in float64, the reference the HF checkpoint in fp32, one layer at a time (vs transformers on the
+0.6B / 0.8B: KL 5.6e-12 / 1.0e-11); relative to the f32 cache, with the pieces higher / lower than its):
+
+| model | tokens (pieces) | f32 | f16 | bf16 | bf16-dot | f16-dot |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B Q8_0 | 45,077 (13) | 0.002175 | +2.1% (11 / 2) | +3.9% (13 / 0) | +5.4% (13 / 0) | +5.9% (13 / 0) |
+| Qwen3-1.7B Q8_0 | 27,718 (8) | 0.002163 | +0.5% (4 / 4) | +2.8% (8 / 0) | +2.9% (8 / 0) | |
+| Qwen3.5-0.8B Q8_0 | 45,095 (13) | 0.001171 | -0.7% (6 / 7) | -0.2% (7 / 6) | +0.3% (8 / 5) | -0.0% (5 / 8) |
+| Qwen3.5-4B Q8_0 | 20,763 (6) | 0.002688 | +0.9% (3 / 3) | | -3.4% (4 / 2) | |
+
+(The 4B's pieces swing: one of them is 21% lower in `bf16-dot`, as Step 7b's legal text moved by +-1-10% under any
+rounding change; without it `bf16-dot` is +0.1%, f16 +2.2%.) Top-1 agreement with the reference and the text's NLL move
+by < 0.2% in every case. The logits thresholds hold everywhere: the `kv` group on the 0.6B .bin (pooled cos 0.99885,
+top-1 36/39; f32 0.99889, 35/39), the models group with `--models-kv bf16-dot` on Qwen3-1.7B Q8_0 / Q4_K_M, Qwen3-4B
+Q8_0 and Qwen3.5-4B Q8_0 (65 checks; pooled cos vs HF / the references 0.99931 / 0.99973, 0.97982 / 0.99972, - /
+0.99979, 0.99983 / 0.99987, the default's 0.99944 / 0.99968, 0.97929 / 0.99974, - / 0.99973, 0.99982 / 0.99987),
+`q35_dot` on the 0.8B (pooled 0.99979 vs HF, 0.99986 vs its reference: the default's), synth-27b vs its numpy reference
+(0.9984 / 0.9978 / 0.9966, as f16), and the long group on the 0.8B at 1k-98k (`--long-kv bf16-dot`, same session as f16:
+pooled cos 0.999927 vs 0.999936, min 0.999814 vs 0.999879, both at 57,343, `bf16-dot` higher at 5 of the 14 positions,
+top-1 14/14 both; verify / decode == prefill and generic == native bitwise; the fact retrieved at 88k). So on Qwen3
+(attention in every layer) the dot products cost about what a bf16 cache costs, ~+3-5% KL, beyond f16's spread; on
+Qwen3.5 / 3.8 (attention in 1 layer of 4) they are within the noise, at short and long context. **Decision: an option**,
+`-k bf16-dot`, not the default: the default stays the arithmetic every golden and comparison was made with, and the
+measurement on the 27B itself (its 16 attention layers of 64, as the 0.8B's 6 of 24) is still to do. For the agentic
+sessions on the 27B it is the setting to use: `bf16-dot` (a single rounding of K / V; `f16-dot` is slower and rounds
+twice).
 
 **The 27B, extrapolated** (not measured: the 27B run is below). Per pass: the 27B's own short-context cost (S7: decode
 118 ms at 8 threads, 97 ms at 16; prefill 45 / 76 tok/s; verify f(2) / f(4) = 1.10 / 1.25, f(8) ~2.15 as the 8B
@@ -638,6 +725,22 @@ goal's ">= 8 tok/s at 90k with speculation" needs cheaper attention per row firs
 verify, an 8-bit KV for the decode read; G7's k by position). To be checked against the 27B itself and the replay
 (G0 (a)).
 
+With `-k bf16-dot` (G4 (b), the same method on the G4 (b) session's synth-27b runs; its f16 runs give the table above to
+within 1-2%: chunk at 98k 200.7 s, 4-row verify 416 ms):
+
+| L | decode ms (tok/s), 8 thr | 16 thr | verify pass 2 / 4 / 8 rows, 8 thr (x decode) | prefill 2,560 tokens, 8 thr | 16 thr |
+|---|---|---|---|---|---|
+| 16,384 | 131 (7.6) | | 152 / 180 / 311 (1.16 / 1.37 / 2.37) | 70 s [79.5] | |
+| 32,768 | 139 (7.2) | | 166 / 208 / 365 (1.19 / 1.49 / 2.62) | 84 s [104] | |
+| 65,536 | 164 (6.1) | 134 (7.5) | 202 / 271 / 488 (1.24 / 1.66 / 2.98) | 112 s [152] | 64 s [86] |
+| 98,304 | 187 (5.3) | 156 (6.4) | 238 / 330 / 603 (1.27 / 1.76 / 3.22) | 140 s [201] | 79 s [112] |
+
+([f16 of the same session]; the decode at 16k is within that session's noise of f16's 127 ms.) A_pre ~0.0205 us per pair
+at 8 threads, ~0.011 at 16; A_dec ~0.044 / ~0.038 us per position. The turn of 2,500 tokens + a 500-token reply at ~90k:
+**~3.7 min at 8 threads (~130 s + ~91 s), ~2.5 min at 16 (~73 s + ~76 s)** instead of ~4.7 / ~3.1 min. Speculation at
+98k (k = 3): a 4-row pass ~330 ms + the draft's 3 steps (~51 ms with its own `bf16-dot`), 2.0-3.7 tokens per pass:
+~5.2-9.7 tok/s against 5.3 plain.
+
 **The 27B run (later, alone on the box: the other services stopped, MemAvailable >= ~23.5 GiB):**
 
 ```
@@ -645,6 +748,7 @@ make bench-long
 flock /tmp/cwayn-bench.lock sh -c 'for t in 8 16; do OMP_NUM_THREADS=$t build/bench_long \
     models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf -L 512,16384,32768,65536,98304 -R 2,4,8 -P 2560 -r 5 -p 1; done' \
     | tee logs/bench-long-27b.txt
+# G4 (b): the same with -k bf16-dot appended (the KV cache is as big: bf16 / f16 are both 2 bytes)
 ```
 
 Its memory: weights 15.3 GiB + KV of 100,865 positions (6.2 GiB, 64 KiB each) + the attention scratch (~0.8 GiB at 16

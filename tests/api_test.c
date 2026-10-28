@@ -1,5 +1,5 @@
 /* Tests of the library API (src/runq.h), run by `make test` (tests/check.py, group api) on each model:
- *   tests/api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv]
+ *   tests/api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv] [--kv-type TYPE]
  * Prints PASS / FAIL lines, exit status 1 if any failed. The forward-pass checks are bitwise: a
  * sequence's logits must not depend on what else the context ran in between or batched with it
  * (sequences interleaved, several sequences in one rq_forward_batch, a prefill chunk next to decode
@@ -9,7 +9,9 @@
  * thread count and build (check.py compares runs at other thread counts and of the generic build);
  * --digest: only those passes (no references, no PASS / FAIL lines); --digest-small: only the short
  * ones (for the slow generic build; --long: and the long ones); --n65: also 65 sequences in one pass
- * (references for 48 more sequences: one model is enough); --kv: also a bf16 KV cache.
+ * (references for 48 more sequences: one model is enough); --kv: also a bf16 KV cache and the bf16 dot-product
+ * attention (bf16-dot, f16-dot: 3 long sequences); --kv-type: the KV cache type of all the other sequences (default
+ * f16; e.g. bf16-dot: every path of the API in the bf16 dot-product attention, its digests across builds).
  *   tests/api_test --two MODEL_A MODEL_B [--gs MODEL_GS]
  * Two models in one process (a draft and a target of speculative decoding: one thread pool, one activation
  * group size): their prefills, decode steps, batched passes (several sequences, a prefill chunk next to decode
@@ -68,9 +70,11 @@ static RqTokens toks(const char *text) {
     return t;
 }
 
+static int KVT = RQ_KV_DEFAULT; // the main tests' KV cache type (--kv-type: e.g. bf16-dot, the bf16 dot-product attention)
+
 static RqSeq *seq_new(int cap) {
     int e;
-    RqSeq *s = rq_seq_new(M, cap, RQ_KV_DEFAULT, &e);
+    RqSeq *s = rq_seq_new(M, cap, KVT, &e);
     if (!s) die("rq_seq_new", e);
     return s;
 }
@@ -340,10 +344,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--long")) bd_long = 1;
         else if (!strcmp(argv[i], "--n65")) bd_n65 = 1;
         else if (!strcmp(argv[i], "--kv")) bd_kv = 1;
+        else if (!strcmp(argv[i], "--kv-type") && i + 1 < argc && (KVT = rq_kv_parse(argv[i + 1])) >= 0) i++;
         else argc = 0;
     }
     if (argc < 2) {
-        fprintf(stderr, "usage: api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv]\n"
+        fprintf(stderr, "usage: api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv] [--kv-type TYPE]\n"
                         "       api_test --two MODEL_A MODEL_B [--gs MODEL_OTHER_GROUP_SIZE]\n"
                         "       api_test --spec TARGET DRAFT [--quick] [--other MODEL_OTHER_VOCABULARY]\n"
                         "       api_test MODEL --sample LOGITS_FILE < PLAN (lines: T P K ROW SEED...)\n");
@@ -901,8 +906,8 @@ static void batch_tests(RqCtx *c, RqTokens A, RqTokens B, RqTokens C, const floa
     if ((e = rq_prefill(c, bs, A.v, A.n, RQ_LOGITS_NONE, NULL, NULL)) != RQ_OK) die("prefill", e);
     if (lng && (e = rq_prefill(c, bl, C.v, C.n, RQ_LOGITS_NONE, NULL, NULL)) != RQ_OK) die("prefill", e);
     if (!only_digest) {
-        bd_refs(c, bs, 8, 25, ns, RQ_KV_DEFAULT, hs);
-        bd_refs(c, bl, 248, 12, nl, RQ_KV_DEFAULT, hl);
+        bd_refs(c, bs, 8, 25, ns, KVT, hs);
+        bd_refs(c, bl, 248, 12, nl, KVT, hl);
     }
     float *out = malloc((size_t)BD_SEQS * V * sizeof(float));
     uint64_t (*rs)[BD_STEPS] = only_digest ? NULL : hs, (*rl)[BD_STEPS] = only_digest ? NULL : hl;
@@ -1091,8 +1096,12 @@ static void batch_tests(RqCtx *c, RqTokens A, RqTokens B, RqTokens C, const floa
         report(oks, "batch_sample", "rq_sample_batch == rq_sample per row (greedy, top-p, full distribution, top-k)");
         free(l2);
 
-        // KV bf16 (f16 above; f32: the plain fp32 tile layout of the same kernels): 3 long sequences
-        for (int kvt = RQ_KV_BF16; kvt <= RQ_KV_BF16 && bd_kv; kvt++) {
+        // KV bf16 (f16 above; f32: the plain fp32 tile layout of the same kernels) and the bf16 dot-product attention
+        // on both 16-bit caches: 3 long sequences
+        int kts[] = { RQ_KV_BF16, RQ_KV_BF16_DOT, RQ_KV_F16_DOT };
+        for (unsigned ki = 0; ki < sizeof(kts) / sizeof(kts[0]) && bd_kv; ki++) {
+            int kvt = kts[ki];
+            if (kvt == KVT) continue;
             RqSeq *b2 = rq_seq_new(M, 0, kvt, &e), *q2[3];
             if (!b2) die("rq_seq_new", e);
             if ((e = rq_prefill(c, b2, C.v, C.n, RQ_LOGITS_NONE, NULL, NULL)) != RQ_OK) die("prefill", e);

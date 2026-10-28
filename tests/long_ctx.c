@@ -5,7 +5,7 @@
  *
  *   build/long_ctx MODEL -T TEXT -o IDS                tokenize a text file (raw text: added tokens recognized, no
  *                                                      template) into int32 ids; stderr: the count
- *   build/long_ctx MODEL -I IDS [-n N] [-P p1,p2,...] [-o OUT] [-V] [-g G] [-c CTX] [-b CHUNK] [-k KV]
+ *   build/long_ctx MODEL -I IDS [-n N] [-P p1,p2,... | -A] [-o OUT] [-V] [-g G] [-c CTX] [-b CHUNK] [-k KV]
  *       -I IDS     the token ids (int32), the first N of them (-n; default all)
  *       -P ...     positions (ascending, < N): the logits after the token at each (row p of -m logits) into OUT:
  *                  int32 npos, int32 vocab, int32 pos[npos], float32 logits[npos][vocab]. The sequence is
@@ -18,7 +18,11 @@
  *                  line per position, "verify p SAME|DIFFER segment=<0/1> decode=<0/1>"
  *       -g G       after the N tokens (and the positions), generate up to G tokens greedily (stop at an end token):
  *                  stdout "gen <ids...>" then "text <the text, escapes as JSON would not need: raw>" lines
- *       -c CTX     sequence capacity (default N + G + 1); -k f16|bf16|f32 (default f16); -b chunk rows (default 512)
+ *       -A         every row's logits of the N tokens into OUT, streamed per chunk of -b rows (rq_prefill RQ_LOGITS_ALL:
+ *                  the bits of runq -m logits, in its file format: int32 N, vocab, ids[N], float32 logits[N][vocab]; the
+ *                  memory of one chunk, not of N rows: scripts/kl_kv.py)
+ *       -c CTX     sequence capacity (default N + G + 1); -k f16|bf16|f32|bf16-dot|f16-dot (default f16); -b chunk rows
+ *                  (default 512)
  *   stderr: timings ([long_ctx] lines). Threads: OMP_NUM_THREADS (else the default). */
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,10 +72,11 @@ static void prefill_to(RqCtx *c, RqSeq *s, const int *ids, int n, float **lg) {
 
 int main(int argc, char **argv) {
     const char *path = NULL, *text = NULL, *idsf = NULL, *outf = NULL, *plist = NULL;
-    int N = -1, G = 0, cap = 0, chunk = 512, kvt = RQ_KV_DEFAULT, vfy = 0;
+    int N = -1, G = 0, cap = 0, chunk = 512, kvt = RQ_KV_DEFAULT, vfy = 0, all = 0;
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-') { path = argv[i]; continue; }
         if (!strcmp(argv[i], "-V")) { vfy = 1; continue; }
+        if (!strcmp(argv[i], "-A")) { all = 1; continue; }
         if (i + 1 >= argc) goto usage;
         const char *v = argv[++i];
         switch (argv[i - 1][1]) {
@@ -113,7 +118,7 @@ int main(int argc, char **argv) {
     int *ids = read_file(idsf, &nb), *pos = NULL, np = plist ? parse_list(plist, &pos) : 0;
     int nids = (int)(nb / sizeof(int));
     if (N < 0 || N > nids) N = nids;
-    if (N < 1 || (np && !outf)) goto usage;
+    if (N < 1 || ((np || all) && !outf) || (np && all)) goto usage;
     for (int i = 0; i < np; i++)
         if (pos[i] < 0 || pos[i] >= N || (i && pos[i] <= pos[i - 1])) { fprintf(stderr, "long_ctx: bad -P (ascending, < %d)\n", N); return 2; }
     if (!cap) cap = N + G + 1;
@@ -137,6 +142,21 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[long_ctx] %s: %d tokens, capacity %d, KV %s, -b %d, %d threads, load %.1f s\n", path, N, cap,
             rq_kv_name(kvt), chunk, rq_threads(), rq_now() - t0);
 
+    if (all) { // every row's logits, a chunk at a time
+        FILE *f = fopen(outf, "wb");
+        int32_t hdr[2] = { N, V };
+        float *buf = malloc((size_t)chunk * V * sizeof(float));
+        if (!f || !buf || fwrite(hdr, 4, 2, f) != 2 || fwrite(ids, 4, N, f) != (size_t)N) { fprintf(stderr, "long_ctx: write %s\n", outf); return 1; }
+        double ta = rq_now();
+        for (int p = 0; p < N; p += chunk) {
+            int k = N - p < chunk ? N - p : chunk;
+            if ((e = rq_prefill(c, s, ids + p, k, RQ_LOGITS_ALL, buf, NULL)) != RQ_OK) die("rq_prefill", e, c);
+            if (fwrite(buf, sizeof(float), (size_t)k * V, f) != (size_t)k * V) { fprintf(stderr, "long_ctx: write %s\n", outf); return 1; }
+        }
+        if (fclose(f)) { fprintf(stderr, "long_ctx: write %s\n", outf); return 1; }
+        fprintf(stderr, "[long_ctx] every row's logits of %d tokens: %.1f s\n", N, rq_now() - ta);
+        free(buf);
+    }
     float *out = np ? malloc((size_t)np * V * sizeof(float)) : NULL, *alt = malloc((size_t)4 * V * sizeof(float));
     double tp = rq_now();
     for (int i = 0; i < np; i++) {
@@ -211,7 +231,7 @@ int main(int argc, char **argv) {
     rq_model_free(m);
     return 0;
 usage:
-    fprintf(stderr, "usage: long_ctx MODEL -T TEXT -o IDS | long_ctx MODEL -I IDS [-n N] [-P p1,p2,...] [-o OUT] [-V] [-g G] "
-                    "[-c CTX] [-b CHUNK] [-k f16|bf16|f32]\n");
+    fprintf(stderr, "usage: long_ctx MODEL -T TEXT -o IDS | long_ctx MODEL -I IDS [-n N] [-P p1,p2,... | -A] [-o OUT] [-V] [-g G] "
+                    "[-c CTX] [-b CHUNK] [-k f16|bf16|f32|bf16-dot|f16-dot]\n");
     return 2;
 }

@@ -172,7 +172,7 @@ more than its new tokens plus the last reply.
   measurement decide; the instruction's exact rounding (two FMAs per pair, DAZ / FTZ, the odd element first) needs
   a C twin for the generic build, verified per CPU. Done when G0's 2.5k-chunk-at-90k prefill is ~2x faster, the
   thresholds hold, and the paths stay bitwise.
-  Status (2026-10-28, `082511f`, docs/qwen38-speculative.md, "G4"): **~1.3x, bit-identical**. The loss was the
+  Status (2026-10-28, `082511f`, docs/qwen38-speculative.md, "G4"): (a) **~1.3x, bit-identical**. The loss was the
   memory traffic per item, not the balance (threads 98% busy at 8, 95% at 16 on synth-27b) nor the inner loop (99 of
   111 GFLOPS per core from L2): `att512_kv` now sweeps a long range 2 blocks at a time (K / V once per item, from L2
   for every group) in groups of <= 6 vectors (~108 GFLOPS per core). synth-27b, 2,560-token chunk at 98k: 12.56 ->
@@ -180,9 +180,27 @@ more than its new tokens plus the last reply.
   16; the 0.8B at 98k 26.0 -> 20.3 s; verify segments at 98k -5-9%; the 27B estimate for the chunk at 98k ~250 ->
   ~200 s (8 threads), ~143 -> ~111 s (16). (a) as written (items per block range with a shared combine) not done:
   ~2-5% of balance to win at 512-row passes, and its partial results would have to live across threads (~60 MB per
-  split row block of the 27B at 98k); short passes (a turn's last few hundred rows) would gain more. Left: (b), the
-  only way to 2x (fp32 has ~20% left; `vdpbf16ps` measured at 1 per cycle, ~1.74 TFLOPS at 8 threads: twice the
-  FMA peak), with its KL measurement and C twin.
+  split row block of the 27B at 98k); short passes (a turn's last few hundred rows) would gain more.
+  (b) **done as an option** (2026-10-28, docs/qwen38-speculative.md, "G4 (b)"): KV types `bf16-dot` / `f16-dot`
+  (`-k bf16-dot`), the attention's products as `vdpbf16ps` computes them (q, K, the softmax weights, V rounded to bf16;
+  the lane's two FMAs, DAZ / FTZ, the odd element first), a C twin in the generic build equal to the instruction on this
+  CPU (`build/bf16dp_test`: edge cases and 6 x 2^24 random lanes, bit for bit), every path of a sequence on the same
+  arithmetic (bitwise: batched == sequential, threads, builds, api digests, long_ctx). The attention part of the
+  2,560-token chunk **~1.72x** (synth-27b at 98k 8.99 -> 5.22 s at 8 threads, 4.89 -> 2.82 s at 16; the 0.8B 18.3 ->
+  10.7 s; `f16-dot` ~1.5x), verify segments at 98k -24-32%, decode -9-16%; the 27B estimate for the chunk at 98k
+  ~200 -> ~140 s (8 threads), ~112 -> ~79 s (16), a turn of 2,500 tokens + a 500-token reply at ~90k ~4.7 -> ~3.7 min
+  (8 threads). Not 2x: one core reaches 1.9x with its K / V in L2 (the softmax's exp and the conversions stay fp32,
+  the scores' chunk sums go through memory), the rest is K / V streamed at twice the rate (prefetched, ~10% left).
+  Accuracy: KL from HF fp32 (scripts/kl_kv.py, pieces of 3,500 tokens of prose, docs and code, relative to the f32
+  cache): Qwen3-0.6B (45k tokens) f16 +2.1%, bf16 +3.9%, bf16-dot +5.4% (higher on all 13 pieces), f16-dot +5.9%;
+  Qwen3-1.7B (28k) f16 +0.5%, bf16 +2.8%, bf16-dot +2.9% (8 of 8); Qwen3.5-0.8B (45k) f16 -0.7%, bf16-dot +0.3%
+  (8 / 13); Qwen3.5-4B (21k) f16 +0.9%, bf16-dot -3.4% (4 / 6; a swinging piece). The logits thresholds hold everywhere
+  (the kv group, q35_dot, synth-27b, the models group with --models-kv on the 1.7B / 4B files, 65 checks, the long
+  group on the 0.8B with --long-kv: 36/36, pooled cos 0.999927 vs f16's 0.999936 in the same session). So **opt-in**,
+  not the default: beyond f16's noise on Qwen3 (attention in every layer: about a bf16 cache's cost), within it on
+  Qwen3.5 (1 layer in 4, as the 27B's 16 of 64): the setting for the 27B's long sessions, once checked on the 27B.
+  Left for G0's 2x on the whole chunk: its matmul part (57 of the 27B's ~140 s at 8 threads), an fp32-free softmax (a
+  change of definition), and the KL at 64k-98k positions (the long group's golden keeps 576 ids per position).
 - [ ] **G5 leftovers: re-prefill and compaction.** G5 is done (docs/server.md and docs/qwen38-speculative.md,
   "Agent sessions": checkpoints at the system block's end, the assistant header, Qwen3.5's turn start, `</think>` and the
   reply's end, `--checkpoints`, slot affinity, SSE keep-alive; on the 0.8B replay every tool turn prefills its new

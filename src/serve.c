@@ -1016,7 +1016,7 @@ static void usage(void) {
             "  --api-key <key>     require 'Authorization: Bearer <key>' (not on /health)\n"
             "  --name <id>         model id in /v1/models and responses, default: the file name\n"
             "  -c, --ctx <int>     context (positions) per sequence, default 8192\n"
-            "  -k <type>           KV cache type f16|bf16|f32, default f16\n"
+            "  -k <type>           KV cache type f16|bf16|f32|bf16-dot|f16-dot, default f16 (-dot: bf16 dot-product attention)\n"
             "  --parallel <int>    requests running at once (batched in each forward pass), default 16\n"
             "  --slots <int>       sequences in the pool: running requests + prefix caches, default parallel + 4\n"
             "  --kv-mem <GiB>      memory of the pool at most (slots x (KV cache of ctx positions + recurrent state and its\n"

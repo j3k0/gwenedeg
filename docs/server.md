@@ -303,7 +303,11 @@ the server's context as the model's window, so pi's compaction triggers where it
 the recorded one, forced (`force_reply`: the recorded message as the template renders it, fed as if generated), and
 the next request carries the server's reply as pi parsed it: the cache sees what a model writing in the template's
 format would have generated, and the round trip (our parse, pi's message, pi's serialization, our rendering) is the
-real one. `--mode live`: the model generates and its own replies go on (the recorded tool results follow them). Per
+real one. `--mode live`: the model generates and its own replies go on (the recorded tool results follow them).
+`--probe-every N --probe-tokens T` (force mode): before every Nth tool turn, the same request live (kind `probe`, at most
+T tokens, its reply dropped; the forced request after it reuses the prompt from the header's checkpoint): the decode
+rate and the speculation at real positions of the session while the rest is replayed (forced replies do not
+speculate). `--per-request` prints each request's prefill / decode seconds too. Per
 request: kind, prompt / cached / prefilled tokens, "new" (a tool turn's prompt minus the previous prompt and reply:
 what a perfect cache prefills), whether the prompt left the slot's tokens before their end (diverged) and where
 (`--server-verbose`: the tokens around it), rollbacks, times. Run on Qwen3.5-0.8B Q8_0, 8 threads, 3 slots, 2026-10-28,
@@ -359,7 +363,73 @@ ending long prefills; two slots if the memory allows them (`--kv-mem`: the summa
 session's slot, and the next request reuses the system block; with one slot it is prefilled again: ~8k tokens, ~3
 min); `--checkpoints 3` saves 150 MiB per slot on Qwen3.8 (its header, the system block and the `</think>` or the
 reply's end; Qwen3.5's turn checkpoint is not needed there). pi's compaction settings and a compaction's cost on the
-27B: [qwen38-speculative.md](qwen38-speculative.md#agent-sessions-replay-and-compaction-g0-a-g5).
+27B: [qwen38-speculative.md](qwen38-speculative.md#agent-sessions-replay-and-compaction-g0-a-g5). The configuration
+measured on the 27B: next section.
+
+## Qwen3.8-27B with pi
+
+The setup for agentic development at 96k on the 16-vCPU / 31 GB box (2026-10-28; TODO's "Agentic development";
+measurements in [qwen38-speculative.md](qwen38-speculative.md): G3, "Long-context costs", "Agent sessions"), with the
+box's other services stopped (~24 GiB available):
+
+```sh
+OMP_NUM_THREADS=16 runq serve models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q3_K_M.gguf -c 98304 -k bf16-dot \
+    --draft models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf --slots 1 --parallel 1 --checkpoints 3 \
+    --spec-calibrate 32768 --timeout 0 --name qwen3.8-27b --port 18080
+```
+
+- **The file: Q3_K_M** (`scripts/download_models.py 3.8-27b-q3km`). At `-c 98304` runq's estimate is 19.45 GiB (weights
+  12.40, a 96k sequence: KV 6.0 + the recurrent state and 3 checkpoints), + the draft at that context (2.03 GiB: its
+  sequence 1.23) and 0.66 GiB for the verify rows' checkpoints: ~22.1 GiB, ~2 GiB to spare. The Q4_K_M needs ~25 GiB
+  there (it fits at 96k only without the draft and with ~1 GiB to spare, or with the draft up to ~64k). The price:
+  the Q3_K_M disagrees with the API's model on ~3.5% / 5.5% of the tokens (thinking off / on; Q4_K_M 1.6% / 3.1%),
+  +2.7% perplexity, KL 0.03 from the Q4_K_M on agentic replies (G3).
+- **`-k bf16-dot`**: the attention's dot products in bf16 (the KV cache is as big as f16's): at 98k a 2,560-token
+  chunk prefills in 86 s instead of 123 (16 threads), decode 4-7% faster; within f16's noise on Qwen3.5 / 3.8 (KL), and
+  the 27B's retrieval of a fact ~84k tokens back passes with it (TODO G2).
+- **16 threads** (all the vCPUs; 8 leave room for other work at ~1.4-1.7x the time: decode at 98k 5.7 vs 6.9 tok/s, the
+  chunk 148 vs 86 s).
+- **Speculation**: `--draft` the 0.8B Q4_K_M with the default auto policy (and the lookup at 3 guesses): at short context
+  the draft (the live session below: 15-23 tok/s at 2-3k positions), at long context mostly the lookup (each verify
+  row pays the attention again: the replay's probes 8.1-13.9 tok/s at 21-81k, ~7-9 plain). `--spec-calibrate 32768`:
+  at the default 8,192 positions the 27B's attention slope is within the noise of its ~90 ms step; even at 32,768 a
+  noisy box can make the calibration fall back to its estimate (2.40 us per position, ~4x the real ~0.6: printed on
+  the startup line; the online correction rescales the whole cost, TODO G7 (b)): restart the server if it shows 2.403.
+- **One slot** (`--slots 1 --parallel 1`): a second 96k slot (7.8 GiB + the draft's 1.2) does not fit, so a
+  compaction's summary request takes the session's slot and the next request prefills the system block again (~2 min;
+  TODO G5 (b)). `--checkpoints 3`: Qwen3.8 needs the header, the system block's end and the reply's end. `--timeout 0`:
+  a compaction's requests prefill for 4-8 min each; the SSE keep-alive comments keep pi's idle timeout from firing.
+
+**pi** (1.4.0; a temporary agent directory, `PI_CODING_AGENT_DIR=DIR`, so `~/.pi` is untouched): `DIR/models.json`
+
+```json
+{"providers": {"runq": {"baseUrl": "http://127.0.0.1:18080/v1", "api": "openai-completions", "apiKey": "none",
+  "compat": {"supportsDeveloperRole": false, "supportsReasoningEffort": true, "supportsStore": false, "maxTokensField": "max_tokens"},
+  "models": [{"id": "qwen3.8-27b", "name": "Qwen3.8-27B (runq)", "reasoning": true, "input": ["text"],
+              "contextWindow": 98304, "maxTokens": 16384, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}}]}}}
+```
+
+and `DIR/settings.json` `{"defaultProvider": "runq", "defaultModel": "qwen3.8-27b", "defaultThinkingLevel": "medium",
+"compaction": {"enabled": true, "reserveTokens": 16384, "keepRecentTokens": 8000}}`: `keepRecentTokens` 8,000 instead
+of pi's 20,000 makes a compaction's next request ~12k tokens shorter (~4-7 min less on the 27B); `reserveTokens` 16,384
+(pi's default) compacts at ~82k. `maxTokens` matters for speculation: the server follows a request with the draft only
+if the time it saves over the remaining `max_tokens` is worth the draft's catch-up. Thinking `medium` sends no effort
+instruction (Qwen3.8's `xhigh`, its default, reasons longest).
+
+**Measured** (the Q3_K_M, the command above; the box at load 10-20 from other jobs):
+- **A live session** (`pi -p --mode json --tools read,bash,edit,write --no-extensions --no-skills --no-context-files`
+  in a scratch Python project: "add `median(xs)` to `textstats/stats.py` (ValueError on an empty list, the mean of the
+  middle values for an even length), tests for it, run them with `python3 -m unittest -v`"): **done in 6 requests, ~80
+  s**: `ls` + `cat` of the files, an `edit` of the module, a `cat -A` check, an `edit` adding 4 tests, the test run (7 / 7
+  pass), a summary; the code correct and in the file's style. Per request: the first (1,694 tokens: pi's system prompt
+  with 4 tools) prefilled in 24 s, the others 0.6-5 s (29-354 new tokens), replies of 46-245 tokens at **15-23 tok/s**
+  (thinking medium: short reasoning).
+- **A replayed session** (54 replies, 144k tokens, compacted once at 84k; replies forced to the recorded ones, live
+  probes every 4th turn): every tool turn prefills only its new tokens (P / 67.5 + 0.19 us x P x (L + P / 2) seconds:
+  e.g. 2,600 tokens at 72k in 70 s), decode with speculation 8-14 tok/s at 21-81k, a compaction ~12.4 min (a
+  30k-token summary request 8 min, the next request 4 min).
+- **What to expect per turn** (2,500 new tokens + a 500-token reply): ~1.2-1.4 min at 8k, ~1.5-1.8 min at 32k, ~2.1-2.5
+  min at 90k (the lower bounds with speculation's x1.2-1.5 on the reply); a compaction ~12 min (~5 turns' worth).
 
 ## Limitations
 

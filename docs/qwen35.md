@@ -403,6 +403,11 @@ position), max |diff| 0.2-0.3 at every distance with two 0.44s. What was checked
   the golden's ids 0.99998 / 0.99993 / 0.99997 / 0.99996 / 0.99990 / 0.99990 at 1k / 4k / 8k / 16k / 24k / 32k, top-1
   6/6, max |diff| 0.16-0.41; the three paths bitwise equal, the generic build too (to 16k); max |K| 19.6, |V| 52.5;
   the fact retrieved from a 28,860-token prompt.
+- **Qwen3.8-27B** (TODO G2, 2026-10-28; `tests/check_long.py --retrieval FILE --kv bf16-dot`, 16 threads, one 27B
+  process with the box's other services stopped, load 13-21): the Q3_K_M file (the agentic one, docs/qwen38-speculative.md,
+  G3) retrieves the fact from the 88,092-token prompt, greedy reply `PLUM-7316-HERON`, with the bf16 dot-product
+  attention, in 2,052 s (prefill and 24 steps). Not run: its logits against a reference at long context (the numpy
+  reference on the file is checked at short context, the models group: cos 0.99983).
 - No bug found: the long-context paths give the reference's logits and the invariants' bits.
 
 ## Commands

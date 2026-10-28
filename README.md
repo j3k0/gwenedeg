@@ -130,6 +130,7 @@ On recorded agentic sessions it guesses ~1.5 tokens per pass alone (the 0.8B dra
 | `3.5-0.8b-q3km` | `Qwen3.5-0.8B-Q3_K_M.gguf` (unsloth) | 470 MB | Q3_K for `attn_q` / `attn_k` / `attn_gate` / `ffn_gate` / `ffn_up` (the 27B Q3_K_M file's 3-bit roles), Q4_K / Q5_K / Q6_K / Q8_0 for the rest: vs its Q4_K_M decode 211 / 209 vs 206 / 192 tok/s, prefill ~0.98x, peak RSS 601 vs 663 MB; vs HF fp32 pooled cos 0.981, top-1 54/62 (Q4_K_M 0.9946, 57/62) |
 | `3.5-4b-q8` | `Qwen3.5-4B-Q8_0.gguf` (unsloth) | 4,482 MB | Qwen3.5-4B: 32 value heads on 16 key heads in its linear layers; as fast as Qwen3-4B Q8_0, perplexity 10.59 (Qwen3-4B: 15.65) |
 | `3.8-27b-q4km` | `Qwen3.8-27B-Q4_K_M.gguf` (unsloth) | 17,107 MB | Qwen3.8-27B (thinks by default; its MTP block is not used): ~16-16.5 GB of RAM, 8.7 tok/s plain, 13-17 with `-D` Qwen3.5-0.8B ([docs/qwen38-speculative.md](docs/qwen38-speculative.md)) |
+| `3.8-27b-q3km` | `Qwen3.8-27B-Q3_K_M.gguf` (unsloth) | 13,819 MB | the same model in 3-bit (Q3_K) for its FFN gate / up, attention q / k / gate and embeddings: ~13.3 GB of RAM, the file for 96k agentic sessions with the draft (below, Agentic development); vs the Q4_K_M: top-1 = the API model's 96.5 / 94.5% (thinking off / on; Q4_K_M 98.4 / 96.9%), perplexity +2.7%, decode +17-22% at 8 threads |
 | `hf`, `1.7b-hf`, `3.5-0.8b-hf`, `3.5-4b-hf` | `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-1.7B`, `Qwen/Qwen3.5-0.8B`, `Qwen/Qwen3.5-4B` (bf16 safetensors) | 1.5 / 4.1 / 1.8 / 9.3 GB | for the `.bin` export and the test goldens |
 
 Measured on the 16-vCPU AMD EPYC Genoa VM (shared, noisy: best of 2, interleaved, 2026-10-26; prefill of
@@ -149,7 +150,8 @@ Measured on the 16-vCPU AMD EPYC Genoa VM (shared, noisy: best of 2, interleaved
 | Qwen3-8B Q4_K_M | 4.9 GB | 158 / 219 | 30 / 30 | 91 / 119 | 11.53 |
 | Qwen3.5-0.8B Q8_0 (\*) | 0.96 GB | 1,506 / 2,039 | 141 / 182 | | 18.86 (512-token windows: 22.729, HF 22.728) |
 | Qwen3.5-4B Q8_0 (\*\*) | 4.8 GB | 308 / 443 | 31 / 30 | | 10.59 (512-token windows: 12.645) |
-| Qwen3.8-27B Q4_K_M (\*\*\*) | 15.9 GB | 45 / 65 | 8.5 / 10.0 | | |
+| Qwen3.8-27B Q4_K_M (\*\*\*) | 15.9 GB | 45 / 65 | 8.5 / 10.0 | | 9.800 (512-token windows) |
+| Qwen3.8-27B Q3_K_M (\*\*\*\*) | 13.0 GB | 42 / 68 (16 threads) | 9.6 / 9.8 (16 threads) | | 10.069 (512-token windows) |
 
 (\*) Another session: prefill 2026-10-27 (`scripts/bench_models.py`, 451 tokens; Qwen3-0.6B Q8_0 alongside: 1,832 /
 2,511), decode 2026-10-26 (0.6B alongside: 209 / 230). Its decode barely slows down with the context (160 / 174 tok/s
@@ -160,6 +162,8 @@ after 1,500 tokens): only 6 of its 24 layers have a KV cache, at 12 KB per token
 (\*\*\*) 2026-10-27, `scripts/bench_models.py`, best of 2, load 9-14 (with the run's own threads); prefill of 488 tokens
 (Qwen3.8's template adds its reasoning instruction); 16 threads: 76 / 10.3; after 1,500 tokens 8.7 / 10.6; startup
 20 s at 8 threads (the 17 GB file read cold: its page cache is dropped after each load).
+(\*\*\*\*) 2026-10-28, `scripts/bench_models.py -t 8,16`, best of 2, load 10-19, the Q4_K_M alongside: 45 / 73 tok/s of
+prefill, 7.9 / 9.1 of decode at 8 / 16 threads; perplexity of both with `scripts/ppl.py -w 512`, docs/qwen38-speculative.md, G3.
 
 Decode is memory-bound and moves with the machine's load (8B ranged 12-30 tok/s); startup takes 0.1-0.2 s
 up to 1.7B, ~0.5 s for 4B and ~1 s for 8B. Q4_K_M is the better trade at 4B / 8B (decode ~1.6x Q8_0 at
@@ -194,7 +198,8 @@ as many value heads, like 4B; the 27B shape is covered by synthetic test models)
 docs/qwen38-speculative.md) loads its main model: the MTP block after its 64 layers (`nextn_predict_layers` 1,
 `blk.64`: an attention layer + `nextn.*`) is checked (names, shapes, types) but not read nor used yet, and its F32
 `ssm_alpha` / `ssm_beta` matrices are applied in fp32; tested on the real file (logits vs its numpy reference cos
-0.9999, top-1 62/62; the bitwise invariants; the models group's `3.8-27b-q4km`, opt-in). Other MTP layouts (several
+0.9999, top-1 62/62; the bitwise invariants; the models group's `3.8-27b-q4km`, opt-in; its Q3_K_M too, `3.8-27b-q3km`:
+cos 0.99983, top-1 62/62; a fact ~84k tokens back retrieved from an 88k-token prompt). Other MTP layouts (several
 blocks, `qwen3` files) are refused with a clear message.
 
 ## Performance
@@ -296,6 +301,21 @@ model_list:
 All flags, the endpoint details, behaviour under load and the measurements are in
 [docs/server.md](docs/server.md). `scripts/litellm_e2e.sh` runs the whole chain against a scratch
 LiteLLM proxy, and `scripts/eval_router.py` measures judge accuracy.
+
+**Agentic development with Qwen3.8-27B (pi)** at a 96k context on the 16-vCPU / 31 GB VM (~24 GiB free):
+
+```sh
+OMP_NUM_THREADS=16 runq serve models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q3_K_M.gguf -c 98304 -k bf16-dot \
+    --draft models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf --slots 1 --parallel 1 --checkpoints 3 \
+    --spec-calibrate 32768 --timeout 0 --name qwen3.8-27b --port 18080
+```
+
+with pi's `openai-completions` provider (`contextWindow` 98304, `maxTokens` 16384, `reasoning` true; compaction
+`keepRecentTokens` 8000; the entry and settings: [docs/server.md](docs/server.md#qwen38-27b-with-pi)). ~22.1 GiB with the
+draft (the Q4_K_M would need ~25). Measured (2026-10-28): a live pi session finished a small coding task (a function,
+its tests, the test run) in 6 requests and ~80 s, decoding at 15-23 tok/s; a recorded 54-reply session replayed to 84k:
+every tool turn prefills only its new tokens (2,600 tokens at 72k: 70 s), decode 8-14 tok/s at 21-81k with
+speculation, a compaction ~12 min; decode at 98k 6.9 tok/s plain, a 2,560-token chunk there 86 s.
 
 ## Library API
 

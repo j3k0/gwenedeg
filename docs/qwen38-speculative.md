@@ -7,8 +7,14 @@ in `src/spec.c`, the CLI's `-D` / `-G` / `--tau`, exact on Qwen3 and Qwen3.5 tar
 16.3 GiB of RSS, logits within cos 0.9999 of the numpy reference, 8.7 tok/s plain, 13-14 tok/s with the draft and
 thinking on, 16.5-17.5 off (8 threads), every output equal to plain decoding's. Since S8 / G7 (2026-10-28) `runq serve`
 speculates too (`--draft`, the prompt lookup, an auto policy choosing the source and the guess count per pass from a
-calibrated cost model, the position and the batch; [below](#in-the-server-s8-and-the-choice-by-position-g7)). Open: the
-MTP drafter, seed-coupled drafting, the 27B's own runs of the server. The open steps are in
+calibrated cost model, the position and the batch; [below](#in-the-server-s8-and-the-choice-by-position-g7)). Since
+2026-10-28 the agentic setup at 96k is measured on the 27B: the Q3_K_M file passed the quality gate against the Q4_K_M
+([G3](#q3_k_m-the-quality-gate-todo-g3-measured-2026-10-28)) and is the file for a 96k session with its draft (~22.1
+GiB), the long-context costs are measured ([G0 (b)](#long-context-costs-todo-g0-b-measured-2026-10-27): decode at 98k
+6.9 tok/s, a 2,560-token chunk 86 s, 16 threads, `bf16-dot`), a pi session replayed through `runq serve` up to 84k with
+a compaction ([Agent sessions](#agent-sessions-replay-and-compaction-g0-a-g5)) and a live pi session completed its
+task ([server.md](server.md#qwen38-27b-with-pi)). Open: the MTP drafter, seed-coupled drafting, the draft model at
+64-98k in a live session. The open steps are in
 [TODO.md](../TODO.md) (section "Qwen3.8-27B with speculative decoding"); this file holds what was verified and the
 design decisions, so that the two cannot drift.
 The architecture is Qwen3.5's (`qwen35`, [qwen35.md](qwen35.md)).
@@ -142,8 +148,9 @@ checkpoints))", the script's estimate below.
 - Total with the 0.8B draft (0.66 GB as Q4_K_M) and a few checkpoints: ~19-20 GB at Q4_K_M (measured at S7: 17.4 GiB
   of RSS with k + 2 = 10 checkpoint slots on each model).
 - The box (2026-10-27): 31.3 GB RAM. With the parcolab, billing and triominos-server containers stopped (decided
-  for the 27B runs; they used ~7.5 GB, 6.2 of it a uvicorn) ~24 GB is available: **Q4_K_M** it is, no Q3_K. Disk:
-  58 GB free, `models/` 29 GB; `/tmp` is a 16 GB tmpfs (RAM): never put model files or venvs there.
+  for the 27B runs; they used ~7.5 GB, 6.2 of it a uvicorn) ~24 GB is available: **Q4_K_M** at short and medium
+  contexts; for the agentic sessions at 96k with the draft the **Q3_K_M** (2026-10-28, [G3](#q3_k_m-the-quality-gate-todo-g3-measured-2026-10-28):
+  ~22.1 GiB against the Q4_K_M's ~25.1). Disk (2026-10-28): 29 GB free with both 27B files; `/tmp` is a 16 GB tmpfs (RAM): never put model files or venvs there.
 - `runq serve`'s slot budget (`--kv-mem`, default half the RAM and at most MemAvailable after the load) counts a slot's
   KV cache, recurrent state and its checkpoints (`--checkpoints`, default 4 since G5: 1.23 GiB per 27B slot at `-c
   8192`, 0.5 GiB KV + 5 x 150 MiB; with 2, as before G5, 0.94 GiB), shown in the startup line.
@@ -519,6 +526,84 @@ train's average speed, summ the bike-lane article in three bullet points; greedy
   noisier: +2.7 / +2.1 / +10.7), **~2.2 ms per row** (150 MiB at ~70 GB/s), 1.8% of a decode step: ~7 ms of a k = 3
   verify pass (4%). Not worth swapping buffers or replaying the DeltaNet inputs for (the ideas S3 kept for later).
 
+## Q3_K_M: the quality gate (TODO G3, measured 2026-10-28)
+
+The agentic sessions need a 96k context with the draft: runq's estimate for the Q4_K_M file at `-c 98304` (one slot, 3
+checkpoints) is 22.37 GiB, + the 0.8B Q4_K_M draft at the same context (2.03 GiB) + the verify rows' checkpoints the
+server keeps (0.66 GiB) = ~25.1 GiB against ~24.0 available (the parcolab, billing and triominos containers stopped): it does not
+fit. Unsloth's Q3_K_M of the same commit (`scripts/download_models.py 3.8-27b-q3km`, sha256 `7f3b845b...` = the HF
+API's LFS oid; Q3_K for `ffn_gate` / `ffn_up`, `attn_gate`, attention q / k and `token_embd`, Q4_K / Q5_K / Q6_K for the
+rest): 19.45 GiB, so ~22.1 GiB with the draft and speculation, **~1.9 GiB to spare**. The gate: is it close enough to the
+Q4_K_M (the reference) for the agent's work? Measured with the containers stopped, one 27B process at a time; the box
+shared with other jobs (load 10-20 during the timings).
+
+| | Q4_K_M | Q3_K_M |
+|---|---|---|
+| file / weights in RAM (runq's estimate) | 17.11 GB / 15.32 GiB | 13.82 GB / 12.40 GiB |
+| `mem_probe FILE 4096`: estimate / peak RSS, context full | 16,621.7 / 16,676.2 MiB (S7) | 13,623.7 / 13,670.4 MiB (-0.3%); load 13.3 s |
+| estimate at `-c 98304` (3 checkpoints), + the draft + the verify rows' checkpoints | 22.37 + 2.69 = ~25.1 GiB | 19.45 + 2.69 = **~22.1 GiB** |
+| logits vs its own numpy reference (`make_model_ref.py`, the models group) | pooled cos 0.99992, top-1 62/62 | 0.99983, 62/62 (long2 min 0.99565) |
+| top-1 = the API's token, thinking off (30 answers, 6,524 tokens) | **98.41%** (6,420) | **96.52%** (6,297) |
+| the same, thinking on (30 answers, 9,265 tokens) | **96.89%** (8,977) | **94.51%** (8,756) |
+| NLL of the API's tokens, off / on (nats) | 0.1153 / 0.1991 | 0.1325 / 0.2222 |
+| KL(Q4_K_M \|\| Q3_K_M), pi sessions' replies (9,112 positions) | | mean **0.0293**, median 0.0014, p99 0.29 |
+| top-1 agreement there / NLL of the replies | | 94.9% / 0.662 -> 0.676 (+1.4% PPL) |
+| perplexity, Beagle ch. I, 512-token windows / whole text | 9.800 / 8.167 | 10.069 (+2.7%) / 8.413 (+3.0%) |
+| decode short / after 1,500 tokens, 8 threads (tok/s) | 7.9 / 8.2 | 9.6 / 9.6 (+17-22%) |
+| the same, 16 threads | 9.1 / 8.7 | 9.8 / 9.5 (+8-9%) |
+| prefill 488 / 1,532 tokens, 8 / 16 threads (tok/s) | 45 / 44, 73 / 74 | 42 / 42, 68 / 67 (-6-8%) |
+| peak RSS (1,500 + 128 tokens, `-c 4096`) | 16,324 MB | 13,329 MB |
+| at 98k, 16 threads, `bf16-dot` (`bench_long`): decode / 4-row verify / 2,560-token chunk | 147 ms / 219 ms / 82.4 s | 146 ms / 258 ms / 85.9 s |
+| `-G 6 --tau 0.4` with the 0.8B draft, 8 threads, off / on: tok/s (x plain), tokens per pass | 16.9 (2.21x) / 13.4 (1.60x); 4.24 / 2.80 | 15.8 (1.83x) / 12.2 (1.37x); 4.37 / 2.66 |
+
+- **Top-1 against the API's model** (`scripts/spec_accept.py measure` with the file as the "draft", all 30 greedy
+  answers per mode of `logs/specmeas-2026-10-27`, every one re-tokenized to the API's ids; S7's 716 / 720 and 579 / 588
+  were one answer per kind, cut shorter): the Q3_K_M disagrees with the API on 3.5% / 5.5% of the tokens against the
+  Q4_K_M's 1.6% / 3.1% (~2x), and with the Q4_K_M itself on 3.5% / 5.6%. Per kind (off): chat 94.2 vs 97.1%, code 97.9
+  vs 99.4, edit 98.3 vs 99.5, math 98.0 vs 99.1, extraction 97.7 vs 98.9, summaries 95.4 vs 97.5. Teacher-forced, so a
+  disagreement is a token where greedy decoding would have gone another way, not an error.
+- **KL on agentic text** (`scripts/kl_quant.py`, new: each file in turn through `build/long_ctx -A`, the rows streamed
+  through a FIFO; the reference's top 1,024 log-probabilities kept per position, the tail's mass as one term: a lower
+  bound, its tail 4e-4 on the replies): 4 pi sessions' streams rendered as runq serve renders Qwen3.8 (`lookup_accept.py
+  sessions`; streams with >= 2,000 reply tokens in their first 16,384, one per session), their first 16,384 tokens,
+  every reply position scored: KL mean 0.0293 (per stream 0.018-0.039), median 0.0014, p90 0.086, p99 0.29; by kind
+  reasoning 0.030 (631 positions), prose 0.042 (3,262; top-1 92.1%), the template's / XML syntax 0.010 (99.0%), tool
+  arguments 0.024 (4,060; 96.5%); no growth with the position (replies at 8-16k: 0.030). For scale, Qwen3.5-0.8B Q8_0
+  -> Q4_K_M on one of these streams: 0.047.
+- **The prompt's text is another matter, and not the gate:** on the context positions (1 in 8 scored) the KL means are
+  1.3 (system block) and 3.9 nats (user / tool turns), carried by positions where the 27B is near-certain of something
+  else than the text: its NLL there is 4.6 / 8.0 nats per token (median 1.9 / 4.3; 37% of the tool-turn positions above
+  10 nats), where the 0.8B has 2.2 on the same stream. Not runq: `tests/ref_qwen35.py` on the Q4_K_M file gives the same
+  profile on the first 1,600 tokens (NLL mean 3.39 vs runq's 3.40, 11% vs 12% above 10 nats). The post-trained 27B
+  does not model user / tool text (never in its loss); the system block's tool instructions are the template's own text,
+  where even the 0.8B's quantized files disagree with fp32 (Q4_K_M p 0.998 for the text's token where HF fp32 and Q8_0
+  give 0.001). The replies are what the agent generates.
+- **Speed:** the Q3_K_M decodes 17-22% faster at short context with 8 threads (less to read), less at 16 (8-9%), and
+  not at 98k (the attention's read dominates); its prefill and its verify rows are slower (the Q3_K kernels' compute
+  per row): f(4) 1.39 at 512 positions against the Q4_K_M's 1.25, so speculation gains less on it (1.83x / 1.37x vs
+  2.21x / 1.60x at 8 threads; acceptance the same: 4.37 / 2.66 tokens per pass vs 4.24 / 2.80). The 32 speculative runs
+  printed plain decoding's text.
+
+**Decision: Q3_K_M is the agentic file at 96k** (the only one where the session, its draft and speculation fit with
+~2 GiB to spare), **Q4_K_M stays the reference** and the better choice wherever it fits: up to ~64k with the draft,
+or at 96k without a draft (22.4 GiB + the lookup's verify checkpoints: ~23.0 GiB, ~1 GiB to spare on this box,
+not recommended). The cost is real but small: ~2x the token disagreements with the API's model (1.6 -> 3.5% off,
+3.1 -> 5.5% on), +2.7-3.0% perplexity on prose, KL 0.03 on the agent's replies (median 0.0014). The live pi session
+below ("Qwen3.8-27B with pi") is the end-to-end check.
+
+Rerun (one 27B process at a time; ~50 min for the KL, ~30 min for the top-1):
+
+```sh
+L=logs/specmeas-2026-10-27; M=models/Qwen3.8-27B-GGUF
+for q in Q3_K_M Q4_K_M; do for g in out_nothink out_think_t0; do .venv/bin/python -I scripts/spec_accept.py measure \
+    $L/$g.json $M/Qwen3.8-27B-$q.gguf -o /var/tmp/meas_${q}_$g.json --threads 16 --template $L/tmpl_38.jinja; done; done
+.venv-hf5/bin/python scripts/ppl.py bench/ppl_beagle_ch1.txt --runq-model $M/Qwen3.8-27B-Q4_K_M.gguf \
+    --runq-model $M/Qwen3.8-27B-Q3_K_M.gguf -w 512 -t 16 --hf-dir models/Qwen3.5-0.8B
+.venv/bin/python -I scripts/lookup_accept.py sessions /var/tmp/streams.pkl      # (local data)
+.venv/bin/python -I scripts/kl_quant.py /var/tmp/streams.pkl $M/Qwen3.8-27B-Q4_K_M.gguf $M/Qwen3.8-27B-Q3_K_M.gguf \
+    --streams 4 --max-pos 16384 -t 16 --out /var/tmp/kl_q4_q3.json
+```
+
 ## Long-context costs (TODO G0 (b), measured 2026-10-27)
 
 What a turn of an agentic session costs at a context of L positions, without prefilling L tokens first (the 27B at
@@ -741,20 +826,58 @@ at 8 threads, ~0.011 at 16; A_dec ~0.044 / ~0.038 us per position. The turn of 2
 98k (k = 3): a 4-row pass ~330 ms + the draft's 3 steps (~51 ms with its own `bf16-dot`), 2.0-3.7 tokens per pass:
 ~5.2-9.7 tok/s against 5.3 plain.
 
-**The 27B run (later, alone on the box: the other services stopped, MemAvailable >= ~23.5 GiB):**
+**The 27B, measured** (2026-10-28, `build/bench_long FILE -L 512,16384,32768,65536,98304 -R 2,4,8 -P 2560 -r 5 -p 1
+-k KV -D Qwen3.5-0.8B-Q4_K_M.gguf`, under the bench lock, one 27B process on the box with the containers stopped, but the
+box shared with other jobs: load 10-21 during the runs, so the medians are noisy by ~10-15% and a few rows are not
+monotonic; the agentic file Q3_K_M (G3) at 8 / 16 threads and f16 / `bf16-dot`, the Q4_K_M at 16 threads `bf16-dot`; ms
+and s, medians; peak ~21.5 GiB with the draft; in [brackets] the extrapolation above, for the Q4_K_M):
 
-```
-make bench-long
-flock /tmp/cwayn-bench.lock sh -c 'for t in 8 16; do OMP_NUM_THREADS=$t build/bench_long \
-    models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf -L 512,16384,32768,65536,98304 -R 2,4,8 -P 2560 -r 5 -p 1; done' \
-    | tee logs/bench-long-27b.txt
-# G4 (b): the same with -k bf16-dot appended (the KV cache is as big: bf16 / f16 are both 2 bytes)
-```
+| file, KV, threads | L | dec ms (tok/s) | seg 2 / 4 / 8 ms | pre 2,560 (s) | draft step ms | best choice: no match / a 4-token match |
+|---|---|---|---|---|---|---|
+| Q3_K_M, `bf16-dot`, 16 | 512 | 83 (12.0) | 96 / 116 / 190 | 37.9 [34] | 5.2 | model k 3 x1.38 / lookup 3 x1.88 |
+| | 16,384 | 107 (9.3) | 126 / 144 / 238 | 44.4 | 6.9 | model k 3 x1.42 / lookup 3 x1.95 |
+| | 32,768 | 118 (8.5) | 130 / 146 / 245 | 52.5 | 8.4 | model k 3 x1.49 / lookup 3 x2.10 |
+| | 65,536 | 115 (8.7) [134] | 136 / 193 / 357 | 68.9 [64] | 12.5 | model k 1 x1.24 / lookup 3 x1.56 |
+| | 98,304 | **146 (6.9)** [156] | 183 / 258 / 437 | **85.9** [79] | 15.4 | model k 1 x1.17 / lookup 3 x1.47 |
+| Q3_K_M, `bf16-dot`, 8 | 512 | 100 (10.0) [118] | 117 / 154 / 264 | 61.5 [57] | 5.4 | model k 1 x1.31 / lookup 3 x1.69 |
+| | 16,384 | 113 (8.8) [131] | 133 / 181 / 315 [152 / 180 / 311] | 75.1 [70] | 7.8 | model k 1 x1.29 / lookup 3 x1.63 |
+| | 32,768 | 123 (8.2) [139] | 149 / 213 / 375 [166 / 208 / 365] | 89.8 [84] | 9.3 | model k 1 x1.24 / lookup 3 x1.50 |
+| | 65,536 | 158 (6.3) [164] | 195 / 275 / 494 [202 / 271 / 488] | 119.0 [112] | 14.2 | model k 1 x1.21 / lookup 3 x1.50 |
+| | 98,304 | **175 (5.7)** [187] | 224 / 333 / 619 [238 / 330 / 603] | **147.7** [140] | 17.9 | model k 1 x1.15 / lookup 3 x1.37 |
+| Q3_K_M, f16, 16 | 512 | 109 (9.2) | 111 / 145 / 225 | 41.4 [34] | 7.4 | |
+| | 32,768 | 110 (9.1) [109] | 134 / 184 / 292 | 67.8 [59] | 9.5 | |
+| | 98,304 | 157 (6.4) [177] | 203 / 285 / 581 | 122.9 [111] | 16.6 | model k 1 x1.15 / lookup 3 x1.44 |
+| Q3_K_M, f16, 8 | 512 | 103 (9.7) | 118 / 156 / 266 | 62.9 [57] | 5.6 | |
+| | 32,768 | 131 (7.6) [146] | 172 / 243 / 435 [183 / 243 / 459] | 109.9 [104] | 10.0 | |
+| | 65,536 | 179 (5.6) [178] | 220 / 329 / 612 [228 / 332 / 619] | 159.6 [152] | 15.6 | |
+| | 98,304 | 182 (5.5) [207] | 254 / 413 / 786 [275 / 420 / 790] | 208.0 [200] | 18.5 | model k 1 x1.07 / lookup 1 x1.23 |
+| Q4_K_M, `bf16-dot`, 16 | 512 | 97 (10.3) | 108 / 117 / 152 | 33.7 [34] | | |
+| | 32,768 | 123 (8.1) | 143 / 165 / 231 | 49.3 | | |
+| | 98,304 | 147 (6.8) [156] | 163 / 219 / 367 | 82.4 [79] | | |
 
-Its memory: weights 15.3 GiB + KV of 100,865 positions (6.2 GiB, 64 KiB each) + the attention scratch (~0.8 GiB at 16
-threads) + 2 checkpoints (0.3): ~22.7 GiB; runq's load-time check refuses it if MemAvailable does not cover its
-estimate (`-m GiB` overrides; with less memory, `-L ...,90112`). ~15 min per thread count (one 2.5k chunk at 98k is
-~2.5-4 min).
+- **The extrapolation held:** the chunk at 98k within 5-10% (the Q3_K_M's matmuls are ~6% slower than the Q4_K_M's the
+  estimate assumed), the verify segments at 8 threads within 2-7%, the decode 5-15% faster than estimated (the
+  Q3_K_M reads 3 GB less per token; the Q4_K_M at 16 threads 147 vs 156 ms). `bf16-dot` vs f16 at 98k: the chunk
+  1.41x / 1.43x faster (8 / 16 threads: 208 -> 148 s, 123 -> 86 s), decode 4-7%, a 4-row verify 19-24%.
+- **The two files at long context:** at 98k and 16 threads the Q4_K_M decodes as fast as the Q3_K_M (147 vs 146 ms: the
+  KV read and the attention dominate) and its verify rows are cheaper (4 rows 219 vs 258 ms: the Q3_K kernels' compute
+  per row), so it would speculate better; the Q3_K_M's case is memory only.
+- **Speculation at 98k** (the measured passes, p 0.6 for the model, a 4-token lookup match at its prior): the model draft
+  at k 1 x1.15-1.17 (k 3 up to 32k at 16 threads, x1.4-1.5), a lookup match 3 guesses x1.37-1.47: ~8-10 tok/s with
+  speculation at 98k (16 threads) against 6.9 plain; the goal's ">= 8 tok/s at 90k" is met when the lookup matches,
+  not on reasoning text.
+- **The cost model's calibration** (`rq_pass_cost_measure`, the server's `--spec-calibrate`): at its default 8,192
+  positions the 27B's attention slope is lost in the noise of a ~100 ms step (4 runs: 0.38-2.40 us per position for
+  the first row, vs ~0.6 from the table); at 32,768 the server measured 0.578 (13.6 s): use `--spec-calibrate 32768`
+  for the 27B (its choice by position then: lookup 3 to 32k, 2 at 64-98k).
+
+**Turn-latency model, measured** (Q3_K_M, `bf16-dot`): a turn at position L with P new tokens and a reply of G tokens
+costs P / R_mm + a_pre P (L + P / 2) + G (t_w + a_dec L), with R_mm 67.5 / 41.6 tok/s (16 / 8 threads: the chunk at 512),
+a_pre 0.19 / 0.34 us per (query, key) pair (the chunk's attention at 98k, 48.0 / 86.2 s), t_w 83 / 100 ms and a_dec
+0.64 / 0.76 us per position. A turn of 2,500 tokens + a 500-token reply at ~90k: **~2.5 min at 16 threads (37 + 43 s
+of prefill, 70 s of plain decode), ~3.7 min at 8** (60 + 78 s, 84 s): the G4 (b) estimate (2.5 / 3.7 min) confirmed;
+with speculation (x1.2-1.5 on the reply) ~2.1-2.3 min at 16 threads. At 32k: ~1.5-1.8 min, at 8k ~1.2-1.4 (16 threads). The replay
+("Agent sessions", below) checks it against a real session.
 
 ## Prompt lookup (TODO G6, G0 (c), measured 2026-10-27)
 
@@ -1017,6 +1140,42 @@ R_mm = 76, t_w = 97 ms, ~0.027 / 0.051 us):
 | **a compaction** | **~28-33 min** (~31-36 before) | **~17-21 min** (~19-23 before) |
 
 (A normal turn at ~80k, 2.5k new tokens and a 500-token reply: ~210 + ~95 s = ~5 min: a compaction costs ~6 turns.)
+
+**Measured on the 27B** (2026-10-28; the Q3_K_M, G3; `scripts/replay_sessions.py --ctx 98304 --threads 16 --slots 1
+--parallel 1 --keep 8000 --reserve 16384 --probe-every 4 --probe-tokens 256` with `--server-arg`s `-k bf16-dot --draft
+Qwen3.5-0.8B-Q4_K_M.gguf --timeout 0 --checkpoints 3 --spec-calibrate 32768`; one pi session of 54 replies, 46 with
+reasoning, 144,674 tokens as one stream, no system change; replies forced to the recorded ones, and before every 4th
+tool turn a live **probe** (new: the same request generated, at most 256 tokens, its reply dropped; the forced request
+after it reuses the prompt); the box at load 10-20 from other jobs; the server's peak ~21.5 GiB):
+
+| requests | prompt tokens | prefilled | time |
+|---|---|---|---|
+| 1 user (the first: system block 7.9k) | 7,874 | 7,874 | 117.6 s |
+| 52 tool turns | 2,456,677 | 50,546 (+ 18,798 in the probes: new 67,582) | 1,124 s of prefill; 69,986 forced reply tokens fed in 1,623 s |
+| 13 probes at 21-81k positions | 648,332 | 18,798 | 409 s of prefill; 3,068 tokens generated in 310 s (**9.9 tok/s**) |
+| compaction at 83,971 tokens: 1 summary request (a split turn's prefix) | 30,217 | 30,217 | **482 s** + 4 s of reply |
+| the next request (system block + summary + the kept ~8k) | 15,925 | 15,925 | **235 s** |
+| all (72 min of wall time) | | 123,360 | 2,367 s of prefill |
+
+- **Every tool turn prefilled its new tokens only** (46 of 52 exactly, the 6 others the new tokens plus their probe's
+  or the previous reply's last few: never more), so the cost of a turn is its new tokens at its position. The
+  measured turn-latency model above (P / 67.5 + 0.19 us x P x (L0 + P / 2)) predicts each of the 39 prefills of >= 500
+  tokens within 0-11% (e.g. 4,293 tokens at 37.9k: 88.4 s measured, 96 predicted; 2,605 at 72.1k: 70.3 / 74.9; the
+  summary's 30,217 from 0: 482 / 534 s).
+- **The compaction cost ~12.4 min at 16 threads** with `keepRecentTokens` 8,000 (the estimate for pi's default 20,000:
+  ~17-21 min): the summary request (here one, a split turn's prefix, 30k tokens) and the next request from 0. With one
+  slot the summary request takes the session's slot, so the system block (7.9k tokens, ~2 min) is prefilled again (TODO
+  G5 (b)).
+- **Decode at 21-81k with speculation: 8.1-13.9 tok/s** (median ~9.7) against ~7-9 plain there (`bench_long`):
+  the lookup speculated in every probe (805 of 1,699 guesses accepted, 47%), the draft model in none: the server
+  follows a request with the draft only if the time saved over its remaining `max_tokens` is worth twice the draft's
+  catch-up (here 21-81k tokens of the 0.8B for at most 256 tokens). pi's requests carry the model's `maxTokens`
+  (16,384 in the setup below), so in a live session the draft follows from the first request on and then only catches
+  up each turn's new tokens; the short live session (docs/server.md, "Qwen3.8-27B with pi") decoded at 15-23 tok/s at
+  2-3k positions. The draft's use at 64-98k in a live session is not measured yet (TODO G7).
+- 6 tool turns diverged from the slot's tokens and rolled back to a checkpoint: their previous reply came back
+  tokenized differently (G5's cases), each re-prefilling a few dozen tokens.
+
 The cheapest mitigations, in order:
 - **Done (runq):** the system block's checkpoint and slot affinity: the next request reuses the ~8k-token system block
   (~200 s at 8 threads) if the summary request ran on another slot (`--slots 2`, if the memory allows it; with one slot

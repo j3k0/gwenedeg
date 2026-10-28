@@ -5,7 +5,10 @@ in `src/spec.c`, the CLI's `-D` / `-G` / `--tau`, exact on Qwen3 and Qwen3.5 tar
 [below](#the-loop-s1)); the verify pass through the decode-rows worker (S2); the file's specifics (the MTP block, F32
 `ssm_alpha` / `ssm_beta`, the 3.8 chat template: S6); the bring-up on the real file (S7, [below](#the-27b-bring-up-s7)):
 16.3 GiB of RSS, logits within cos 0.9999 of the numpy reference, 8.7 tok/s plain, 13-14 tok/s with the draft and
-thinking on, 16.5-17.5 off (8 threads), every output equal to plain decoding's. Open: the MTP drafter and the server. The open steps are in
+thinking on, 16.5-17.5 off (8 threads), every output equal to plain decoding's. Since S8 / G7 (2026-10-28) `runq serve`
+speculates too (`--draft`, the prompt lookup, an auto policy choosing the source and the guess count per pass from a
+calibrated cost model, the position and the batch; [below](#in-the-server-s8-and-the-choice-by-position-g7)). Open: the
+MTP drafter, seed-coupled drafting, the 27B's own runs of the server. The open steps are in
 [TODO.md](../TODO.md) (section "Qwen3.8-27B with speculative decoding"); this file holds what was verified and the
 design decisions, so that the two cannot drift.
 The architecture is Qwen3.5's (`qwen35`, [qwen35.md](qwen35.md)).
@@ -804,6 +807,76 @@ make teacher-force && $P draft $S models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.g
 $P report $S --draft /var/tmp/draft.npz --by-kind [--cost long]
 L=logs/specmeas-2026-10-27; $P report --by-kind --answers $L/out_nothink.json:$L/meas_Qwen3.5-0.8B-Q4_K_M_out_nothink.json
 ```
+
+## In the server (S8) and the choice by position (G7)
+
+`runq serve --draft DRAFT` (and / or `--lookup N`): speculation inside the engine's batched passes, the output exactly
+plain decoding's ([server.md](server.md#speculative-decoding-todo-s8-g7): the design, the request field, the timings,
+the tests). A decoding request's segment is `[t, g1..gn]` with every row's logits next to the other requests' rows and
+prompt chunks; its rows are sampled in rounds (one row per request and round, so each RNG draws in plain decoding's
+order) through the plain path; the sequence is cut after the first row whose token is not the next guess (Qwen3.5:
+on that row's checkpoint; the slot's G5 checkpoints stay, k + 1 transient ones per speculating request). The draft has a
+sequence per slot and its own batched passes. `rq_spec_run` (the CLI, `--spec auto`) takes the same per-pass choice.
+
+**The cost model** (`RqPassCost`, `src/runq.h`): a pass of R rows costs `t_w f(R) + att S1 + att_x S2`: t_w the weights'
+part of a decode step, f(R) its growth with the rows (a measured table), att per position of context for a segment's
+first row (the KV cache's read and its arithmetic), att_x per position for each further row of the segment (the
+arithmetic: the rows share the read). Calibrated at the start of the server (`--spec-calibrate L`, default 8192) and of
+`runq --spec auto` on the empty sequences: `rq_pass_cost_measure`, a decode step and segments of 2-16 rows at 16 positions
+(f), a decode step and an 8-row segment at L (att, att_x), the fastest of 5 runs each (~1 s on the 0.6B, ~5 s on the 4B,
+est. ~15 s on the 27B), then corrected online: each decode / verify pass and each draft guess pass timed against the
+calibrated prediction, a moving average of the log ratio per model (~20 passes, clamped to 0.5-4x) scaling the costs
+the policy uses. A first version charged every row the full attention: on the 0.6B at 4,096 positions a verify row
+adds ~2.8 ms against ~7 ms for the first row's attention, so it undervalued guesses at long context; att_x fixed it
+(the calibrated model's choice then matches the one from the measured passes, below).
+
+**The policy, one sequence alone** (`rq_spec_choose`): the best of a plain step (1 token for T(1)), n lookup guesses
+(1 + p + .. + p^n tokens for T(n + 1)) and k model guesses (the same with the model's p, for T(k + 1) + k draft steps),
+p per guess (geometric: a guess counts only if the earlier ones were accepted): the model's from its accepted / checked
+guesses, the lookup's per match length (priors from pi's sessions: 0.45 at 2 tokens, 0.72 at 4, 0.85 at 8, 0.94 at 16),
+each request's own counts shrunk to the server's, shrunk to the prior. **In the server**, per pass over all decoding
+requests: greedily the (request, source, n) that raises the pass's expected tokens per second the most, while it does;
+the bar is the batch's own efficiency (a plain pass of N decoding requests gives N tokens for little more than a step), so
+it speculates less as the batch fills, and a choice is made only if its expected gain is > 1. The draft follows a
+request only if a model pass would beat plain for it alone and the time saved over the reply's remaining tokens is
+worth twice the catch-up; its catch-up rows ride along the draft's passes, a pass of their own only for a lag of half
+the prompt budget while the model is in use.
+
+**The choice by position** (`build/bench_long -D DRAFT -R 2,3,4,5`: the measured passes at each L, a 4-token lookup match
+and the model's p 0.6; 8 threads, the bench lock, load 7-10). The 27B with the 0.8B Q4_K_M draft, extrapolated from
+synth-27b (`-W 118,1.10,1.15,1.25,1.34 -A 16`: the 27B's short-context step and f(2..5) from S7 + 16 x the synth's
+attention above 512; the draft measured at L):
+
+| L | plain (est.) | no lookup match: model | a 4-token match: lookup | the lookup alone |
+|---|---|---|---|---|
+| 512 | 8.5 tok/s | k 2, x1.56 | 4, x2.15 | 4, x2.15 |
+| 16,384 | 7.6 | k 2, x1.38 | 3, x1.73 | 3, x1.73 |
+| 32,768 | 6.7 | k 2, x1.23 | 3, x1.54 | 3, x1.54 |
+| 65,536 | 5.5 | k 1, x1.17 | 2, x1.43 | 2, x1.43 |
+| 98,304 | 4.7 | k 1, x1.13 | 2, x1.38 | 2, x1.38 |
+
+At 98k the model guess is barely worth it at p 0.6 (k 1: x1.13; below 1 for p < ~0.45, e.g. thinking on), and its draft
+costs ~2 GiB at 96k (G3): the lookup is the source there, its guess count falling from 4 to 2 as each verify row pays
+the attention again (synth-27b at 98k: a second row of a segment adds ~0.6 of the first row's attention, so ~1/3 of
+the 27B's decode step). Qwen3.5-4B Q8_0
+with the same draft, measured (and the calibrated model's choice, `-C 8192`):
+
+| L | plain | no match: model, measured / calibrated model | a 4-token match: lookup, measured / model |
+|---|---|---|---|
+| 512 | 33.6 tok/s | k 2, x1.23 / k 1, x1.28 | 4, x2.11 / 4, x1.99 |
+| 8,192 | 27.9 | k 2, x1.38 / k 1, x1.25 | 4, x2.33 / 4, x1.91 |
+| 16,384 | 27.6 | k 1, x1.04 / k 1, x1.23 | 4, x1.77 / 4, x1.85 |
+| 24,576 | 22.2 | k 1, x1.16 / k 1, x1.21 | 2, x1.75 / 4, x1.82 |
+
+(Noisy at load 7-10: the 8,192 row's median decode step was 46 ms for a best of 32.) The calibrated model's choices are
+within one guess of the measured ones; the first version (median of 3, att_x from a 4-row segment) gave att_x 0.04 us
+where the 4B's segments imply ~0.2, and lookup 4 instead of 2-3 at 24-32k.
+
+**Measured in the server** (`scripts/bench_serve.py`, 8 threads, 128-token greedy replies, 2 per client, the box at load
+12-18; the table: [server.md](server.md#speculative-decoding-todo-s8-g7)): one client, auto 1.2-1.35x plain (Qwen3-1.7B +
+0.6B Q4_K_M 84 vs 62-66 tok/s on code; Qwen3.5-4B + 0.8B Q4_K_M 35-37 vs 28-31); four clients, auto within the runs'
+noise of plain (187-208 vs 190-214; 71-76 vs 75-78) where the fixed draft at k 3 loses 15-20%: the batch fills the
+weights' read that speculation would otherwise use. The 27B's own runs (the server, its draft, 32k-96k) are left (TODO G7).
 
 ## Agent sessions: replay and compaction (G0 (a), G5)
 

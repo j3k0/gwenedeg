@@ -25,8 +25,9 @@
  * both were cut
  * back, as a chat's next turn; a raw text that copies a block of its prompt) and each draft setting (k = 1 / 3 / 8,
  * adaptive tau 0.5 with k 8; the prompt lookup alone, no draft model: 4 guesses, 30 with matches of >= 4 tokens;
- * combined: lookup 8 (>= 3) + k 3, lookup 3 + k 8 tau 0.5; --quick: k 3, adaptive, lookup 4 and the first combined,
- * fewer cases): the tokens, the RNG state after each, every sampled logits vector's position and hash, the stop, the
+ * combined: lookup 8 (>= 3) + k 3, lookup 3 + k 8 tau 0.5; auto (G7: RqSpecOpts.cost): k 3 + lookup 3 with the cost
+ * models calibrated at the start, k 8 + lookup 8 with a cost model where guesses are nearly free; --quick: k 3,
+ * adaptive, lookup 4, the first combined and the second auto, fewer cases): the tokens, the RNG state after each, every sampled logits vector's position and hash, the stop, the
  * cache's tokens and one more decode step's logits. Also k 0 == rq_generate, the vocabulary check (the draft itself
  * accepted; --other: a model of another vocabulary refused, loaded tokenizer-only), for Qwen3.5, that every rollback
  * landed on its checkpoint (RqSpecStats.refed 0), the copy's acceptance with the lookup alone (>= 3 tokens per pass)
@@ -1707,9 +1708,26 @@ static int spec_main(int argc, char **argv) {
         { "text_copy_greedy", 3, { 0, 0.9f, NULL, 0 }, 1, 110, 0, 0, 0, 1 },
         { "text_copy_seeded_turn2", 3, { 0.6f, 0.9f, NULL, 20 }, 13, 70, 0, 0, 1, 0 },
     };
+    // G7, auto: the cost models calibrated here (on empty sequences), and a cheap one (guesses nearly free: every pass
+    // guesses, the maximum of either source)
+    RqPassCost tcal, dcal, tfree, dfree;
+    {
+        RqSeq *x = seq_new(0), *y = rq_seq_new(SD, 0, RQ_KV_DEFAULT, &e);
+        if (!y || rq_pass_cost_measure(c, x, 600, 2, &tcal) != RQ_OK || rq_pass_cost_measure(dc, y, 600, 2, &dcal) != RQ_OK)
+            die("rq_pass_cost_measure", RQ_ERR_STATE);
+        rq_seq_free(x);
+        rq_seq_free(y);
+        tfree = tcal;
+        tfree.att = tfree.att_x = 0;
+        for (int i = 1; i < tfree.n; i++) tfree.f[i] = 1 + 1e-4 * i;
+        dfree = dcal;
+        dfree.t_w = 1e-9;
+        dfree.att = dfree.att_x = 0;
+    }
     const RqSpecOpts opts[] = { { 1, 0, 0, 0 }, { 3, 0, 0, 0 }, { 8, 0, 0, 0 }, { 8, 0.5f, 0, 0 }, { 0, 0, 4, 0 },
-                                { 0, 0, 30, 4 }, { 3, 0, 8, 3 }, { 8, 0.5f, 3, 0 } };
-    const int quick_opts[] = { 1, 3, 4, 6 };
+                                { 0, 0, 30, 4 }, { 3, 0, 8, 3 }, { 8, 0.5f, 3, 0 }, { 3, 0, 3, 0, &tcal, &dcal },
+                                { 8, 0, 8, 0, &tfree, &dfree } };
+    const int quick_opts[] = { 1, 3, 4, 6, 9 };
     const char *stop_name[] = { "end", "limit", "context", "callback" };
     int refed = 0;
     for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
@@ -1721,8 +1739,8 @@ static int spec_main(int argc, char **argv) {
                  stop_name[ref.stop[k->turn2] & 3], k->turn2 ? "/" : "", k->turn2 ? stop_name[ref.stop[1] & 3] : "");
         for (size_t oi = 0; oi < sizeof(opts) / sizeof(opts[0]) && ok; oi++) {
             int qi = 0;
-            while (qi < 4 && quick_opts[qi] != (int)oi) qi++;
-            if (quick && qi == 4) continue;
+            while (qi < 5 && quick_opts[qi] != (int)oi) qi++;
+            if (quick && qi == 5) continue;
             const RqSpecOpts *o = &opts[oi];
             int okk = (e = sp_run(c, dc, k, o, &got)) == RQ_OK && sp_same(&ref, &got);
             okk &= got.st.accepted <= got.st.drafted && (I.linear_layers || got.st.refed == 0);
@@ -1731,7 +1749,8 @@ static int spec_main(int argc, char **argv) {
             refed += got.st.refed;
             size_t dl = strlen(d);
             char how[48] = "";
-            if (o->k) snprintf(how, sizeof(how), "k%d%s", o->k, o->tau > 0 ? " tau 0.5" : "");
+            if (o->cost) snprintf(how, sizeof(how), "auto%s:", o->cost == &tfree ? "-free" : "");
+            if (o->k) snprintf(how + strlen(how), sizeof(how) - strlen(how), "k%d%s", o->k, o->tau > 0 ? " tau 0.5" : "");
             if (o->lookup) {
                 size_t hl = strlen(how);
                 snprintf(how + hl, sizeof(how) - hl, "%sL%d%s", hl ? "+" : "", o->lookup, o->lookup_min ? (o->lookup_min == 3 ? ">=3" : ">=4") : "");
@@ -1774,6 +1793,67 @@ static int spec_main(int argc, char **argv) {
     }
     // Qwen3.5: every rollback on a checkpoint (both sequences)
     if (I.linear_layers) report(refed == 0, "spec_rollback_exact", refed ? "positions fed again after a rollback" : "no position fed again");
+    // a verify row's checkpoint kept (rq_seq_checkpoint_at below the length: the server's </think> inside a verify pass),
+    // the rows' dropped (rq_seq_checkpoint_rows_drop: the end of a job's speculation); a truncation there == a fresh prefill
+    {
+        RqTokens u = toks("The quick brown fox jumps over the lazy dog. The quick brown fox");
+        int P = u.n - 4, held[RQ_CHECKPOINTS_MAX], nh, ok = 1;
+        float *ref = logits_alone(c, u.v, u.n, NULL, 0), *lg;
+        RqSeq *s = seq_new(0);
+        rq_seq_set_checkpoints(s, 6);
+        ok &= rq_prefill(c, s, u.v, P, RQ_LOGITS_NONE, NULL, NULL) == RQ_OK && rq_seq_checkpoint_rows(s, P, 3) == RQ_OK;
+        ok &= rq_prefill(c, s, u.v + P, 4, RQ_LOGITS_ALL, NULL, NULL) == RQ_ERR_ARG; // (all rows need an output buffer)
+        float *out = malloc((size_t)4 * V * sizeof(float));
+        ok &= rq_prefill(c, s, u.v + P, 4, RQ_LOGITS_ALL, out, NULL) == RQ_OK;
+        ok &= rq_seq_checkpoint_at(s, P + 2) == RQ_OK && (rq_seq_checkpoint_at(s, P - 1) == RQ_ERR_ARG) == (I.linear_layers > 0);
+        rq_seq_checkpoint_rows_drop(s);
+        nh = rq_seq_checkpoints(s, held, RQ_CHECKPOINTS_MAX);
+        ok &= I.linear_layers ? nh == 1 && held[0] == P + 2 : nh == 0;
+        ok &= rq_seq_truncate(s, P + 2) == RQ_OK && rq_seq_len(s) == P + 2;
+        ok &= rq_prefill(c, s, u.v + P + 2, 2, RQ_LOGITS_LAST, NULL, &lg) == RQ_OK && same(lg, ref + (size_t)(u.n - 1) * V, V);
+        ok &= rq_seq_checkpoint_rows(s, rq_seq_len(s), 2) == RQ_OK; // (a later rows call keeps it)
+        rq_seq_checkpoint_rows_drop(s);
+        nh = rq_seq_checkpoints(s, held, RQ_CHECKPOINTS_MAX);
+        ok &= I.linear_layers ? nh == 1 && held[0] == P + 2 : nh == 0;
+        report(ok, "spec_checkpoint_keep", I.linear_layers ? "a verify row's checkpoint kept, the others dropped; truncated there "
+               "== a fresh prefill" : "no-ops (Qwen3)");
+        free(out);
+        free(ref);
+        rq_seq_free(s);
+        rq_tokens_free(&u);
+    }
+    // the cost model (G7): a calibration on an empty sequence (emptied again), its shape; the choice by the costs
+    {
+        RqPassCost t, dd;
+        RqSeq *s = seq_new(0);
+        double t0 = rq_now();
+        int ok = rq_pass_cost_measure(c, s, 600, 2, &t) == RQ_OK && rq_seq_len(s) == 0 && t.calibrated && t.t_w > 0 && t.att >= 0 &&
+                 t.att_x >= 0 && t.att_x <= t.att && t.n >= 2 && t.r[0] == 1 && t.f[0] == 1;
+        for (int i = 1; i < t.n; i++) ok &= t.f[i] >= t.f[i - 1] && t.r[i] > t.r[i - 1];
+        ok &= rq_pass_cost(&t, 0, 0, 0) == 0 && rq_pass_cost(&t, 1, 0, 0) == t.t_w && rq_pass_cost(&t, 64, 0, 0) > rq_pass_cost(&t, 16, 0, 0);
+        ok &= rq_pass_cost_measure(c, s, 20, 1, &dd) == RQ_ERR_ARG; // (too short)
+        snprintf(d, sizeof(d), "decode %.2f ms + %.3f / %.3f us per position (first / further rows), f(4) %.2f, f(16) %.2f (%.1f s)",
+                 t.t_w * 1e3, t.att * 1e6, t.att_x * 1e6, rq_pass_cost(&t, 4, 0, 0) / t.t_w, rq_pass_cost(&t, 16, 0, 0) / t.t_w, rq_now() - t0);
+        // a free draft that is always right: the model; no draft and a long match: the lookup; a huge attention: plain
+        // (on a cost model where extra rows are cheap, as on the AVX-512 build: the generic build's are not)
+        for (int i = 1; i < t.n; i++) t.f[i] = 1 + 0.05 * (t.r[i] - 1);
+        t.att = t.att_x = 1e-9;
+        dd = t;
+        dd.t_w = 1e-9;
+        dd.att = dd.att_x = 0;
+        RqSpecChoice x = rq_spec_choose(&t, &dd, 100, 3, 0.99, 3, 0.5);
+        ok &= x.src == RQ_SPEC_MODEL && x.n == 3 && x.gain > 1;
+        x = rq_spec_choose(&t, NULL, 100, 3, 0.99, 3, 0.94);
+        ok &= x.src == RQ_SPEC_LOOKUP && x.gain > 1;
+        RqPassCost h = t;
+        h.att = h.att_x = 1e-3;
+        h.t_w = 1e-6;
+        x = rq_spec_choose(&h, &dd, 100000, 3, 0.6, 3, 0.6);
+        ok &= x.src == RQ_SPEC_PLAIN && x.n == 0 && x.gain == 1;
+        ok &= rq_spec_expect(0.5, 3) > 0.875 - 1e-12 && rq_spec_expect(0.5, 3) < 0.875 + 1e-12 && rq_spec_expect(0.7, 0) == 0 && rq_lookup_prior(16) > rq_lookup_prior(2);
+        report(ok, "spec_cost_model", d);
+        rq_seq_free(s);
+    }
     for (int i = 0; i < 4; i++) rq_tokens_free(&sp_prompt[i]);
     rq_tokens_free(&sp_turn2);
     rq_ctx_free(dc);

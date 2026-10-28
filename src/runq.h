@@ -136,7 +136,8 @@ void rq_seq_reset(RqSeq *s);                   // empty (position 0)
 int rq_seq_truncate(RqSeq *s, int n);
 int rq_seq_keep(const RqSeq *s, int n);        // the length rq_seq_truncate(s, n) would keep (n for Qwen3)
 // Qwen3.5: keep the recurrent state at length pos (>= the current length) as a checkpoint, taken by the forward
-// pass that reaches it (or now, if the sequence is there); several can be pending, inside one pass or later ones.
+// pass that reaches it (or now, if the sequence is there; pos below the length: RQ_OK if one is held there, made a
+// checkpoint of its own if it was one of rq_seq_checkpoint_rows'); several can be pending, inside one pass or later ones.
 // The sequence keeps a set of them (rq_seq_set_checkpoints: 2 by default, ~19 MB each for the 0.8B, ~150 MiB for
 // the 27B, allocated at first use); a new one takes a free slot, else the one at the lowest position. Checkpoints
 // past a truncation are dropped; pending ones are forgotten by rq_seq_truncate / copy (dst) / reset. E.g. the
@@ -146,8 +147,12 @@ int rq_seq_checkpoint_at(RqSeq *s, int pos);
 // Qwen3.5: a checkpoint after each of rows pos..pos+n-1 of the next pass(es) (lengths pos + 1 .. pos + n; pos >= the
 // length, 1 <= n <= RQ_CHECKPOINTS_MAX), e.g. the rows of a speculative verify segment, so that rq_seq_truncate
 // lands exactly on any of them. They replace the previous call's (taken or pending; those of rq_seq_checkpoint_at
-// stay): n + those slots keep them all. A no-op for Qwen3. RQ_ERR_ARG
+// stay): n + those slots keep them all. A no-op for Qwen3. RQ_ERR_ARG. rq_seq_checkpoint_at(s, pos) with pos at or
+// below the length makes the one held at pos (if any) a checkpoint of its own, kept from then on (e.g. a verify row
+// whose token closed a reasoning block); rq_seq_checkpoint_rows_drop forgets the rows' checkpoints (taken or
+// pending; their slots become free), e.g. when the speculative loop of a sequence ends
 int rq_seq_checkpoint_rows(RqSeq *s, int pos, int n);
+void rq_seq_checkpoint_rows_drop(RqSeq *s);
 // Qwen3.5: the number of checkpoint slots (1..RQ_CHECKPOINTS_MAX; default 2); fewer than in use: the checkpoints at
 // the highest positions stay, the others' buffers are freed. RQ_ERR_ARG
 #define RQ_CHECKPOINTS_MAX 32
@@ -437,6 +442,11 @@ typedef struct {
                  // guesses per pass, fewer only before max_new or the end of the context)
     int lookup;  // guesses per pass of the prompt lookup, at most (0..RQ_SPEC_K_MAX; 0 = off)
     int lookup_min; // the shortest match the lookup uses, in tokens (>= 2; 0: RQ_LOOKUP_MIN_DEFAULT)
+    // G7, auto (cost not NULL): per pass the source and the guess count from the cost models (target, draft; below,
+    // rq_spec_choose) at the sequence's position, with the acceptance seen so far in this call (the model's per guess,
+    // the lookup's per match length; priors 0.6 and rq_lookup_prior): a plain step when no guess pays off. k and lookup
+    // are then the maximums (the lookup's matches from 2 tokens unless lookup_min); the output is the same either way
+    const struct RqPassCost *cost, *dcost;
 } RqSpecOpts;
 typedef struct {
     RqGenStats gen;    // as rq_generate's (t_prefill: both models' prompt; t_gen: the loop)
@@ -462,6 +472,48 @@ int rq_generate_spec(RqCtx *c, RqSeq *s, RqCtx *dc, RqSeq *ds, const int *tokens
 // position; runs until g is done, as rq_generate's loop after rq_gen_start would. Adds to st's counters, sets
 // st->gen.n_gen / stop / t_gen
 int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const RqSpecOpts *o, RqSpecStats *st);
+
+// The draft model's guess from its logits (rq_spec_run's): the argmax (the lowest id among equals; among the tokens
+// allow permits, if not NULL); *p1 = its probability, only compared with tau (tau > 0: 0 if it is below tau, else 1 or
+// more exactly 1 / the softmax's sum; tau 0: 1). -1 if no token is allowed
+int rq_spec_pick(const float *logits, int n, const unsigned char *allow, float tau, float *p1);
+
+// The cost model of speculation (TODO G7: the source and the guess count per pass from the position and the measured
+// costs). A model's forward pass of R rows takes
+//     t_w x f(R) + att x S1 + att_x x S2   seconds
+// t_w: a decode step's part that does not depend on the context (the weights' read); f(R): its growth with the rows of
+// the pass (f(1) = 1; a table of measured points r[i] -> f[i], linear between them and, past the last, at the last
+// segment's slope); att: the attention's time per position of context for the first row of a segment (S1: the sum of the
+// segments' first positions; a decode step at L pays att x L), att_x: for each further row of a segment (S2: the sum of
+// their positions; they share the first row's read of the KV cache, so att_x <= att; at long context on a model with
+// many query heads per KV head they still pay most of it: G0 (b)). rq_pass_cost_measure calibrates it on a context and
+// an empty sequence of its model (filled with synthetic values up to 16 and L positions, rq_seq_fill_synthetic, then
+// emptied: a decode step and segments of 2-16 rows with every row's logits, the fastest of reps runs each);
+// rq_pass_cost_default estimates it from the model's size (no pass). rq_spec_choose: for one sequence alone at position L, the best of a plain step, a pass with n <=
+// lmax lookup guesses each accepted with p_lookup (lmax 0: no match), a pass with k <= kmax model guesses each
+// accepted with p_model and their k draft steps (d NULL: no draft model); gain = its tokens per second / plain's. The
+// expected accepted guesses of n are p + p^2 + ... + p^n (rq_spec_expect: each one is checked only if the previous
+// ones were accepted); rq_lookup_prior(len): a prior p for a lookup match of len tokens (from pi's sessions)
+#define RQ_PASS_COST_N 12
+typedef struct RqPassCost {
+    double t_w, att, att_x;         // seconds
+    int n, r[RQ_PASS_COST_N];       // the table of f: rows (r[0] = 1)
+    double f[RQ_PASS_COST_N];
+    int calibrated;                 // 1: rq_pass_cost_measure, 0: rq_pass_cost_default
+} RqPassCost;
+double rq_pass_cost(const RqPassCost *pc, int rows, double pos_first, double pos_more);
+int rq_pass_cost_measure(RqCtx *c, RqSeq *s, int L, int reps, RqPassCost *out);
+void rq_pass_cost_default(const RqModel *m, RqPassCost *out);
+enum { RQ_SPEC_PLAIN = 0, RQ_SPEC_LOOKUP = 1, RQ_SPEC_MODEL = 2 };
+typedef struct {
+    int src, n;            // RQ_SPEC_*, guesses
+    double gain;           // expected tokens per second / plain decoding's (1 for plain)
+    double t_plain, t_pass; // the cost model's plain step and this choice's pass (+ draft steps), seconds
+} RqSpecChoice;
+RqSpecChoice rq_spec_choose(const RqPassCost *t, const RqPassCost *d, int L, int kmax, double p_model, int lmax,
+                            double p_lookup);
+double rq_spec_expect(double p, int n);
+double rq_lookup_prior(int len);
 
 // The prompt-lookup index (rq_spec_run's; for tools that simulate the loop, e.g. tests/teacher_force.c): the
 // positions of every pair of consecutive tokens of a sequence, a hash table of chains (the most recent first), O(1)

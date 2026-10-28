@@ -27,7 +27,11 @@ worker, a 4-row segment 1.20-1.29x a decode step), and so is S1, the loop (`rq_g
 (Unsloth's Q4_K_M: 16.3 GiB of RSS, the load estimate within 0.3%; logits vs its numpy reference cos 0.9999, top-1
 62/62; plain 8.7 tok/s, with the 0.8B Q4_K_M draft 13.2-14.1 tok/s thinking on, 16.6-17.2 off, 8 threads, every output
 plain decoding's; a checkpoint per verify row 2.2 ms (S3's cost); the opt-in `3.8-27b-q4km` of the `models` group;
-[docs](docs/qwen38-speculative.md#the-27b-bring-up-s7)): each step below keeps `make test` green and compare_bins
+[docs](docs/qwen38-speculative.md#the-27b-bring-up-s7)), and so is S8, the server (2026-10-28: `runq serve --draft FILE`
+and / or `--lookup N`, the guesses verified in the engine's batched passes, the draft's steps in its own batched passes,
+Qwen3.5's checkpoints per verify row transient next to the slot's G5 budget; outputs exactly plain decoding's,
+`server_test.py --spec` in the `spec` group; the auto policy of G7; `timings.speculative`;
+[docs](docs/server.md#speculative-decoding-todo-s8-g7)): each step below keeps `make test` green and compare_bins
 identical where it promises no output change. **Disk and RAM:** ~40 GB free with the 27B Q4_K_M downloaded (`models/Qwen3.8-27B-GGUF`, sha256
 checked), `models/` 45 GB; `/tmp` is a 16 GB tmpfs (RAM: no models or venvs there); check `df` / `MemAvailable`
 before every download or 27B run, keep >= 15 GB of disk free (the 4B / 1.7B HF checkpoints were removed: they only
@@ -44,11 +48,6 @@ Steps:
   tok/s and acceptance there (with the copy cost per row, `bench_verify -c`), and the default k / tau for it (and for
   the 27B: `-G 6 --tau 0.4` was +4-7% over the default `-G 3` there). Done when outputs equal
   plain decoding bitwise (greedy, seeded, thinking on / off) and tok/s + acceptance are recorded.
-- [ ] **S8. Server.** `runq serve --draft FILE`: the draft rows join the job's segment in the batched pass, k per
-  request; speculate less as the batch fills. (`rq_spec_run` is one sequence's loop on its own passes: the engine
-  needs the same round split into steps of its scheduler: draft rows, then the verify segment in the shared pass,
-  then `rq_gen_step` per row and the truncations, as `src/spec.c` does them.) Done when `server_test.py` shows equal outputs with and without the
-  draft, and `scripts/bench_serve.py` numbers at 1 / 4 clients.
 - [ ] **S9. The MTP drafter** (`blk.64`, same file; validated at load into `RqModel.mtp`, `MtpBlock`: pointers into
   the mapping, to convert / repack when the drafter is built). The target's last hidden state + the next token's embedding ->
   `eh_proj` -> one full-attention layer with its own KV cache -> the shared output (~9-10 ms per guess for the 1 GB
@@ -118,8 +117,8 @@ more than its new tokens plus the last reply.
   request from the session, pi's compaction runs at the server's window, replies forced to the recorded ones through
   `force_reply` or generated with `--mode live`; per request the reused prefix, prefilled / new tokens, divergences
   and rollbacks from the response's `timings`, times; docs/server.md, "Agent sessions"), run on the 0.8B at 32k and
-  96k on two sessions (G5's numbers). Left of (a): the speculation stats per turn (S8: the server has no draft yet)
-  and the 27B's own run.. (c) done on proxies (2026-10-27, `scripts/lookup_accept.py`, docs/qwen38-speculative.md, "Prompt
+  96k on two sessions (G5's numbers); the per-kind table has the speculation counters since S8 (`--mode live`
+  with `--server-arg=--draft ...`). Left of (a): the 27B's own run (with its draft: the speculation per turn).. (c) done on proxies (2026-10-27, `scripts/lookup_accept.py`, docs/qwen38-speculative.md, "Prompt
   lookup"): pi's sessions rendered as Qwen3.8 (4,508 replies, 2.0 M tokens before position 98k: other models'
   replies, the 27B's are not recorded), teacher-forced: the prompt lookup alone 1.56 tokens per pass (k 3; syntax 2.9,
   edits' old text 2.6, reasoning / prose 1.3), the 0.8B draft 2.40 (k 3; on a 95k-token subset up to 32k positions),
@@ -197,13 +196,23 @@ more than its new tokens plus the last reply.
 - [ ] **G6 leftovers: prompt lookup.** Prompt-lookup drafting is in (`--lookup N [--lookup-min M]`, with or without
   `-D`; exact; docs/qwen38-speculative.md, "Prompt lookup": ~1.5 tokens per pass on agentic replies, 2.8-3.9x on edits
   that return the prompt's code; with the 0.8B draft at short context it adds nothing; at long context it is the
-  cheap one). Left: in the server (S8); G7's per-position choice between the lookup and the model; tool schemas whose
+  cheap one; in the server and chosen per pass since S8 / G7). Left: tool schemas whose
   old / new text are plain string parameters (pi's `edits` array is JSON-escaped, so multi-line old text does not match
   the raw file text in the context: a pi-side change or a custom edit tool).
-- [ ] **G7. Speculation at long context.** A verify segment of k + 1 rows shares the KV read but multiplies the
-  attention work (k = 3: 4x), so the best k falls as the context grows. Choose k (and tau) per pass from the
-  position and the measured costs (G0), in the CLI and the server. Done when speculation is never slower than plain
-  decoding at any context length in G0's benchmark, and its gain at 90k is recorded.
+- [ ] **G7. Speculation at long context.** Status (2026-10-28, docs/qwen38-speculative.md, "In the server (S8) and the
+  choice by position (G7)"): the source and the guess count per pass from a cost model (`RqPassCost`: t_w f(R) + att x
+  the segments' first positions + att_x x their further rows', calibrated at the start, `rq_pass_cost_measure`), the
+  position, the batch and the acceptance seen: `runq serve --spec auto` (the default with `--draft` / `--lookup`; per
+  request `speculative`) and `runq --spec auto`; plain steps when the expected gain is < 1. The choice by position
+  (`build/bench_long -D`, the 27B extrapolated from synth-27b, the 0.8B Q4_K_M draft, p 0.6): the model k 2 up to 32k (x1.56
+  -> x1.23), k 1 at 64-98k (x1.17 -> x1.13; nothing for p < ~0.45), a 4-token lookup match 4 guesses at 512 down to 2 at
+  98k (x2.15 -> x1.38). Left: (a) the 27B itself: the server with its draft at 32k-96k (G0's replay, `--mode live`),
+  the gain at 90k measured rather than extrapolated; (b) the online correction scales each model's whole cost by one
+  measured ratio: f(R)'s shape and the attention's slope are only calibrated at the start; (c) the draft's prompt catch-up runs with the prefill
+  (+~20 ms TTFT on short prompts with the 0.6B draft, more on long ones): defer it, or bound it by the expected reply
+  length as the decode-time catch-up is; (d) adaptive length in auto (the draft's top-1 probability per guess, as tau,
+  instead of the geometric p only); (e) S10's seed-coupled draft would raise p at temperature > 0, which the policy
+  would then pick up.
 
 ## Platforms
 

@@ -19,7 +19,7 @@ static int max_new_tokens = 0; // -n: stop after this many generated tokens, 0 =
 
 // speculative decoding (-D draft.gguf, -G k, --tau; --lookup N, --lookup-min L): the draft model, its context and
 // sequence (m NULL: no draft model), the options (o.k 0 and o.lookup 0: plain decoding)
-static struct { RqModel *m; RqCtx *c; RqSeq *s; RqSpecOpts o; } draft;
+static struct { RqModel *m; RqCtx *c; RqSeq *s; RqSpecOpts o; RqPassCost tc, dc; } draft;
 #define SPECULATIVE (draft.m || draft.o.lookup > 0)
 
 static void die(const char *msg) {
@@ -49,11 +49,12 @@ static void report_spec(const RqSpecStats *st) {
     // the speculative loop's counters (after report_timing); with the prompt lookup, its share after the totals
     char tau[32] = "", how[96] = "", lk[160] = "";
     if (draft.o.tau > 0) snprintf(tau, sizeof(tau), ", tau %g", draft.o.tau);
-    if (draft.m) snprintf(how, sizeof(how), "k %d%s", draft.o.k, tau);
+    if (draft.o.cost) snprintf(how, sizeof(how), "auto, ");
+    if (draft.m) snprintf(how + strlen(how), sizeof(how) - strlen(how), "k %s%d%s", draft.o.cost ? "<= " : "", draft.o.k, tau);
     if (draft.o.lookup > 0) {
         size_t l = strlen(how);
-        snprintf(how + l, sizeof(how) - l, "%slookup %d (match >= %d)", l ? ", " : "", draft.o.lookup,
-                 draft.o.lookup_min > 0 ? draft.o.lookup_min : RQ_LOOKUP_MIN_DEFAULT);
+        snprintf(how + l, sizeof(how) - l, "%slookup %s%d (match >= %d)", l && how[l - 1] != ' ' ? ", " : "", draft.o.cost ? "<= " : "",
+                 draft.o.lookup, draft.o.lookup_min > 0 ? draft.o.lookup_min : draft.o.cost ? 2 : RQ_LOOKUP_MIN_DEFAULT);
         snprintf(lk, sizeof(lk), " | lookup: %d passes, %d drafted, %d accepted (%.1f%%)", st->lookup_passes,
                  st->lookup_drafted, st->lookup_accepted, 100.0 * st->lookup_accepted / (st->lookup_drafted > 0 ? st->lookup_drafted : 1));
     }
@@ -645,6 +646,9 @@ static void error_usage(void) {
     fprintf(stderr, "              the last tokens earlier in the context (no model; with -D: the draft model where none matches),\n");
     fprintf(stderr, "              at most %d, default 0 (off); the output is exactly plain decoding's\n", RQ_SPEC_K_MAX);
     fprintf(stderr, "  --lookup-min <int> with --lookup: the shortest match used, in tokens (>= 2), default %d\n", RQ_LOOKUP_MIN_DEFAULT);
+    fprintf(stderr, "  --spec <mode> with -D / --lookup: fixed (default: -G / --lookup guesses, the lookup first) or auto: per pass the\n");
+    fprintf(stderr, "              source and guess count from a cost model calibrated at the start (-G, --lookup: the maximums;\n");
+    fprintf(stderr, "              a plain step when no guess pays off); the output is exactly plain decoding's either way\n");
     fprintf(stderr, "Threads: OMP_NUM_THREADS, default nproc - nproc/8 (Apple Silicon: the performance cores)\n");
     exit(EXIT_FAILURE);
 }
@@ -694,6 +698,7 @@ int main(int argc, char *argv[]) {
     int spec_k = -1;            // -G: guesses per pass (-1: SPEC_K_DEFAULT)
     float spec_tau = 0;         // --tau
     int lookup = 0, lookup_min = 0; // --lookup, --lookup-min (0: RQ_LOOKUP_MIN_DEFAULT)
+    int spec_auto = 0;          // --spec auto (G7: the cost model's choice per pass)
 
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
@@ -722,6 +727,12 @@ int main(int argc, char *argv[]) {
             int mn = argv[i][8] == '-';
             if (end == argv[i + 1] || *end || v < (mn ? 2 : 0) || v > (mn ? RQ_LOOKUP_LMAX : RQ_SPEC_K_MAX)) error_usage();
             *(mn ? &lookup_min : &lookup) = (int)v;
+            continue;
+        }
+        if (!strcmp(argv[i], "--spec")) {
+            if (!strcmp(argv[i + 1], "auto")) spec_auto = 1;
+            else if (!strcmp(argv[i + 1], "fixed")) spec_auto = 0;
+            else error_usage();
             continue;
         }
         if (!strcmp(argv[i], "--tau")) {
@@ -848,6 +859,25 @@ int main(int argc, char *argv[]) {
     if (!seq) die("malloc failed!");
     RqCtx *ctx = rq_ctx_new(m, prefill_chunk, 0, &e);
     if (!ctx) die("malloc failed!");
+    if (spec_auto && SPECULATIVE) { // (--spec auto: both models' costs, on their empty sequences; emptied again)
+        double t0 = rq_now();
+        int L = rq_seq_capacity(seq) - 32 < 8192 ? rq_seq_capacity(seq) - 32 : 8192, r1 = RQ_ERR_ARG, r2 = RQ_OK;
+        RqCtx *cc = rq_ctx_max_batch(ctx) >= 16 ? ctx : rq_ctx_new(m, 16, 0, &e), *dcc = NULL;
+        if (cc) r1 = rq_pass_cost_measure(cc, seq, L, 5, &draft.tc);
+        if (r1 == RQ_OK && draft.m && (dcc = rq_ctx_max_batch(draft.c) >= 16 ? draft.c : rq_ctx_new(draft.m, 16, 0, &e)))
+            r2 = rq_pass_cost_measure(dcc, draft.s, L < rq_seq_capacity(draft.s) - 32 ? L : rq_seq_capacity(draft.s) - 32, 5, &draft.dc);
+        if (cc && cc != ctx) rq_ctx_free(cc);
+        if (dcc && dcc != draft.c) rq_ctx_free(dcc);
+        if (r1 != RQ_OK || (draft.m && (!dcc || r2 != RQ_OK))) {
+            rq_pass_cost_default(m, &draft.tc);
+            if (draft.m) rq_pass_cost_default(draft.m, &draft.dc);
+        }
+        draft.o.cost = &draft.tc;
+        draft.o.dcost = draft.m ? &draft.dc : NULL;
+        fprintf(stderr, "[timing] spec-auto costs: target %.2f ms + %.3f / %.3f us x position (%s)%s", draft.tc.t_w * 1e3,
+                draft.tc.att * 1e6, draft.tc.att_x * 1e6, draft.tc.calibrated ? "measured" : "estimated", draft.m ? "" : "\n");
+        if (draft.m) fprintf(stderr, ", draft %.2f ms + %.3f us (%.1f s)\n", draft.dc.t_w * 1e3, draft.dc.att * 1e6, rq_now() - t0);
+    }
     rq_seq_seed(seq, rng_seed);
     RqSampling cfg = { temperature, topp, NULL, top_k }, mcfg = cfg;
     int ms = rq_model_sampling(m, &mcfg) & ~samp_given; // (the file's values for the options not given; silent)

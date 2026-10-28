@@ -123,6 +123,11 @@ struct Job {
     double deadline;            // rq_now() time limit, 0 = none
     RqTokens force;             // force_reply (a benchmark hook, scripts/replay_sessions.py): the reply's tokens, fed as if
                                 // sampled (in passes of several rows), then the end token; empty: generate
+    // speculative decoding (engine.c, docs/server.md): SPEC_OFF / SPEC_AUTO / SPEC_FIXED, the draft model's guesses per
+    // pass at most (0: none; needs EngineOpts.draft), tau, the prompt lookup's guesses at most (0: none), its shortest
+    // match (0: the default). serve.c: the server's defaults, or the request's "speculative" object
+    int spec, spec_k, spec_lookup, spec_lmin;
+    float spec_tau;
 
     // output (written by the engine under mu; serve.c reads it under mu)
     void *mu, *cv;              // pthread mutex / condition (engine.c)
@@ -140,7 +145,11 @@ struct Job {
     int cancel;                 // set by the connection (client gone): the engine stops at the next step
     int refs;                   // the submitter and the engine
     int slot;                   // the sequence (slot) used
+    // speculation's counters (timings): decode passes; per source the passes with guesses, guesses, accepted ones
+    int sp_passes, sp_model[3], sp_lookup[3], sp_draft_rows, sp_refed; // (refed: positions fed again after a rollback: 0)
 };
+
+enum { SPEC_OFF = 0, SPEC_AUTO = 1, SPEC_FIXED = 2 };
 
 typedef struct {
     const char *model_path;
@@ -155,6 +164,12 @@ typedef struct {
     int queue;                  // queued jobs at most (waiting, not running)
     int verbose;
     int checkpoints;            // Qwen3.5: recurrent-state checkpoints per slot (0: 4; engine.c, ck_plan_job)
+    // speculative decoding (engine.c): the draft model (NULL: none; rq_spec_check passed), the cost calibration's
+    // context length (0: rq_pass_cost_default), whether a request may speculate at all (calibrate when set)
+    RqModel *draft;
+    int calib;
+    int spec_used;              // requests speculate by default (the cost calibration runs at the start)
+    int spec_kmax;              // the default guesses per pass at most (either source): the transient checkpoints counted
 } EngineOpts;
 
 typedef struct Engine Engine;
@@ -165,7 +180,9 @@ void engine_stop(Engine *e, double grace); // reject the queue, let the running 
 void engine_free(Engine *e);                // (after engine_stop, once no connection uses it)
 int engine_queued(Engine *e, int *running); // waiting jobs; *running: jobs running
 void engine_describe(Engine *e, char *buf, size_t n); // the effective pool / batching settings (one line)
+void engine_describe_spec(Engine *e, char *buf, size_t n); // speculation: the cost model, the choice by position
 const ConVocab *engine_vocab(Engine *e);
+#define SPEC_GUESS_MAX 16 // guesses per pass of a request at most (either source)
 
 Job *job_new(void);
 void job_release(Job *j);                    // drop a reference (freed at 0)

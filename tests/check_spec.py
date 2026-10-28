@@ -3,7 +3,7 @@
   api        tests/api_test --spec on the Qwen3-0.6B pair (target Q8_0, draft Q4_K_M; every case and draft setting),
              the generic build's api_test --spec --quick, and Qwen3.5-0.8B Q8_0 + its Q4_K_M as the draft (--quick:
              the hybrid rollbacks, every one on its checkpoint); the vocabulary check refuses the other family
-  cli        runq -D DRAFT -G k [--tau], --lookup N (the prompt lookup alone, no -D) and both combined vs the same
+  cli        runq -D DRAFT -G k [--tau], --lookup N (the prompt lookup alone, no -D), both combined and --spec auto (G7) vs the same
              command without them: stdout byte for byte, stderr but the [timing] lines, the exit status, and in chat
              mode the RUNQ_CHAT_DUMP files (the cache's ids and every sampled logits vector, bitwise): generate and
              chat, greedy and seeded (top-p, top-k), thinking off / on, -n inside a verify pass, -n 1 / 2, the
@@ -11,6 +11,10 @@
              that copies its prompt (lookup: >= 3 tokens per pass); -G 0 with -D is plain decoding byte for byte
              (stderr included); a draft of another vocabulary, -G without -D and a bad --lookup / --lookup-min are
              refused; one generate and one chat case on the generic build
+  server     runq serve with speculation (tests/server_test.py --spec: the Qwen3-0.6B pair, Qwen3.5-0.8B Q8_0 + Q4_K_M, the
+             0.8B with the prompt lookup alone): every request with "speculative": false and with fixed settings / auto,
+             outputs identical (content, reasoning, tool calls, finish, usage, logprobs; streamed and not; concurrent
+             requests; a conversation's next turn reuses what plain decoding's would)
 """
 import concurrent.futures as cf
 import os
@@ -28,9 +32,10 @@ CHAT_USERS = ["Name three colours.", "And three animals?", "Which of those is th
 # (-D DRAFT is passed with the settings that have -G; --lookup alone: no draft model)
 LOOKUP = ["--lookup", "4"]
 COMBINED = ["-G", "3", "--lookup", "8", "--lookup-min", "3"]
+AUTO = ["-G", "3", "--lookup", "3", "--spec", "auto"]  # (G7: the cost model's choice per pass, calibrated at the start)
 K_ALL = [["-G", "1"], ["-G", "3"], ["-G", "8"], ["-G", "8", "--tau", "0.5"], LOOKUP, ["--lookup", "30", "--lookup-min", "4"],
-         COMBINED]
-K_TWO = [["-G", "3"], ["-G", "8", "--tau", "0.5"], LOOKUP, COMBINED]
+         COMBINED, AUTO, ["--lookup", "4", "--spec", "auto"]]
+K_TWO = [["-G", "3"], ["-G", "8", "--tau", "0.5"], LOOKUP, COMBINED, AUTO]
 COPY_PROMPT = ("def moving_average(xs, n):\n    out = []\n    for i in range(len(xs)):\n        if i < n - 1:\n"
                "            out.append(None)\n        else:\n            out.append(sum(xs[i-n+1:i+1]) / n)\n    return out\n\n\n"
                "# the same function again, copied verbatim:\n\ndef moving_average(xs, n):\n")
@@ -161,6 +166,14 @@ def spec_start(a, tmp, ex):
         if a.q35 and os.path.exists(q35d):
             futs.append(("api", "spec_api/qwen35", ex.submit(run, [a.api_test, "--spec", a.q35, q35d, "--quick", "--other", a.gguf],
                                                              SPEC_THREADS)))
+    # runq serve with speculation (server_test.py --spec): the Qwen3 pair, the Qwen3.5 pair, the lookup alone
+    srv = [sys.executable, "-I", os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_test.py"), "--runq", a.runq,
+           "--threads", str(SPEC_THREADS)]
+    futs.append(("api", "spec_server/qwen3", ex.submit(run, srv + ["--model", a.gguf, "--spec", a.q4], SPEC_THREADS)))
+    if a.q35 and os.path.exists(q35d):
+        futs.append(("api", "spec_server/qwen35", ex.submit(run, srv + ["--model", a.q35, "--spec", q35d], SPEC_THREADS)))
+    if a.q35:
+        futs.append(("api", "spec_server/lookup", ex.submit(run, srv + ["--model", a.q35, "--spec", "none"], SPEC_THREADS)))
     for i, case in enumerate(CLI_CASES):
         futs.append(("cli", "spec_cli", ex.submit(cli_case, a.runq, a.gguf, a.q4, case, d, f"c{i}")))
     if a.generic:
@@ -194,7 +207,7 @@ def spec_start(a, tmp, ex):
         out.append((p.returncode == 1 and "needs a draft model" in e, "refused_no_draft", f"-G 3 without -D: exit status {p.returncode}"))
         p = run([a.runq, a.gguf, "-m", "generate", "-n", "4", "-i", "hi", "-D", a.q4, "--tau", "2"], 2)
         out.append((p.returncode == 1 and b"Usage:" in p.stderr, "bad_tau", f"--tau 2: exit status {p.returncode}"))
-        bad = [["--lookup", "31"], ["--lookup", "-1"], ["--lookup", "4", "--lookup-min", "1"], ["--lookup", "x"]]
+        bad = [["--lookup", "31"], ["--lookup", "-1"], ["--lookup", "4", "--lookup-min", "1"], ["--lookup", "x"], ["--spec", "maybe"]]
         codes = [run([a.runq, a.gguf, "-m", "generate", "-n", "4", "-i", "hi"] + b, 2) for b in bad]
         out.append((all(p.returncode == 1 and b"Usage:" in p.stderr for p in codes), "bad_lookup",
                     "; ".join(f"{' '.join(b)}: exit status {p.returncode}" for b, p in zip(bad, codes))))

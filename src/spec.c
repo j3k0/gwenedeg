@@ -62,7 +62,7 @@ int rq_spec_check(const RqModel *target, const RqModel *draft, char *err, size_t
     return RQ_OK;
 }
 
-static int draft_pick(const float *lg, int V, const unsigned char *allow, float tau, float *p1) {
+int rq_spec_pick(const float *lg, int V, const unsigned char *allow, float tau, float *p1) {
     // the draft's guess: its argmax (the lowest id on ties; among the allowed tokens with a mask); with tau > 0 its
     // probability, 1 / sum exp(l - max), only compared with tau: the sum stops once it shows p1 < tau
     int best = -1;
@@ -217,7 +217,9 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
     float *out = NULL;
     Buf buf = { NULL, 0 };
     RqLookup *lk = NULL;
-    int kmax = k > kl ? k : kl, guess[RQ_SPEC_K_MAX + 1], nck0 = s->nck;
+    int kmax = k > kl ? k : kl, guess[RQ_SPEC_K_MAX + 1], nck0 = s->nck, aut = o && o->cost, mlen = 0;
+    double acm[2] = { 0, 0 }, acl[RQ_LOOKUP_LMAX + 1][2]; // (auto: the model's guesses, the lookup's per match length)
+    memset(acl, 0, sizeof(acl));
     if (kmax > 0) {
         if (!(out = malloc((size_t)(kmax + 1) * V * sizeof(float)))) return RQ_ERR_NOMEM;
         ck_slots(s, kmax + 2);
@@ -235,14 +237,14 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
         int lim = r == RQ_GEN_LAST ? 0 : kmax, nd = 0, src = 0;
         if (g->max_new > 0 && lim > g->max_new - g->n_gen - 1) lim = g->max_new - g->n_gen - 1;
         if (lim > cap - 1 - P) lim = cap - 1 - P;
+        int ml = 0;
         if (kl > 0 && lim > 0) { // the lookup first: the sequence's tokens are indexed as they become final
             double td = rq_now();
-            int ml;
             if (rq_lookup_add(lk, rq_seq_tokens(s), P) != RQ_OK) { // (a sequence cut below the indexed length)
                 rq_lookup_reset(lk);
                 rq_lookup_add(lk, rq_seq_tokens(s), P);
             }
-            nd = rq_lookup_draft(lk, rq_seq_tokens(s), t, kl < lim ? kl : lim, lmin, guess + 1, &ml);
+            nd = rq_lookup_draft(lk, rq_seq_tokens(s), t, kl < lim ? kl : lim, aut && !(o->lookup_min > 0) ? 2 : lmin, guess + 1, &ml);
             if (g->cfg->allow) // (a guess the mask forbids cannot be sampled: the guesses stop before it)
                 for (int j = 1; j <= nd; j++)
                     if (!g->cfg->allow[guess[j]]) { nd = j - 1; break; }
@@ -251,12 +253,22 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
         }
         int kk = src ? 0 : k < lim ? k : lim;
         if (k > 0 && kk > rq_seq_capacity(ds) - P) kk = rq_seq_capacity(ds) - P;
+        if (aut && lim > 0) { // (G7: the source and the count from the cost model at P, the acceptance seen so far)
+            int km = k < lim ? k : lim, mlc = ml > RQ_LOOKUP_LMAX ? RQ_LOOKUP_LMAX : ml;
+            if (k > 0 && km > rq_seq_capacity(ds) - P) km = rq_seq_capacity(ds) - P;
+            double pmd = (acm[1] + 8 * 0.6) / (acm[0] + 8), plk = (acl[mlc][1] + 8 * rq_lookup_prior(mlc)) / (acl[mlc][0] + 8);
+            RqSpecChoice x = rq_spec_choose(o->cost, k > 0 && o->dcost ? o->dcost : NULL, P, km, pmd, nd, plk);
+            src = x.src == RQ_SPEC_LOOKUP;
+            nd = src ? x.n : 0;
+            kk = x.src == RQ_SPEC_MODEL ? x.n : 0;
+            mlen = mlc;
+        }
         if (kk > 0) {
             double td = rq_now();
             float *lg = NULL, p1;
             e = draft_follow(dc, ds, rq_seq_tokens(s), P, t, kk, &buf, &lg, st);
             while (e == RQ_OK) {
-                int d = draft_pick(lg, V, g->cfg->allow, tau, &p1);
+                int d = rq_spec_pick(lg, V, g->cfg->allow, tau, &p1);
                 if (d < 0 || (tau > 0 && p1 < tau)) break;
                 guess[++nd] = d;
                 if (nd == kk) break;
@@ -283,7 +295,7 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
         st->lookup_passes += src;
         st->lookup_drafted += src ? nd : 0;
         // accept: step through the rows while the sample is the next row's token
-        int keep = P + 1 + nd, fed = 0;
+        int keep = P + 1 + nd, fed = 0, pacc = 0, prej = 0;
         for (int j = 0; j <= nd; j++) {
             r = rq_gen_step(g, c, P + j, rows + (size_t)j * V);
             if (r < 0) { e = r; break; }
@@ -291,11 +303,18 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
             if (j < nd && g->token == guess[j + 1]) { // (already in the cache at P + j + 1)
                 st->accepted++;
                 st->lookup_accepted += src;
+                pacc++;
                 if (r == RQ_GEN_LAST) { keep = P + 2 + j; fed = 1; break; }
                 continue;
             }
             keep = P + 1 + j;
+            prej = j < nd;
             break;
+        }
+        if (aut && nd > 0) { // (the acceptance per guess: accepted / checked)
+            double *a = src ? acl[mlen] : acm;
+            a[0] += pacc + prej;
+            a[1] += pacc;
         }
         if (e != RQ_OK) break;
         if (keep < rq_seq_len(s)) { // (Qwen3.5: lands on the checkpoint of row keep - 1 - P)
@@ -363,4 +382,167 @@ int rq_generate_spec(RqCtx *c, RqSeq *s, RqCtx *dc, RqSeq *ds, const int *tokens
     st->gen.n_prompt = gs.n_prompt;
     st->gen.t_prefill = gs.t_prefill;
     return e;
+}
+
+// ------------------------------------------------------------------------------------ the cost model (TODO G7)
+// A pass of R rows: t_w f(R) + att S1 + att_x S2 (runq.h: S1 the segments' first positions, S2 the others'). Calibrated
+// on an empty sequence filled
+// with synthetic values (rq_seq_fill_synthetic: the passes' time does not depend on them): every configuration once
+// per rep in turn, the fastest per configuration (a shared machine's load only ever adds time; the differences below
+// are small against a pass at short context); R = 1 is a decode step, R > 1 a segment of R rows with every row's
+// logits (a verify pass); at a short context L0 for f(R), a decode step and an 8-row segment at L for the attention
+static const int cost_rows[] = { 1, 2, 3, 4, 5, 6, 8, 12, 16 };
+#define COST_NR ((int)(sizeof(cost_rows) / sizeof(cost_rows[0])))
+
+double rq_pass_cost(const RqPassCost *pc, int rows, double pos_first, double pos_more) {
+    if (rows <= 0) return 0;
+    double f;
+    int n = pc->n;
+    if (n < 1) f = rows;
+    else if (rows <= pc->r[0]) f = pc->f[0] * rows / pc->r[0];
+    else {
+        int i = 1;
+        while (i < n - 1 && pc->r[i] < rows) i++;
+        if (n == 1) f = pc->f[0] * rows / pc->r[0];
+        else {
+            // between r[i - 1] and r[i], or past the last entry: the last segment's slope (at least 0.05 per row)
+            double s = (pc->f[i] - pc->f[i - 1]) / (pc->r[i] - pc->r[i - 1]);
+            if (rows > pc->r[n - 1] && s < 0.05) s = 0.05;
+            f = pc->f[i - 1] + s * (rows - pc->r[i - 1]);
+        }
+    }
+    return pc->t_w * f + pc->att * pos_first + pc->att_x * pos_more;
+}
+
+void rq_pass_cost_default(const RqModel *m, RqPassCost *pc) {
+    // without a calibration: the weights read at ~60 GB/s, the KV entries of a position at ~60 GB/s plus their
+    // arithmetic at ~0.3 TFLOPS (8 threads on the dev box), f(R) as measured on Qwen3-1.7B / 8B (S2: ~0.07 per row up
+    // to 5 rows, then ~0.12); rough, but every quantity scales with the model as the measured ones do
+    static const double f[] = { 1, 1.08, 1.15, 1.25, 1.35, 1.45, 1.65, 2.1, 2.6 };
+    memset(pc, 0, sizeof(*pc));
+    RqModelMem mm;
+    RqSeqMem sm;
+    double w = rq_model_mem(m, &mm) == RQ_OK ? (double)mm.weights : 1e9;
+    const Config *p = &m->config;
+    double kvb = rq_seq_mem(m, 4096, RQ_KV_F16, &sm) == RQ_OK ? (double)sm.kv / 4096 : 1e5;
+    pc->t_w = w / 60e9 + 1e-3;
+    pc->att_x = 4.0 * m->n_attn * p->n_heads * p->head_dim / 0.3e12; // (a row's arithmetic)
+    pc->att = kvb / 60e9 + pc->att_x;                                  // (+ the read of the KV entries)
+    pc->n = COST_NR;
+    for (int i = 0; i < COST_NR; i++) {
+        pc->r[i] = cost_rows[i];
+        pc->f[i] = f[i];
+    }
+    pc->calibrated = 0;
+}
+
+static int cmp_dbl(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+
+int rq_pass_cost_measure(RqCtx *c, RqSeq *s, int L, int reps, RqPassCost *pc) {
+    // (s: an empty sequence of this context's model; emptied again afterwards)
+    const RqModel *m = s->m;
+    int V = m->config.vocab_size, L0 = 16, rmax = cost_rows[COST_NR - 1], e = RQ_OK;
+    if (reps < 1) reps = 1;
+    if (reps > 31) reps = 31;
+    if (L > rq_seq_capacity(s) - rmax - 1) L = rq_seq_capacity(s) - rmax - 1;
+    if (L < L0 + 64 || rq_seq_len(s) != 0 || rq_ctx_max_batch(c) < rmax) return RQ_ERR_ARG;
+    float *out = malloc((size_t)rmax * V * sizeof(float));
+    double *t = malloc((size_t)(COST_NR + 2) * reps * sizeof(double)), med[COST_NR + 2];
+    int toks[32];
+    if (!out || !t) {
+        free(out);
+        free(t);
+        return RQ_ERR_NOMEM;
+    }
+    for (int i = 0; i < 32; i++)
+        toks[i] = (1000 + 37 * i) % V;
+    for (int phase = 0; phase < 2 && e == RQ_OK; phase++) {
+        int Lx = phase ? L : L0, nc = phase ? 2 : COST_NR, base = phase ? COST_NR : 0;
+        if ((e = rq_seq_fill_synthetic(s, Lx, 0x5eed + phase)) != RQ_OK) break;
+        if ((e = rq_seq_checkpoint_at(s, Lx)) != RQ_OK) break; // (Qwen3.5: the truncations land here)
+        for (int rep = -1; rep < reps && e == RQ_OK; rep++) // (rep -1: a warm-up)
+            for (int k = 0; k < nc && e == RQ_OK; k++) {
+                int R = phase ? (k ? 8 : 1) : cost_rows[k];
+                float *lg;
+                double t0 = rq_now();
+                e = R == 1 ? rq_decode(c, s, toks[0], &lg) : rq_prefill(c, s, toks, R, RQ_LOGITS_ALL, out, &lg);
+                double dt = rq_now() - t0;
+                if (e == RQ_OK) e = rq_seq_truncate(s, Lx);
+                if (rep >= 0) t[(base + k) * reps + rep] = dt;
+            }
+    }
+    rq_seq_reset(s);
+    free(out);
+    if (e != RQ_OK) {
+        free(t);
+        return e;
+    }
+    for (int k = 0; k < COST_NR + 2; k++) {
+        qsort(t + k * reps, reps, sizeof(double), cmp_dbl);
+        med[k] = t[k * reps];
+    }
+    free(t);
+    // the attention: the growth from L0 to L of a decode step (the first row) and of an 8-row segment (+ 7 further rows;
+    // cost_rows[6] = 8)
+    double a1 = (med[COST_NR] - med[0]) / (L - L0), ax = (med[COST_NR + 1] - med[6] - (med[COST_NR] - med[0])) / (7.0 * (L - L0));
+    RqPassCost est;
+    rq_pass_cost_default(m, &est);
+    memset(pc, 0, sizeof(*pc));
+    pc->att = a1; // (lost in the noise, e.g. a short L on a small model: the estimate's)
+    if (!(pc->att > 0.1 * est.att)) pc->att = est.att;
+    pc->att_x = ax < 0 ? 0 : ax > pc->att ? pc->att : ax;
+    pc->t_w = med[0] - pc->att * L0;
+    if (pc->t_w < 0.5 * med[0]) pc->t_w = 0.5 * med[0];
+    pc->n = COST_NR;
+    for (int k = 0; k < COST_NR; k++) {
+        pc->r[k] = cost_rows[k];
+        int R = cost_rows[k];
+        pc->f[k] = (med[k] - pc->att * L0 - pc->att_x * (R - 1) * (L0 + R / 2.0)) / pc->t_w;
+        if (k == 0) pc->f[k] = 1;
+        if (k > 0 && pc->f[k] < pc->f[k - 1]) pc->f[k] = pc->f[k - 1]; // (noise: never cheaper with more rows)
+    }
+    pc->calibrated = 1;
+    return RQ_OK;
+}
+
+double rq_spec_expect(double p, int n) {
+    double e = 0, q = 1;
+    for (int i = 0; i < n; i++) {
+        q *= p;
+        e += q;
+    }
+    return e;
+}
+
+double rq_lookup_prior(int len) {
+    // per guess, the chance that a lookup guess is accepted after a match of len tokens (docs/qwen38-speculative.md,
+    // Prompt lookup: pi's sessions teacher-forced, the accepted run after a match of 2 / 4 / 8 / >= 16 tokens was ~1.0 /
+    // 2.8 / 5.9 / 15.6 tokens: a geometric run with p ~0.5 / 0.74 / 0.85 / 0.94)
+    static const double p[] = { 0, 0.3, 0.45, 0.6, 0.72, 0.75, 0.8, 0.8, 0.85, 0.85, 0.85, 0.85, 0.9, 0.9, 0.9, 0.9, 0.94 };
+    return len < 0 ? 0 : len > 16 ? 0.94 : p[len];
+}
+
+RqSpecChoice rq_spec_choose(const RqPassCost *t, const RqPassCost *d, int L, int kmax, double p_model, int lmax,
+                            double p_lookup) {
+    // one sequence alone at position L (its rows at L, L + 1, ...): plain = 1 token per decode step; lookup n = 1 +
+    // E(p_lookup, n) per pass of n + 1 rows; model k = 1 + E(p_model, k) per pass of k + 1 rows + k draft steps
+    RqSpecChoice best = { RQ_SPEC_PLAIN, 0, 1.0, 0, 0 };
+    double plain = rq_pass_cost(t, 1, L, 0);
+    best.t_plain = best.t_pass = plain;
+    for (int src = RQ_SPEC_LOOKUP; src <= RQ_SPEC_MODEL; src++) {
+        int nmax = src == RQ_SPEC_LOOKUP ? lmax : d ? kmax : 0;
+        double p = src == RQ_SPEC_LOOKUP ? p_lookup : p_model;
+        for (int n = 1; n <= nmax; n++) {
+            double T = rq_pass_cost(t, n + 1, L, n * (double)L + n * (n + 1) / 2.0);
+            if (src == RQ_SPEC_MODEL)
+                for (int i = 0; i < n; i++)
+                    T += rq_pass_cost(d, 1, L + i, 0);
+            double g = (1 + rq_spec_expect(p, n)) / T * plain;
+            if (g > best.gain) best = (RqSpecChoice) { src, n, g, plain, T };
+        }
+    }
+    return best;
 }

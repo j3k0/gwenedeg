@@ -47,6 +47,16 @@ only (src/tools.c):
              and == the raw reply's; the round trip's second turn reuses the first (cached_tokens) and answers;
              max_completion_tokens over max_tokens; errors (tool_choice required / a named function, a custom tool, bad
              arguments, json_schema with tools, a late system message, no user query)
+With --spec DRAFT (tests/check_spec.py: the Qwen3-0.6B Q8_0 + Q4_K_M pair, Qwen3.5-0.8B Q8_0 + Q4_K_M; "none": the prompt
+lookup alone, the 0.8B), the speculative decoding group only (the server: -D DRAFT or --lookup 4):
+  spec       every request with "speculative": false (plain decoding) and with fixed settings (the draft model at k 1 / 3 /
+             8 with tau 0.5, the lookup alone at 1 / 4 / 16 guesses, both) and auto: content, reasoning, tool calls,
+             finish_reason, usage and logprobs (bitwise logits) identical, streamed and not: greedy, seeded (top-p, top-k),
+             thinking cut inside a verify pass, max_tokens 1 / 2 / 5, stop strings, the end of the context inside a pass, a
+             reply that copies its prompt (the lookup's guesses accepted); four requests at once (fixed settings, auto) ==
+             each alone without; a conversation's next turn reuses the first prompt + its reply (cached_tokens; Qwen3.5: the
+             checkpoints as plain decoding leaves them) and == a fresh prefill's; tool calls (Qwen3.5: streamed, with
+             thinking); timings.speculative / draft_n; the request's errors; the startup line (the cost model)
 """
 import argparse
 import concurrent.futures as cf
@@ -451,6 +461,174 @@ def run_checkpoints(a, t, port, env):
         f"cached {c9} == the turn's first reply header at {hdr} (prompt {len(p3)})")
 
 
+# ---------------------------------------------------------------------------------------- speculative decoding (S8)
+SPEC_MODEL = [{"mode": "fixed", "k": 1, "lookup": 0}, {"mode": "fixed", "k": 3, "lookup": 0},
+              {"mode": "fixed", "k": 8, "tau": 0.5, "lookup": 0}, {"mode": "fixed", "k": 3, "lookup": 8, "lookup_min": 3}]
+SPEC_LOOKUP = [{"mode": "fixed", "lookup": 4}, {"mode": "fixed", "lookup": 16, "lookup_min": 3}, {"mode": "fixed", "lookup": 1}]
+COPY_CODE = ("def moving_average(xs, n):\n    out = []\n    for i in range(len(xs)):\n        if i < n - 1:\n"
+             "            out.append(None)\n        else:\n            out.append(sum(xs[i-n+1:i+1]) / n)\n    return out\n")
+
+
+def run_spec(a, t, port, has_draft, logname):
+    """speculation on == off (the server runs with a draft model, or the lookup alone): every request with
+    "speculative": false (plain decoding) and with fixed settings (the draft model at k 1 / 3 / 8 + tau, the lookup alone,
+    both) and auto, compared: content, reasoning, tool calls (without their random ids), finish_reason, usage, logprobs
+    (bitwise logits), streamed and not; concurrent requests; a conversation's next turn reuses what plain decoding's
+    would (the cache and, Qwen3.5, the checkpoints as plain decoding leaves them)"""
+    rep = t.report
+    settings = (SPEC_MODEL if has_draft else []) + SPEC_LOOKUP + ["auto"]
+    q35 = a.q35_spec
+
+    def out(st, d):
+        if st != 200:
+            return (st, d)
+        m, c = d["choices"][0]["message"], d["choices"][0]
+        calls = [x["function"] for x in m.get("tool_calls") or []]
+        u = dict(d["usage"])
+        return (m.get("content"), m.get("reasoning_content"), calls, c["finish_reason"], u["completion_tokens"], u["prompt_tokens"],
+                json.dumps(c.get("logprobs")))
+
+    def stats(d):
+        return d.get("timings", {}).get("speculative") if isinstance(d, dict) else None
+
+    def acc(ds):
+        g = sum(s[src]["drafted"] for s in ds if s for src in ("model", "lookup"))
+        k = sum(s[src]["accepted"] for s in ds if s for src in ("model", "lookup"))
+        return k, g
+
+    def equal_case(name, body, sets, stream_too=False, check=None):
+        st, ref, _ = chat(port, dict(body, speculative=False))
+        want = out(st, ref)
+        ok, seen, det = st == 200 and stats(ref) is None, [], []
+        for s in sets:
+            st2, d, _ = chat(port, dict(body, speculative=s))
+            got = out(st2, d)
+            same = got == want
+            ok &= same and stats(d) is not None
+            seen.append(stats(d))
+            if not same:
+                det.append(f"{s}: {str(got)[:120]} vs {str(want)[:120]}")
+        if stream_too:
+            sref = stream(port, dict(body, speculative=False, stream_options={"include_usage": True}))
+            for s in sets[1::2]:
+                sg = stream(port, dict(body, speculative=s, stream_options={"include_usage": True}))
+                same = sg[:3] == sref[:3] and sg[3]["completion_tokens"] == sref[3]["completion_tokens"] and sg[0] == (want[0] or "")
+                ok &= same
+                if not same:
+                    det.append(f"stream {s}: {sg[:3]!r} vs {sref[:3]!r}")
+        if check:
+            c_ok, c_det = check(ref, seen)
+            ok &= c_ok
+            det.append(c_det)
+        refed = sum(x.get("refed", 0) for x in seen if x)
+        ok &= refed == 0  # (every rollback on its row's checkpoint)
+        k, g = acc(seen)
+        rep(ok, f"spec/{name}", f"{len(sets)} settings{' + streamed' if stream_too else ''} == plain; {k}/{g} guesses accepted"
+            + (f"; {refed} positions fed again" if refed else "") + ("; " + "; ".join(det) if det else ""))
+        return ref
+
+    def at(i):  # (a rotation of the settings: every case runs a few, every setting runs in several cases)
+        return [settings[(i + k) % len(settings)] for k in range(3)] + ["auto"]
+
+    # greedy, streamed and not; seeded (top-p, top-k); thinking cut inside a pass; max_tokens 1 / 2 / 5; logprobs
+    g = {"messages": [{"role": "user", "content": AUS}], "temperature": 0, "max_tokens": 60}
+    ref = equal_case("greedy", g, settings, stream_too=True)
+    equal_case("seeded", {"messages": [{"role": "user", "content": CATS}], "temperature": 0.8, "top_p": 0.9, "seed": 42,
+                          "max_tokens": 48}, at(1), stream_too=True)
+    equal_case("seeded_top_k", {"messages": [{"role": "user", "content": CATS}], "temperature": 1.2, "top_p": 0.95, "top_k": 3,
+                                "seed": 9, "max_tokens": 40}, at(2))
+    equal_case("thinking", {"messages": [{"role": "user", "content": MULT}], "temperature": 0, "max_tokens": 41,
+                            "reasoning_effort": "high"}, at(3), stream_too=True)
+    equal_case("thinking_seeded", {"messages": [{"role": "user", "content": MULT}], "temperature": 0.7, "seed": 3, "max_tokens": 90,
+                                   "reasoning_effort": "high"}, at(4))
+    for n in (1, 2, 5):
+        equal_case(f"max_tokens_{n}", dict(g, max_tokens=n), at(n))
+    equal_case("logprobs", dict(g, max_tokens=24, logprobs=True, top_logprobs=3), at(5))
+    words = (text_of(ref) or "").split()
+    word = words[len(words) // 2].strip(".,") if len(words) > 4 else "zzzz"
+    equal_case("stop_string", dict(g, stop=["zzz", word]), at(6), stream_too=True,
+               check=lambda r, s: (r["choices"][0]["finish_reason"] == "stop" and word not in (text_of(r) or ""), f"stop {word!r}"))
+    # a reply that copies its prompt: the lookup's guesses accepted
+    copy = {"messages": [{"role": "user", "content": "Repeat this code exactly, with no comment:\n\n" + COPY_CODE}], "temperature": 0,
+            "max_tokens": 80}
+    lk = [{"mode": "fixed", "lookup": 8, "k": 0}, {"mode": "fixed", "lookup": 4, "k": 0}, "auto"]
+    equal_case("copy_lookup", copy, lk, check=lambda r, s: (s[0]["lookup"]["accepted"] >= 20, f"lookup 8: {s[0]['lookup']}"))
+    # the end of the context inside a verify pass (-c 2048)
+    def count_prompt(n_words):
+        return {"messages": [{"role": "user", "content": "Here are some words: " + " ".join(["apple"] * n_words) +
+                              "\nNow count from 1 to 500, separated by spaces."}], "temperature": 0}
+    st, d, _ = chat(port, dict(count_prompt(1000), max_tokens=1, speculative=False))
+    per = 1  # (" apple": one token)
+    longp = count_prompt(1000 + (2048 - 37 - d["usage"]["prompt_tokens"]) // per if st == 200 else 1000)
+    equal_case("context_end", longp, at(7), check=lambda r, s: (r["choices"][0]["finish_reason"] == "length" and
+                                                                r["usage"]["prompt_tokens"] + r["usage"]["completion_tokens"] == 2048,
+                                                                f"usage {r['usage']}"))
+    # concurrent: different requests at once, each with speculation == each alone without
+    bodies = [dict(g, max_tokens=40), {"messages": [{"role": "user", "content": CATS}], "temperature": 0.8, "top_p": 0.9, "seed": 5,
+                                       "max_tokens": 40},
+              dict(copy, max_tokens=50), {"messages": [{"role": "user", "content": MULT}], "temperature": 0, "max_tokens": 30,
+                                          "reasoning_effort": "high", "logprobs": True, "top_logprobs": 2}]
+    alone = [out(*chat(port, dict(b, speculative=False))[:2]) for b in bodies]
+    for rnd, sets in enumerate([settings[:4], ["auto"] * 4]):
+        with cf.ThreadPoolExecutor(max_workers=4) as ex:
+            futs = [ex.submit(chat, port, dict(b, speculative=s)) for b, s in zip(bodies, sets)]
+            res = [f.result() for f in futs]
+        got = [out(*r[:2]) for r in res]
+        k, gs = acc([stats(r[1]) for r in res])
+        rep(got == alone, f"spec/concurrent_{'fixed' if rnd == 0 else 'auto'}", f"4 at once {sets} == each alone, plain; {k}/{gs} accepted"
+            + ("" if got == alone else f"; {[i for i in range(4) if got[i] != alone[i]]} differ"))
+    # a conversation's next turn: what it reuses (cached_tokens) is plain decoding's (the reply's tokens; Qwen3.5: the
+    # checkpoints left as plain decoding leaves them); the second turn == plain
+    def conv(sys_text, s):
+        b = {"temperature": 0, "max_tokens": 24}
+        msgs = [{"role": "system", "content": sys_text}, {"role": "user", "content": ADA[0]}]
+        st, d1, _ = chat(port, dict(b, messages=msgs, speculative=s, cache_prompt=False))
+        msgs2 = msgs + [{"role": "assistant", "content": text_of(d1) or ""}, {"role": "user", "content": ADA[1]}]
+        st2, d2, _ = chat(port, dict(b, messages=msgs2, speculative=s))
+        st3, d3, _ = chat(port, dict(b, messages=msgs2, speculative=False, cache_prompt=False))
+        u = d1["usage"]
+        want = u["prompt_tokens"] + u["completion_tokens"] - (d1["choices"][0]["finish_reason"] == "length")
+        return out(st2, d2) == out(st3, d3), d2["usage"]["prompt_tokens_details"]["cached_tokens"], want
+    ok, det = True, []
+    for i, s in enumerate([False] + settings[:3]):
+        same, cached, want = conv(f"You are terse. (variant {i})", s)
+        ok &= same and cached == want
+        det.append(f"{s}: cached {cached} (the first prompt + its reply: {want})" + ("" if same else ", second turn DIFFERS"))
+    rep(ok, "spec/next_turn_cache", "; ".join(det))
+    # tools (Qwen3.5): a call, streamed and not, with thinking
+    if q35:
+        tb = {"messages": WEATHER, "tools": TOOLS, "temperature": 0, "max_tokens": 200}
+        equal_case("tools_call", tb, at(8), stream_too=True, check=lambda r, s: (r["choices"][0]["finish_reason"] == "tool_calls",
+                                                                                 f"finish {r['choices'][0]['finish_reason']}"))
+        equal_case("tools_thinking", dict(tb, reasoning_effort="high", max_tokens=300), at(9))
+        st, d, _ = chat(port, dict(tb, speculative=False, stream=False))
+        sref = [(c["function"]["name"], c["function"]["arguments"]) for c in d["choices"][0]["message"].get("tool_calls") or []]
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+        c.request("POST", "/v1/chat/completions", body=json.dumps(dict(tb, stream=True, speculative=settings[0])).encode())
+        ev = [json.loads(l[6:]) for l in c.getresponse().read().decode().split("\n") if l.startswith("data: ") and l != "data: [DONE]"]
+        c.close()
+        sc = [(x["function"]["name"], x["function"]["arguments"]) for e in ev if e.get("choices") for x in e["choices"][0]["delta"].get("tool_calls", [])]
+        rep(sc == sref and len(sc) >= 1, "spec/tools_stream_deltas", f"{sc} == {sref}")
+    # the counters: timings.speculative and llama.cpp's draft_n / draft_n_accepted
+    st, d, _ = chat(port, dict(copy, speculative={"mode": "fixed", "lookup": 8, "k": 0}))
+    ti = d["timings"]
+    sp = ti.get("speculative", {})
+    ok = st == 200 and sp.get("mode") == "fixed" and ti["draft_n"] == sp["model"]["drafted"] + sp["lookup"]["drafted"] and \
+        ti["draft_n_accepted"] == sp["model"]["accepted"] + sp["lookup"]["accepted"] and sp["model"]["drafted"] == 0 and \
+        sp["lookup"]["passes"] > 0 and ti["predicted_n"] - 1 <= sp["passes"] + ti["draft_n_accepted"] <= ti["predicted_n"]
+    rep(ok, "spec/timings", f"{ti}")
+    # errors
+    bad = [{"mode": "sometimes"}, {"k": 99}, {"lookup_min": 1}, 3]
+    if not has_draft:
+        bad.append({"k": 2})
+    codes = [chat(port, dict(g, speculative=b)) for b in bad]
+    rep(all(c[0] == 400 and c[1]["error"]["param"] == "speculative" for c in codes), "spec/errors",
+        "; ".join(f"{b}: {c[0]} {c[1].get('error', {}).get('message', '')[:60]!r}" for b, c in zip(bad, codes)))
+    log = open(logname).read()
+    rep("speculative decoding auto" in log and "costs: target" in log, "spec/startup_line",
+        next((l for l in log.splitlines() if "speculative decoding" in l), "no startup line")[:300])
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--runq", required=True)
@@ -459,7 +637,10 @@ def main():
     ap.add_argument("--slow", action="store_true", help="relaxed latency bounds (sanitizer builds)")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--tools", action="store_true", help="the tool call group only (a Qwen3.5 / Qwen3.8 model)")
+    ap.add_argument("--spec", metavar="DRAFT", help="the speculative decoding group only: the server with this draft model "
+                    "(\"none\": the prompt lookup alone)")
     a = ap.parse_args()
+    a.q35_spec = False
     t = T(a)
     slow = 10 if a.slow else 1
     log = tempfile.NamedTemporaryFile(prefix="runq-serve-", suffix=".log", delete=False)
@@ -467,11 +648,12 @@ def main():
     if a.tools:  # (SSE keep-alive comments after 0.05 s without a chunk instead of 15 s: tools/stream_keepalive)
         env["RUNQ_SSE_KEEPALIVE"] = "0.05"
     srv = subprocess.Popen([a.runq, "serve", a.model, "--port", "0", "-c", "2048", "--parallel", "4", "--slots", "6", "--chunk", "16", "--queue", "4",
-                            "--max-body", "65536", "--name", "test-model"] + (["--checkpoints", "5"] if a.tools else []),
+                            "--max-body", "65536", "--name", "test-model"] + (["--checkpoints", "5"] if a.tools else []) +
+                           ((["-D", a.spec] if a.spec != "none" else ["--lookup", "4"]) + ["--spec-calibrate", "1024"] if a.spec else []),
                            stderr=log, stdout=subprocess.DEVNULL, env=env)
     # the CLI references, in parallel with the server tests
     ex = cf.ThreadPoolExecutor(max_workers=3)
-    ref = {} if a.tools else {
+    ref = {} if a.tools or a.spec else {
         "aus": ex.submit(cli, a, ["-t", "0", "-n", "40", "-i", AUS]),
         "pirate": ex.submit(cli, a, ["-t", "0", "-n", "16", "-y", PIRATE_SYS, "-i", PIRATE]),
         "ada": ex.submit(cli, a, ["-t", "0", "-n", "32"], "\n".join(ADA) + "\n"),
@@ -492,7 +674,11 @@ def main():
         t.report(False, "server/start", open(log.name).read()[-500:])
         return 1
     try:
-        if a.tools:
+        if a.spec:
+            st, d, _ = req(port, "POST", "/v1/chat/completions", {"messages": WEATHER, "tools": TOOLS, "max_tokens": 1})
+            a.q35_spec = st == 200  # (tool calls: the Qwen3.5 / 3.8 templates)
+            run_spec(a, t, port, a.spec != "none", log.name)
+        elif a.tools:
             run_tools(a, t, port)
         else:
             run_all(a, t, port, ref, slow, log.name)

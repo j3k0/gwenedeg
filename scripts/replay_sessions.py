@@ -25,7 +25,9 @@ beyond: tool turns whose extra is more than the previous reply and its header, i
 differently from what was generated: the goal is none), whether the
 prompt left the slot's tokens before their end (diverged: the history was sent differently from what was generated)
 and whether the hybrid state rolled back further (rollback: the kept length is a checkpoint below the common prefix),
-prefill and decode times. Sessions are replayed one after the other on one server (a fresh one per run).
+prefill and decode times, the reply tokens, and with speculation (--server-arg=--draft --server-arg=FILE, or
+--server-arg=--lookup --server-arg=3; --mode live: forced replies do not speculate) the guesses accepted / drafted per
+source (timings.speculative). Sessions are replayed one after the other on one server (a fresh one per run).
 """
 import argparse
 import glob
@@ -127,15 +129,21 @@ def table(recs, out=sys.stdout, per_request=False):
             div = t.get("common_tokens", 0) < t.get("slot_tokens", 0) and t.get("common_tokens", 0) < n - 1
             rb = t.get("common_tokens", cached) - cached
             beyond = max(0, pre - new - reply) if new is not None and reply is not None else 0
+            sp = t.get("speculative") or {}
             rows.append((kind, dict(r, n=n, cached=cached, comp=comp, pre=pre, new=new, div=div, rb=rb, beyond=beyond,
-                                    pms=t.get("prompt_ms", 0), dms=t.get("predicted_ms", 0))))
+                                    pms=t.get("prompt_ms", 0), dms=t.get("predicted_ms", 0),
+                                    sp=[sp.get(src, {}).get(k, 0) for src in ("model", "lookup") for k in ("drafted", "accepted")])))
         agg = {}
         for kind, x in rows:
             if kind == "compaction":
                 continue
             g = agg.setdefault(kind, {"n": 0, "prompt": 0, "pre": 0, "new": 0, "extra": 0, "div": 0, "rb": 0, "pms": 0.0, "exact": 0,
-                                      "beyond": 0})
+                                      "beyond": 0, "comp": 0, "dms": 0.0, "md": 0, "ma": 0, "ld": 0, "la": 0})
             g["n"] += 1
+            g["comp"] += x["comp"]
+            g["dms"] += x["dms"]
+            for k, v in zip(("md", "ma", "ld", "la"), x["sp"]):
+                g[k] += v
             g["prompt"] += x["n"]
             g["pre"] += x["pre"]
             g["pms"] += x["pms"]
@@ -149,15 +157,16 @@ def table(recs, out=sys.stdout, per_request=False):
         name = rs[0].get("session_name", sid)
         print(f"\nsession {name}: {sum(1 for k, _ in rows if k == 'compaction')} compaction(s)", file=out)
         print(f"  {'kind':<16}{'reqs':>6}{'prompt tok':>12}{'prefilled':>11}{'new':>10}{'extra':>9}{'exact':>7}{'beyond':>7}{'diverged':>9}"
-              f"{'rollback':>9}{'prefill s':>10}", file=out)
+              f"{'rollback':>9}{'prefill s':>10}{'reply tok':>10}{'decode s':>9}  speculation: model, lookup accepted / drafted", file=out)
         for kind, g in sorted(agg.items()):
             tool = kind == "tool"
             newc = f"{g['new']:>10}" if tool else f"{'-':>10}"
             extra = f"{g['extra']:>9}" if tool else f"{'-':>9}"
             exact = f"{g['exact']:>7}" if tool else f"{'-':>7}"
             beyond = f"{g['beyond']:>7}" if tool else f"{'-':>7}"
+            spec = f"  {g['ma']} / {g['md']}, {g['la']} / {g['ld']}" if g["md"] + g["ld"] else ""
             print(f"  {kind:<16}{g['n']:>6}{g['prompt']:>12}{g['pre']:>11}{newc}{extra}{exact}{beyond}{g['div']:>9}{g['rb']:>9}"
-                  f"{g['pms'] / 1e3:>10.1f}", file=out)
+                  f"{g['pms'] / 1e3:>10.1f}{g['comp']:>10}{g['dms'] / 1e3:>9.1f}{spec}", file=out)
             t = tot.setdefault(kind, dict.fromkeys(g, 0))
             for k in g:
                 t[k] += g[k]
@@ -170,15 +179,17 @@ def table(recs, out=sys.stdout, per_request=False):
                     continue
                 t = x.get("timings", {})
                 flags = ("diverged " if x["div"] else "") + (f"rollback {x['rb']} " if x["rb"] > 0 else "") + \
-                        ("copied " if t.get("copied") else "") + (f"beyond the last reply {x['beyond']}" if x["beyond"] else "")
+                        ("copied " if t.get("copied") else "") + (f"beyond the last reply {x['beyond']} " if x["beyond"] else "") + \
+                        (f"spec {x['sp'][1]}/{x['sp'][0]} + {x['sp'][3]}/{x['sp'][2]}" if x["sp"][0] + x["sp"][2] else "")
                 print(f"  {x['seq']:>4} {kind:<16}{x['n']:>8}{x['cached']:>8}{x['pre']:>7}{x['new'] if x['new'] is not None else '-':>7}"
                       f"{x['comp']:>7}{t.get('slot', -1):>5}{t.get('slot_tokens', 0):>9}{t.get('common_tokens', 0):>8}  {flags}", file=out)
     if len(sessions) > 1:
         print("\nall sessions:", file=out)
         for kind, g in sorted(tot.items()):
             extra = f"new {g['new']}, extra {g['extra']}, exact {g['exact']}/{g['n']}, beyond the last reply {g['beyond']}, " if kind == "tool" else ""
+            spec = f", speculation: model {g['ma']} / {g['md']}, lookup {g['la']} / {g['ld']} accepted" if g["md"] + g["ld"] else ""
             print(f"  {kind:<16}{g['n']:>5} requests, prompt {g['prompt']}, prefilled {g['pre']} ({extra}diverged {g['div']}, "
-                  f"rollback {g['rb']}), prefill {g['pms'] / 1e3:.1f} s", file=out)
+                  f"rollback {g['rb']}), prefill {g['pms'] / 1e3:.1f} s, {g['comp']} reply tokens in {g['dms'] / 1e3:.1f} s{spec}", file=out)
 
 
 def main():

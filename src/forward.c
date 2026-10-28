@@ -291,6 +291,14 @@ void rq_seq_reset(RqSeq *s) {
 
 int rq_seq_checkpoint_at(RqSeq *s, int pos) {
     if (!s->m->hy.on) return RQ_OK; // (nothing to keep: every length can be truncated to)
+    if (pos < s->len && pos >= 0) { // (one held there, e.g. a verify row's: kept from now on)
+        for (int i = 0; i < s->nck; i++)
+            if (s->ck[i].pos == pos && !s->ck[i].wr) {
+                s->ck[i].rows = 0;
+                return RQ_OK;
+            }
+        return RQ_ERR_ARG;
+    }
     if (pos < s->len || pos > s->cap) return RQ_ERR_ARG;
     ck_unplan(s);
     if (pos == s->len) {
@@ -323,6 +331,20 @@ int rq_seq_checkpoint_rows(RqSeq *s, int pos, int n) {
     for (int i = 1; i <= n; i++)
         pend_add(s, pos + i, 1);
     return RQ_OK;
+}
+
+void rq_seq_checkpoint_rows_drop(RqSeq *s) {
+    if (!s->m->hy.on) return;
+    ck_unplan(s);
+    for (int i = 0; i < s->nck; i++)
+        if (s->ck[i].rows) {
+            s->ck[i].pos = -1;
+            s->ck[i].rows = 0;
+        }
+    int k = 0;
+    for (int i = 0; i < s->npend; i++)
+        if (!s->pend[i].rows) s->pend[k++] = s->pend[i];
+    s->npend = k;
 }
 
 int rq_seq_set_checkpoints(RqSeq *s, int n) {

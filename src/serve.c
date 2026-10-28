@@ -45,6 +45,9 @@ typedef struct {
     long long created;
     unsigned long long seq; // request counter (ids, seeds)
     pthread_mutex_t mu;
+    // speculative decoding: a draft model loaded, the defaults of requests (SPEC_*, model / lookup guesses, tau, min match)
+    int has_draft, spec_mode, spec_k, spec_lookup, spec_lmin;
+    float spec_tau;
 } App;
 
 static void logline(App *a, HttpReq *r, int status, const Job *j, const char *note) {
@@ -404,6 +407,53 @@ static int parse_force(App *a, const Js *root, Chat *ch, ReqErr *e) {
     return 0;
 }
 
+static int spec_mode_name(const Js *v) {
+    return json_str_eq(v, "off") ? SPEC_OFF : json_str_eq(v, "auto") ? SPEC_AUTO : json_str_eq(v, "fixed") ? SPEC_FIXED : -1;
+}
+
+static int parse_spec(App *a, const Js *root, Job *j, ReqErr *e) {
+    // speculative decoding (an extension; the output is plain decoding's either way): the server's defaults, or the
+    // request's "speculative": false / true, "off" / "auto" / "fixed", or {"mode", "k", "tau", "lookup", "lookup_min"}
+    // (the fields not given: the server's; true / auto with no source configured: the lookup, 3 guesses)
+    j->spec = a->spec_mode;
+    j->spec_k = a->spec_k;
+    j->spec_tau = a->spec_tau;
+    j->spec_lookup = a->spec_lookup;
+    j->spec_lmin = a->spec_lmin;
+    const Js *sp = json_get(root, "speculative");
+    if (!sp || sp->t == JS_NULL) return 0;
+    int mode = -1;
+    if (sp->t == JS_FALSE) mode = SPEC_OFF;
+    else if (sp->t == JS_TRUE) mode = SPEC_AUTO;
+    else if (sp->t == JS_STR) mode = spec_mode_name(sp);
+    else if (sp->t == JS_OBJ) {
+        const Js *m = json_get(sp, "mode");
+        long long k = j->spec_k, l = j->spec_lookup, lm = j->spec_lmin;
+        double tau = j->spec_tau;
+        if (get_int(sp, "k", 0, SPEC_GUESS_MAX, &k, e) || get_int(sp, "lookup", 0, SPEC_GUESS_MAX, &l, e) ||
+            get_int(sp, "lookup_min", 0, RQ_LOOKUP_LMAX, &lm, e) || get_num(sp, "tau", 0, 1, &tau, e)) {
+            char m2[sizeof(e->msg)];
+            snprintf(m2, sizeof(m2), "speculative.%s", e->msg + 1); // ('k' must be ... -> speculative.k' must ...)
+            snprintf(e->msg, sizeof(e->msg), "'%s", m2);
+            e->param = "speculative";
+            return -1;
+        }
+        if (lm == 1) return bad(e, "speculative", "'lookup_min' must be 0 (the default) or 2..16%s", NULL);
+        if (k > 0 && !a->has_draft) return bad(e, "speculative", "'speculative.k' needs a draft model (runq serve --draft FILE)%s", NULL);
+        j->spec_k = (int)k;
+        j->spec_lookup = (int)l;
+        j->spec_lmin = (int)lm;
+        j->spec_tau = (float)tau;
+        mode = m && m->t != JS_NULL ? spec_mode_name(m) : j->spec != SPEC_OFF ? j->spec : SPEC_AUTO;
+    }
+    if (mode < 0) return bad(e, "speculative", "'speculative' must be a boolean, \"off\", \"auto\", \"fixed\" or an object {mode, k, tau, "
+                             "lookup, lookup_min}%s", NULL);
+    j->spec = mode;
+    if (mode != SPEC_OFF && j->spec_k == 0 && j->spec_lookup == 0 && !(sp->t == JS_OBJ && (json_get(sp, "k") || json_get(sp, "lookup"))))
+        j->spec_lookup = 3;
+    return 0;
+}
+
 static int parse_chat(App *a, const Js *root, Chat *ch, Job *j, ReqErr *e) {
     if (!root || root->t != JS_OBJ) return bad(e, NULL, "the request body must be a JSON object%s", NULL);
     const Js *v = json_get(root, "model");
@@ -539,6 +589,7 @@ static int parse_chat(App *a, const Js *root, Chat *ch, Job *j, ReqErr *e) {
     int cache = 1;
     if (get_bool(root, "cache_prompt", &cache, e)) return -1;
     j->no_cache = !cache;
+    if (parse_spec(a, root, j, e)) return -1;
 
     // thinking: off unless reasoning_effort low / medium / high / xhigh or chat_template_kwargs.enable_thinking; Qwen3.8
     // (its template): on by default, the effort xhigh (= high), medium or low (RQ_THINK_*), also as
@@ -601,13 +652,22 @@ static void usage_json(JBuf *b, const Job *j) {
 }
 
 static void timings_json(JBuf *b, const Job *j) {
-    // llama.cpp's "timings" (prompt_n: the tokens prefilled, cache_n: reused) and runq's: the slot, its length at
-    // admission and its common prefix with the prompt (so a rollback to a checkpoint shows as common_tokens > cache_n)
+    // llama.cpp's "timings" (prompt_n: the tokens prefilled, cache_n: reused; with speculation draft_n / draft_n_accepted:
+    // the guesses verified and accepted) and runq's: the slot, its length at admission and its common prefix with the
+    // prompt (so a rollback to a checkpoint shows as common_tokens > cache_n); "speculative": the decode passes, per source
+    // (the draft model, the prompt lookup) the passes with guesses, the guesses and the accepted ones, the draft's rows
     double pre = j->t_first > 0 ? j->t_first - j->t_start : 0, gen = j->t_first > 0 && j->t_end > j->t_first ? j->t_end - j->t_first : 0;
     jb_printf(b, "{\"prompt_n\": %d, \"prompt_ms\": %.3f, \"predicted_n\": %d, \"predicted_ms\": %.3f, \"cache_n\": %d, \"slot\": %d, "
-              "\"slot_tokens\": %d, \"common_tokens\": %d, \"copied\": %s, \"queue_ms\": %.3f}", j->n_prompt - j->n_cached, pre * 1e3, j->n_gen,
+              "\"slot_tokens\": %d, \"common_tokens\": %d, \"copied\": %s, \"queue_ms\": %.3f", j->n_prompt - j->n_cached, pre * 1e3, j->n_gen,
               gen * 1e3, j->n_cached, j->slot, j->n_slot, j->n_common, j->copied ? "true" : "false",
               j->t_start > 0 ? (j->t_start - j->t_submit) * 1e3 : 0.0);
+    if (j->spec != SPEC_OFF)
+        jb_printf(b, ", \"draft_n\": %d, \"draft_n_accepted\": %d, \"speculative\": {\"mode\": \"%s\", \"passes\": %d, \"model\": "
+                  "{\"passes\": %d, \"drafted\": %d, \"accepted\": %d}, \"lookup\": {\"passes\": %d, \"drafted\": %d, \"accepted\": %d}, "
+                  "\"draft_rows\": %d, \"refed\": %d}", j->sp_model[1] + j->sp_lookup[1], j->sp_model[2] + j->sp_lookup[2],
+                  j->spec == SPEC_FIXED ? "fixed" : "auto", j->sp_passes, j->sp_model[0], j->sp_model[1], j->sp_model[2], j->sp_lookup[0],
+                  j->sp_lookup[1], j->sp_lookup[2], j->sp_draft_rows, j->sp_refed);
+    jb_cstr(b, "}");
 }
 
 static const char *finish_name(const Job *j) {
@@ -936,6 +996,16 @@ static void handle(void *app, HttpConn *c, HttpReq *r) {
 
 // -------------------------------------------------------------------------------------------- main
 
+static void usage(void);
+
+static int num_arg(const char *v, int lo, int hi) {
+    // an integer option in [lo, hi], else the usage
+    char *end;
+    long x = strtol(v, &end, 10);
+    if (end == v || *end || x < lo || x > hi) usage();
+    return (int)x;
+}
+
 static void usage(void) {
     fprintf(stderr,
             "Usage:   runq serve <checkpoint> [options]\n"
@@ -970,6 +1040,17 @@ static void usage(void) {
             "  --top-k <int>       default top_k, default 0 = off (-t / -p / --top-k not given: the model's recommended\n"
             "                      values if its GGUF has them, general.sampling.*)\n"
             "  -n <int>            default max tokens (requests without one), default 0 = up to the context\n"
+            "  -D, --draft <path>  draft model for speculative decoding (the same vocabulary; the output stays plain decoding's)\n"
+            "  -G <int>            with --draft: the draft model's guesses per pass at most, default 3\n"
+            "  --tau <float>       with --draft: stop guessing at a draft top-1 probability < tau, default 0 (off)\n"
+            "  --lookup <int>      prompt lookup: guesses per pass at most copied after a match of the last tokens earlier in\n"
+            "                      the context (no model), default 3 with --draft (auto), else 0 = off\n"
+            "  --lookup-min <int>  the shortest match the lookup uses (>= 2), default: by the cost model (auto), 2 (fixed)\n"
+            "  --spec <mode>       auto|fixed|off: auto (the default with --draft / --lookup) chooses the source and guess\n"
+            "                      count per pass from the position, the batch and the measured costs (plain steps when no\n"
+            "                      guess pays off); fixed: -G / --lookup as given (the lookup first); requests may override\n"
+            "  --spec-calibrate <int> the cost model's calibration at the start: passes at this many positions, default\n"
+            "                      8192 (0: estimates from the model's size)\n"
             "  --threads <int>     threads per forward pass, default OMP_NUM_THREADS or nproc - nproc/8\n"
             "  -v, --verbose       log request bodies and responses\n");
     exit(EXIT_FAILURE);
@@ -983,6 +1064,9 @@ int serve_main(int argc, char **argv) {
     const char *path = argv[1], *name = NULL, *host = "127.0.0.1", *key = NULL;
     int port = 8080, ctx = 8192, kv = RQ_KV_DEFAULT, batch = RQ_BATCH_MAX, slots = 0, queue = 64, conns = 128, threads = 0, verbose = 0, maxtok = 0;
     int parallel = 16, chunk = 64, copy_min = 32, ckpts = 4;
+    const char *draft_path = NULL;
+    int spec_k = 3, lookup = -1, lookup_min = 0, spec_mode = -1, calib = 8192;
+    float spec_tau = 0;
     long long maxbody = 4 << 20;
     double timeout = 600, temp = 1.0, topp = 1.0, kv_mem = 0, mem = 0;
     int page_cache = 0;
@@ -1025,6 +1109,13 @@ int serve_main(int argc, char **argv) {
         else if (!strcmp(f, "--top-k")) { topk = atoi(v); samp_given |= RQ_SAMPLING_TOPK; }
         else if (!strcmp(f, "-n")) maxtok = atoi(v);
         else if (!strcmp(f, "--threads")) threads = atoi(v);
+        else if (!strcmp(f, "-D") || !strcmp(f, "--draft")) draft_path = v;
+        else if (!strcmp(f, "-G")) spec_k = num_arg(v, 0, SPEC_GUESS_MAX);
+        else if (!strcmp(f, "--tau")) { char *end; spec_tau = strtof(v, &end); if (end == v || *end || !(spec_tau >= 0 && spec_tau <= 1)) usage(); }
+        else if (!strcmp(f, "--lookup")) lookup = num_arg(v, 0, SPEC_GUESS_MAX);
+        else if (!strcmp(f, "--lookup-min")) { lookup_min = num_arg(v, 2, RQ_LOOKUP_LMAX); }
+        else if (!strcmp(f, "--spec")) { if ((spec_mode = !strcmp(v, "off") ? SPEC_OFF : !strcmp(v, "auto") ? SPEC_AUTO : !strcmp(v, "fixed") ? SPEC_FIXED : -2) == -2) usage(); }
+        else if (!strcmp(f, "--spec-calibrate")) calib = num_arg(v, 0, 1 << 30);
         else usage();
     }
     if (port < 0 || port > 65535 || ctx < 16 || slots < 0 || slots > 1024 || parallel < 1 || parallel > 256 || kv_mem < 0 || chunk < 1 ||
@@ -1054,6 +1145,25 @@ int serve_main(int argc, char **argv) {
     }
     if (ctx > a.info.seq_len) ctx = a.info.seq_len;
     a.ctx = ctx;
+    // speculative decoding: the draft model (the same load options), the defaults of requests
+    RqModel *dm = NULL;
+    if (draft_path) {
+        if (!(dm = rq_model_load(draft_path, &mo, err, sizeof(err)))) { fprintf(stderr, "runq serve: draft: %s\n", err); return 1; }
+        RqModelInfo di;
+        rq_model_info(dm, &di);
+        if (di.warning) fprintf(stderr, "warning: draft: %s\n", di.warning);
+        if (rq_spec_check(m, dm, err, sizeof(err)) != RQ_OK) { fprintf(stderr, "runq serve: --draft %s: %s\n", draft_path, err); return 1; }
+        if (di.seq_len < ctx) { fprintf(stderr, "runq serve: --draft %s: its context (%d) is shorter than -c %d\n", draft_path, di.seq_len, ctx); return 1; }
+    }
+    if (spec_mode < 0) spec_mode = dm || lookup > 0 ? SPEC_AUTO : SPEC_OFF;
+    if (lookup < 0) lookup = dm && spec_mode == SPEC_AUTO ? 3 : 0;
+    a.has_draft = dm != NULL;
+    a.spec_mode = spec_mode;
+    a.spec_k = dm ? spec_k : 0;
+    a.spec_lookup = lookup;
+    a.spec_lmin = lookup_min;
+    a.spec_tau = spec_tau;
+    if (a.spec_k == 0 && a.spec_lookup == 0) a.spec_mode = SPEC_OFF;
     a.verbose = verbose;
     a.api_key = key;
     RqSampling ms = { (float)temp, (float)topp, NULL, topk };
@@ -1073,7 +1183,8 @@ int serve_main(int argc, char **argv) {
         else if (n > 4 && !strcmp(b + n - 4, ".bin")) n -= 4;
         snprintf(a.model_id, sizeof(a.model_id), "%.*s", (int)n, b);
     }
-    EngineOpts eo = { path, ctx, kv, batch, chunk, parallel, slots, kv_mem, copy_min, queue, verbose, ckpts };
+    EngineOpts eo = { path, ctx, kv, batch, chunk, parallel, slots, kv_mem, copy_min, queue, verbose, ckpts, dm, calib,
+                      a.spec_mode != SPEC_OFF, a.spec_k > a.spec_lookup ? a.spec_k : a.spec_lookup };
     double t0 = rq_now();
     a.eng = engine_start(m, &eo, err, sizeof(err));
     if (!a.eng) { fprintf(stderr, "runq serve: %s\n", err); return 1; }
@@ -1085,6 +1196,14 @@ int serve_main(int argc, char **argv) {
     engine_describe(a.eng, desc, sizeof(desc));
     fprintf(stderr, "runq serve: %s as '%s' (context %d of %d, KV %s, %d threads, chat template %s, vocab index %.0f ms)\nrunq serve: %s\n",
             path, a.model_id, ctx, a.info.ctx_max, rq_kv_name(kv), rq_threads(), rq_chat_name(a.info.chat), (rq_now() - t0) * 1e3, desc);
+    if (a.spec_mode != SPEC_OFF || dm) {
+        char sd[1024], lk[64] = "off";
+        engine_describe_spec(a.eng, sd, sizeof(sd));
+        if (a.spec_lookup > 0) snprintf(lk, sizeof(lk), "%d guesses (match >= %s%.0d)", a.spec_lookup, a.spec_lmin ? "" : "by cost", a.spec_lmin);
+        fprintf(stderr, "runq serve: speculative decoding %s: draft %s (k <= %d, tau %g), lookup %s; %s\n",
+                a.spec_mode == SPEC_AUTO ? "auto" : a.spec_mode == SPEC_FIXED ? "fixed" : "off (requests may ask)", dm ? draft_path : "none",
+                a.spec_k, a.spec_tau, lk, sd);
+    }
     fprintf(stderr, "runq serve: listening on http://%s%s%s:%d\n", strchr(host, ':') ? "[" : "", host, strchr(host, ':') ? "]" : "", bound);
     fflush(stderr);
     http_run(lfd, &ho, handle, &a);
@@ -1095,6 +1214,7 @@ int serve_main(int argc, char **argv) {
         return 0;
     }
     engine_free(a.eng);
+    rq_model_free(dm);
     rq_model_free(m);
     pthread_mutex_destroy(&a.mu);
     fprintf(stderr, "runq serve: stopped\n");

@@ -23,11 +23,14 @@
  * raw text; greedy and seeded sampling with top-p / top-k; stops at an end token, at max_new and at the end of the
  * context inside a verify pass, the draft's context shorter than the target's or than the prompt; a second call after
  * both were cut
- * back, as a chat's next turn) and each draft setting (k = 1 / 3 / 8, adaptive tau 0.5 with k 8; --quick: k 3 and
- * adaptive, fewer cases): the tokens, the RNG state after each, every sampled logits vector's position and hash, the
- * stop, the cache's tokens and one more decode step's logits. Also k 0 == rq_generate, the vocabulary check (the draft
- * itself accepted; --other: a model of another vocabulary refused, loaded tokenizer-only) and, for Qwen3.5, that
- * every rollback landed on its checkpoint (RqSpecStats.refed 0).
+ * back, as a chat's next turn; a raw text that copies a block of its prompt) and each draft setting (k = 1 / 3 / 8,
+ * adaptive tau 0.5 with k 8; the prompt lookup alone, no draft model: 4 guesses, 30 with matches of >= 4 tokens;
+ * combined: lookup 8 (>= 3) + k 3, lookup 3 + k 8 tau 0.5; --quick: k 3, adaptive, lookup 4 and the first combined,
+ * fewer cases): the tokens, the RNG state after each, every sampled logits vector's position and hash, the stop, the
+ * cache's tokens and one more decode step's logits. Also k 0 == rq_generate, the vocabulary check (the draft itself
+ * accepted; --other: a model of another vocabulary refused, loaded tokenizer-only), for Qwen3.5, that every rollback
+ * landed on its checkpoint (RqSpecStats.refed 0), the copy's acceptance with the lookup alone (>= 3 tokens per pass)
+ * and the lookup index (rq_lookup_*) against a brute-force search on synthetic sequences.
  *   tests/api_test MODEL --sample LOGITS_FILE < PLAN
  * rq_sample on the rows of a -m logits file, with the settings and RNG states of PLAN's lines ("T P K ROW
  * SEED..."): SAMPLE lines for tests/sampler_ref.py (the sampler's exact order replayed in numpy: top-k). */
@@ -1493,15 +1496,16 @@ typedef struct {
 } SpOut;
 
 static RqModel *SD;
-static RqTokens sp_prompt[3], sp_turn2;
+static RqTokens sp_prompt[4], sp_turn2;
 
 static int sp_run(RqCtx *c, RqCtx *dc, const SpCase *k, const RqSpecOpts *o, SpOut *out) {
-    // o NULL: rq_generate
+    // o NULL: rq_generate; o->k 0: the lookup alone, no draft model (dc, ds NULL)
     int e, np = sp_prompt[k->prompt].n;
     RqSeq *s = rq_seq_new(M, k->cap ? np + k->cap : 0, RQ_KV_DEFAULT, &e);
     if (!s) die("rq_seq_new", e);
-    RqSeq *ds = o ? rq_seq_new(SD, k->dcap ? np + k->dcap : 0, RQ_KV_DEFAULT, &e) : NULL;
-    if (o && !ds) die("rq_seq_new (draft)", e);
+    RqSeq *ds = o && o->k ? rq_seq_new(SD, k->dcap ? np + k->dcap : 0, RQ_KV_DEFAULT, &e) : NULL;
+    if (o && o->k && !ds) die("rq_seq_new (draft)", e);
+    if (!ds) dc = NULL;
     rq_seq_seed(s, k->seed);
     memset(out, 0, sizeof(*out));
     out->rec.s = s;
@@ -1514,6 +1518,8 @@ static int sp_run(RqCtx *c, RqCtx *dc, const SpCase *k, const RqSpecOpts *o, SpO
             e = rq_generate_spec(c, s, dc, ds, t.v, t.n, &k->cfg, k->max_new, o, &cb, &st);
             out->st.passes += st.passes, out->st.drafted += st.drafted, out->st.accepted += st.accepted;
             out->st.refed += st.refed, out->st.draft_steps += st.draft_steps;
+            out->st.lookup_passes += st.lookup_passes, out->st.lookup_drafted += st.lookup_drafted;
+            out->st.lookup_accepted += st.lookup_accepted;
         } else {
             e = rq_generate(c, s, t.v, t.n, &k->cfg, k->max_new, &cb, &st.gen);
         }
@@ -1548,6 +1554,70 @@ static int sp_same(const SpOut *a, const SpOut *b) {
            a->len == b->len && a->htok == b->htok && a->rng == b->rng && a->hnext == b->hnext;
 }
 
+static int lk_brute(const int *toks, int n, int t, int kmax, int min_len, int *guess, int *len) {
+    // rq_lookup_draft's rule, by a scan: the RQ_LOOKUP_CHAIN most recent j (1 <= j <= n - 1) with (toks[j - 1],
+    // toks[j]) == (toks[n - 1], t), the longest match backwards (up to RQ_LOOKUP_LMAX; the most recent among equals)
+    int best = -1, bl = 0, c = 0;
+    *len = 0;
+    for (int j = n - 1; j >= 1 && c < RQ_LOOKUP_CHAIN && n >= 2; j--) {
+        if (toks[j] != t || toks[j - 1] != toks[n - 1]) continue;
+        c++;
+        int l = 2;
+        while (l < RQ_LOOKUP_LMAX && j - l >= 0 && toks[j - l] == toks[n - l]) l++;
+        if (l > bl) bl = l, best = j;
+        if (bl == RQ_LOOKUP_LMAX) break;
+    }
+    if (best < 0 || bl < min_len || kmax < 1) return 0;
+    *len = bl;
+    int m = n - best < kmax ? n - best : kmax;
+    for (int i = 0; i < m; i++) guess[i] = best + 1 + i < n ? toks[best + 1 + i] : t;
+    return m;
+}
+
+static void lookup_index_test(void) {
+    // rq_lookup_* == lk_brute at every position of synthetic sequences (alphabets of 2-300 tokens, repeated blocks with
+    // edits, so that chains are long and matches of every length occur), indexed incrementally (1-3 tokens per call) and
+    // after a reset; kmax 1 / 5 / 30, min_len 2 / 4
+    enum { N = 3000 };
+    static int tk[N];
+    int g1[RQ_SPEC_K_MAX], g2[RQ_SPEC_K_MAX], bad = 0, found = 0, lmax = 0, checks = 0;
+    uint64_t x = 88172645463325252ull;
+    const int alpha[] = { 2, 5, 40, 300 };
+    for (int ai = 0; ai < 4; ai++) {
+        for (int i = 0; i < N; i++) {
+            x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+            int r = (int)(x % 100);
+            tk[i] = i >= 64 && r < 70 ? tk[i - 1 - (int)(x >> 40) % 63] : (int)((x >> 20) % (unsigned)alpha[ai]);
+            if (i >= 200 && r >= 70 && r < 85) tk[i] = tk[i - 150]; // (long copies)
+        }
+        RqLookup *lk = rq_lookup_new(N);
+        if (!lk) die("rq_lookup_new", RQ_ERR_NOMEM);
+        for (int pass = 0; pass < 2; pass++) {
+            rq_lookup_reset(lk);
+            for (int n = 0; n < N - 1;) {
+                n += 1 + (int)((x >> 33) % 3), x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+                if (n > N - 1) n = N - 1;
+                if (rq_lookup_add(lk, tk, n) != RQ_OK) bad++;
+                const int ks[] = { 1, 5, 30 }, ms[] = { 2, 4 };
+                int t = tk[n];
+                for (int a = 0; a < 3; a++)
+                    for (int b = 0; b < 2; b++) {
+                        int l1, l2, n1 = rq_lookup_draft(lk, tk, t, ks[a], ms[b], g1, &l1);
+                        int n2 = lk_brute(tk, n, t, ks[a], ms[b], g2, &l2);
+                        bad += n1 != n2 || l1 != l2 || memcmp(g1, g2, (size_t)n1 * sizeof(int));
+                        found += n1 > 0, lmax = l1 > lmax ? l1 : lmax, checks++;
+                    }
+            }
+        }
+        bad += rq_lookup_add(lk, tk, N + 1) != RQ_ERR_ARG; // (past the capacity)
+        rq_lookup_free(lk);
+    }
+    char d[160];
+    snprintf(d, sizeof(d), "%d lookups == a brute-force scan (%d found a match, the longest %d tokens)%s", checks, found,
+             lmax, bad ? ": DIFFER" : "");
+    report(!bad && found > checks / 4 && lmax == RQ_LOOKUP_LMAX, "spec_lookup_index", d);
+}
+
 static int spec_main(int argc, char **argv) {
     const char *path[2] = { NULL, NULL }, *other = NULL;
     int quick = 0, bad = 0;
@@ -1576,6 +1646,7 @@ static int spec_main(int argc, char **argv) {
     RqCtx *c = rq_ctx_new(M, 64, 0, &e), *dc = c ? rq_ctx_new(SD, 64, 0, &e) : NULL;
     if (!dc) die("rq_ctx_new", e);
 
+    lookup_index_test();
     // the vocabulary check: the draft and the target itself accepted; another vocabulary refused
     {
         double t0 = rq_now();
@@ -1598,6 +1669,13 @@ static int spec_main(int argc, char **argv) {
     rq_chat_user(M, "Name three colours.", 0, &sp_prompt[0]);
     rq_chat_user(M, "Write a C function that reverses a string in place.", 1, &sp_prompt[1]);
     sp_prompt[2] = toks("def is_prime(n):\n    \"\"\"Return True if n is a prime number.\"\"\"\n");
+    // (a block of the prompt that the model copies: greedy, both test models do, verbatim)
+    sp_prompt[3] = toks("def moving_average(xs, n):\n    out = []\n    for i in range(len(xs)):\n        if i < n - 1:\n"
+                        "            out.append(None)\n        else:\n            out.append(sum(xs[i-n+1:i+1]) / n)\n"
+                        "    return out\n\n\ndef moving_sum(xs, n):\n    out = []\n    for i in range(len(xs)):\n"
+                        "        if i < n - 1:\n            out.append(None)\n        else:\n"
+                        "            out.append(sum(xs[i-n+1:i+1]))\n    return out\n\n\n"
+                        "# the two functions again, copied verbatim:\n\ndef moving_average(xs, n):\n");
     rq_chat_end(M, &sp_turn2);
     rq_chat_user(M, "And three animals?", 0, &sp_turn2);
     const SpCase cases[] = {
@@ -1610,8 +1688,12 @@ static int spec_main(int argc, char **argv) {
         { "text_draft_shorter_than_prompt", 2, { 0, 0.9f, NULL, 0 }, 1, 12, 0, -3, 0, 0 },
         { "chat_turn2_seeded", 0, { 0.7f, 0.9f, NULL, 40 }, 3, 24, 0, 0, 1, 0 },
         { "think_turn2_greedy", 1, { 0, 0.9f, NULL, 0 }, 1, 30, 0, 0, 1, 1 },
+        { "text_copy_greedy", 3, { 0, 0.9f, NULL, 0 }, 1, 110, 0, 0, 0, 1 },
+        { "text_copy_seeded_turn2", 3, { 0.6f, 0.9f, NULL, 20 }, 13, 70, 0, 0, 1, 0 },
     };
-    const RqSpecOpts opts[] = { { 1, 0 }, { 3, 0 }, { 8, 0 }, { 8, 0.5f } };
+    const RqSpecOpts opts[] = { { 1, 0, 0, 0 }, { 3, 0, 0, 0 }, { 8, 0, 0, 0 }, { 8, 0.5f, 0, 0 }, { 0, 0, 4, 0 },
+                                { 0, 0, 30, 4 }, { 3, 0, 8, 3 }, { 8, 0.5f, 3, 0 } };
+    const int quick_opts[] = { 1, 3, 4, 6 };
     const char *stop_name[] = { "end", "limit", "context", "callback" };
     int refed = 0;
     for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
@@ -1622,14 +1704,36 @@ static int spec_main(int argc, char **argv) {
         snprintf(d, sizeof(d), "%d%s tok, stop %s%s%s:", ref.ngen[0] + ref.ngen[1], k->turn2 ? " (2 calls)" : "",
                  stop_name[ref.stop[k->turn2] & 3], k->turn2 ? "/" : "", k->turn2 ? stop_name[ref.stop[1] & 3] : "");
         for (size_t oi = 0; oi < sizeof(opts) / sizeof(opts[0]) && ok; oi++) {
-            if (quick && oi != 1 && oi != 3) continue;
-            int okk = (e = sp_run(c, dc, k, &opts[oi], &got)) == RQ_OK && sp_same(&ref, &got);
+            int qi = 0;
+            while (qi < 4 && quick_opts[qi] != (int)oi) qi++;
+            if (quick && qi == 4) continue;
+            const RqSpecOpts *o = &opts[oi];
+            int okk = (e = sp_run(c, dc, k, o, &got)) == RQ_OK && sp_same(&ref, &got);
             okk &= got.st.accepted <= got.st.drafted && (I.linear_layers || got.st.refed == 0);
+            okk &= got.st.lookup_accepted <= got.st.lookup_drafted && got.st.lookup_drafted <= got.st.drafted &&
+                   (o->lookup || got.st.lookup_passes == 0) && (o->k || got.st.lookup_drafted == got.st.drafted);
             refed += got.st.refed;
             size_t dl = strlen(d);
-            snprintf(d + dl, sizeof(d) - dl, " k%d%s %d/%d in %d passes%s%s", opts[oi].k, opts[oi].tau > 0 ? " tau 0.5" : "",
-                     got.st.accepted, got.st.drafted, got.st.passes, got.st.refed ? " REFED" : "", okk ? "" : " DIFFER");
+            char how[48] = "";
+            if (o->k) snprintf(how, sizeof(how), "k%d%s", o->k, o->tau > 0 ? " tau 0.5" : "");
+            if (o->lookup) {
+                size_t hl = strlen(how);
+                snprintf(how + hl, sizeof(how) - hl, "%sL%d%s", hl ? "+" : "", o->lookup, o->lookup_min ? (o->lookup_min == 3 ? ">=3" : ">=4") : "");
+            }
+            snprintf(d + dl, sizeof(d) - dl, " %s %d/%d in %d passes%s%s", how, got.st.accepted, got.st.drafted, got.st.passes,
+                     got.st.refed ? " REFED" : "", okk ? "" : " DIFFER");
+            if (o->k && o->lookup) {
+                dl = strlen(d);
+                snprintf(d + dl, sizeof(d) - dl, " (lookup %d/%d)", got.st.lookup_accepted, got.st.lookup_drafted);
+            }
             ok &= okk;
+            if (k->prompt == 3 && k->cfg.temperature == 0 && oi == 4) { // the copy, the lookup alone (4 guesses)
+                double tpp = (double)got.st.gen.n_gen / (got.st.passes > 0 ? got.st.passes : 1);
+                char dd[160];
+                snprintf(dd, sizeof(dd), "a verbatim copy, lookup 4 alone: %.2f tokens per pass (%d/%d guesses accepted)", tpp,
+                         got.st.accepted, got.st.drafted);
+                report(okk && tpp >= 3.0, "spec_lookup_copy", dd);
+            }
         }
         if (e != RQ_OK) {
             size_t dl = strlen(d);
@@ -1654,7 +1758,7 @@ static int spec_main(int argc, char **argv) {
     }
     // Qwen3.5: every rollback on a checkpoint (both sequences)
     if (I.linear_layers) report(refed == 0, "spec_rollback_exact", refed ? "positions fed again after a rollback" : "no position fed again");
-    for (int i = 0; i < 3; i++) rq_tokens_free(&sp_prompt[i]);
+    for (int i = 0; i < 4; i++) rq_tokens_free(&sp_prompt[i]);
     rq_tokens_free(&sp_turn2);
     rq_ctx_free(dc);
     rq_ctx_free(c);

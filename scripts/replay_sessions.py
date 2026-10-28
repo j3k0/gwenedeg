@@ -27,7 +27,9 @@ prompt left the slot's tokens before their end (diverged: the history was sent d
 and whether the hybrid state rolled back further (rollback: the kept length is a checkpoint below the common prefix),
 prefill and decode times, the reply tokens, and with speculation (--server-arg=--draft --server-arg=FILE, or
 --server-arg=--lookup --server-arg=3; --mode live: forced replies do not speculate) the guesses accepted / drafted per
-source (timings.speculative). Sessions are replayed one after the other on one server (a fresh one per run).
+source (timings.speculative). --probe-every N (force mode): before every Nth reply after tool results, a live request
+with the same context (kind probe, at most --probe-tokens tokens, its reply dropped; the forced request after it reuses
+the prompt): the decode rate and the speculation at that position of the real session, the rest replayed as forced. Sessions are replayed one after the other on one server (a fresh one per run).
 """
 import argparse
 import glob
@@ -108,7 +110,7 @@ def table(recs, out=sys.stdout, per_request=False):
         prev = None
         rows = []
         for r in rs:
-            if r["kind"] not in ("turn", "summary", "turn_prefix") or "usage" not in r:
+            if r["kind"] not in ("turn", "summary", "turn_prefix", "probe") or "usage" not in r:
                 if r["kind"] == "compaction":
                     rows.append(("compaction", r))
                 continue
@@ -172,7 +174,7 @@ def table(recs, out=sys.stdout, per_request=False):
                 t[k] += g[k]
         if per_request:
             print(f"  {'#':>4} {'kind':<16}{'prompt':>8}{'cached':>8}{'pre':>7}{'new':>7}{'reply':>7}{'slot':>5}{'slot tok':>9}"
-                  f"{'common':>8}  flags", file=out)
+                  f"{'common':>8}{'pre s':>8}{'dec s':>7}{'tok/s':>6}  flags", file=out)
             for kind, x in rows:
                 if kind == "compaction":
                     print(f"  {x['seq']:>4} compaction ({x.get('reason')}, ~{x.get('tokens_before')} tokens before)", file=out)
@@ -182,7 +184,8 @@ def table(recs, out=sys.stdout, per_request=False):
                         ("copied " if t.get("copied") else "") + (f"beyond the last reply {x['beyond']} " if x["beyond"] else "") + \
                         (f"spec {x['sp'][1]}/{x['sp'][0]} + {x['sp'][3]}/{x['sp'][2]}" if x["sp"][0] + x["sp"][2] else "")
                 print(f"  {x['seq']:>4} {kind:<16}{x['n']:>8}{x['cached']:>8}{x['pre']:>7}{x['new'] if x['new'] is not None else '-':>7}"
-                      f"{x['comp']:>7}{t.get('slot', -1):>5}{t.get('slot_tokens', 0):>9}{t.get('common_tokens', 0):>8}  {flags}", file=out)
+                      f"{x['comp']:>7}{t.get('slot', -1):>5}{t.get('slot_tokens', 0):>9}{t.get('common_tokens', 0):>8}"
+                      f"{x['pms'] / 1e3:>8.1f}{x['dms'] / 1e3:>7.1f}{x['comp'] / max(x['dms'] / 1e3, 1e-9) if x['dms'] else 0:>6.1f}  {flags}", file=out)
     if len(sessions) > 1:
         print("\nall sessions:", file=out)
         for kind, g in sorted(tot.items()):
@@ -211,6 +214,9 @@ def main():
     ap.add_argument("--mode", choices=["force", "live"], default="force")
     ap.add_argument("--live-tokens", type=int, default=512)
     ap.add_argument("--max-requests", type=int, default=0, help="per session (0: all)")
+    ap.add_argument("--probe-every", type=int, default=0, help="--mode force: before every Nth reply after tool results a "
+                    "live request with the same context (kind probe, its reply dropped): decode and speculation there")
+    ap.add_argument("--probe-tokens", type=int, default=256, help="a probe's max_tokens")
     ap.add_argument("--reserve", type=int, help="pi's compaction.reserveTokens (default min(16384, ctx / 4))")
     ap.add_argument("--keep", type=int, help="pi's compaction.keepRecentTokens (default min(20000, ctx / 4))")
     ap.add_argument("--pi", help="pi's install directory (default: the newest ~/.pi/agent/install/releases/*)")
@@ -246,7 +252,8 @@ def main():
                 print(f"session {name} ...", file=sys.stderr, flush=True)
                 cmd = ["node", os.path.join(ROOT, "scripts", "replay_pi.mjs"), "--pi", pdir, "--session", f,
                        "--url", f"http://127.0.0.1:{port}/v1", "--model", "runq", "--ctx", str(a.ctx), "--mode", a.mode,
-                       "--live-tokens", str(a.live_tokens), "--max-requests", str(a.max_requests)]
+                       "--live-tokens", str(a.live_tokens), "--max-requests", str(a.max_requests),
+                       "--probe-every", str(a.probe_every), "--probe-tokens", str(a.probe_tokens)]
                 if a.reserve is not None:
                     cmd += ["--reserve", str(a.reserve)]
                 if a.keep is not None:

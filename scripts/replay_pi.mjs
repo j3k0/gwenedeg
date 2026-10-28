@@ -7,6 +7,7 @@
 //
 //   node scripts/replay_pi.mjs --pi PI_DIR --session FILE --url http://127.0.0.1:8080/v1 --model ID --ctx 98304 \
 //        [--mode force|live] [--live-tokens 512] [--reserve N] [--keep N] [--max-requests N] [--thinking LEVEL]
+//        [--probe-every N] [--probe-tokens 256]
 //
 // PI_DIR: pi's install (the directory holding node_modules/@earendil-works/...). Per request, one JSON line on stdout:
 // kind (turn / summary / turn_prefix), the session entry, usage, the server's timings (runq: prefilled, cached, the
@@ -18,7 +19,10 @@
 // writing in the template's format would have generated, and the round trip (the server's parse -> pi's message ->
 // pi's serialization -> the server's rendering) is the real one. --mode live: the model generates up to
 // --live-tokens tokens and that reply goes on in the history (the recorded tool results follow it: a session whose
-// replies are the model's own, to measure how its real outputs re-serialize).
+// replies are the model's own, to measure how its real outputs re-serialize). --probe-every N (force mode): before
+// every Nth reply after tool results, a live request with the same context (kind "probe", at most --probe-tokens
+// tokens; its reply is dropped): the decode rate and the speculation at that position of the real session; the forced
+// request after it reuses the prompt (the slot's checkpoint at the assistant header).
 //
 // Compaction: as pi with the server's context window (--ctx): after each reply (and before a new user prompt) the
 // projected context is checked (shouldCompact: tokens > ctx - reserveTokens); then pi's prepareCompaction / compact
@@ -40,6 +44,9 @@ const mode = args.mode || "force";
 const ctx = parseInt(args.ctx, 10);
 const liveTokens = parseInt(args["live-tokens"] || "512", 10);
 const maxRequests = parseInt(args["max-requests"] || "0", 10);
+const probeEvery = parseInt(args["probe-every"] || "0", 10);
+const probeTokens = parseInt(args["probe-tokens"] || "256", 10);
+let nToolTurns = 0;
 const settings = {
     enabled: true,
     reserveTokens: parseInt(args.reserve || String(Math.min(16384, Math.floor(ctx / 4))), 10),
@@ -120,7 +127,8 @@ function streamFn(kind, entry, force) {
         };
         const s = streamSimple(m, context, {
             ...options, apiKey: "none",
-            onPayload: (params) => (force !== undefined && mode === "force" ? { ...params, force_reply: force } : params),
+            onPayload: (params) => (kind === "probe" ? { ...params, max_tokens: probeTokens }
+                : force !== undefined && mode === "force" ? { ...params, force_reply: force } : params),
             fetch: fetchHook,
         });
         const result = s.result.bind(s);
@@ -186,6 +194,10 @@ async function maybeCompact(reason) {
 async function request(entry) {
     // the assistant reply of `entry`: the request pi sends for it, the reply as the server returns it
     const rec = entry.message;
+    if (mode === "force" && probeEvery > 0 && after === "toolResult" && ++nToolTurns % probeEvery === 0) {
+        const context = { messages: convertToLlm(sm.buildSessionContext(replayed).messages) };
+        await streamFn("probe", entry.id, undefined)(model, context, { reasoning: thinking === "off" ? undefined : thinking, sessionId }).result();
+    }
     for (let attempt = 0; attempt < 2; attempt++) {
         const context = { messages: convertToLlm(sm.buildSessionContext(replayed).messages) };
         const s = streamFn("turn", entry.id, forcedReply(rec))(model, context, { reasoning: thinking === "off" ? undefined : thinking, sessionId });

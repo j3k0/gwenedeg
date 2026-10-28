@@ -29,7 +29,7 @@ HDR = $(wildcard src/*.h)
 Q8  = models/Qwen3-0.6B-q8.bin
 B   = build
 
-.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test api-test tools-test bench-batch bench-verify long-ctx bench-long mem-probe FORCE
+.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test api-test tools-test bench-batch bench-verify long-ctx bench-long teacher-force mem-probe FORCE
 
 all: runq
 
@@ -106,6 +106,13 @@ $(B)/bench_long: tests/bench_long.c src/runq.h $(LIB:%=$(B)/native/%.o)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
 
 bench-long: $(B)/bench_long
+
+# draft predictions teacher-forced on long token streams (tests/teacher_force.c: the argmax and its probability at given
+# positions; scripts/lookup_accept.py draft, TODO G0 (c))
+$(B)/teacher_force: tests/teacher_force.c src/runq.h $(LIB:%=$(B)/native/%.o)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
+
+teacher-force: $(B)/teacher_force
 
 # the load-time memory estimate vs the measured RSS, the page cache after the load (tests/mem_probe.c; Linux)
 $(B)/mem_probe: tests/mem_probe.c src/runq.h $(LIB:%=$(B)/native/%.o)

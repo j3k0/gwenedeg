@@ -3,12 +3,14 @@
   api        tests/api_test --spec on the Qwen3-0.6B pair (target Q8_0, draft Q4_K_M; every case and draft setting),
              the generic build's api_test --spec --quick, and Qwen3.5-0.8B Q8_0 + its Q4_K_M as the draft (--quick:
              the hybrid rollbacks, every one on its checkpoint); the vocabulary check refuses the other family
-  cli        runq -D DRAFT -G k [--tau] vs the same command without -D: stdout byte for byte, stderr but the [timing]
-             lines, the exit status, and in chat mode the RUNQ_CHAT_DUMP files (the cache's ids and every sampled
-             logits vector, bitwise): generate and chat, greedy and seeded (top-p, top-k), thinking off / on, -n inside
-             a verify pass, -n 1 / 2, the context's end (generate, and chat turns dropped at -c 160), -b 1, piped
-             multi-turn chats; -G 0 with -D is plain decoding byte for byte (stderr included); a draft of another
-             vocabulary or -G without -D are refused; one generate and one chat case on the generic build
+  cli        runq -D DRAFT -G k [--tau], --lookup N (the prompt lookup alone, no -D) and both combined vs the same
+             command without them: stdout byte for byte, stderr but the [timing] lines, the exit status, and in chat
+             mode the RUNQ_CHAT_DUMP files (the cache's ids and every sampled logits vector, bitwise): generate and
+             chat, greedy and seeded (top-p, top-k), thinking off / on, -n inside a verify pass, -n 1 / 2, the
+             context's end (generate, and chat turns dropped at -c 160), -b 1, piped multi-turn chats, a generation
+             that copies its prompt (lookup: >= 3 tokens per pass); -G 0 with -D is plain decoding byte for byte
+             (stderr included); a draft of another vocabulary, -G without -D and a bad --lookup / --lookup-min are
+             refused; one generate and one chat case on the generic build
 """
 import concurrent.futures as cf
 import os
@@ -23,8 +25,15 @@ STORY = "Once upon a time, in a small village by the sea,"
 CHAT_USERS = ["Name three colours.", "And three animals?", "Which of those is the largest?"]
 # (name, args after the model, stdin lines or None, draft settings, flags) -- every case also runs without -D
 # (the reference); draft settings: lists of extra args
-K_ALL = [["-G", "1"], ["-G", "3"], ["-G", "8"], ["-G", "8", "--tau", "0.5"]]
-K_TWO = [["-G", "3"], ["-G", "8", "--tau", "0.5"]]
+# (-D DRAFT is passed with the settings that have -G; --lookup alone: no draft model)
+LOOKUP = ["--lookup", "4"]
+COMBINED = ["-G", "3", "--lookup", "8", "--lookup-min", "3"]
+K_ALL = [["-G", "1"], ["-G", "3"], ["-G", "8"], ["-G", "8", "--tau", "0.5"], LOOKUP, ["--lookup", "30", "--lookup-min", "4"],
+         COMBINED]
+K_TWO = [["-G", "3"], ["-G", "8", "--tau", "0.5"], LOOKUP, COMBINED]
+COPY_PROMPT = ("def moving_average(xs, n):\n    out = []\n    for i in range(len(xs)):\n        if i < n - 1:\n"
+               "            out.append(None)\n        else:\n            out.append(sum(xs[i-n+1:i+1]) / n)\n    return out\n\n\n"
+               "# the same function again, copied verbatim:\n\ndef moving_average(xs, n):\n")
 CLI_CASES = [
     ("gen_greedy", ["-m", "generate", "-t", "0", "-n", "60", "-i", GEN_PROMPT], None, K_ALL, {}),
     ("gen_seeded_topk", ["-m", "generate", "-t", "1", "-p", "0.95", "-K", "20", "-s", "7", "-n", "50", "-i", STORY], None, K_TWO, {}),
@@ -42,9 +51,10 @@ CLI_CASES = [
     ("chat_reply_cut", ["-m", "chat", "-t", "1", "-s", "8", "-c", "100", "-i", "Write a long story about a lighthouse."], None,
      K_TWO, {"dump": True, "cut": True}),
     ("chat_one_turn", ["-m", "chat", "-t", "0", "-r", "1", "-n", "48", "-i", "What is 17 * 23?"], None, K_TWO, {"dump": True}),
+    ("gen_copy", ["-m", "generate", "-t", "0", "-n", "48", "-i", COPY_PROMPT], None, [["--lookup", "8"], COMBINED], {"copy": True}),
 ]
 # on the generic build (fewer: its kernels are slower)
-GENERIC_CASES = [("gen_greedy", ["-G", "3"]), ("chat_greedy", ["-G", "8", "--tau", "0.5"])]
+GENERIC_CASES = [("gen_greedy", ["-G", "3"]), ("chat_greedy", ["-G", "8", "--tau", "0.5"]), ("gen_copy", COMBINED)]
 # Qwen3.5-0.8B Q8_0 + its Q4_K_M: a thinking chat whose second turn rolls the recurrent state back to a checkpoint
 Q35_CASES = [("q35_chat_think", ["-m", "chat", "-r", "1", "-t", "0", "-n", "48"], CHAT_USERS[:2], K_TWO, {"dump": True}),
              ("q35_gen_seeded", ["-m", "generate", "-t", "1", "-K", "20", "-s", "4", "-n", "40", "-i", STORY], None, K_TWO, {})]
@@ -92,13 +102,18 @@ def compare(ref, got, what, timing_ok=True):
 
 
 def acc(stats):
-    """accepted / drafted over a run's speculative lines"""
+    """accepted / drafted over a run's speculative lines (and tokens per pass of the last)"""
     a = d = 0
     for l in stats:
         f = l.replace(",", "").split()
         d += int(f[f.index("drafted") - 1])
         a += int(f[f.index("accepted") - 1])
     return f"{a}/{d}"
+
+
+def tok_per_pass(stats):
+    f = stats[-1].replace(",", "").split() if stats else []
+    return float(f[f.index("tok/pass") - 1]) if "tok/pass" in f else 0.0
 
 
 def cli_case(runq, model, draft, case, tmp, tag, ks=None, suffix=""):
@@ -110,11 +125,14 @@ def cli_case(runq, model, draft, case, tmp, tag, ks=None, suffix=""):
         return [(False, name, f"reference run failed: {ref[2].decode(errors='replace')[-300:]}")]
     detail, ok = [], True
     for k in (ks or kset):
-        got = cli_run(runq, model, args, users, tmp, f"{tag}_{'_'.join(k)}", draft, k)
+        got = cli_run(runq, model, args, users, tmp, f"{tag}_{'_'.join(k)}", draft if "-G" in k else None, k)
         o, why = compare(ref, got, " ".join(k))
         o &= len(got[4]) == (len(users) if users is not None and "-i" not in args else 1)
+        if chk.get("copy") and o and tok_per_pass(got[4]) < 3.0:
+            o, why = False, f"a verbatim copy at {tok_per_pass(got[4])} tokens per pass (< 3)"
         ok &= o
-        detail.append(f"{' '.join(k)}: {acc(got[4])}" + ("" if o else f" DIFFER ({why or 'no speculative line'})"))
+        detail.append(f"{' '.join(k)}: {acc(got[4])}" + (f" ({tok_per_pass(got[4]):.2f} tok/pass)" if chk.get("copy") else "")
+                      + ("" if o else f" DIFFER ({why or 'no speculative line'})"))
     if chk.get("dropped") and b"[context] full" not in ref[2]:
         ok = False
         detail.append("context full not reached")
@@ -176,6 +194,13 @@ def spec_start(a, tmp, ex):
         out.append((p.returncode == 1 and "needs a draft model" in e, "refused_no_draft", f"-G 3 without -D: exit status {p.returncode}"))
         p = run([a.runq, a.gguf, "-m", "generate", "-n", "4", "-i", "hi", "-D", a.q4, "--tau", "2"], 2)
         out.append((p.returncode == 1 and b"Usage:" in p.stderr, "bad_tau", f"--tau 2: exit status {p.returncode}"))
+        bad = [["--lookup", "31"], ["--lookup", "-1"], ["--lookup", "4", "--lookup-min", "1"], ["--lookup", "x"]]
+        codes = [run([a.runq, a.gguf, "-m", "generate", "-n", "4", "-i", "hi"] + b, 2) for b in bad]
+        out.append((all(p.returncode == 1 and b"Usage:" in p.stderr for p in codes), "bad_lookup",
+                    "; ".join(f"{' '.join(b)}: exit status {p.returncode}" for b, p in zip(bad, codes))))
+        p = run([a.runq, a.gguf, "-m", "generate", "-n", "4", "-i", "hi", "--lookup", "4", "-G", "3"], 2)
+        e = p.stderr.decode(errors="replace")
+        out.append((p.returncode == 1 and "needs a draft model" in e, "refused_lookup_g", f"--lookup 4 -G 3 without -D: exit status {p.returncode}"))
         return out
     futs.append(("cli", "spec_cli", ex.submit(refused)))
     return futs

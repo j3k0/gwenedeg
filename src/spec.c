@@ -17,7 +17,11 @@
  * many rows a pass has.
  * Qwen3.5 (the recurrent state cannot be rewound): a checkpoint after each guess row of the target's pass and of
  * the draft's steps (rq_seq_checkpoint_rows; k + 2 slots: those, the prompt's, one spare), so that both truncations
- * land exactly; one that does not (no checkpoint there) refeeds the missing positions (RqSpecStats.refed). */
+ * land exactly; one that does not (no checkpoint there) refeeds the missing positions (RqSpecStats.refed).
+ * Prompt lookup (TODO G6, RqSpecOpts.lookup): before the draft, the guesses may come from the target's own tokens: the
+ * longest recent match of its last tokens + t earlier in the sequence (RqLookup, below), the tokens after it; when it
+ * finds one (>= lookup_min tokens), the draft model is not run that round (it catches up on the next one it drafts:
+ * draft_follow's common prefix). The verify and accept steps are the same, so is the output. */
 #include "internal.h"
 
 static uint64_t vocab_hash(const RqModel *m) {
@@ -115,6 +119,84 @@ static int draft_follow(RqCtx *dc, RqSeq *ds, const int *toks, int n, int t, int
     return rq_prefill(dc, ds, buf->v, m, lg ? RQ_LOGITS_LAST : RQ_LOGITS_NONE, NULL, lg);
 }
 
+// ---------------------------------------------------------------------------------------------- prompt lookup
+// A hash table of chains over the pairs of consecutive tokens (as LZ77 compressors index their matches): head[h] the
+// latest position i whose pair (toks[i - 1], toks[i]) hashes to h, prev[i] the one before it with the same hash (-1:
+// none). A lookup walks the chain of the pair (last token, next token) from the most recent, at most RQ_LOOKUP_CHAIN
+// positions, and keeps the longest match backwards (up to RQ_LOOKUP_LMAX tokens): the same choice as trying the
+// longest n-gram first (n = LMAX .. 2, the most recent occurrence of each) while the chain reaches it
+struct RqLookup {
+    int *head, *prev;
+    int hbits, cap, n; // n: tokens indexed (the pairs ending at 1 .. n - 1)
+};
+
+static inline unsigned lk_hash(const RqLookup *lk, int a, int b) {
+    uint64_t x = ((uint64_t)(uint32_t)a << 32 | (uint32_t)b) * 0x9E3779B97F4A7C15ull;
+    return (unsigned)(x >> (64 - lk->hbits));
+}
+
+RqLookup *rq_lookup_new(int capacity) {
+    if (capacity < 1) capacity = 1;
+    RqLookup *lk = calloc(1, sizeof(*lk));
+    if (!lk) return NULL;
+    lk->hbits = 10;
+    while (lk->hbits < 24 && (1 << lk->hbits) < 2 * capacity) lk->hbits++;
+    lk->cap = capacity;
+    lk->head = malloc(sizeof(int) << lk->hbits);
+    lk->prev = malloc((size_t)capacity * sizeof(int));
+    if (!lk->head || !lk->prev) {
+        rq_lookup_free(lk);
+        return NULL;
+    }
+    rq_lookup_reset(lk);
+    return lk;
+}
+
+void rq_lookup_free(RqLookup *lk) {
+    if (!lk) return;
+    free(lk->head);
+    free(lk->prev);
+    free(lk);
+}
+
+void rq_lookup_reset(RqLookup *lk) {
+    memset(lk->head, 0xff, sizeof(int) << lk->hbits); // (-1)
+    lk->n = 0;
+}
+
+int rq_lookup_add(RqLookup *lk, const int *toks, int n) {
+    if (n > lk->cap || n < lk->n) return RQ_ERR_ARG;
+    for (int i = lk->n > 1 ? lk->n : 1; i < n; i++) {
+        unsigned h = lk_hash(lk, toks[i - 1], toks[i]);
+        lk->prev[i] = lk->head[h];
+        lk->head[h] = i;
+    }
+    lk->n = n;
+    return RQ_OK;
+}
+
+int rq_lookup_draft(const RqLookup *lk, const int *toks, int t, int kmax, int min_len, int *guess, int *len) {
+    int n = lk->n, best = -1, bl = 0;
+    *len = 0;
+    if (n < 2 || kmax < 1) return 0;
+    int a = toks[n - 1];
+    for (int j = lk->head[lk_hash(lk, a, t)], c = 0; j >= 0 && c < RQ_LOOKUP_CHAIN; j = lk->prev[j], c++) {
+        // j: the pair (toks[j - 1], toks[j]), 1 <= j <= n - 1; the match: backwards from j - 1 vs from n - 1
+        if (toks[j] != t || toks[j - 1] != a) continue; // (another pair, the same hash)
+        int l = 2;
+        while (l < RQ_LOOKUP_LMAX && j - l >= 0 && toks[j - l] == toks[n - l]) l++;
+        if (l > bl) bl = l, best = j;
+        if (bl == RQ_LOOKUP_LMAX) break;
+    }
+    if (best < 0 || bl < min_len) return 0;
+    *len = bl;
+    // the tokens after it in toks[0..n-1], t: positions best + 1 .. n (n: t)
+    int m = n - best < kmax ? n - best : kmax;
+    for (int i = 0; i < m; i++)
+        guess[i] = best + 1 + i < n ? toks[best + 1 + i] : t;
+    return m;
+}
+
 static void ck_slots(RqSeq *s, int n) {
     // Qwen3.5: at least n checkpoint slots
     if (s->m->hy.on && s->nck < n) rq_seq_set_checkpoints(s, n);
@@ -124,27 +206,50 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
     RqSeq *s = g->s;
     RqSpecStats z;
     if (!st) st = &z;
-    int k = o ? o->k : 0, V = s->m->config.vocab_size, e = RQ_OK;
+    int k = o ? o->k : 0, kl = o ? o->lookup : 0, V = s->m->config.vocab_size, e = RQ_OK;
+    int lmin = o && o->lookup_min > 0 ? o->lookup_min : RQ_LOOKUP_MIN_DEFAULT;
     float tau = o ? o->tau : 0;
-    if (k < 0 || k > RQ_SPEC_K_MAX || (k > 0 && (!dc || !ds || ds == s)) || !logits) return RQ_ERR_ARG;
+    if (k < 0 || k > RQ_SPEC_K_MAX || kl < 0 || kl > RQ_SPEC_K_MAX || (o && o->lookup_min < 0) ||
+        (k > 0 && (!dc || !ds || ds == s)) || !logits)
+        return RQ_ERR_ARG;
     if (k > 0 && rq_spec_check(s->m, ds->m, NULL, 0) != RQ_OK) return RQ_ERR_ARG;
     double t0 = rq_now();
     float *out = NULL;
     Buf buf = { NULL, 0 };
-    int guess[RQ_SPEC_K_MAX + 1], nck0 = s->nck;
-    if (k > 0) {
-        if (!(out = malloc((size_t)(k + 1) * V * sizeof(float)))) return RQ_ERR_NOMEM;
-        ck_slots(s, k + 2);
-        ck_slots(ds, k + 2);
+    RqLookup *lk = NULL;
+    int kmax = k > kl ? k : kl, guess[RQ_SPEC_K_MAX + 1], nck0 = s->nck;
+    if (kmax > 0) {
+        if (!(out = malloc((size_t)(kmax + 1) * V * sizeof(float)))) return RQ_ERR_NOMEM;
+        ck_slots(s, kmax + 2);
+        if (k > 0) ck_slots(ds, k + 2);
+    }
+    if (kl > 0 && !(lk = rq_lookup_new(rq_seq_capacity(s)))) {
+        free(out);
+        return RQ_ERR_NOMEM;
     }
     int r = rq_gen_step(g, c, rq_seq_len(s) - 1, logits);
     while (r > 0) {
         int P = rq_seq_len(s), t = g->token, cap = rq_seq_capacity(s);
-        // guesses: at most k, the tokens left before max_new but one (the pass's last row gives one more), the
-        // positions left (the pass's rows P..P + n), and the draft's capacity (its rows P..P + n - 1)
-        int kk = r == RQ_GEN_LAST ? 0 : k, nd = 0;
-        if (g->max_new > 0 && kk > g->max_new - g->n_gen - 1) kk = g->max_new - g->n_gen - 1;
-        if (kk > cap - 1 - P) kk = cap - 1 - P;
+        // guesses: at most k (kl from the lookup), the tokens left before max_new but one (the pass's last row gives
+        // one more), the positions left (the pass's rows P..P + n), and the draft's capacity (its rows P..P + n - 1)
+        int lim = r == RQ_GEN_LAST ? 0 : kmax, nd = 0, src = 0;
+        if (g->max_new > 0 && lim > g->max_new - g->n_gen - 1) lim = g->max_new - g->n_gen - 1;
+        if (lim > cap - 1 - P) lim = cap - 1 - P;
+        if (kl > 0 && lim > 0) { // the lookup first: the sequence's tokens are indexed as they become final
+            double td = rq_now();
+            int ml;
+            if (rq_lookup_add(lk, rq_seq_tokens(s), P) != RQ_OK) { // (a sequence cut below the indexed length)
+                rq_lookup_reset(lk);
+                rq_lookup_add(lk, rq_seq_tokens(s), P);
+            }
+            nd = rq_lookup_draft(lk, rq_seq_tokens(s), t, kl < lim ? kl : lim, lmin, guess + 1, &ml);
+            if (g->cfg->allow) // (a guess the mask forbids cannot be sampled: the guesses stop before it)
+                for (int j = 1; j <= nd; j++)
+                    if (!g->cfg->allow[guess[j]]) { nd = j - 1; break; }
+            src = nd > 0;
+            st->t_draft += rq_now() - td;
+        }
+        int kk = src ? 0 : k < lim ? k : lim;
         if (k > 0 && kk > rq_seq_capacity(ds) - P) kk = rq_seq_capacity(ds) - P;
         if (kk > 0) {
             double td = rq_now();
@@ -175,6 +280,8 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
         if (e != RQ_OK || r == RQ_GEN_LAST) break;
         st->passes++;
         st->drafted += nd;
+        st->lookup_passes += src;
+        st->lookup_drafted += src ? nd : 0;
         // accept: step through the rows while the sample is the next row's token
         int keep = P + 1 + nd, fed = 0;
         for (int j = 0; j <= nd; j++) {
@@ -183,6 +290,7 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
             if (r == RQ_GEN_DONE) { keep = P + 1 + j; break; }
             if (j < nd && g->token == guess[j + 1]) { // (already in the cache at P + j + 1)
                 st->accepted++;
+                st->lookup_accepted += src;
                 if (r == RQ_GEN_LAST) { keep = P + 2 + j; fed = 1; break; }
                 continue;
             }
@@ -202,7 +310,8 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
     }
     free(out);
     free(buf.v);
-    if (k > 0 && s->m->hy.on) {
+    rq_lookup_free(lk);
+    if (kmax > 0 && s->m->hy.on) {
         // the target's checkpoints as rq_generate leaves them: the rows' dropped, its slot count back (a later
         // truncation, e.g. a chat's next turn, lands where it would after plain decoding: the same tokens to prefill,
         // the same RNG draws). The draft keeps its own (they only save it refeeding)
@@ -225,10 +334,12 @@ int rq_generate_spec(RqCtx *c, RqSeq *s, RqCtx *dc, RqSeq *ds, const int *tokens
     RqSpecStats z;
     if (!st) st = &z;
     memset(st, 0, sizeof(*st));
-    int k = o ? o->k : 0;
-    if (k == 0) return rq_generate(c, s, tokens, n, cfg, max_new, cb, &st->gen);
-    if (k < 0 || k > RQ_SPEC_K_MAX || !dc || !ds || ds == s) return RQ_ERR_ARG;
-    if (rq_spec_check(s->m, ds->m, NULL, 0) != RQ_OK) return RQ_ERR_ARG;
+    int k = o ? o->k : 0, kl = o ? o->lookup : 0;
+    if (k == 0 && kl == 0) return rq_generate(c, s, tokens, n, cfg, max_new, cb, &st->gen);
+    if (k < 0 || k > RQ_SPEC_K_MAX || kl < 0 || kl > RQ_SPEC_K_MAX || o->lookup_min < 0 ||
+        (k > 0 && (!dc || !ds || ds == s)))
+        return RQ_ERR_ARG;
+    if (k > 0 && rq_spec_check(s->m, ds->m, NULL, 0) != RQ_OK) return RQ_ERR_ARG;
     double t0 = rq_now();
     float *logits = NULL;
     int e = rq_prefill(c, s, tokens, n, RQ_LOGITS_LAST, NULL, &logits);
@@ -236,11 +347,13 @@ int rq_generate_spec(RqCtx *c, RqSeq *s, RqCtx *dc, RqSeq *ds, const int *tokens
     st->gen.n_prompt = n;
     // the draft follows the prompt (its first round feeds the sampled token; a draft context shorter than the prompt:
     // what fits, the loop guesses nothing past it)
-    Buf buf = { NULL, 0 };
-    int nd = rq_seq_len(s) < rq_seq_capacity(ds) ? rq_seq_len(s) : rq_seq_capacity(ds);
-    e = draft_follow(dc, ds, rq_seq_tokens(s), nd, -1, 0, &buf, NULL, st);
-    free(buf.v);
-    if (e != RQ_OK) return e;
+    if (k > 0) {
+        Buf buf = { NULL, 0 };
+        int nd = rq_seq_len(s) < rq_seq_capacity(ds) ? rq_seq_len(s) : rq_seq_capacity(ds);
+        e = draft_follow(dc, ds, rq_seq_tokens(s), nd, -1, 0, &buf, NULL, st);
+        free(buf.v);
+        if (e != RQ_OK) return e;
+    }
     st->draft_steps = st->refed = 0; // (the loop's only: a chat's rollback to its checkpoint is not the loop's)
     RqGen g;
     rq_gen_start(&g, s, cfg, max_new, cb, n);

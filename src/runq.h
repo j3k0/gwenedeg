@@ -412,11 +412,22 @@ unsigned long long rq_logits_hash(const float *logits, int n);
 // that the rollbacks land exactly (RqSpecStats.refed counts the positions fed again where one did not); afterwards
 // the target's are as rq_generate leaves them (the rows' dropped, its slot count back: a later rq_seq_truncate lands
 // where it would after plain decoding), the draft keeps its k + 2
+// Prompt lookup (TODO G6): the guesses can also come from the sequence itself, no model: at each pass, the most recent
+// earlier occurrence of the sequence's last tokens (the last sampled one included; the longest match of up to
+// RQ_LOOKUP_LMAX tokens among the RQ_LOOKUP_CHAIN most recent occurrences of the last two, rq_lookup_draft) and the
+// tokens that followed it are the guesses, when the match has at least lookup_min tokens; else the draft model's (with
+// a draft: combined) or none (a plain step). Agentic replies copy from their context (an edit's old text, paths,
+// identifiers, tool output). The verify loop is the same, so the output is still rq_generate's exactly. ds / dc may be
+// NULL with k 0 and lookup > 0
 #define RQ_SPEC_K_MAX 30
+#define RQ_LOOKUP_MIN_DEFAULT 2
 typedef struct {
-    int k;       // guesses per pass, at most (0..RQ_SPEC_K_MAX; 0 = plain decoding: rq_generate, the draft unused)
+    int k;       // guesses per pass of the draft model, at most (0..RQ_SPEC_K_MAX; 0 = no draft model; with lookup 0 too:
+                 // plain decoding, rq_generate)
     float tau;   // adaptive length: stop drafting at the first guess whose draft top-1 probability is < tau (0 = off: k
                  // guesses per pass, fewer only before max_new or the end of the context)
+    int lookup;  // guesses per pass of the prompt lookup, at most (0..RQ_SPEC_K_MAX; 0 = off)
+    int lookup_min; // the shortest match the lookup uses, in tokens (>= 2; 0: RQ_LOOKUP_MIN_DEFAULT)
 } RqSpecOpts;
 typedef struct {
     RqGenStats gen;    // as rq_generate's (t_prefill: both models' prompt; t_gen: the loop)
@@ -425,7 +436,9 @@ typedef struct {
     int accepted;      // guesses accepted (tokens that cost no target pass of their own: n_gen ~ passes + accepted)
     int draft_steps;   // draft forward passes (catching up on the accepted tokens included)
     int refed;         // positions fed again because a rollback landed short (Qwen3.5 without that checkpoint): 0
-    double t_draft, t_verify; // seconds: the draft (passes, picking the guesses), the target's passes
+    double t_draft, t_verify; // seconds: the draft (passes, picking the guesses; the lookup's), the target's passes
+    int lookup_passes, lookup_drafted, lookup_accepted; // the passes whose guesses came from the prompt lookup, their
+                       // guesses and accepted ones (included in passes / drafted / accepted; the model's: the rest)
 } RqSpecStats;
 // RQ_OK if draft can draft for target (vocabulary size and a hash of every token's bytes equal), else RQ_ERR_ARG with
 // the reason in err (RQ_ERR_STATE: a model without its tokenizer). rq_generate_spec / rq_spec_run check it too
@@ -440,6 +453,24 @@ int rq_generate_spec(RqCtx *c, RqSeq *s, RqCtx *dc, RqSeq *ds, const int *tokens
 // position; runs until g is done, as rq_generate's loop after rq_gen_start would. Adds to st's counters, sets
 // st->gen.n_gen / stop / t_gen
 int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const RqSpecOpts *o, RqSpecStats *st);
+
+// The prompt-lookup index (rq_spec_run's; for tools that simulate the loop, e.g. tests/teacher_force.c): the
+// positions of every pair of consecutive tokens of a sequence, a hash table of chains (the most recent first), O(1)
+// per token added. rq_lookup_new: for sequences of up to capacity tokens (NULL: no memory). rq_lookup_add: index
+// toks[0..n-1] (n <= capacity), given the toks[0..m-1] of the previous calls unchanged (m <= n; the new pairs only;
+// rq_lookup_reset first otherwise). rq_lookup_draft: the guesses after the indexed tokens toks[0..n-1] and t (the next
+// token, not indexed): among the RQ_LOOKUP_CHAIN most recent occurrences of (toks[n-1], t) in toks, the one whose
+// match with the end of toks[0..n-1], t is the longest (counted up to RQ_LOOKUP_LMAX tokens; the most recent among
+// equals); if it is >= min_len tokens (>= 2), the tokens that followed it in toks[0..n-1], t, at most kmax, go to
+// guess; returns their count (0: no such match), *len the match's length (0: none)
+#define RQ_LOOKUP_CHAIN 64
+#define RQ_LOOKUP_LMAX 16
+typedef struct RqLookup RqLookup;
+RqLookup *rq_lookup_new(int capacity);
+void rq_lookup_free(RqLookup *lk);
+void rq_lookup_reset(RqLookup *lk);
+int rq_lookup_add(RqLookup *lk, const int *toks, int n);
+int rq_lookup_draft(const RqLookup *lk, const int *toks, int t, int kmax, int min_len, int *guess, int *len);
 
 // ----------------------------------------------------------------------------------------- test hooks
 // rows r0..r0+nr-1 of the matrix `name` (llama.cpp tensor name; GGUF only) dequantized from the file's

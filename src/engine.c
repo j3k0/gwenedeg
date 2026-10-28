@@ -1762,8 +1762,8 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
     if (o->spec_used && o->calib > 0) {
         double t0 = rq_now();
         int L = o->calib < o->ctx - 32 ? o->calib : o->ctx - 32;
-        if ((rc = rq_pass_cost_measure(e->c, e->slot[0].seq, L, 3, &e->tcost)) != RQ_OK ||
-            (e->dm && (rc = rq_pass_cost_measure(e->dc, e->slot[0].dseq, L, 3, &e->dcost)) != RQ_OK))
+        if ((rc = rq_pass_cost_measure(e->c, e->slot[0].seq, L, 5, &e->tcost)) != RQ_OK ||
+            (e->dm && (rc = rq_pass_cost_measure(e->dc, e->slot[0].dseq, L, 5, &e->dcost)) != RQ_OK))
             fprintf(stderr, "runq serve: the speculation cost calibration failed (%s): estimates instead\n", rq_strerror(rc));
         if (e->hybrid) rq_seq_set_checkpoints(e->slot[0].seq, e->ckn);
         if (e->dhybrid) rq_seq_set_checkpoints(e->slot[0].dseq, e->ckn);

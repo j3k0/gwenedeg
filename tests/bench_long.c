@@ -173,8 +173,8 @@ int main(int argc, char **argv) {
         if (calib > 0) {
             int cl = calib < cap - 32 ? calib : cap - 32;
             double tc = rq_now();
-            if ((e = rq_pass_cost_measure(c, s, cl, 3, &tcost)) != RQ_OK) die("rq_pass_cost_measure", e, c);
-            if ((e = rq_pass_cost_measure(dc, ds, cl, 3, &dcost)) != RQ_OK) die("rq_pass_cost_measure (draft)", e, dc);
+            if ((e = rq_pass_cost_measure(c, s, cl, 5, &tcost)) != RQ_OK) die("rq_pass_cost_measure", e, c);
+            if ((e = rq_pass_cost_measure(dc, ds, cl, 5, &dcost)) != RQ_OK) die("rq_pass_cost_measure (draft)", e, dc);
             printf("# the cost models (rq_pass_cost_measure at %d positions, %.1f s): target %.2f ms + %.3f / %.3f us x position "
                    "(a segment's first / further rows), f(2/4/8) %.2f / %.2f / %.2f; draft %.2f ms + %.3f us\n", cl, rq_now() - tc,
                    tcost.t_w * 1e3, tcost.att * 1e6, tcost.att_x * 1e6, rq_pass_cost(&tcost, 2, 0, 0) / tcost.t_w,

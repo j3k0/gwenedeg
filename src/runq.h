@@ -442,6 +442,11 @@ typedef struct {
                  // guesses per pass, fewer only before max_new or the end of the context)
     int lookup;  // guesses per pass of the prompt lookup, at most (0..RQ_SPEC_K_MAX; 0 = off)
     int lookup_min; // the shortest match the lookup uses, in tokens (>= 2; 0: RQ_LOOKUP_MIN_DEFAULT)
+    // G7, auto (cost not NULL): per pass the source and the guess count from the cost models (target, draft; below,
+    // rq_spec_choose) at the sequence's position, with the acceptance seen so far in this call (the model's per guess,
+    // the lookup's per match length; priors 0.6 and rq_lookup_prior): a plain step when no guess pays off. k and lookup
+    // are then the maximums (the lookup's matches from 2 tokens unless lookup_min); the output is the same either way
+    const struct RqPassCost *cost, *dcost;
 } RqSpecOpts;
 typedef struct {
     RqGenStats gen;    // as rq_generate's (t_prefill: both models' prompt; t_gen: the loop)
@@ -483,14 +488,14 @@ int rq_spec_pick(const float *logits, int n, const unsigned char *allow, float t
 // their positions; they share the first row's read of the KV cache, so att_x <= att; at long context on a model with
 // many query heads per KV head they still pay most of it: G0 (b)). rq_pass_cost_measure calibrates it on a context and
 // an empty sequence of its model (filled with synthetic values up to 16 and L positions, rq_seq_fill_synthetic, then
-// emptied: a decode step and segments of 2-16 rows with every row's logits, the median of reps runs each);
+// emptied: a decode step and segments of 2-16 rows with every row's logits, the fastest of reps runs each);
 // rq_pass_cost_default estimates it from the model's size (no pass). rq_spec_choose: for one sequence alone at position L, the best of a plain step, a pass with n <=
 // lmax lookup guesses each accepted with p_lookup (lmax 0: no match), a pass with k <= kmax model guesses each
 // accepted with p_model and their k draft steps (d NULL: no draft model); gain = its tokens per second / plain's. The
 // expected accepted guesses of n are p + p^2 + ... + p^n (rq_spec_expect: each one is checked only if the previous
 // ones were accepted); rq_lookup_prior(len): a prior p for a lookup match of len tokens (from pi's sessions)
 #define RQ_PASS_COST_N 12
-typedef struct {
+typedef struct RqPassCost {
     double t_w, att, att_x;         // seconds
     int n, r[RQ_PASS_COST_N];       // the table of f: rows (r[0] = 1)
     double f[RQ_PASS_COST_N];

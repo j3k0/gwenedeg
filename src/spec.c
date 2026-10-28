@@ -217,7 +217,9 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
     float *out = NULL;
     Buf buf = { NULL, 0 };
     RqLookup *lk = NULL;
-    int kmax = k > kl ? k : kl, guess[RQ_SPEC_K_MAX + 1], nck0 = s->nck;
+    int kmax = k > kl ? k : kl, guess[RQ_SPEC_K_MAX + 1], nck0 = s->nck, aut = o && o->cost, mlen = 0;
+    double acm[2] = { 0, 0 }, acl[RQ_LOOKUP_LMAX + 1][2]; // (auto: the model's guesses, the lookup's per match length)
+    memset(acl, 0, sizeof(acl));
     if (kmax > 0) {
         if (!(out = malloc((size_t)(kmax + 1) * V * sizeof(float)))) return RQ_ERR_NOMEM;
         ck_slots(s, kmax + 2);
@@ -235,14 +237,14 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
         int lim = r == RQ_GEN_LAST ? 0 : kmax, nd = 0, src = 0;
         if (g->max_new > 0 && lim > g->max_new - g->n_gen - 1) lim = g->max_new - g->n_gen - 1;
         if (lim > cap - 1 - P) lim = cap - 1 - P;
+        int ml = 0;
         if (kl > 0 && lim > 0) { // the lookup first: the sequence's tokens are indexed as they become final
             double td = rq_now();
-            int ml;
             if (rq_lookup_add(lk, rq_seq_tokens(s), P) != RQ_OK) { // (a sequence cut below the indexed length)
                 rq_lookup_reset(lk);
                 rq_lookup_add(lk, rq_seq_tokens(s), P);
             }
-            nd = rq_lookup_draft(lk, rq_seq_tokens(s), t, kl < lim ? kl : lim, lmin, guess + 1, &ml);
+            nd = rq_lookup_draft(lk, rq_seq_tokens(s), t, kl < lim ? kl : lim, aut && !(o->lookup_min > 0) ? 2 : lmin, guess + 1, &ml);
             if (g->cfg->allow) // (a guess the mask forbids cannot be sampled: the guesses stop before it)
                 for (int j = 1; j <= nd; j++)
                     if (!g->cfg->allow[guess[j]]) { nd = j - 1; break; }
@@ -251,6 +253,16 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
         }
         int kk = src ? 0 : k < lim ? k : lim;
         if (k > 0 && kk > rq_seq_capacity(ds) - P) kk = rq_seq_capacity(ds) - P;
+        if (aut && lim > 0) { // (G7: the source and the count from the cost model at P, the acceptance seen so far)
+            int km = k < lim ? k : lim, mlc = ml > RQ_LOOKUP_LMAX ? RQ_LOOKUP_LMAX : ml;
+            if (k > 0 && km > rq_seq_capacity(ds) - P) km = rq_seq_capacity(ds) - P;
+            double pmd = (acm[1] + 8 * 0.6) / (acm[0] + 8), plk = (acl[mlc][1] + 8 * rq_lookup_prior(mlc)) / (acl[mlc][0] + 8);
+            RqSpecChoice x = rq_spec_choose(o->cost, k > 0 && o->dcost ? o->dcost : NULL, P, km, pmd, nd, plk);
+            src = x.src == RQ_SPEC_LOOKUP;
+            nd = src ? x.n : 0;
+            kk = x.src == RQ_SPEC_MODEL ? x.n : 0;
+            mlen = mlc;
+        }
         if (kk > 0) {
             double td = rq_now();
             float *lg = NULL, p1;
@@ -283,7 +295,7 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
         st->lookup_passes += src;
         st->lookup_drafted += src ? nd : 0;
         // accept: step through the rows while the sample is the next row's token
-        int keep = P + 1 + nd, fed = 0;
+        int keep = P + 1 + nd, fed = 0, pacc = 0, prej = 0;
         for (int j = 0; j <= nd; j++) {
             r = rq_gen_step(g, c, P + j, rows + (size_t)j * V);
             if (r < 0) { e = r; break; }
@@ -291,11 +303,18 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
             if (j < nd && g->token == guess[j + 1]) { // (already in the cache at P + j + 1)
                 st->accepted++;
                 st->lookup_accepted += src;
+                pacc++;
                 if (r == RQ_GEN_LAST) { keep = P + 2 + j; fed = 1; break; }
                 continue;
             }
             keep = P + 1 + j;
+            prej = j < nd;
             break;
+        }
+        if (aut && nd > 0) { // (the acceptance per guess: accepted / checked)
+            double *a = src ? acl[mlen] : acm;
+            a[0] += pacc + prej;
+            a[1] += pacc;
         }
         if (e != RQ_OK) break;
         if (keep < rq_seq_len(s)) { // (Qwen3.5: lands on the checkpoint of row keep - 1 - P)
@@ -369,8 +388,9 @@ int rq_generate_spec(RqCtx *c, RqSeq *s, RqCtx *dc, RqSeq *ds, const int *tokens
 // A pass of R rows: t_w f(R) + att S1 + att_x S2 (runq.h: S1 the segments' first positions, S2 the others'). Calibrated
 // on an empty sequence filled
 // with synthetic values (rq_seq_fill_synthetic: the passes' time does not depend on them): every configuration once
-// per rep in turn, the median per configuration; R = 1 is a decode step, R > 1 a segment of R rows with every row's
-// logits (a verify pass); at a short context L0 for f(R), at L for the attention's slope
+// per rep in turn, the fastest per configuration (a shared machine's load only ever adds time; the differences below
+// are small against a pass at short context); R = 1 is a decode step, R > 1 a segment of R rows with every row's
+// logits (a verify pass); at a short context L0 for f(R), a decode step and an 8-row segment at L for the attention
 static const int cost_rows[] = { 1, 2, 3, 4, 5, 6, 8, 12, 16 };
 #define COST_NR ((int)(sizeof(cost_rows) / sizeof(cost_rows[0])))
 
@@ -445,7 +465,7 @@ int rq_pass_cost_measure(RqCtx *c, RqSeq *s, int L, int reps, RqPassCost *pc) {
         if ((e = rq_seq_checkpoint_at(s, Lx)) != RQ_OK) break; // (Qwen3.5: the truncations land here)
         for (int rep = -1; rep < reps && e == RQ_OK; rep++) // (rep -1: a warm-up)
             for (int k = 0; k < nc && e == RQ_OK; k++) {
-                int R = phase ? (k ? 4 : 1) : cost_rows[k];
+                int R = phase ? (k ? 8 : 1) : cost_rows[k];
                 float *lg;
                 double t0 = rq_now();
                 e = R == 1 ? rq_decode(c, s, toks[0], &lg) : rq_prefill(c, s, toks, R, RQ_LOGITS_ALL, out, &lg);
@@ -462,11 +482,12 @@ int rq_pass_cost_measure(RqCtx *c, RqSeq *s, int L, int reps, RqPassCost *pc) {
     }
     for (int k = 0; k < COST_NR + 2; k++) {
         qsort(t + k * reps, reps, sizeof(double), cmp_dbl);
-        med[k] = t[k * reps + reps / 2];
+        med[k] = t[k * reps];
     }
     free(t);
-    // the attention: the growth from L0 to L of a decode step (the first row) and of a 4-row segment (+ 3 further rows)
-    double a1 = (med[COST_NR] - med[0]) / (L - L0), ax = (med[COST_NR + 1] - med[3] - (med[COST_NR] - med[0])) / (3.0 * (L - L0));
+    // the attention: the growth from L0 to L of a decode step (the first row) and of an 8-row segment (+ 7 further rows;
+    // cost_rows[6] = 8)
+    double a1 = (med[COST_NR] - med[0]) / (L - L0), ax = (med[COST_NR + 1] - med[6] - (med[COST_NR] - med[0])) / (7.0 * (L - L0));
     RqPassCost est;
     rq_pass_cost_default(m, &est);
     memset(pc, 0, sizeof(*pc));

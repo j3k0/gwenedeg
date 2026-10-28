@@ -121,8 +121,13 @@ double rq_mem_available(void);
 // --------------------------------------------------------------------------------------- sequence
 typedef struct RqSeq RqSeq;
 
-enum { RQ_KV_F32 = 0, RQ_KV_BF16 = 1, RQ_KV_F16 = 2, RQ_KV_DEFAULT = RQ_KV_F16 };
-const char *rq_kv_name(int kv_type);   // "f32", "bf16", "f16"
+// KV cache type of a sequence: the element type, and the attention's arithmetic. f32 / bf16 / f16: the fp32 attention
+// on the exactly converted values. bf16-dot / f16-dot (opt-in, runq --attn bf16): the bf16 dot-product attention (q,
+// K, the softmax weights and V rounded to bf16, the products as vdpbf16ps does them: ~2x the attention rate on an
+// AVX512_BF16 CPU, less accurate; definition in kernels_avx512.h), on a bf16 cache (its own V layout) or an f16 cache
+// (as f16, rounded again to bf16 when read: slower, a double rounding). Every path of the sequence uses its type
+enum { RQ_KV_F32 = 0, RQ_KV_BF16 = 1, RQ_KV_F16 = 2, RQ_KV_BF16_DOT = 5, RQ_KV_F16_DOT = 6, RQ_KV_DEFAULT = RQ_KV_F16 };
+const char *rq_kv_name(int kv_type);   // "f32", "bf16", "f16", "bf16-dot", "f16-dot"
 int rq_kv_parse(const char *name);     // the type, or RQ_ERR_ARG
 
 // capacity: positions (0 = the model's seq_len); the KV cache is address space, touched as used

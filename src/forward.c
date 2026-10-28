@@ -149,7 +149,7 @@ RqSeq *rq_seq_new(const RqModel *m, int capacity, int kv_type, int *err) {
     const Config *p = &m->config;
     if (!m->has_weights) { e = RQ_ERR_STATE; goto fail; }
     if (capacity <= 0) capacity = p->seq_len;
-    if (capacity > p->seq_len || kv_type < KV_F32 || kv_type > KV_F16 || (kv_type != KV_F32 && p->head_dim % 32)) {
+    if (capacity > p->seq_len || !kv_type_ok(kv_type) || (kv_type != KV_F32 && p->head_dim % 32)) {
         e = RQ_ERR_ARG;
         goto fail;
     }
@@ -159,7 +159,8 @@ RqSeq *rq_seq_new(const RqModel *m, int capacity, int kv_type, int *err) {
     s->cap = capacity;
     s->kv_len = (capacity + ATT_P - 1) / ATT_P * ATT_P; // (whole blocks: the cache layout)
     s->att_nb = s->kv_len / ATT_P;
-    s->kvt = kv_type;
+    s->kvt = kv_type & ~KV_DOT;
+    s->att = kv_type;
     s->kv_esz = kv_type == KV_F32 ? 4 : 2;
     s->kv_size = (size_t)m->n_attn * s->kv_len * m->kv_dim; // (the attention layers only)
     s->key_cache = alloc_big(s->kv_size * s->kv_esz);
@@ -434,7 +435,7 @@ static void copy_worker(void *arg, int tid, int nt) {
 int rq_seq_copy(RqSeq *dst, const RqSeq *src, int n) {
     // (on the thread pool: one parallel job between forward passes, as rq_sample_batch). A hybrid model: n ==
     // src's length (its current state), else src's longest checkpoint <= n, else 0
-    if (!dst || !src || dst == src || dst->m != src->m || dst->kvt != src->kvt || n < 0 || n > src->len || n > dst->cap)
+    if (!dst || !src || dst == src || dst->m != src->m || dst->att != src->att || n < 0 || n > src->len || n > dst->cap)
         return RQ_ERR_ARG;
     if (src->m->hy.on) {
         int b = n == src->len ? -1 : ck_best(src, n);
@@ -453,13 +454,13 @@ int rq_seq_copy(RqSeq *dst, const RqSeq *src, int n) {
 }
 
 const char *rq_kv_name(int t) {
-    static const char *name[] = { "f32", "bf16", "f16" };
-    return t >= KV_F32 && t <= KV_F16 ? name[t] : "?";
+    static const char *name[] = { "f32", "bf16", "f16", "?", "?", "bf16-dot", "f16-dot" };
+    return kv_type_ok(t) ? name[t] : "?";
 }
 
 int rq_kv_parse(const char *s) {
-    for (int t = KV_F32; t <= KV_F16; t++)
-        if (!strcmp(s, rq_kv_name(t))) return t;
+    for (int t = KV_F32; t <= (KV_F16 | KV_DOT); t++)
+        if (kv_type_ok(t) && !strcmp(s, rq_kv_name(t))) return t;
     return RQ_ERR_ARG;
 }
 
@@ -1177,13 +1178,7 @@ ATT_EXACT static inline float exp_att(float x) { RQ_FP_EXACT
     return y;
 }
 
-static inline float bf16_f32(uint16_t h) {
-    // bf16 -> fp32, exact
-    uint32_t u = (uint32_t)h << 16;
-    float f;
-    memcpy(&f, &u, 4);
-    return f;
-}
+// (bf16_f32, f32_bf16: kernels_avx512.h)
 
 static inline uint16_t f32_f16(float f) {
     // fp32 -> IEEE half, round to nearest even (the f16 KV cache stores; the same operations in every
@@ -1204,16 +1199,6 @@ static inline uint16_t f32_f16(float f) {
     h = a >= 0x477ff000u ? 0x7bffu : h;                  // >= 65520: would round to inf
     h = a > 0x7f800000u ? (0x7e00u | ((a >> 13) & 0x3ffu)) : h;
     return (uint16_t)(sign | h);
-}
-
-static inline uint16_t f32_bf16(float f) {
-    // fp32 -> bf16, round to nearest even (the bf16 KV cache stores). Integer arithmetic, the same in
-    // every build; equal to vcvtneps2bf16 for every non-denormal input (it flushes denormals, which
-    // -Ofast's FTZ / DAZ never produce here); NaN stays a (quiet) NaN
-    uint32_t u;
-    memcpy(&u, &f, 4);
-    uint32_t r = (u + 0x7fffu + ((u >> 16) & 1)) >> 16;
-    return (uint16_t)((u & 0x7fffffffu) > 0x7f800000u ? (u >> 16) | 0x40 : r);
 }
 
 ATT_EXACT static void attention_vec(const float *q, float *out, float *ml, int n, const float *kt, const float *vt,
@@ -1323,15 +1308,177 @@ static void kv_block_f32(int kvt, float *kf, float *vf, const uint16_t *kh, cons
             vf[r0 + i] = bf16_f32(vh[r0 + (i & ~31) + 2 * (i & 15) + ((i >> 4) & 1)]);
 }
 
-static void attention_part(int kvt, int nv, const float *const *q, float *const *out, float *const *part, const int *np,
+// ------------------------------------------------ the bf16 dot-product attention (RQ_KV_BF16_DOT / RQ_KV_F16_DOT)
+// Definition in kernels_avx512.h (att512_kv_dot); here its C twin for the generic build (and NEON: no kernel of its
+// own), operation for operation: vdpbf16ps's lane is two fmaf, the odd element first, which with FTZ / DAZ set (the
+// whole call runs so: att_ftz_on) equal the instruction bit for bit (build/bf16dp_test, tests/bf16dp_test.c)
+#if defined(__x86_64__) || defined(__i386__)
+#include <xmmintrin.h>
+static inline unsigned att_ftz_on(void) {
+    // MXCSR's FTZ and DAZ for a bf16 dot-product attention call (the instruction's rule; runq's -Ofast startup sets
+    // them already); returns the MXCSR to restore
+    unsigned c = _mm_getcsr();
+    if ((c & 0x8040) != 0x8040)
+        _mm_setcsr(c | 0x8040);
+    return c;
+}
+static inline void att_ftz_off(unsigned c) {
+    if ((c & 0x8040) != 0x8040)
+        _mm_setcsr(c);
+}
+#else
+// (other platforms: their flush mode, -Ofast's (AArch64: FPCR.FZ, which detects tininess before rounding: the twin's
+// results there can differ from an x86 CPU's in the products' underflow cases))
+static inline unsigned att_ftz_on(void) { return 0; }
+static inline void att_ftz_off(unsigned c) { (void)c; }
+#endif
+
+static volatile float att_zero = 0.0f; // (+0 that the compiler cannot fold: fma(+0, +0, c) is c + (+0), not c)
+
+ATT_EXACT static inline float att_dot2(float c, float a1, float b1, float a0, float b0) { RQ_FP_EXACT
+    // a dword lane of vdpbf16ps: c + a1 b1 (the odd element first), then + a0 b0, two FMAs each rounded
+    c = ATT_FMA(a1, b1, c);
+    return ATT_FMA(a0, b0, c);
+}
+
+static inline float bf16_round(float x) { return bf16_f32(f32_bf16(x)); }
+
+ATT_EXACT static void attention_vec_dot(const float *qb, float *out, float *ml, int n, const float *kt, const float *vt,
+                                        size_t ts, int hd, float scale, float *S) { RQ_FP_EXACT
+    // attention_vec with the bf16 dot products: qb = q rounded to bf16, kt / vt = the block's K' / V' (bf16 values) in
+    // the fp32 tile layout; S: n (rounded up to 16) floats, then the weights w (bf16 values)
+    int nt = (n + ATT_T - 1) / ATT_T;
+    for (int tb = 0; tb < nt; tb++) {
+        const float *k = kt + (size_t)tb * ts;
+        float a[ATT_T], c[ATT_T];
+        for (int j = 0; j < ATT_T; j++)
+            a[j] = 0.0f; // (not used: chunk 0 is assigned)
+        for (int i0 = 0; i0 < hd; i0 += ATT_DC) {
+            for (int j = 0; j < ATT_T; j++)
+                c[j] = 0.0f;
+            for (int i = i0; i < i0 + ATT_DC; i += 2) // dim pairs (i, i + 1), the odd one first
+                for (int j = 0; j < ATT_T; j++)
+                    c[j] = att_dot2(c[j], qb[i + 1], k[(i + 1) * ATT_T + j], qb[i], k[i * ATT_T + j]);
+            for (int j = 0; j < ATT_T; j++)
+                a[j] = i0 > 0 ? a[j] + c[j] : c[j];
+        }
+        for (int j = 0; j < ATT_T; j++)
+            S[tb * ATT_T + j] = a[j] * scale;
+    }
+    float m = S[0];
+    for (int t = 1; t < n; t++)
+        if (S[t] > m)
+            m = S[t];
+    float sum[ATT_T];
+    for (int j = 0; j < ATT_T; j++)
+        sum[j] = 0.0f;
+    for (int tb = 0; tb < nt; tb++)
+        for (int j = 0; j < ATT_T; j++) {
+            int t = tb * ATT_T + j;
+            float w = bf16_round(t < n ? exp_att(S[t] - m) : 0.0f);
+            S[t] = w;
+            sum[j] = sum[j] + w;
+        }
+    for (int w = ATT_T / 2; w >= 1; w /= 2) // the reduction tree of att512_sum16
+        for (int j = 0; j < w; j++)
+            sum[j] = sum[j] + sum[j + w];
+    float inv = 1.0f / sum[0];
+    if (ml) {
+        ml[0] = m;
+        ml[1] = sum[0];
+    }
+    for (int i = 0; i < hd; i++)
+        out[i] = 0.0f;
+    for (int t = 0; t < n; t += 2) { // position pairs (t, t + 1), the odd one first; t + 1 beyond n: (+0, +0)
+        const float *v0 = vt + (size_t)(t / ATT_T) * ts + (size_t)(t % ATT_T) * hd, *v1 = v0 + hd;
+        float w0 = S[t];
+        if (t + 1 < n) {
+            float w1 = S[t + 1];
+            for (int i = 0; i < hd; i++)
+                out[i] = att_dot2(out[i], w1, v1[i], w0, v0[i]);
+        } else {
+            float z = att_zero;
+            for (int i = 0; i < hd; i++)
+                out[i] = att_dot2(out[i], z, z, w0, v0[i]);
+        }
+    }
+    if (!ml)
+        for (int i = 0; i < hd; i++)
+            out[i] = out[i] * inv;
+}
+
+static void kv_block_dot(int kvt, float *kf, float *vf, const uint16_t *kh, const uint16_t *vh, int ntl, int hd) {
+    // the first ntl tiles of one (kv head, block) of a bf16-dot / f16-dot cache as K' / V' (bf16 values) in the fp32
+    // tile layout (kv_block_f32 for the dot products: an f16 element rounded to bf16, the bf16-dot V in position pairs)
+    size_t ne = (size_t)ntl * ATT_T * hd;
+    if (kvt == KV_F16) {
+        for (size_t e = 0; e < ne; e++) {
+            kf[e] = bf16_round(fp16_to_f32(kh[e]));
+            vf[e] = bf16_round(fp16_to_f32(vh[e]));
+        }
+        return;
+    }
+    for (size_t t0 = 0; t0 < ne; t0 += (size_t)ATT_T * hd)     // K: as the bf16 cache
+        for (int i = 0; i < hd; i++)
+            for (int j = 0; j < ATT_T; j++)
+                kf[t0 + (size_t)i * ATT_T + j] = bf16_f32(kh[t0 + (size_t)(i & ~1) * ATT_T + 2 * j + (i & 1)]);
+    for (size_t t = 0; t < (size_t)ntl * ATT_T; t++)           // V: dim i of positions 2m, 2m + 1 at 2m hd + 2 i (+ 1)
+        for (int i = 0; i < hd; i++)
+            vf[t * hd + i] = bf16_f32(vh[(t & ~(size_t)1) * hd + 2 * (size_t)i + (t & 1)]);
+}
+
+static void attention_part_dot(int kvt, int nv, const float *const *q, float *const *out, float *const *part, const int *np,
+                               int b0, int b1, const void *kt, const void *vt, size_t bs, int hd, float scale, float *S,
+                               float *conv) {
+    // attention_part's generic C version for the bf16 dot products (kvt: the storage, KV_BF16 or KV_F16)
+    size_t ts = (size_t)ATT_T * hd;
+    float qb[hd];
+    for (int b = b0; b < b1; b++) {
+        int nmax = 0;
+        for (int r = 0; r < nv; r++) {
+            int n = np[r] - b * ATT_P < ATT_P ? np[r] - b * ATT_P : ATT_P;
+            nmax = n > nmax ? n : nmax;
+        }
+        if (nmax <= 0)
+            break;
+        kv_block_dot(kvt, conv, conv + (size_t)ATT_P * hd, (const uint16_t *)kt + (size_t)b * bs, (const uint16_t *)vt + (size_t)b * bs,
+                     (nmax + ATT_T - 1) / ATT_T, hd);
+        for (int r = 0; r < nv; r++) {
+            int n = np[r] - b * ATT_P < ATT_P ? np[r] - b * ATT_P : ATT_P;
+            if (n <= 0)
+                continue;
+            for (int i = 0; i < hd; i++)
+                qb[i] = bf16_round(q[r][i]);
+            if (!part)
+                attention_vec_dot(qb, out[r], NULL, n, conv, conv + (size_t)ATT_P * hd, ts, hd, scale, S);
+            else
+                attention_vec_dot(qb, part[r] + (size_t)b * ATT_PSTRIDE(hd), part[r] + (size_t)b * ATT_PSTRIDE(hd) + hd, n, conv,
+                                  conv + (size_t)ATT_P * hd, ts, hd, scale, S);
+        }
+    }
+}
+
+static void attention_part(int att, int nv, const float *const *q, float *const *out, float *const *part, const int *np,
                            int b0, int b1, const void *kt, const void *vt, size_t bs, int hd, float scale, float *S,
                            float *conv) {
-    // nv query vectors q[r] sharing one kv head (kt / vt: its tile 0; kvt: cache type), vector r over
-    // positions 0..np[r]-1. part NULL: the whole attention into out[r] (all np <= ATT_P). Else the
+    // nv query vectors q[r] sharing one kv head (kt / vt: its tile 0; att: the sequence's attention type, RqSeq.att),
+    // vector r over positions 0..np[r]-1. part NULL: the whole attention into out[r] (all np <= ATT_P). Else the
     // partial results of the blocks b0..b1-1 of ATT_P positions that vector r reaches, block b at
     // part[r] + b * ATT_PSTRIDE(hd): o (unnormalized), m (max score), l (sum of exponentials).
     // S: scratch of att_scores_floats(nv, b1 - b0) floats (internal.h); conv: 2 * ATT_P * hd floats (the
-    // generic C version's fp32 copy of a 16-bit cache block; this thread's)
+    // generic C version's fp32 copy of a 16-bit cache block, the AVX-512 f16-dot conversion; this thread's)
+    int kvt = att & ~KV_DOT;
+    if (att & KV_DOT) {
+        unsigned csr = att_ftz_on();
+#ifdef RUNQ_ATT512
+        if (att512_ok(hd))
+            att512_kv_dot(kvt, nv, q, out, part, np, b0, b1, kt, vt, bs, hd, scale, S, (uint16_t *)conv);
+        else
+#endif
+            attention_part_dot(kvt, nv, q, out, part, np, b0, b1, kt, vt, bs, hd, scale, S, conv);
+        att_ftz_off(csr);
+        return;
+    }
 #ifdef RUNQ_ATT512
     if (att512_ok(hd)) { att512_kv(kvt, nv, q, out, part, np, b0, b1, kt, vt, bs, hd, scale, S); return; }
 #endif
@@ -1372,7 +1519,7 @@ static void attention_part(int kvt, int nv, const float *const *q, float *const 
     }
 }
 
-static void attention_kv(int kvt, int nv, const float *const *q, float *const *out, const int *np, const void *kt,
+static void attention_kv(int att, int nv, const float *const *q, float *const *out, const int *np, const void *kt,
                          const void *vt, size_t bs, int hd, float scale, float *S, float *part, float *conv) {
     // nv query vectors q[r] sharing one kv head, vector r over positions 0..np[r]-1, into out[r]:
     // per block of ATT_P positions the partial results, then their combination (one block: the
@@ -1382,7 +1529,7 @@ static void attention_kv(int kvt, int nv, const float *const *q, float *const *o
     for (int r = 0; r < nv; r++)
         nmax = np[r] > nmax ? np[r] : nmax;
     if (nmax <= ATT_P) {
-        attention_part(kvt, nv, q, out, NULL, np, 0, 1, kt, vt, bs, hd, scale, S, conv);
+        attention_part(att, nv, q, out, NULL, np, 0, 1, kt, vt, bs, hd, scale, S, conv);
         return;
     }
     int nbm = (nmax + ATT_P - 1) / ATT_P;
@@ -1390,7 +1537,7 @@ static void attention_kv(int kvt, int nv, const float *const *q, float *const *o
     float *pv[ATT_NV_MAX];
     for (int r = 0; r < nv; r++)
         pv[r] = part + (size_t)r * nbm * st;
-    attention_part(kvt, nv, q, NULL, pv, np, 0, nbm, kt, vt, bs, hd, scale, S, conv);
+    attention_part(att, nv, q, NULL, pv, np, 0, nbm, kt, vt, bs, hd, scale, S, conv);
     for (int r = 0; r < nv; r++)
         att_combine(out[r], (np[r] + ATT_P - 1) / ATT_P, pv[r], st, hd);
 }
@@ -1402,12 +1549,22 @@ static inline size_t kv_tile(int t, int h, int n_kv, int hd) {
     return (((size_t)(t / ATT_P) * n_kv + h) * ATT_P + (size_t)(t % ATT_P / ATT_T) * ATT_T) * hd;
 }
 
-static void kv_store(int kvt, void *kl0, void *vl0, int t, int h, int n_kv, int hd, const float *k, const float *v) {
+static void kv_store(int att, void *kl0, void *vl0, int t, int h, int n_kv, int hd, const float *k, const float *v) {
     // head h of the key / value rows k, v of position t into the layer's cache tiles kl, vl
-    // (k or v may be NULL: only the other one); kvt: cache type (bf16 / f16: rounded to nearest even,
-    // layouts in kernels_avx512.h)
+    // (k or v may be NULL: only the other one); att: the sequence's attention type (RqSeq.att: the cache type,
+    // bf16 / f16 rounded to nearest even; a bf16-dot cache's V in position pairs; layouts in kernels_avx512.h)
     size_t o = kv_tile(t, h, n_kv, hd);
-    int j = t % ATT_T;
+    int j = t % ATT_T, kvt = att & ~KV_DOT;
+    if (att == (KV_BF16 | KV_DOT)) {
+        uint16_t *kl = kl0, *vl = vl0;
+        if (k)
+            for (int i = 0; i < hd; i++)
+                kl[o + (size_t)(i & ~1) * ATT_T + 2 * j + (i & 1)] = f32_bf16(k[i]);
+        if (v)
+            for (int i = 0; i < hd; i++)
+                vl[o + (size_t)(j & ~1) * hd + 2 * i + (j & 1)] = f32_bf16(v[i]);
+        return;
+    }
     if (kvt == KV_F16) {
         uint16_t *kl = kl0, *vl = vl0;
         if (k)
@@ -2065,10 +2222,10 @@ static void decode_worker(void *arg, int tid, int nt) {
                 } else if (r == kv_mul) {
                     matvec_rows(c->k, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wk + al, dim, g * hd, (g + 1) * hd);
                     qk_norm_rope(c->k + g * hd, 1, hd, w->k_norm_weights + al * hd, hd, c->rope, rd);
-                    kv_store(s->kvt, kl, NULL, pos, g, nkv, hd, c->k + g * hd, NULL);
+                    kv_store(s->att, kl, NULL, pos, g, nkv, hd, c->k + g * hd, NULL);
                 } else {
                     matvec_rows(c->v, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wv + al, dim, g * hd, (g + 1) * hd);
-                    kv_store(s->kvt, NULL, vl, pos, g, nkv, hd, NULL, c->v + g * hd);
+                    kv_store(s->att, NULL, vl, pos, g, nkv, hd, NULL, c->v + g * hd);
                 }
                 rq_count(S, l * nkv + g, 1);
                 continue;
@@ -2086,7 +2243,7 @@ static void decode_worker(void *arg, int tid, int nt) {
                 npv[r] = pos + 1;
             }
             size_t o = kv_tile(0, g, nkv, hd);
-            attention_part(s->kvt, kv_mul, qv, ov, nb == 1 ? NULL : pv, npv, b, b + 1, kl + o * s->kv_esz, vl + o * s->kv_esz, bs,
+            attention_part(s->att, kv_mul, qv, ov, nb == 1 ? NULL : pv, npv, b, b + 1, kl + o * s->kv_esz, vl + o * s->kv_esz, bs,
                            hd, m->att_scale, c->att + ((size_t)g * c->att_nb + b) * kv_mul * ATT_P, conv);
             if (nb > 1) { // the last block of this kv head to finish combines them
                 if (rq_count(S, (p->n_layers + l) * nkv + g, 1) < nb)
@@ -2394,7 +2551,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
                 float *kr = c->k_b + (size_t)b * kv_dim + g * hd;
                 qk_norm_rope(c->q_b + (size_t)b * qd + g * kv_mul * qh, kv_mul, qh, w->q_norm_weights + al * hd, hd, cs, rd);
                 qk_norm_rope(kr, 1, hd, w->k_norm_weights + al * hd, hd, cs, rd);
-                kv_store(sq->kvt, kl, vl, t, g, nkv, hd, kr, c->v_b + (size_t)b * kv_dim + g * hd);
+                kv_store(sq->att, kl, vl, t, g, nkv, hd, kr, c->v_b + (size_t)b * kv_dim + g * hd);
             }
         }
         PH_END_NOEPI
@@ -2436,14 +2593,14 @@ static void prefill_worker(void *arg, int tid, int nt) {
             size_t o = kv_tile(0, g, nkv, hd);
             if (sp >= 0) { // block j of the single row b0
                 int j = i % nbk;
-                attention_part(sq->kvt, nv, qv, ov, pv, npv, j, j + 1, kl + o * sq->kv_esz, vl + o * sq->kv_esz, bs, hd, m->att_scale,
+                attention_part(sq->att, nv, qv, ov, pv, npv, j, j + 1, kl + o * sq->kv_esz, vl + o * sq->kv_esz, bs, hd, m->att_scale,
                                att, conv);
                 if (rq_count(S, l * ncl + job->nrb + sp * nkv + g, 1) < nbk)
                     continue;
                 for (int r = 0; r < nv; r++)
                     att_combine(ov[r], nbk, pv[r], ATT_PSTRIDE(hd), hd);
             } else {
-                attention_kv(sq->kvt, nv, qv, ov, npv, kl + o * sq->kv_esz, vl + o * sq->kv_esz, bs, hd, m->att_scale, att, part,
+                attention_kv(sq->att, nv, qv, ov, npv, kl + o * sq->kv_esz, vl + o * sq->kv_esz, bs, hd, m->att_scale, att, part,
                              conv);
             }
             if (rq_count(S, l * ncl + rb, 1) < nkv)
@@ -2818,7 +2975,7 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
                     float *kr = c->k_b + (size_t)b * kv_dim + g * hd;
                     qk_norm_rope(c->q_b + (size_t)b * qd + g * nq, kv_mul, qh, w->q_norm_weights + al * hd, hd, cs, rd);
                     qk_norm_rope(kr, 1, hd, w->k_norm_weights + al * hd, hd, cs, rd);
-                    kv_store(sq->kvt, (char *)sq->key_cache + loff * sq->kv_len * sq->kv_esz,
+                    kv_store(sq->att, (char *)sq->key_cache + loff * sq->kv_len * sq->kv_esz,
                              (char *)sq->value_cache + loff * sq->kv_len * sq->kv_esz, c->row_pos[b], g, nkv, hd, kr,
                              c->v_b + (size_t)b * kv_dim + g * hd);
                 }
@@ -2854,13 +3011,13 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
                     npv[nv] = c->row_pos[b] + 1;
                 }
             if (job->split && nbk > 1) { // block j's partial results; the last block of (row block, kv head) combines
-                attention_part(sq->kvt, nv, qv, ov, pv, npv, j, j + 1, kl + o, vl + o, bs, hd, m->att_scale, att, conv);
+                attention_part(sq->att, nv, qv, ov, pv, npv, j, j + 1, kl + o, vl + o, bs, hd, m->att_scale, att, conv);
                 if (rq_count(S, cb + 2 * nkv + n + u * nkv + g, 1) < nbk)
                     continue;
                 for (int r = 0; r < nv; r++) // (each row over its own blocks)
                     att_combine(ov[r], (npv[r] + ATT_P - 1) / ATT_P, pv[r], pst, hd);
             } else {
-                attention_kv(sq->kvt, nv, qv, ov, npv, kl + o, vl + o, bs, hd, m->att_scale, att, part, conv);
+                attention_kv(sq->att, nv, qv, ov, npv, kl + o, vl + o, bs, hd, m->att_scale, att, part, conv);
             }
             if (rq_count(S, cb + 2 * nkv + u, 1) < nkv)
                 continue;

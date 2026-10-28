@@ -55,8 +55,10 @@ extern int GS;
 #define RQ_SEQ_CK 2
 #define RQ_SEQ_CK_MAX RQ_CHECKPOINTS_MAX
 
-// KV cache element type: fp32, bf16 or f16 (16-bit: half the bytes; layouts in kernels_avx512.h)
-enum { KV_F32 = RQ_KV_F32, KV_BF16 = RQ_KV_BF16, KV_F16 = RQ_KV_F16 };
+// KV cache element type: fp32, bf16 or f16 (16-bit: half the bytes; layouts in kernels_avx512.h); KV_DOT: the flag of
+// the bf16 dot-product attention in a sequence's attention type (RqSeq.att: RQ_KV_BF16_DOT = KV_BF16 | KV_DOT, ...)
+enum { KV_F32 = RQ_KV_F32, KV_BF16 = RQ_KV_BF16, KV_F16 = RQ_KV_F16, KV_DOT = 4 };
+static inline int kv_type_ok(int t) { return (t >= KV_F32 && t <= KV_F16) || t == (KV_BF16 | KV_DOT) || t == (KV_F16 | KV_DOT); }
 
 // ---------------------------------------------------------------------------------------- the model
 
@@ -314,6 +316,8 @@ struct RqSeq {
     int kv_len;         // cap rounded up to whole attention blocks (ATT_P positions: the cache layout)
     int att_nb;         // attention blocks of ATT_P positions in kv_len
     int kvt;            // cache element type: KV_F32, KV_BF16, KV_F16
+    int att;            // the attention's type (rq_seq_new's kv_type): kvt, | KV_DOT for the bf16 dot products (the
+                        // attention calls and the K / V stores take it: a bf16-dot cache has its own V layout)
     size_t kv_esz;      // bytes per cache element: 4 or 2
     size_t kv_size;     // elements per cache
     // kv cache: per layer kv_len / ATT_T tiles of ATT_T positions x n_kv_heads, layout in

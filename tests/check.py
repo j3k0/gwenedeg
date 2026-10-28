@@ -32,9 +32,10 @@ Tests (see tests/README.md):
              completions == runq -m chat, prefix reuse bitwise, streaming, json_schema constrained
              decoding, errors, queue / cancellation, fuzzing, shutdown; the tool call parser
              (build/tools_test, tests/tools_test.c: no model)
-  kv         the KV cache types other than the default f16 (-k f32, -k bf16): logits vs HF (en, code,
-             long2), batched vs sequential, threads and AVX-512 vs generic bitwise; their greedy goldens
-             (f32_generate, bf16_generate) run in the greedy group
+  kv         the KV cache types other than the default f16 (-k f32, -k bf16; -k bf16-dot / f16-dot: the bf16
+             dot-product attention): logits vs HF (en, code, long2), batched vs sequential, threads and AVX-512 vs
+             generic bitwise; their greedy goldens (f32_generate, bf16_generate) run in the greedy group; vdpbf16ps
+             vs its definition (build/bf16dp_test[-emu], tests/bf16dp_test.c: edge cases, random lanes, conversions)
   synth      synthetic GGUF models cut out of the Q4_K_M file (tests/make_synth.py; the shapes of the bigger
              Qwen3 models: dim 768, GQA 4, untied Q4_K embedding, RoPE theta 5e6, the 2507 templates): logits vs a
              numpy reference, batched / threads / generic bitwise, api_test, chat template renderings
@@ -197,7 +198,8 @@ Q4_KERNELS = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_L
 # KV cache types other than the default (f16, Step 7b), on the .bin (group kv): logits vs HF (-b 64 on
 # KV_LOGITS + pooled, the same thresholds; long2 past one attention block), batched vs sequential (en
 # -b 7, long2 -b 64), threads (long2 -b 64, 8 vs 3) and AVX-512 vs generic (en -b 1, long2 -b 64), bitwise
-KV_TYPES = ["f32", "bf16"]
+KV_TYPES = ["f32", "bf16", "bf16-dot", "f16-dot"]  # (-dot: the bf16 dot-product attention, TODO G4 (b))
+BF16DP_LANES = str(1 << 22)  # bf16dp_test's random lanes per distribution (default 2^24: ~4x as long)
 KV_LOGITS = [THREADS_PROMPT, "code"]
 KV_BATCHED = [(THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG3, BATCH)]
 KV_KERNELS = [(THREADS_PROMPT, SEQ), (BATCH_LONG3, BATCH)]
@@ -394,12 +396,13 @@ def prefetch_all(a, tmp, only, fg, bg):
             sub(fg, q4, qt, n, c, THREADS_LONG if nd != THREADS_LONG else 8)
 
 
-API_THREADS = {"bin": 3, "gguf": 4, "q4": 4, "pair": 4}  # the API test's runs (in the background from the start)
+API_THREADS = {"bin": 3, "gguf": 4, "q4": 4, "pair": 4, "dot": 4}  # the API test's runs (in the background from the start)
 # the batched passes again (api_test --digest: their logits hashes only) at other thread counts (Q4_K_M, else
 # the .bin; 8 and 16 threads: the short passes) and on the generic build (--digest-small, 3 threads: the short
 # passes of the .bin and Q4_K_M; the long ones' generic attention: chat/long_context_generic): the same DIGEST
 # lines. 65 sequences in one pass (--n65): Q4_K_M
-# only; a bf16 KV cache (--kv): the .bin
+# only; a bf16 KV cache and the bf16 dot-product attention (--kv): the .bin; every API path in the bf16 dot-product
+# attention (tag dot: --kv-type bf16-dot on the GGUF Q8_0 file) and its digests at 16 threads and on the generic build
 API_DIGEST_THREADS = (1, 8, 16)
 API_GENERIC_THREADS = 3
 
@@ -416,6 +419,8 @@ def api_runs(a, ex, gx):
     if a.gguf and a.q4:  # two models in one process (Q8_0 + Q4_K_M; the .bin: another group size, refused)
         main["pair"] = ex.submit(run, [a.api_test, "--two", a.gguf, a.q4, "--gs", a.model], API_THREADS["pair"])
     gen = a.api_test + "-generic"
+    if a.gguf:
+        main["dot"] = ex.submit(run, [a.api_test, a.gguf, "--kv-type", "bf16-dot"], API_THREADS["dot"])
     # the sampler's top-k draws == tests/sampler_ref.py's numpy replay, both builds (one thread each)
     main["sampler"] = ex.submit(run, [sys.executable, "-I", os.path.join(ROOT, "tests", "sampler_ref.py"), "--runq", a.runq,
                                       "--api-test", a.api_test] + (["--api-test", gen] if os.path.exists(gen) else []) +
@@ -425,6 +430,10 @@ def api_runs(a, ex, gx):
         for tag, m in models:
             if m and tag != "gguf":
                 dg[(tag, "generic")] = gx.submit(run, [gen, m, "--digest-small"], API_GENERIC_THREADS)
+    if a.gguf:
+        dg[("dot", "t16")] = ex.submit(run, [a.api_test, a.gguf, "--digest-small", "--kv-type", "bf16-dot"], 16)
+        if os.path.exists(gen):
+            dg[("dot", "generic")] = gx.submit(run, [gen, a.gguf, "--digest-small", "--kv-type", "bf16-dot"], API_GENERIC_THREADS)
     tag, m = ("q4", a.q4) if a.q4 else ("bin", a.model)
     for t in API_DIGEST_THREADS:
         mode = ["--digest"] + n65.get(tag, []) if t == 1 else ["--digest-small"]
@@ -1236,6 +1245,9 @@ def test_kv(a, res, tmp):
     texts = dict(batched_prompts())
     n_a = int(os.environ["OMP_NUM_THREADS"])
     n_b = THREADS_LONG if n_a != THREADS_LONG else 8
+    # vdpbf16ps vs the definition of the bf16 dot-product attention (and the kernel's emulation without AVX512_BF16)
+    dp = [os.path.join(ROOT, "build", x) for x in ("bf16dp_test", "bf16dp_test-emu")]
+    procs = [(x, subprocess.Popen([x, BF16DP_LANES], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)) for x in dp if os.path.exists(x)]
     for kv in KV_TYPES:
         v, d = argparse.Namespace(**{**vars(a), "extra": ["-k", kv]}), os.path.join(tmp, f"kv_{kv}")
         os.makedirs(d, exist_ok=True)
@@ -1255,6 +1267,17 @@ def test_kv(a, res, tmp):
                 same, detail = same_files(logits_file(v, d, name, texts[name], chunk),
                                           logits_file(gen, gd, name, texts[name], chunk, GEN_THREADS))
                 res.report(same, f"kv_{kv}_kernels/{name}_b{chunk}", f"-k {kv}, SIMD (AVX-512 / NEON) vs generic, -b {chunk}: {detail}")
+    if not procs:
+        print("      (bf16dp tests skipped: no build/bf16dp_test; make bf16dp-test, x86-64)")
+    for x, pr in procs:
+        out = pr.communicate()[0].decode(errors="replace")
+        lines = [l for l in out.splitlines() if l.startswith(("PASS ", "FAIL ", "SKIP "))]
+        sfx = "_emu" if x.endswith("-emu") else ""
+        for l in lines:
+            name, _, detail = l[5:].partition("  ")
+            res.report(not l.startswith("FAIL "), f"kv_{name.strip()}{sfx}", detail.strip())
+        if pr.returncode != 0 or not lines:
+            res.report(False, f"kv_bf16dp{sfx}/run", f"exit status {pr.returncode}: {out[-300:]}")
 
 
 # ----------------------------------------------------------------------------- main
@@ -1273,6 +1296,9 @@ def main():
                          "long-context checks; both opt-in)")
     ap.add_argument("--update-models", action="store_true", help="write the models group's greedy goldens")
     ap.add_argument("--model-tags", default="", help="models group: only these FAMILY tags (comma-separated; default all)")
+    ap.add_argument("--models-kv", default="", help="models group: this KV cache type (-k, e.g. bf16-dot: the bf16 dot-product "
+                    "attention's logits and bitwise checks; no greedy / api / server checks)")
+    ap.add_argument("--long-kv", default="", help="long group: this KV cache type (-k of build/long_ctx, e.g. bf16-dot)")
     ap.add_argument("--update-greedy", action="store_true", help="regenerate the greedy goldens")
     ap.add_argument("--jobs", type=int, default=8, help="parallel runq processes for the tokenizer test")
     ap.add_argument("-v", "--verbose", action="store_true", help="per-position logits metrics")
@@ -1327,7 +1353,7 @@ def main():
                          ("models", lambda: check_models.test_models(a, res, tmp, texts, a.update_models,
                                                                      set(a.model_tags.split(",")) if a.model_tags else None)),
                          ("long", lambda: check_long.test_long(a, res, tmp, set(a.model_tags.split(",")) if a.model_tags
-                                                               else None))]:
+                                                               else None, a.long_kv))]:
             if name in only:
                 t = time.time()
                 print(f"== {name}")

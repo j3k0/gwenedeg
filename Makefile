@@ -29,7 +29,7 @@ HDR = $(wildcard src/*.h)
 Q8  = models/Qwen3-0.6B-q8.bin
 B   = build
 
-.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test api-test tools-test bench-batch bench-verify long-ctx bench-long teacher-force mem-probe FORCE
+.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test api-test tools-test bench-batch bench-verify long-ctx bench-long teacher-force mem-probe bf16dp-test FORCE
 
 all: runq
 
@@ -119,6 +119,19 @@ $(B)/mem_probe: tests/mem_probe.c src/runq.h $(LIB:%=$(B)/native/%.o)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
 
 mem-probe: $(B)/mem_probe
+
+# vdpbf16ps vs the definition of the bf16 dot-product attention (tests/bf16dp_test.c: edge cases, random lanes, the
+# conversions; -emu: the AVX-512 kernel's emulation for CPUs without AVX512_BF16); make test runs both (group kv).
+# Not -Ofast: its finite-math-only folds isnan() and its no-signed-zeros the reference's zeros (the test sets MXCSR)
+$(B)/bf16dp_test: tests/bf16dp_test.c src/kernels_avx512.h
+	@mkdir -p $(@D)
+	$(CC) -O2 -march=native $(CPPFLAGS) $< $(LDLIBS) -o $@
+$(B)/bf16dp_test-emu: tests/bf16dp_test.c src/kernels_avx512.h
+	@mkdir -p $(@D)
+	$(CC) -O2 -march=native $(CPPFLAGS) -mno-avx512bf16 $< $(LDLIBS) -o $@
+
+bf16dp-test: $(B)/bf16dp_test $(B)/bf16dp_test-emu
+	$(B)/bf16dp_test && $(B)/bf16dp_test-emu
 
 # NEON kernels (kernels_neon.h: K-quants, Q8_0) vs the generic ones, on random data: bit-identical
 kq-neon-test: tests/kernels/kq_neon_test.c src/kernels_neon.h src/kquants.h

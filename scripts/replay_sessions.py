@@ -16,10 +16,13 @@ if generated; the next request carries the server's parse of it, through pi), so
 in the template's format would have generated; --mode live: the model generates (up to --live-tokens) and its own
 reply goes on in the history.
 
-Per request (the JSON lines, the table): kind (turn after tool results / after a user message / the first after a
-compaction; summary: pi's compaction request), prompt tokens, cached (usage.prompt_tokens_details.cached_tokens),
+Per request (the JSON lines, the table): kind (turn after tool results / after a user message / after pi changed
+its system prompt (a system message in the session: its sections or tools) / the first after a compaction; summary:
+pi's compaction request), prompt tokens, cached (usage.prompt_tokens_details.cached_tokens),
 prefilled (timings.prompt_n), new: the tokens a perfect cache would prefill (a turn: its prompt minus the previous
-turn's prompt and reply; otherwise the whole prompt), extra = prefilled - new (what the cache missed), whether the
+turn's prompt and reply; otherwise the whole prompt), extra = prefilled - new (what the cache missed; exact: extra <= 1;
+beyond: tool turns whose extra is more than the previous reply and its header, i.e. not the reply sent back
+differently from what was generated: the goal is none), whether the
 prompt left the slot's tokens before their end (diverged: the history was sent differently from what was generated)
 and whether the hybrid state rolled back further (rollback: the kept length is a checkpoint below the common prefix),
 prefill and decode times. Sessions are replayed one after the other on one server (a fresh one per run).
@@ -110,9 +113,12 @@ def table(recs, out=sys.stdout, per_request=False):
             u, t = r["usage"], r.get("timings", {})
             n, cached, comp = u["prompt_tokens"], u["prompt_tokens_details"]["cached_tokens"], u["completion_tokens"]
             pre = t.get("prompt_n", n - cached)
+            reply = None
             if r["kind"] == "turn":
-                kind = "post-compaction" if r.get("after_compaction") else "user" if r.get("after") == "user" else "tool"
+                kind = "post-compaction" if r.get("after_compaction") else "user" if r.get("after") == "user" else \
+                    "system-change" if r.get("after") == "system" else "tool"
                 new = n - (prev["usage"]["prompt_tokens"] + prev["usage"]["completion_tokens"]) if prev and kind == "tool" else None
+                reply = prev["usage"]["completion_tokens"] + 5 if prev else None  # (+ its header: <|im_start|>assistant\n<think>\n)
                 prev = r
             else:
                 kind, new = r["kind"], None
@@ -120,13 +126,15 @@ def table(recs, out=sys.stdout, per_request=False):
                 new = None
             div = t.get("common_tokens", 0) < t.get("slot_tokens", 0) and t.get("common_tokens", 0) < n - 1
             rb = t.get("common_tokens", cached) - cached
-            rows.append((kind, dict(r, n=n, cached=cached, comp=comp, pre=pre, new=new, div=div, rb=rb,
+            beyond = max(0, pre - new - reply) if new is not None and reply is not None else 0
+            rows.append((kind, dict(r, n=n, cached=cached, comp=comp, pre=pre, new=new, div=div, rb=rb, beyond=beyond,
                                     pms=t.get("prompt_ms", 0), dms=t.get("predicted_ms", 0))))
         agg = {}
         for kind, x in rows:
             if kind == "compaction":
                 continue
-            g = agg.setdefault(kind, {"n": 0, "prompt": 0, "pre": 0, "new": 0, "extra": 0, "div": 0, "rb": 0, "pms": 0.0, "exact": 0})
+            g = agg.setdefault(kind, {"n": 0, "prompt": 0, "pre": 0, "new": 0, "extra": 0, "div": 0, "rb": 0, "pms": 0.0, "exact": 0,
+                                      "beyond": 0})
             g["n"] += 1
             g["prompt"] += x["n"]
             g["pre"] += x["pre"]
@@ -137,15 +145,18 @@ def table(recs, out=sys.stdout, per_request=False):
                 g["new"] += x["new"]
                 g["extra"] += x["pre"] - x["new"]
                 g["exact"] += x["pre"] - x["new"] <= 1
+                g["beyond"] += x["beyond"] > 0
         name = rs[0].get("session_name", sid)
         print(f"\nsession {name}: {sum(1 for k, _ in rows if k == 'compaction')} compaction(s)", file=out)
-        print(f"  {'kind':<16}{'reqs':>6}{'prompt tok':>12}{'prefilled':>11}{'new':>10}{'extra':>9}{'exact':>7}{'diverged':>9}"
+        print(f"  {'kind':<16}{'reqs':>6}{'prompt tok':>12}{'prefilled':>11}{'new':>10}{'extra':>9}{'exact':>7}{'beyond':>7}{'diverged':>9}"
               f"{'rollback':>9}{'prefill s':>10}", file=out)
         for kind, g in sorted(agg.items()):
-            newc = f"{g['new']:>10}" if kind == "tool" else f"{'-':>10}"
-            extra = f"{g['extra']:>9}" if kind == "tool" else f"{'-':>9}"
-            exact = f"{g['exact']:>7}" if kind == "tool" else f"{'-':>7}"
-            print(f"  {kind:<16}{g['n']:>6}{g['prompt']:>12}{g['pre']:>11}{newc}{extra}{exact}{g['div']:>9}{g['rb']:>9}"
+            tool = kind == "tool"
+            newc = f"{g['new']:>10}" if tool else f"{'-':>10}"
+            extra = f"{g['extra']:>9}" if tool else f"{'-':>9}"
+            exact = f"{g['exact']:>7}" if tool else f"{'-':>7}"
+            beyond = f"{g['beyond']:>7}" if tool else f"{'-':>7}"
+            print(f"  {kind:<16}{g['n']:>6}{g['prompt']:>12}{g['pre']:>11}{newc}{extra}{exact}{beyond}{g['div']:>9}{g['rb']:>9}"
                   f"{g['pms'] / 1e3:>10.1f}", file=out)
             t = tot.setdefault(kind, dict.fromkeys(g, 0))
             for k in g:
@@ -159,13 +170,13 @@ def table(recs, out=sys.stdout, per_request=False):
                     continue
                 t = x.get("timings", {})
                 flags = ("diverged " if x["div"] else "") + (f"rollback {x['rb']} " if x["rb"] > 0 else "") + \
-                        ("copied" if t.get("copied") else "")
+                        ("copied " if t.get("copied") else "") + (f"beyond the last reply {x['beyond']}" if x["beyond"] else "")
                 print(f"  {x['seq']:>4} {kind:<16}{x['n']:>8}{x['cached']:>8}{x['pre']:>7}{x['new'] if x['new'] is not None else '-':>7}"
                       f"{x['comp']:>7}{t.get('slot', -1):>5}{t.get('slot_tokens', 0):>9}{t.get('common_tokens', 0):>8}  {flags}", file=out)
     if len(sessions) > 1:
         print("\nall sessions:", file=out)
         for kind, g in sorted(tot.items()):
-            extra = f"new {g['new']}, extra {g['extra']}, exact {g['exact']}/{g['n']}, " if kind == "tool" else ""
+            extra = f"new {g['new']}, extra {g['extra']}, exact {g['exact']}/{g['n']}, beyond the last reply {g['beyond']}, " if kind == "tool" else ""
             print(f"  {kind:<16}{g['n']:>5} requests, prompt {g['prompt']}, prefilled {g['pre']} ({extra}diverged {g['div']}, "
                   f"rollback {g['rb']}), prefill {g['pms'] / 1e3:.1f} s", file=out)
 

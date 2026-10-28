@@ -422,6 +422,19 @@ def run_checkpoints(a, t, port, env):
         c8 >= u6["prompt_tokens"] + u6["completion_tokens"] - 1, "tools/ckpt_affinity",
         f"the other conversation: copied {d7['timings']['copied']}, cached {d7['timings']['cache_n']}; the long one next: cached "
         f"{c8} of {d8['usage']['prompt_tokens']} (its previous prompt + reply {u6['prompt_tokens'] + u6['completion_tokens']})")
+    # a long prefill streamed: SSE comment lines (": keep-alive") while no chunk comes (clients' idle timeouts: pi's 300 s);
+    # the events around them unchanged
+    body = dict(base, messages=[sysm, {"role": "user", "content": LONG_SYS * 4 + "Summarize."}], max_tokens=6)
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+    c.request("POST", "/v1/chat/completions", body=json.dumps(dict(body, stream=True, cache_prompt=False)).encode())
+    raw = c.getresponse().read().decode()
+    c.close()
+    ev = [json.loads(l[6:]) for l in raw.split("\n") if l.startswith("data: ") and l != "data: [DONE]"]
+    ka = raw.count("\n: keep-alive\n\n")
+    st, once, _ = chat(port, dict(body, cache_prompt=False))
+    text = "".join(x["choices"][0]["delta"].get("reasoning_content") or "" for x in ev if x.get("choices"))
+    rep(ka >= 1 and st == 200 and text == once["choices"][0]["message"]["reasoning_content"] and raw.endswith("data: [DONE]\n\n"),
+        "tools/stream_keepalive", f"{ka} keep-alive comment(s) (RUNQ_SSE_KEEPALIVE=0.05), the reasoning == the non-streamed one's")
     # Qwen3.5: a new user query drops the turn's reasoning (its template): the request goes back to the turn's first reply
     # (the checkpoint at its header), not further
     t1 = [sysm, {"role": "user", "content": "Check notes.txt."}]
@@ -451,6 +464,8 @@ def main():
     slow = 10 if a.slow else 1
     log = tempfile.NamedTemporaryFile(prefix="runq-serve-", suffix=".log", delete=False)
     env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
+    if a.tools:  # (SSE keep-alive comments after 0.05 s without a chunk instead of 15 s: tools/stream_keepalive)
+        env["RUNQ_SSE_KEEPALIVE"] = "0.05"
     srv = subprocess.Popen([a.runq, "serve", a.model, "--port", "0", "-c", "2048", "--parallel", "4", "--slots", "6", "--chunk", "16", "--queue", "4",
                             "--max-body", "65536", "--name", "test-model"] + (["--checkpoints", "5"] if a.tools else []),
                            stderr=log, stdout=subprocess.DEVNULL, env=env)

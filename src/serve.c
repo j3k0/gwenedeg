@@ -639,6 +639,8 @@ static void wait_job(HttpConn *c, Job *j, double *next_check) {
     if (gone) __atomic_store_n(&j->cancel, 1, __ATOMIC_RELEASE);
 }
 
+static double sse_keepalive = 15; // seconds without a chunk before an SSE comment line (": keep-alive"; env RUNQ_SSE_KEEPALIVE)
+
 static void run_stream(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const char *id) {
     JBuf b = { 0 };
     size_t sent_c = 0, sent_r = 0;
@@ -650,9 +652,17 @@ static void run_stream(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const 
     if (ch->include_usage) jb_cstr(&b, ", \"usage\": null");
     jb_cstr(&b, "}\n\n");
     if (http_stream_write(c, b.p, b.n)) __atomic_store_n(&j->cancel, 1, __ATOMIC_RELEASE);
+    double last = rq_now();
     job_lock(j);
     for (;;) {
         int done = j->state == JOB_DONE;
+        if (!done && rq_now() - last > sse_keepalive) { // (a long queue wait or prefill: an SSE comment, so that clients'
+            job_unlock(j);                               // idle timeouts, e.g. pi's 300 s, do not end the stream)
+            if (http_stream_write(c, ": keep-alive\n\n", 14)) __atomic_store_n(&j->cancel, 1, __ATOMIC_RELEASE);
+            last = rq_now();
+            job_lock(j);
+            continue;
+        }
         if (j->content.n > sent_c || j->reasoning.n > sent_r) {
             jb_reset(&b);
             chunk_head(a, &b, id, ch);
@@ -673,6 +683,7 @@ static void run_stream(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const 
             jb_cstr(&b, "}\n\n");
             job_unlock(j);
             if (http_stream_write(c, b.p, b.n)) __atomic_store_n(&j->cancel, 1, __ATOMIC_RELEASE);
+            last = rq_now();
             job_lock(j);
             continue;
         }
@@ -687,6 +698,7 @@ static void run_stream(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const 
             jb_cstr(&b, "}\n\n");
             job_unlock(j);
             if (http_stream_write(c, b.p, b.n)) __atomic_store_n(&j->cancel, 1, __ATOMIC_RELEASE);
+            last = rq_now();
             job_lock(j);
             continue;
         }
@@ -966,6 +978,8 @@ static void usage(void) {
 int serve_main(int argc, char **argv) {
     // argv[0] = "serve"
     if (argc < 2 || argv[1][0] == '-') usage();
+    const char *ka = getenv("RUNQ_SSE_KEEPALIVE"); // (seconds; tests use a short one)
+    if (ka && atof(ka) > 0) sse_keepalive = atof(ka);
     const char *path = argv[1], *name = NULL, *host = "127.0.0.1", *key = NULL;
     int port = 8080, ctx = 8192, kv = RQ_KV_DEFAULT, batch = RQ_BATCH_MAX, slots = 0, queue = 64, conns = 128, threads = 0, verbose = 0, maxtok = 0;
     int parallel = 16, chunk = 64, copy_min = 32, ckpts = 4;

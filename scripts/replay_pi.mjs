@@ -47,6 +47,14 @@ const settings = {
 };
 
 const mod = (p) => import(pathToFileURL(`${args.pi}/node_modules/@earendil-works/${p}`).href);
+// pi's HTTP idle timeout (settings httpIdleTimeoutMs, default 300 s: a prefill longer than that without a byte ends
+// the request); --http-timeout MS, default 0: none (runq serve sends SSE keep-alive comments, older builds do not)
+{
+    const undici = await import(pathToFileURL(`${args.pi}/node_modules/undici/index.js`).href);
+    const ms = parseInt(args["http-timeout"] || "0", 10);
+    undici.setGlobalDispatcher(new undici.Agent({ headersTimeout: ms, bodyTimeout: ms }));
+    undici.install?.(); // (fetch on the same undici, as pi does)
+}
 const sm = await mod("pi-coding-agent/dist/core/session-manager.js");
 const { convertToLlm } = await mod("pi-coding-agent/dist/core/messages.js");
 const cmp = await mod("pi-coding-agent/dist/core/compaction/compaction.js");

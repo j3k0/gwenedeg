@@ -37,6 +37,10 @@ synth-q35-27b-mtp.gguf: the same + the MTP block as the 27B lays it out: block_c
 synth-q35-27b-f32.gguf: synth-q35-27b-mtp.gguf with the rest of the 27B file's layout: ssm_alpha / ssm_beta F32 (the
   Q8_0 rows dequantized: the same values, applied in fp32 by runq), Qwen3.8's chat template (tests/golden/templates/
   qwen3.8.jinja, the 27B's) and its tokenizer.ggml.bos_token_id 248044 (<|endoftext|>, what runq takes without it).
+synth-q35-iq.gguf (~200 MB): synth-q35-27b.gguf with its matrices requantized (tests/iqquant.py) to Q2_K and the
+  i-quants (src/iquants.h), the types mixed within each role over the layers and within the fused phases (q / k / v,
+  gate / up, qkv / z), as in Underdog Saluki 27B's file: every one of the nine types in several roles, an IQ1_M
+  token_embd and an IQ3_S output (Saluki's), ssm_alpha / ssm_beta Q8_0 (Saluki's). Built from synth-q35-27b.gguf.
 synth-tok-qwen3.8.gguf, synth-tok-qwen3.8-hf.gguf (~8 MB): tokenizer-only files (the 0.8B's tokenizer and metadata, a
   token_embd entry of an unknown type without data) with Qwen3.8's template: the 27B GGUF's (Unsloth's) resp. Qwen's
   own (qwen3.8-hf.jinja): `runq -m render` vs tests/golden/chat_render.json (needs the Q8_0 source only).
@@ -56,6 +60,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ggufmini as G  # noqa: E402
+import iqquant  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "models", "Qwen3.5-0.8B-GGUF", "Qwen3.5-0.8B-Q8_0.gguf")
@@ -145,6 +150,10 @@ SRC_Q4 = os.path.join(ROOT, "models", "Qwen3.5-0.8B-GGUF", "Qwen3.5-0.8B-Q4_K_M.
 M27 = "synth-q35-27b.gguf"
 M27_MTP = "synth-q35-27b-mtp.gguf"
 M27_F32 = "synth-q35-27b-f32.gguf"
+M27_IQ = "synth-q35-iq.gguf"
+# synth-q35-iq.gguf: the type of role r (index in IQ_ROLES) of layer l: IQ_ROT[(3 r + l) % 9]
+IQ_ROT = [G.IQ2_XXS, G.IQ1_S, G.IQ3_S, G.IQ2_XS, G.IQ1_M, G.Q2_K, G.IQ3_XXS, G.IQ2_S, G.IQ4_XS]
+IQ_ROLES = ["attn_q", "attn_k", "attn_v", "attn_output", "attn_qkv", "attn_gate", "ssm_out", "ffn_gate", "ffn_up", "ffn_down"]
 TEMPLATES = os.path.join(ROOT, "tests", "golden", "templates")
 TOK38 = {"synth-tok-qwen3.8.gguf": "qwen3.8", "synth-tok-qwen3.8-hf.gguf": "qwen3.8-hf"}  # file: template
 BOS38 = 248044  # the 27B's tokenizer.ggml.bos_token_id (<|endoftext|>)
@@ -282,6 +291,30 @@ def build_27b(f8, f4, path, mtp, f32=False):
     G.write_gguf(path, kvs, t)
 
 
+def build_iq(src, path):
+    """synth-q35-iq.gguf: the matrices of synth-q35-27b.gguf (src) dequantized and requantized to the types of IQ_ROT"""
+    f = G.GgufFile(src)
+    kvs = [(k, G.raw_kv(G.GV_STR, "gwenedeg-synth-q35-iq (synth-q35-27b requantized: Q2_K and the i-quants)")
+            if k == "general.name" else raw) for k, raw in f.kv_raw]
+    t = []
+    for name in f.order:
+        ne, ty, _ = f.tensors[name]
+        data = f.tensor_bytes(name)
+        parts = name.split(".")
+        new = None
+        if name == "token_embd.weight":
+            new = G.IQ1_M
+        elif name == "output.weight":
+            new = G.IQ3_S
+        elif len(parts) == 4 and parts[0] == "blk" and parts[2] in IQ_ROLES:
+            new = IQ_ROT[(3 * IQ_ROLES.index(parts[2]) + int(parts[1])) % len(IQ_ROT)]
+        if new is not None:
+            x = G.dequant(ty, data, int(ne[1]), int(ne[0]))
+            data, ty = iqquant.quantize(new, x), new
+        t.append((name, ne, ty, np.ascontiguousarray(data).tobytes()))
+    G.write_gguf(path, kvs, t)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--src", default=SRC)
@@ -296,7 +329,9 @@ def main():
     if not q4:
         print(f"note: missing {a.src_q4}: no {M27} / {M27_MTP}", file=sys.stderr)
     h = hashlib.sha256()
-    for p in [os.path.abspath(__file__), os.path.join(os.path.dirname(os.path.abspath(__file__)), "ggufmini.py")] + \
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in [os.path.abspath(__file__), os.path.join(here, "ggufmini.py"), os.path.join(here, "iqquant.py"),
+              os.path.join(ROOT, "src", "iq_grids.h")] + \
              [os.path.join(TEMPLATES, t + ".jinja") for t in TOK38.values()]:
         with open(p, "rb") as fh:
             h.update(fh.read())
@@ -305,7 +340,7 @@ def main():
     if q4:
         st = os.stat(q4)
         stamp.update(src_q4=os.path.abspath(q4), size_q4=st.st_size, mtime_q4=int(st.st_mtime))
-    names = list(MODELS) + BAD + list(TOK38) + ([M27, M27_MTP, M27_F32] if q4 else [])
+    names = list(MODELS) + BAD + list(TOK38) + ([M27, M27_MTP, M27_F32, M27_IQ] if q4 else [])
     sp = os.path.join(a.out, "stamp.json")
     if not a.force and os.path.exists(sp) and all(os.path.exists(os.path.join(a.out, n)) for n in names):
         with open(sp) as fh:
@@ -324,7 +359,7 @@ def main():
     build_bad(f, os.path.join(a.out, BAD[2]), {"qwen35.nextn_predict_layers": (G.GV_U32, int(f.kv["qwen35.block_count"]))})
     for n, t in TOK38.items():
         build_tok(f, os.path.join(a.out, n), template(t), BOS38 if t == "qwen3.8" else None)
-    for n in (M27, M27_MTP, M27_F32):
+    for n in (M27, M27_MTP, M27_F32, M27_IQ):
         if os.path.exists(os.path.join(a.out, n)):
             os.remove(os.path.join(a.out, n))
     if q4:
@@ -332,6 +367,7 @@ def main():
         build_27b(f, f4, os.path.join(a.out, M27), False)
         build_27b(f, f4, os.path.join(a.out, M27_MTP), True)
         build_27b(f, f4, os.path.join(a.out, M27_F32), True, True)
+        build_iq(os.path.join(a.out, M27), os.path.join(a.out, M27_IQ))
     with open(sp, "w") as fh:
         json.dump(stamp, fh)
     print(a.out)

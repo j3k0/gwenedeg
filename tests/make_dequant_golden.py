@@ -11,6 +11,12 @@ and from the repacked Q3P / Q4P / Q5P / Q6P layouts the matmul kernels read) wit
 Needs the `gguf` package (pip install gguf; written with gguf 0.19.0) and numpy, e.g. in a scratch
 venv:  python3 -m venv /tmp/g && /tmp/g/bin/pip install gguf && /tmp/g/bin/python tests/make_dequant_golden.py
 The runq tests themselves only need numpy.
+
+--iq: tests/golden/dequant/iq_blocks.npz, for Q2_K and the i-quants (src/iquants.h): per type the raw blocks and gguf-py's
+float32 of (a) the first 1024 values of row 17 of the first tensor of that type in Underdog Saluki 27B's file
+(--model, default models/Underdog-Saluki-27B-1.0-GGUF/...: all nine types) and (b) 4 x 256 random block bytes (seed 7;
+finite fp16 scales): every bit pattern of the formats. tests/check_models.py checks tests/ggufmini.py's numpy
+dequantization against these, bitwise (runq is checked against ggufmini on the files: iq_synth_run, the models group).
 """
 import argparse
 import os
@@ -26,6 +32,48 @@ MODEL5 = os.path.join(ROOT, "models", "Qwen3.5-0.8B-GGUF", "Qwen3.5-0.8B-Q4_K_M.
 OUT5 = os.path.join(ROOT, "tests", "golden", "dequant", "q5_k.npz")
 MODEL3 = os.path.join(ROOT, "models", "Qwen3.5-0.8B-GGUF", "Qwen3.5-0.8B-Q3_K_M.gguf")
 OUT3 = os.path.join(ROOT, "tests", "golden", "dequant", "q3_k.npz")
+MODEL_IQ = os.path.join(ROOT, "models", "Underdog-Saluki-27B-1.0-GGUF", "Underdog-Saluki-27B-1.0-IQ2-mix.gguf")
+OUT_IQ = os.path.join(ROOT, "tests", "golden", "dequant", "iq_blocks.npz")
+IQ = {10: 84, 16: 66, 17: 74, 18: 98, 19: 50, 21: 110, 22: 82, 23: 136, 29: 56}  # ggml type: block bytes
+
+
+def make_iq(model, out_path):
+    from gguf import GGMLQuantizationType as QT
+    r = GGUFReader(model)
+    out, names, types = {}, [], []
+    rng = np.random.default_rng(7)
+    first = {}
+    for t in r.tensors:
+        ty = int(t.tensor_type)
+        if ty in IQ and ty not in first and len(t.shape) == 2:
+            first[ty] = t
+    for ty in sorted(IQ):
+        bb = IQ[ty]
+        t = first[ty]
+        real = np.ascontiguousarray(np.asarray(t.data[17:18])[:, :4 * bb])          # 4 super-blocks of row 17
+        rnd = rng.integers(0, 256, size=(16, bb), dtype=np.uint8)
+        h = (0x1000 + rng.integers(0, 0x3000, size=16)).astype(np.uint16)          # fp16 scales 2^-11 .. 2^1
+        hb = h.view(np.uint8).reshape(16, 2)
+        if ty == 10:
+            rnd[:, 80:82], rnd[:, 82:84] = hb, hb[::-1]
+        elif ty == 29:  # IQ1_M: the scale's 4 nibbles in the top nibbles of the 4 scale words
+            sc = rnd[:, 48:56].copy().view(np.uint16)
+            for j in range(4):
+                sc[:, j] = (sc[:, j] & 0x0FFF) | (((h >> (4 * j)) & 15) << 12)
+            rnd[:, 48:56] = sc.view(np.uint8)
+        else:
+            rnd[:, 0:2] = hb
+        for kind, raw in (("real", real), ("random", rnd.reshape(4, 4 * bb))):
+            i = len(names)
+            rows = dequantize(raw, QT(ty)).astype(np.float32)
+            out[f"raw{i}"], out[f"rows{i}"] = raw, rows
+            names.append(f"{QT(ty).name}_{kind}")
+            types.append(ty)
+            print(f"{names[-1]}: {rows.shape}" + (f" ({t.name} row 17)" if kind == "real" else ""))
+    out["names"], out["type"] = np.array(names), np.array(types, dtype=np.int32)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    np.savez_compressed(out_path, **out)
+    print(f"wrote {os.path.relpath(out_path, ROOT)} ({os.path.getsize(out_path)} bytes)")
 
 # (tensor, first row, rows): each crosses a 16-row block boundary of the repacked layouts
 CASES = [
@@ -64,7 +112,11 @@ def main():
     ap.add_argument("-o", "--out")
     ap.add_argument("--q5", action="store_true", help="the Qwen3.5 Q5_K cases (q5_k.npz) instead of the 0.6B ones")
     ap.add_argument("--q3", action="store_true", help="the Qwen3.5 Q3_K cases (q3_k.npz) instead of the 0.6B ones")
+    ap.add_argument("--iq", action="store_true", help="Q2_K and the i-quants (iq_blocks.npz, from Underdog Saluki 27B's file)")
     a = ap.parse_args()
+    if a.iq:
+        make_iq(a.model or MODEL_IQ, a.out or OUT_IQ)
+        return
     cases = CASES3 if a.q3 else CASES5 if a.q5 else CASES
     a.model = a.model or (MODEL3 if a.q3 else MODEL5 if a.q5 else MODEL)
     a.out = a.out or (OUT3 if a.q3 else OUT5 if a.q5 else OUT)

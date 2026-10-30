@@ -21,8 +21,12 @@ weights are included.
 - Used for: the GGUF file format (`src/gguf.c`, `tests/ggufmini.py`), the ggml tensor type numbers and
   llama.cpp's tensor and metadata names, and the Q8_0 / Q3_K / Q4_K / Q5_K / Q6_K block formats with their
   dequantization expressions (`src/kquants.h`: `get_scale_min_k4`'s unpacking of the 6-bit scales and Q3_K's,
-  `dequantize_row_q3_K` / `_q4_K` / `_q5_K` / `_q6_K`). These are reimplemented to be bit-compatible; no ggml source
-  file is included.
+  `dequantize_row_q3_K` / `_q4_K` / `_q5_K` / `_q6_K`), likewise the Q2_K and i-quant block formats (IQ1_S, IQ1_M,
+  IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS: `src/iquants.h`, `tests/ggufmini.py`, `tests/iqquant.py`). These are
+  reimplemented to be bit-compatible; no ggml source file is included. The i-quant codebooks (`iq2xxs_grid`,
+  `iq2xs_grid`, `iq2s_grid`, `iq3xxs_grid`, `iq3s_grid`, `iq1s_grid`, `kvalues_iq4nl`: data of the formats) are copied
+  value for value from ggml's `ggml-common.h` into `src/iq_grids.h` by `tools/gen_iq_grids.py`, with tables derived
+  from them.
 - License: MIT.
 
 ```
@@ -68,6 +72,16 @@ SOFTWARE.
   tokenizers, and chat renderings).
 - License: Apache License 2.0 (Qwen3.8-27B: the model card's `license: apache-2.0`, also the GGUF's `general.license`),
   full text in [licenses/Apache-2.0.txt](licenses/Apache-2.0.txt).
+
+## Underdog Saluki 27B 1.0 (model)
+
+- Source: `ConwayResearch/Underdog-Saluki-27B-1.0` @ 5acfd92 on Hugging Face (built on Qwen3.8-27B and ISTA-DASLab's
+  `Qwen3.8-27B-GSQ-RCO-GGUF`), downloaded by `scripts/download_models.py saluki-27b`; not included.
+- Used for: the opt-in test references `tests/golden/models/saluki-27b/` (logits of `tests/ref_qwen35.py` on the file)
+  and `tests/golden/models/greedy/saluki-27b.txt`, and the rows of its blocks in `tests/golden/dequant/iq_blocks.npz`
+  (with gguf-py's dequantization of them).
+- License: Apache License 2.0 (the model card; the repository's LICENSE and NOTICE), full text in
+  [licenses/Apache-2.0.txt](licenses/Apache-2.0.txt).
 
 ## Hugging Face transformers / tokenizers
 

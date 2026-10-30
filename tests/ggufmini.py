@@ -4,11 +4,14 @@ GgufFile(path): the metadata (raw byte spans and decoded scalars / strings / arr
 a GGUF v2 / v3 file (layout: src/gguf.c), the tensor data as numpy views of a memory map.
 write_gguf(path, kvs, tensors): a GGUF v3 file from (key, raw value bytes) pairs (raw_kv / copied spans)
 and (name, ne, ggml type, data bytes) tuples.
-dequant(type, data, nrows, ncols): Q8_0 / Q3_K / Q4_K / Q5_K / Q6_K / F32 rows to float32 with ggml's expressions
-(dequantize_row_q8_0 / _q3_K / _q4_K / _q5_K / _q6_K: the same float32 operations as gguf-py, bit for bit;
-checked against tests/golden/dequant). Used by tests/make_synth.py (the synthetic models), tests/ref_forward.py (the
-numpy reference forward pass) and tests/check_models.py.
+dequant(type, data, nrows, ncols): Q8_0 / Q2_K .. Q6_K / the i-quants (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+IQ3_S, IQ4_XS) / F32 rows to float32 with ggml's expressions (dequantize_row_q8_0 / _q3_K / .. / _iq4_xs: the same float32
+operations as gguf-py, bit for bit; checked against tests/golden/dequant; the i-quant codebooks are read from
+src/iq_grids.h). Used by tests/make_synth.py (the synthetic models), tests/ref_forward.py (the numpy reference forward
+pass) and tests/check_models.py.
 """
+import os
+import re
 import struct
 
 import numpy as np
@@ -17,9 +20,14 @@ GV_U8, GV_I8, GV_U16, GV_I16, GV_U32, GV_I32, GV_F32, GV_BOOL, GV_STR, GV_ARR, G
 _SCALAR = {GV_U8: "<B", GV_I8: "<b", GV_U16: "<H", GV_I16: "<h", GV_U32: "<I", GV_I32: "<i", GV_F32: "<f",
            GV_BOOL: "<?", GV_U64: "<Q", GV_I64: "<q", GV_F64: "<d"}
 F32, F16, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K = 0, 1, 8, 11, 12, 13, 14
+Q2_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M = 10, 16, 17, 18, 19, 21, 22, 23, 29
+IQ_TYPES = (Q2_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M)  # (src/iquants.h)
 BLOCK = {F32: (1, 4), F16: (1, 2), Q8_0: (32, 34), Q3_K: (256, 110), Q4_K: (256, 144), Q5_K: (256, 176),
-         Q6_K: (256, 210)}  # values, bytes
-TYPE_NAME = {F32: "F32", F16: "F16", Q8_0: "Q8_0", Q3_K: "Q3_K", Q4_K: "Q4_K", Q5_K: "Q5_K", Q6_K: "Q6_K"}
+         Q6_K: (256, 210), Q2_K: (256, 84), IQ2_XXS: (256, 66), IQ2_XS: (256, 74), IQ3_XXS: (256, 98), IQ1_S: (256, 50),
+         IQ3_S: (256, 110), IQ2_S: (256, 82), IQ4_XS: (256, 136), IQ1_M: (256, 56)}  # values, bytes
+TYPE_NAME = {F32: "F32", F16: "F16", Q8_0: "Q8_0", Q3_K: "Q3_K", Q4_K: "Q4_K", Q5_K: "Q5_K", Q6_K: "Q6_K", Q2_K: "Q2_K",
+             IQ2_XXS: "IQ2_XXS", IQ2_XS: "IQ2_XS", IQ3_XXS: "IQ3_XXS", IQ1_S: "IQ1_S", IQ3_S: "IQ3_S", IQ2_S: "IQ2_S",
+             IQ4_XS: "IQ4_XS", IQ1_M: "IQ1_M"}
 
 
 def row_bytes(t, ncols):
@@ -171,9 +179,142 @@ def _q4k_scale_min(s):
     return sc, mn
 
 
+_GRIDS = None
+
+
+def grids():
+    """the codebooks of src/iq_grids.h as numpy arrays (name -> array; the uint64 / uint32 grids also as their bytes,
+    name + "_b": (entries, 8 or 4) uint8, iq1s_grid's as int8), parsed once"""
+    global _GRIDS
+    if _GRIDS is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "iq_grids.h")
+        src = open(path, encoding="utf-8").read()
+        dts = {"uint64_t": np.uint64, "uint32_t": np.uint32, "uint16_t": np.uint16, "uint8_t": np.uint8, "int8_t": np.int8}
+        g = {}
+        for m in re.finditer(r"static const (\w+) (\w+)\[(\d+)\][^=]*= \{(.*?)\};", src, re.S):
+            ctype, name, n, body = m.groups()
+            vals = [int(v, 0) for v in re.findall(r"-?0x[0-9a-fA-F]+|-?\d+", body)]
+            assert len(vals) == int(n), name
+            g[name] = np.array(vals, dtype=dts[ctype])
+        for name in ("iq2xxs_grid", "iq2xs_grid", "iq2s_grid", "iq3xxs_grid", "iq3s_grid", "iq1s_grid"):
+            a = g[name]
+            g[name + "_b"] = a.view(np.uint8).reshape(len(a), a.dtype.itemsize)
+        g["iq1s_grid_b"] = g["iq1s_grid_b"].view(np.int8)
+        g["ksigns"] = np.array([s | (bin(s).count("1") & 1) << 7 for s in range(128)], dtype=np.uint8)
+        _GRIDS = g
+    return _GRIDS
+
+
+def _bits8(b):
+    """(..., ) uint8 -> (..., 8) bits, bit j at j"""
+    return (b[..., None] >> np.arange(8, dtype=np.uint8)) & 1
+
+
+def _sgn(bits):
+    return np.where(bits != 0, np.float32(-1.0), np.float32(1.0))
+
+
+def _dequant_iq(typ, data, nrows, ncols):
+    """Q2_K and the i-quants: ggml's dequantize_row_* (every product exact in fp32: the grouping does not matter; Q2_K's
+    final subtraction is rounded once, as in ggml)"""
+    G = grids()
+    blk = data.reshape(-1, BLOCK[typ][1])
+    nb = blk.shape[0]
+    u16 = lambda a: np.ascontiguousarray(a).view(np.uint16)  # noqa: E731
+    u32 = lambda a: np.ascontiguousarray(a).view(np.uint32)  # noqa: E731
+    if typ == Q2_K:
+        sc = blk[:, 0:16].astype(np.int32)
+        qs = blk[:, 16:80].reshape(nb, 2, 1, 32)
+        d, dmin = _f16(blk[:, 80:82]).reshape(-1, 1), _f16(blk[:, 82:84]).reshape(-1, 1)
+        q = ((qs >> (2 * np.arange(4, dtype=np.uint8)).reshape(1, 1, 4, 1)) & 3).reshape(nb, 16, 16).astype(np.float32)
+        dl = (d * (sc & 15).astype(np.float32)).reshape(nb, 16, 1)
+        ml = (dmin * (sc >> 4).astype(np.float32)).reshape(nb, 16, 1)
+        return (dl * q - ml).reshape(nrows, ncols)
+    if typ in (IQ2_XXS, IQ2_XS, IQ2_S):
+        d = _f16(blk[:, 0:2]).reshape(nb, 1, 1)
+        if typ == IQ2_XXS:
+            g8 = blk[:, 2:66].reshape(nb, 8, 8)
+            idx = g8[:, :, 0:4].astype(np.int64)                                     # (nb, 8 groups, 4 chunks)
+            a1 = u32(g8[:, :, 4:8]).reshape(nb, 8, 1)
+            sb = G["ksigns"][(a1 >> (7 * np.arange(4, dtype=np.uint32))) & 127]       # (nb, 8, 4)
+            db = (d * (np.float32(0.5) + (a1 >> 28).astype(np.float32)) * np.float32(0.25))  # (nb, 8, 1)
+            gr = G["iq2xxs_grid_b"][idx].astype(np.float32)                         # (nb, 8, 4, 8)
+            y = db[..., None] * gr * _sgn(_bits8(sb))
+            return y.reshape(nrows, ncols)
+        if typ == IQ2_XS:
+            qs = u16(blk[:, 2:66]).reshape(nb, 8, 4).astype(np.int64)
+            idx, sb, scb = qs & 511, G["ksigns"][qs >> 9], blk[:, 66:74]
+            gr = G["iq2xs_grid_b"][idx].astype(np.float32)
+        else:
+            qs, signs, qh, scb = blk[:, 2:34], blk[:, 34:66], blk[:, 66:74], blk[:, 74:82]
+            l2 = 2 * np.arange(4, dtype=np.int64)
+            idx = qs.reshape(nb, 8, 4).astype(np.int64) | ((qh.astype(np.int64)[:, :, None] >> l2) & 3) << 8
+            sb = signs.reshape(nb, 8, 4)
+            gr = G["iq2s_grid_b"][idx].astype(np.float32)
+        nib = ((scb[:, :, None] >> np.array([0, 0, 4, 4], dtype=np.uint8)) & 15).astype(np.float32)  # (nb, 8, 4): l / 2
+        db = d * (np.float32(0.5) + nib) * np.float32(0.25)
+        y = db[..., None] * gr * _sgn(_bits8(sb))
+        return y.reshape(nrows, ncols)
+    if typ in (IQ3_XXS, IQ3_S):
+        d = _f16(blk[:, 0:2]).reshape(nb, 1, 1)
+        qs = blk[:, 2:66].reshape(nb, 8, 8).astype(np.int64)                           # (nb, group, step t)
+        if typ == IQ3_XXS:
+            ss = u32(blk[:, 66:98]).reshape(nb, 8, 1)
+            sb = G["ksigns"][(ss >> (7 * np.arange(4, dtype=np.uint32))) & 127]         # (nb, 8, 4 chunks)
+            db = d * (np.float32(0.5) + (ss >> 28).astype(np.float32)) * np.float32(0.5)
+            gr = G["iq3xxs_grid_b"][qs].astype(np.float32)                            # (nb, 8, 8 steps, 4)
+        else:
+            qh = blk[:, 66:74].astype(np.int64)
+            idx = qs | ((qh[:, :, None] >> np.arange(8, dtype=np.int64)) & 1) << 8
+            sb = blk[:, 74:106].reshape(nb, 8, 4)
+            scb = blk[:, 106:110]
+            nib = ((scb[:, :, None] >> np.array([0, 4], dtype=np.uint8)) & 15).reshape(nb, 8, 1).astype(np.float32)
+            db = d * (np.float32(1.0) + np.float32(2.0) * nib)
+            gr = G["iq3s_grid_b"][idx].astype(np.float32)
+        y = db[..., None] * gr.reshape(nb, 8, 4, 8) * _sgn(_bits8(sb))
+        return y.reshape(nrows, ncols)
+    if typ in (IQ1_S, IQ1_M):
+        if typ == IQ1_S:
+            d = _f16(blk[:, 0:2]).reshape(nb, 1, 1)
+            qs = blk[:, 2:34].reshape(nb, 8, 4).astype(np.int64)
+            qh = u16(blk[:, 34:50]).reshape(nb, 8, 1).astype(np.int64)
+            idx = qs | ((qh >> (3 * np.arange(4, dtype=np.int64))) & 7) << 8
+            dl = d * (2 * ((qh >> 12) & 7) + 1).astype(np.float32)                    # (nb, 8, 1)
+            delta = np.where(qh & 0x8000, np.float32(-0.125), np.float32(0.125))        # (nb, 8, 1)
+        else:
+            sc = u16(blk[:, 48:56]).astype(np.int64)                                   # (nb, 4)
+            dh = ((sc[:, 0] >> 12) | ((sc[:, 1] >> 8) & 0x00F0) | ((sc[:, 2] >> 4) & 0x0F00) | (sc[:, 3] & 0xF000))
+            d = dh.astype(np.uint16).view(np.float16).astype(np.float32).reshape(nb, 1, 1)
+            qs = blk[:, 0:32].reshape(nb, 8, 4).astype(np.int64)
+            qh = blk[:, 32:48].reshape(nb, 8, 2).astype(np.int64)
+            q = (qh[:, :, :, None] >> np.array([0, 4], dtype=np.int64)).reshape(nb, 8, 4)  # nibble l % 2 of qh[2 ib + l / 2]
+            idx = qs | (q & 7) << 8
+            delta = np.where(q & 8, np.float32(-0.125), np.float32(0.125))            # (nb, 8, 4)
+            ib = np.arange(8, dtype=np.int64)
+            s3 = (sc[:, ib // 2][:, :, None] >> (6 * (ib % 2)[:, None] + 3 * (np.arange(4) // 2)[None, :])) & 7  # (nb, 8, 4)
+            dl = d * (2 * s3 + 1).astype(np.float32)
+        gr = G["iq1s_grid_b"][idx].astype(np.float32)                                  # (nb, 8, 4, 8)
+        y = dl[..., None] * (gr + delta[..., None])
+        return y.reshape(nrows, ncols)
+    if typ == IQ4_XS:
+        d = _f16(blk[:, 0:2]).reshape(nb, 1)
+        sh = u16(blk[:, 2:4]).reshape(nb, 1).astype(np.int64)
+        sl = blk[:, 4:8].astype(np.int64)
+        ib = np.arange(8, dtype=np.int64)
+        ls = ((sl[:, ib // 2] >> (4 * (ib % 2))) & 15) | ((sh >> (2 * ib)) & 3) << 4          # (nb, 8)
+        dl = (d * (ls - 32).astype(np.float32)).reshape(nb, 8, 1)
+        qs = blk[:, 8:136].reshape(nb, 8, 16)
+        kv = G["kvalues_iq4nl"].astype(np.float32)
+        q = np.concatenate([kv[qs & 15], kv[qs >> 4]], axis=2)                           # (nb, 8, 32)
+        return (dl * q).reshape(nrows, ncols)
+    raise ValueError(f"ggml type {typ} not supported here")
+
+
 def dequant(typ, data, nrows, ncols):
     """rows of a tensor (uint8 (nrows, row bytes)) -> float32 (nrows, ncols), ggml's expressions"""
     data = np.ascontiguousarray(data, dtype=np.uint8)
+    if typ in IQ_TYPES:
+        return _dequant_iq(typ, data, nrows, ncols)
     if typ == F32:
         return data.view(np.float32).reshape(nrows, ncols).copy()
     if typ == F16:

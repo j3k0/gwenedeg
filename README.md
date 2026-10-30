@@ -6,8 +6,9 @@ called `runq`**, as in qwen3.c, the project it grew from. The library keeps the 
 `rq_` prefix).
 
 - **Models**: Qwen3-0.6B, 1.7B, 4B and 8B, plus Qwen3-4B-Instruct-2507 / Thinking-2507, and Qwen3.5-0.8B and 4B (the
-  hybrid architecture: Gated DeltaNet linear attention + gated attention; 0.8B Q8_0, Q4_K_M and Q3_K_M, 4B Q8_0). It loads GGUF
-  **Q8_0**, **Q4_K_M**, **Q5_K_M** and **Q3_K_M** files directly (weights, tokenizer and hyperparameters come from the file; chat templates are built
+  hybrid architecture: Gated DeltaNet linear attention + gated attention; 0.8B Q8_0, Q4_K_M and Q3_K_M, 4B Q8_0), Qwen3.8-27B, and
+  **Underdog Saluki 27B** (Qwen3.8-27B in 7.9 GB, an i-quant mix tuned for tool calling). It loads GGUF
+  **Q8_0**, **Q4_K_M**, **Q5_K_M**, **Q3_K_M** and the **i-quant / Q2_K** mixes (IQ1_S .. IQ4_XS) directly (weights, tokenizer and hyperparameters come from the file; chat templates are built
   in), and also qwen3.c's Q8_0 `.bin` export.
 - **Kernels**: AVX-512 VNNI on x86-64, NEON (dot product) on AArch64 / Apple Silicon, and generic C
   everywhere else. The SIMD kernels give bit-identical results to the generic ones.
@@ -131,6 +132,7 @@ On recorded agentic sessions it guesses ~1.5 tokens per pass alone (the 0.8B dra
 | `3.5-4b-q8` | `Qwen3.5-4B-Q8_0.gguf` (unsloth) | 4,482 MB | Qwen3.5-4B: 32 value heads on 16 key heads in its linear layers; as fast as Qwen3-4B Q8_0, perplexity 10.59 (Qwen3-4B: 15.65) |
 | `3.8-27b-q4km` | `Qwen3.8-27B-Q4_K_M.gguf` (unsloth) | 17,107 MB | Qwen3.8-27B (thinks by default; its MTP block is not used): ~16-16.5 GB of RAM, 8.7 tok/s plain, 13-17 with `-D` Qwen3.5-0.8B ([docs/qwen38-speculative.md](docs/qwen38-speculative.md)) |
 | `3.8-27b-q3km` | `Qwen3.8-27B-Q3_K_M.gguf` (unsloth) | 13,819 MB | the same model in 3-bit (Q3_K) for its FFN gate / up, attention q / k / gate and embeddings: ~13.3 GB of RAM, the file for 96k agentic sessions with the draft (below, Agentic development); vs the Q4_K_M: top-1 = the API model's 96.5 / 94.5% (thinking off / on; Q4_K_M 98.4 / 96.9%), perplexity +2.7%, decode +17-22% at 8 threads |
+| `saluki-27b` | `Underdog-Saluki-27B-1.0-IQ2-mix.gguf` (ConwayResearch) | 7,898 MB | Qwen3.8-27B as a Q2_K / IQ1_S .. IQ4_XS mix tuned for tool calling (thinks by default; Qwen's own Qwen3.8 template): 8.4 GB of RAM, decode 13-15 tok/s at 16 threads (the fastest 27B here), prefill ~0.72x the Q3_K_M's, perplexity +18% over it ([docs/iquants.md](docs/iquants.md)) |
 | `hf`, `1.7b-hf`, `3.5-0.8b-hf`, `3.5-4b-hf` | `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-1.7B`, `Qwen/Qwen3.5-0.8B`, `Qwen/Qwen3.5-4B` (bf16 safetensors) | 1.5 / 4.1 / 1.8 / 9.3 GB | for the `.bin` export and the test goldens |
 
 Measured on the 16-vCPU AMD EPYC Genoa VM (shared, noisy: best of 2, interleaved, 2026-10-26; prefill of
@@ -152,6 +154,7 @@ Measured on the 16-vCPU AMD EPYC Genoa VM (shared, noisy: best of 2, interleaved
 | Qwen3.5-4B Q8_0 (\*\*) | 4.8 GB | 308 / 443 | 31 / 30 | | 10.59 (512-token windows: 12.645) |
 | Qwen3.8-27B Q4_K_M (\*\*\*) | 15.9 GB | 45 / 65 | 8.5 / 10.0 | | 9.800 (512-token windows) |
 | Qwen3.8-27B Q3_K_M (\*\*\*\*) | 13.0 GB | 42 / 68 (16 threads) | 9.6 / 9.8 (16 threads) | | 10.069 (512-token windows) |
+| Underdog Saluki 27B IQ2-mix (\*\*\*\*\*) | 8.45 GB | 30 / 54 (16 threads) | 9.9 / 13.3 (16 threads) | | 11.841 (512-token windows) |
 
 (\*) Another session: prefill 2026-10-27 (`scripts/bench_models.py`, 451 tokens; Qwen3-0.6B Q8_0 alongside: 1,832 /
 2,511), decode 2026-10-26 (0.6B alongside: 209 / 230). Its decode barely slows down with the context (160 / 174 tok/s
@@ -164,6 +167,8 @@ after 1,500 tokens): only 6 of its 24 layers have a KV cache, at 12 KB per token
 20 s at 8 threads (the 17 GB file read cold: its page cache is dropped after each load).
 (\*\*\*\*) 2026-10-28, `scripts/bench_models.py -t 8,16`, best of 2, load 10-19, the Q4_K_M alongside: 45 / 73 tok/s of
 prefill, 7.9 / 9.1 of decode at 8 / 16 threads; perplexity of both with `scripts/ppl.py -w 512`, docs/qwen38-speculative.md, G3.
+(\*\*\*\*\*) 2026-10-30, `scripts/bench_models.py -t 8,16 -r 2`, the Q3_K_M alongside (42 / 74 prefill, 9.8 / 12.3 decode
+at 8 / 16 threads; 13.3 GB); decode after 1,500 tokens 9.8 / 14.3; startup 2.3 s at 16 threads; docs/iquants.md.
 
 Decode is memory-bound and moves with the machine's load (8B ranged 12-30 tok/s); startup takes 0.1-0.2 s
 up to 1.7B, ~0.5 s for 4B and ~1 s for 8B. Q4_K_M is the better trade at 4B / 8B (decode ~1.6x Q8_0 at
@@ -189,8 +194,8 @@ The tests use it, and it is the format for comparing with upstream: `scripts/dow
 scripts/setup_venv.sh && scripts/export_q8.sh` (a `.venv` with CPU torch) gives `models/Qwen3-0.6B-q8.bin`.
 `make models` does the same.
 
-Not supported: other GGUF types (Q4_0, Q4_1, IQ*, F16 / BF16, Q2_K, and the Unsloth "UD" files that use
-them: rejected with a clean error; a "UD" file made only of Q3_K / Q4_K / Q5_K / Q6_K / Q8_0 loads), Qwen3-14B and larger (untested),
+Not supported: other GGUF types (Q4_0, Q4_1, IQ4_NL, TQ1_0 / TQ2_0, F16 / BF16 matrices, and the files that use them:
+rejected with a clean error; Unsloth's "UD" files made of Q2_K / Q3_K .. Q6_K / the i-quants / Q8_0 load), Qwen3-14B and larger (untested),
 the MoE models (`qwen3moe`, `qwen35moe`: Qwen3.5-35B-A3B and up, Qwen3.6-35B-A3B), images, Qwen3-Embedding / Reranker,
 RoPE scaling (YaRN), and Hadamard-folded GGUFs (`prism.hadamard.*` metadata: rejected). The other dense Qwen3.5 / 3.6
 sizes should load but are untested: 2B (as many value heads as key heads, like 0.8B), 9B, 27B and Qwen3.6-27B (2x / 3x
@@ -371,6 +376,7 @@ rq_sample_batch(c, seq, logits, N, cfg, N, tok);  // the next token of each, per
 | `src/spec.c` | speculative decoding: the draft's (or the prompt lookup's) guesses verified in one pass of the model (`rq_generate_spec`) |
 | `src/threads.c`, `src/threads.h` | the thread pool and its phase synchronization |
 | `src/kernels_avx512.h`, `src/kernels_neon.h`, `src/kquants.h` | SIMD kernels; the K-quant formats and the exact arithmetic every kernel follows |
+| `src/iquants.h`, `src/iq_grids.h` | Q2_K and the i-quants (IQ1_S .. IQ4_XS): formats, repacked layouts, arithmetic, generic and AVX-512 kernels; the codebooks (generated by `tools/gen_iq_grids.py`) |
 | `src/unicode_tables.h`, `src/unicode_nfc.h` | Unicode classes and NFC tables, generated by `tools/gen_unicode_tables.py` |
 | `src/cli.c` | the `runq` command line and its test hooks |
 | `src/serve.c`, `src/engine.c`, `src/http.c`, `src/constrain.c`, `src/tools.c`, `src/json.c` | `runq serve` (not part of the library): OpenAI layer, scheduler and slot pool, HTTP/1.1, constrained decoding, tool calls, JSON |
@@ -398,11 +404,11 @@ make test-models                          # optional: every downloaded bigger mo
 than key heads), 686 with its Q4_K_M file too (`3.5-0.8b-q4km`; ~70-80 s), 27 more with its Q3_K_M file (`3.5-0.8b-q3km`). It needs numpy (from `.venv` or the system `python3`) and the 0.6B
 `.bin`; the GGUF groups are skipped if their files are missing. It covers:
 tokenizer ids against HF; logits against HF fp32 (cosine, top-1 / top-5); batched against sequential,
-thread-count and generic-against-SIMD bit-identity; Q4_K_M, Q5_K and Q3_K dequantization against gguf-py; the KV cache
+thread-count and generic-against-SIMD bit-identity; Q4_K_M, Q5_K, Q3_K, Q2_K and i-quant dequantization against gguf-py; the KV cache
 types; greedy-output goldens; chat-template rendering against HF's `apply_chat_template`; the library
 API; speculative decoding against plain decoding (tokens and logits bits; in the server, request by request); the server over HTTP; synthetic GGUF models with the bigger models' shapes; and Qwen3.5-0.8B (its tokenizer,
 logits against HF fp32, the same invariants, chats that roll back to a state checkpoint) and synthetic Qwen3.5 models
-with the 4B / 27B head layout. Golden references
+with the 4B / 27B head layout (one of them in all nine i-quant / Q2_K types, as Underdog Saluki 27B). Golden references
 come from HF transformers and are committed under `tests/golden/`. See [tests/README.md](tests/README.md).
 
 Benchmarks: `make bench` (decode, thread sweep), `make bench-prefill`, `scripts/bench_all.sh` (the runq
@@ -416,8 +422,10 @@ and builds mynah-slm, an optional reference engine for comparison (not part of t
 ## Limitations
 
 - Qwen3 dense models and dense Qwen3.5 (0.8B and 4B tested; `general.architecture` qwen3 / qwen35, gpt2 tokenizer with the qwen2 /
-  qwen35 pre-tokenizer). GGUF Q8_0 / Q3_K_M / Q4_K_M / Q5_K_M (any mix of Q8_0, Q3_K, Q4_K, Q5_K and Q6_K tensors; F32 only for Qwen3.5's
-  `ssm_alpha` / `ssm_beta`, as in Qwen3.8-27B) and qwen3.c's `.bin`. No other quantization types, no MoE, no RoPE scaling,
+  qwen35 pre-tokenizer). GGUF Q8_0 / Q3_K_M / Q4_K_M / Q5_K_M and the i-quant mixes (any mix of Q8_0, Q2_K .. Q6_K, IQ1_S, IQ1_M,
+  IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS tensors; F32 only for Qwen3.5's `ssm_alpha` / `ssm_beta`, as in
+  Qwen3.8-27B) and qwen3.c's `.bin`. The i-quants have AVX-512 kernels (fastest with AVX512-VBMI) and the generic ones
+  (NEON included); their prefill is ~0.72x the K-quants' (docs/iquants.md). No other quantization types, no MoE, no RoPE scaling,
   no images, no Jinja interpreter (the templates are built in: Qwen3's, Qwen3.5's, Qwen3.8's). Qwen3.8-27B: its MTP block
   is not used (not a draft yet: TODO S9); it needs ~17 GB of free RAM (18.65 GiB estimated at the default `-c` 40,960).
 - Fast paths: x86-64 with AVX-512 VNNI (selected at compile time with `-march=native`) and AArch64 with

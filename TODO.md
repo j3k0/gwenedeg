@@ -262,10 +262,20 @@ Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M (Qwen3.8-27B Q4_K_M, the same
 
 ## Models and formats
 
-- [ ] **More GGUF types**: Q4_0 / Q4_1, Q2_K (the Unsloth "UD" files of the small bit widths), IQ4_XS, F16 / BF16
-  weights. Each needs its block format, a repacked layout and generic, AVX-512 and NEON kernels that follow one
-  arithmetic definition, as in `src/kquants.h` (Q5_K and Q3_K, done, are the templates: a new bit plane on Q4_K's
-  fold, resp. 3-bit values with a bit plane on Q6_K's). Tests:
+- [x] **Q2_K and the i-quants** (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS; 2026-10-30): Underdog Saluki
+  27B 1.0 (`saluki-27b`, 7.9 GB) and the Unsloth "UD" files made of them load and run; [docs/iquants.md](docs/iquants.md).
+- [ ] **i-quant prefill**: a tiled GEMM for the types of `src/iquants.h` (each group is decoded once per 8 activation rows
+  today, `iq_rows`; no tiles, no small-batch kernels): Saluki prefills at ~0.72x the 27B Q3_K_M's tok/s (30 / 54 vs
+  42 / 74 at 8 / 16 threads). Decode the 16-row block's codes once into a scratch tile (as `kq_unpack_tile`) and run
+  more activation rows per pass; maybe 32-row tiles sharing the activation broadcasts.
+- [ ] **NEON kernels for the i-quants** (AArch64 runs `iq_dot`, the generic definition: correct, slow): `tbl` lookups
+  of the byte code tables, the same integer fold.
+- [ ] **The Saluki MTP variant** (`Kujira/Underdog-Saluki-27B-1.0-MTP-GGUF`: Saluki + an MTP block) once S9 runs MTP
+  blocks: a self-drafting 7.9 GB 27B.
+- [ ] **More GGUF types**: Q4_0 / Q4_1, IQ4_NL, F16 / BF16 weights (Unsloth's Qwen3.5-0.8B UD-IQ3_XXS has F16 matrices).
+  Each needs its block format, a repacked layout and generic, AVX-512 and NEON kernels that follow one
+  arithmetic definition, as in `src/kquants.h` / `src/iquants.h` (Q5_K and Q3_K, done, are the templates: a new bit
+  plane on Q4_K's fold, resp. 3-bit values with a bit plane on Q6_K's; the i-quants: an integer scale per sub-block). Tests:
   dequantization bitwise against gguf-py (`-m dequant`, `tests/make_dequant_golden.py`), logits against the file's
   dequantized-weights reference (`tests/make_model_ref.py`), and the bitwise groups. Q6_K-only files should already
   load, but are untested.

@@ -284,6 +284,80 @@ def dequant_check(runq, model, golden, res, prefix):
         res.report(ok, f"{prefix}/{name}", f"{what}: " + ", ".join(detail) + " (gguf-py)")
 
 
+def dequant_vs_mini(runq, model, cases, prefix):
+    """runq -m dequant of rows (blocks and repacked layout) == tests/ggufmini.py's dequantization of the file's blocks,
+    bitwise (ggufmini: == gguf-py, iq_mini_check): [(ok, name, detail)]; cases: (tensor, first row, rows)"""
+    f = G.GgufFile(model)
+    out = []
+    for name, r0, n in cases:
+        ne, ty, _ = f.tensors[name]
+        want = G.dequant(ty, f.tensor_bytes(name)[r0:r0 + n], n, int(ne[0]))
+        d = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"dequant-{os.getpid()}-{abs(hash((model, name, r0)))}.bin")
+        p = run([runq, model, "-c", "64", "-m", "dequant", "-i", f"{name}:{r0}:{n}", "-o", d], 2)
+        what = f"{G.TYPE_NAME.get(ty, ty)} rows {r0}..{r0 + n - 1} x {int(ne[0])}"
+        if p.returncode != 0:
+            out.append((False, f"{prefix}/{name}", f"runq -m dequant failed: {p.stderr.decode(errors='replace')[-300:]}"))
+            continue
+        h = np.fromfile(d, dtype=np.int32, count=3)
+        got = np.fromfile(d, dtype=np.float32, offset=12).reshape(1 + int(h[2]), int(h[0]), int(h[1]))
+        os.remove(d)
+        ok, detail = got.shape[1:] == want.shape, []
+        for j, src in enumerate(["blocks", "repacked"][:got.shape[0]]):
+            same_ = ok and np.array_equal(got[j].view(np.uint32), want.view(np.uint32))
+            ok &= same_
+            detail.append(f"{src} " + ("bit-identical" if same_ else "DIFFER"))
+        out.append((ok, f"{prefix}/{name}", f"{what}: " + ", ".join(detail) + " (ggufmini)"))
+    return out
+
+
+def iq_mini_check():
+    """tests/ggufmini.py's dequantization of Q2_K and the i-quants == gguf-py's (tests/golden/dequant/iq_blocks.npz:
+    rows of Underdog Saluki 27B's file and random blocks of every type, tests/make_dequant_golden.py --iq), bitwise"""
+    g = np.load(os.path.join(GOLDEN, "dequant", "iq_blocks.npz"))
+    out = []
+    for i, name in enumerate(g["names"]):
+        ty, raw, want = int(g["type"][i]), g[f"raw{i}"], g[f"rows{i}"]
+        got = G.dequant(ty, raw, want.shape[0], want.shape[1])
+        ok = np.array_equal(got.view(np.uint32), want.view(np.uint32))
+        out.append((ok, f"q35/iq/mini_dequant/{name}", f"{G.TYPE_NAME[ty]} {want.shape[0]} x {want.shape[1]}: ggufmini vs gguf-py "
+                    + ("bit-identical" if ok else f"DIFFER ({int((got.view(np.uint32) != want.view(np.uint32)).sum())} values)")))
+    return out
+
+
+def iq_types_cases(model):
+    """one tensor of every Q2_K / i-quant type of a file: rows 15..16 (across a 16-row block) and its last 17 rows"""
+    f = G.GgufFile(model)
+    seen, cases = set(), []
+    for name in f.order:
+        ne, ty, _ = f.tensors[name]
+        if ty in G.IQ_TYPES and ty not in seen and len(ne) == 2:
+            seen.add(ty)
+            cases += [(name, 15, 2), (name, int(ne[1]) - 17, 17)]
+    return cases
+
+
+def iq_synth_run(a, sd, tmp, texts):
+    """synth-q35-iq.gguf: ggufmini == gguf-py (iq_mini_check); runq's dequantization == ggufmini for every type; the
+    AVX-512 gather decode (RUNQ_IQ_GATHER=1, the decode of CPUs without VBMI) gives the same logits as the default"""
+    import hashlib
+    out = iq_mini_check()
+    model = os.path.join(sd, "synth-q35-iq.gguf")
+    if not os.path.exists(model):
+        return out
+    out += dequant_vs_mini(a.runq, model, iq_types_cases(model), "q35/synth-q35-iq/dequant")
+    for name, chunk in (("en", 7), ("long2", 64)):
+        hs = []
+        for env in ({}, {"RUNQ_IQ_GATHER": "1"}):
+            path = os.path.join(tmp, f"iq_gather_{name}_{len(env)}.bin")
+            p = run([a.runq, model, "-c", "4096", "-m", "logits", "-b", str(chunk), "-i", texts[name], "-o", path], 4, env)
+            hs.append(hashlib.sha256(open(path, "rb").read()).hexdigest() if p.returncode == 0 else f"exit {p.returncode}")
+            if os.path.exists(path):
+                os.remove(path)
+        out.append((hs[0] == hs[1] and not hs[0].startswith("exit"), f"q35/synth-q35-iq/gather/{name}_b{chunk}",
+                    "RUNQ_IQ_GATHER=1 vs the default decode: " + ("bit-identical" if hs[0] == hs[1] else f"DIFFER {hs}")))
+    return out
+
+
 # tag, file, chat template variant, golden subdirectories (tests/golden/models/<sub>: hf = HF fp32, else the
 # dequantized-weights reference of this file), thresholds per golden
 FAMILY = [
@@ -315,15 +389,25 @@ FAMILY = [
     # only test file with a Q3_K token_embd: its rows through kq_dequant_row), Q4_K / Q5_K / Q6_K for the rest. ~13.4 GiB
     # of RSS (BIG); golden: make_model_ref.py on the file (189 s)
     ("3.8-27b-q3km", "Qwen3.8-27B-GGUF/Qwen3.8-27B-Q3_K_M.gguf", "qwen3.8", [("3.8-27b-q3km", "ref")]),
+    # Underdog Saluki 27B 1.0 (ConwayResearch, scripts/download_models.py saluki-27b): Qwen3.8-27B (64 layers, no MTP block)
+    # as a 7.9 GB IQ mix: Q2_K and the eight i-quants of src/iquants.h mixed within each role, an IQ1_M token_embd, an IQ3_S
+    # output, Q8_0 alpha / beta, a few Q4_K; Qwen's own Qwen3.8 template (= tests/golden/templates/qwen3.8-hf.jinja).
+    # ~8.6 GiB of RSS (BIG); golden: make_model_ref.py on the file (303 s); dequantized rows of every type vs ggufmini
+    # (IQ_MINI). Measured vs the golden: cos mean 0.99994-0.99998, min 0.99989, top-1 62/62 (the int8 activations only);
+    # the entry takes ~12 min (8 threads), most of it the generic build's kernels runs
+    ("saluki-27b", "Underdog-Saluki-27B-1.0-GGUF/Underdog-Saluki-27B-1.0-IQ2-mix.gguf", "qwen3.8", [("saluki-27b", "ref")]),
 ]
 # files checked against MemAvailable first (runq's own estimate at the default context, api_test's, + BIG_MARGIN GiB
 # for the logits files in TMPDIR and the server's slots): skipped with a note if it does not fit. Their runs go one
 # at a time (the models group runs its files in turn); GWENEDEG_TEST_MEM (GiB) stands in for MemAvailable
-BIG = {"3.8-27b-q4km", "3.8-27b-q3km"}
+BIG = {"3.8-27b-q4km", "3.8-27b-q3km", "saluki-27b"}
 BIG_MARGIN = 1.5
 # dequantized rows vs gguf-py (tests/golden/dequant, tests/make_dequant_golden.py --q5 / --q3), bitwise, per FAMILY tag:
 # from the file's blocks and from the repacked layouts (`runq -m dequant`)
 DEQUANT = {"3.5-0.8b-q4km": "q5_k.npz", "3.5-0.8b-q3km": "q3_k.npz"}
+# files with Q2_K / i-quant tensors: one tensor of every such type, `runq -m dequant` vs tests/ggufmini.py (== gguf-py:
+# iq_mini_check), bitwise; and the AVX-512 gather decode (RUNQ_IQ_GATHER=1) == the default one (en, -b 7)
+IQ_MINI = {"saluki-27b"}
 # more kernel checks for the files with a new kernel type (Q5_K, Q3_K) or code path (4B: value heads != key heads): AVX-512 vs
 # generic logits at -b 64 (the GEMM tiles of every Q5_K matrix: 15 rows = 6 + 6 + 3; the batched DeltaNet items), and
 # the batched passes' api_test digests (--digest-small) of both builds
@@ -500,6 +584,14 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
         # dequantization vs gguf-py
         if tag in DEQUANT:
             dequant_check(a.runq, model, DEQUANT[tag], res, f"{prefix}/{tag}/dequant")
+        if tag in IQ_MINI:
+            for ok, name, det in dequant_vs_mini(a.runq, model, iq_types_cases(model), f"{prefix}/{tag}/dequant"):
+                res.report(ok, name, det)
+            gpath_ = os.path.join(d, "en_b7_gather.bin")
+            p = run([a.runq, model, "-c", "4096", "-m", "logits", "-b", "7", "-i", texts["en"], "-o", gpath_] + extra, nd,
+                    {"RUNQ_IQ_GATHER": "1"})
+            ok, det = same(lf("en", 7), gpath_) if p.returncode == 0 else (False, p.stderr.decode(errors="replace")[-200:])
+            res.report(ok, f"{prefix}/{tag}/gather/en_b7", f"RUNQ_IQ_GATHER=1 vs the default decode: {det}")
         # greedy golden
         gpath = os.path.join(gdir, "greedy", f"{tag}.txt")
         want = open(gpath, encoding="utf-8").read().rstrip("\n") if os.path.exists(gpath) else None
@@ -600,12 +692,17 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
 # group's 0.9993-0.9958); with the q heads on kv head h % 2 instead of h // 6 0.31-0.40, value heads grouped 0.25-0.38
 # synth-q35-27b-f32.gguf: the same with F32 alpha / beta (fp32 activations there, f32_rows), the MTP block, Qwen3.8's
 # template: measured cos mean 0.9984 / 0.9976 / 0.9966, min 0.9791, top-1 290/338
+# synth-q35-iq.gguf: synth-q35-27b requantized to Q2_K and the i-quants (all nine, mixed as in Underdog Saluki 27B's file,
+# an IQ1_M embedding, an IQ3_S classifier: src/iquants.h): measured cos mean 0.9973 / 0.9982 / 0.9966, min 0.9874, top-1
+# 280/338 (the int8 activations on 1.5- to 4-bit weights, as synth-q35-27b); bitwise: the gather and VBMI AVX-512 decodes
+# and the generic kernel give the same logits (RUNQ_IQ_GATHER=1: iq_synth_run, with the dequantization checks)
 Q35_SYNTH = {"synth-q35-r2.gguf": True, "synth-q35-r3.gguf": False, "synth-q35-27b.gguf": True,
-             "synth-q35-27b-f32.gguf": True}  # file: full api_test (else digests)
+             "synth-q35-27b-f32.gguf": True, "synth-q35-iq.gguf": True}  # file: full api_test (else digests)
 Q35_SYNTH_REF = ["en", "code", "long2"]
 TH_Q35_SYNTH = dict(cos_mean=0.999, cos_pos=0.99, top1=0.8)
 TH_Q35_SYNTH_KQ = {"synth-q35-27b": dict(cos_mean=0.993, cos_pos=0.95, top1=0.7),
-                   "synth-q35-27b-f32": dict(cos_mean=0.993, cos_pos=0.95, top1=0.7)}  # (per model, else TH_Q35_SYNTH)
+                   "synth-q35-27b-f32": dict(cos_mean=0.993, cos_pos=0.95, top1=0.7),
+                   "synth-q35-iq": dict(cos_mean=0.993, cos_pos=0.95, top1=0.7)}  # (per model, else TH_Q35_SYNTH)
 Q35_SYNTH_SAME = [(("en", 1), ("en", 7)), (("en", 1), ("en", 64)), (("all", 1), ("all", 64)), (("long2", 1), ("long2", 64)),
                   (("long2", 64), ("long2", 512)), (("long2", 64), ("long2", 64, 3)),
                   (("en", 1), ("en", 1, "gen")), (("en", 7), ("en", 7, "gen")), (("long2", 64), ("long2", 64, "gen"))]
@@ -980,6 +1077,8 @@ def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
         ([ex.submit(q35_two_run, a, sd)] if a.api_test else []) if sd else []
     synth.append(ex.submit(q35_serve_slots, a))
     synth.append(ex.submit(q35_server_tools, a))
+    if sd:  # Q2_K and the i-quants: dequantization (ggufmini vs gguf-py, runq vs ggufmini), the gather decode
+        synth.append(ex.submit(iq_synth_run, a, sd, os.path.join(t, "synth"), texts))
     # the bf16 dot-product attention (KV bf16-dot, TODO G4 (b)): synth-q35-27b (the 27B's attention shape) and every API
     # path on the 0.8B (the logits / bitwise checks of the 0.8B: test_models below, prefix q35_dot)
     s27 = os.path.join(sd, "synth-q35-27b.gguf") if sd else ""

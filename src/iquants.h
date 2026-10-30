@@ -60,24 +60,29 @@
  *
  * Repacked layouts, for (d, k) matrices with d % 16 == 0, k % 256 == 0: as kquants.h, block rb = rows 16 rb .. 16 rb +
  * 15, super-block s at kp + (rb * k / 256 + s) * SB (one block contiguous over all k). The file's fields stay as they
- * are, transposed over the block's 16 rows so that a field of the 16 rows is one load ("lane r" = row r): per group g
- * the grid indices of a chunk as 16 bytes (zero-extended to the 16 dword lanes, then gathered), the sign bits as one
- * 64-bit mask per step of 4 columns t (bit 4 r + b = value 4 t + b of row r is negative: a masked negation), the scales
- * as nibbles in one dword per row. Sizes per row and super-block (file: ...): SB / 16.
+ * are (IQ1: its grid indices replaced by their codes), transposed over the block's 16 rows so that a field of the 16
+ * rows is one load ("lane r" = dword lane r = row r): per group g the grid indices lane-major (byte 4 r + l = chunk l of
+ * row r), the sign bits as one 64-bit mask per step of 4 columns t (bit 4 r + b = value 4 t + b of row r is negative),
+ * the scales as nibbles in one dword per row. Sizes per row and super-block (file: ...): SB / 16.
  *   common  +0  uint16 d[16]   the fp16 d of row r (IQ1_M: the assembled one; Q2_K: then uint16 dmin[16] at +32)
  *   Q2P     SB 1344 (84 = file). +64 uint8 scm[16][16] at 16 j + r: scales[j] of row r. +320 + 128 g + 64 h: lane r,
  *           byte b, bits 2 t, 2 t + 1 = q of column 32 g + 16 h + 4 t + b (t < 4)
- *   I2XXS   SB 1120 (70; file 66). +32 uint32 sc[16]: nibble g = ls of group g. +96 + 128 g: idx[4][16] (byte 16 l + r:
- *           the grid index of chunk l), +64 sgn[8] (uint64, step t of the group)
+ *   I2XXS   SB 1120 (70; file 66). +32 uint32 sc[16]: nibble g = ls of group g. +96 + 128 g: idx[16][4] (byte 4 r + l:
+ *           the grid index of chunk l of row r: lane-major, so one table lookup of the 64 bytes gives every step's
+ *           codes in its lane), +64 sgn[8] (uint64, step t of the group)
  *   I2XS,   SB 1312 (82; IQ2_XS file 74, IQ2_S 82). +32 uint32 sc[2][16]: at 64 p + 4 r nibble 2 (g % 4) + h = the scale
- *   I2S     of sub-block h of group g = 4 p + g % 4. +160 + 144 g: idx[4][16] (low 8 bits), +64 hi[16] (bits 2 l,
- *           2 l + 1: index bits 8, 9 of chunk l; IQ2_XS: bit 2 l only), +80 sgn[8]
- *   I3XXS   SB 1632 (102; file 98). +32 uint32 sc[16] (nibble g). +96 + 192 g: idx[8][16] (step t), +128 sgn[8]
- *   I3S     SB 1760 (110 = file). +32 uint32 sc[16] (nibble g). +96 + 208 g: idx[8][16] (low 8 bits), +128 hi[16] (bit t:
+ *   I2S     of sub-block h of group g = 4 p + g % 4. +160 + 144 g: idx[16][4] (low 8 bits, lane-major), +64 hi[16] (bits
+ *           2 l, 2 l + 1: index bits 8, 9 of chunk l; IQ2_XS: bit 2 l only), +80 sgn[8]
+ *   I3XXS   SB 1632 (102; file 98). +32 uint32 sc[16] (nibble g). +96 + 192 g: idx[2][16][4] (byte 64 h + 4 r + j: the
+ *           index of step 4 h + j of row r, lane-major), +128 sgn[8]
+ *   I3S     SB 1760 (110 = file). +32 uint32 sc[16] (nibble g). +96 + 208 g: idx[2][16][4] (low 8 bits), +128 hi[16] (bit t:
  *           index bit 8 of step t: the file's qh[g]), +144 sgn[8]
- *   I1S     SB 800 (50 = file). +32 + 96 g: idx[4][16] (low 8 bits), +64 uint16 qh[16] (the file's qh[g] of row r)
- *   I1M     SB 928 (58; file 56). +32 uint32 sc[2][16] (as I2XS, 3-bit scales). +160 + 96 g: idx[4][16], +64 qh[2][16]
- *           (16 p + r: the file's qh[2 g + p] of row r)
+ *   I1S     SB 1136 (71; file 50). +32 uint32 sc[16] (nibble g: the 3-bit scale of group g). +96 uint16 dm[8] (bit r
+ *           of dm[g]: the delta of group g of row r is negative). +112 + 128 g: clo[16][4], +64 chi[16][4] (byte 4 r +
+ *           l: the low / high byte of iq1s_code[the index of chunk l of row r]: the 2048-entry codebook is looked up at
+ *           load, which takes 0.6 more bits per weight; the kernels' gathers of it were 3x slower than the rest)
+ *   I1M     SB 1248 (78; file 56). +32 uint32 sc[2][16] (as I2XS, 3-bit scales). +160 + 136 g: clo[16][4], +64 chi[16][4]
+ *           (as I1S), +128 uint64 dm (bit 4 r + l: the delta of chunk l of row r is negative)
  *   I4XS    SB 2240 (140; file 136). +32 int8 sc[8][16] (16 g + r: ls - 32). +192 + 256 g: 4 chunks c of 64 bytes: lane
  *           r, byte b: low nibble = q of column 32 g + 8 c + b, high nibble = of column + 4 (Q4P's nibble order)
  */
@@ -135,10 +140,10 @@ static inline int iq_sb_bytes(int type) {
     case GGML_IQ2_XXS: return 1120;
     case GGML_IQ2_XS: case GGML_IQ2_S: return 1312;
     case GGML_IQ3_XXS: return 1632;
-    case GGML_IQ1_S: return 800;
+    case GGML_IQ1_S: return 1136;
     case GGML_IQ3_S: return 1760;
     case GGML_IQ4_XS: return 2240;
-    case GGML_IQ1_M: return 928;
+    case GGML_IQ1_M: return 1248;
     }
     return 0;
 }
@@ -369,7 +374,7 @@ static void iq_pack_blocks(int type, uint8_t *kp, const uint8_t *src, int nblk, 
                         uint8_t *gp = o + 96 + 128 * g;
                         iq_or32(o + 32 + 4 * r, (a1 >> 28) << 4 * g);
                         for (int l = 0; l < 4; l++) {
-                            gp[16 * l + r] = (uint8_t)(a0 >> 8 * l);
+                            gp[4 * r + l] = (uint8_t)(a0 >> 8 * l);
                             iq_signs8(gp + 64, r, l, iq_ksigns(a1 >> 7 * l & 127));
                         }
                     }
@@ -384,11 +389,11 @@ static void iq_pack_blocks(int type, uint8_t *kp, const uint8_t *src, int nblk, 
                         for (int l = 0; l < 4; l++) {
                             if (xs) {
                                 int q = kq_u16(b + 2 + 2 * (4 * g + l));
-                                gp[16 * l + r] = (uint8_t)q;
+                                gp[4 * r + l] = (uint8_t)q;
                                 gp[64 + r] |= (uint8_t)((q >> 8 & 1) << 2 * l);
                                 iq_signs8(gp + 80, r, l, iq_ksigns(q >> 9));
                             } else {
-                                gp[16 * l + r] = b[2 + 4 * g + l];
+                                gp[4 * r + l] = b[2 + 4 * g + l];
                                 iq_signs8(gp + 80, r, l, b[34 + 4 * g + l]);
                             }
                         }
@@ -403,7 +408,7 @@ static void iq_pack_blocks(int type, uint8_t *kp, const uint8_t *src, int nblk, 
                         uint8_t *gp = o + 96 + 192 * g;
                         iq_or32(o + 32 + 4 * r, (a >> 28) << 4 * g);
                         for (int t = 0; t < 8; t++)
-                            gp[16 * t + r] = b[2 + 8 * g + t];
+                            gp[64 * (t / 4) + 4 * r + t % 4] = b[2 + 8 * g + t];
                         for (int l = 0; l < 4; l++)
                             iq_signs8(gp + 128, r, l, iq_ksigns(a >> 7 * l & 127));
                     }
@@ -414,7 +419,7 @@ static void iq_pack_blocks(int type, uint8_t *kp, const uint8_t *src, int nblk, 
                         uint8_t *gp = o + 96 + 208 * g;
                         iq_or32(o + 32 + 4 * r, (uint32_t)(b[106 + g / 2] >> 4 * (g % 2) & 15) << 4 * g);
                         for (int t = 0; t < 8; t++)
-                            gp[16 * t + r] = b[2 + 8 * g + t];
+                            gp[64 * (t / 4) + 4 * r + t % 4] = b[2 + 8 * g + t];
                         gp[128 + r] = b[66 + g];
                         for (int l = 0; l < 4; l++)
                             iq_signs8(gp + 144, r, l, b[74 + 4 * g + l]);
@@ -423,23 +428,31 @@ static void iq_pack_blocks(int type, uint8_t *kp, const uint8_t *src, int nblk, 
                 case GGML_IQ1_S:
                     memcpy(o + 2 * r, b, 2);
                     for (int g = 0; g < 8; g++) {
-                        uint8_t *gp = o + 32 + 96 * g;
-                        for (int l = 0; l < 4; l++)
-                            gp[16 * l + r] = b[2 + 4 * g + l];
-                        memcpy(gp + 64 + 2 * r, b + 34 + 2 * g, 2);
+                        uint8_t *gp = o + 112 + 128 * g;
+                        int qh = kq_u16(b + 34 + 2 * g);
+                        iq_or32(o + 32 + 4 * r, (uint32_t)(qh >> 12 & 7) << 4 * g);
+                        if (qh & 0x8000) o[96 + 2 * g + r / 8] |= (uint8_t)(1 << r % 8);
+                        for (int l = 0; l < 4; l++) {
+                            int c = iq1s_code[b[2 + 4 * g + l] | (qh >> 3 * l & 7) << 8];
+                            gp[4 * r + l] = (uint8_t)c;
+                            gp[64 + 4 * r + l] = (uint8_t)(c >> 8);
+                        }
                     }
                     break;
                 case GGML_IQ1_M: {
                     uint16_t d = iq1m_d(b);
                     memcpy(o + 2 * r, &d, 2);
                     for (int g = 0; g < 8; g++) {
-                        uint8_t *gp = o + 160 + 96 * g;
+                        uint8_t *gp = o + 160 + 136 * g;
                         int sc = kq_u16(b + 48 + 2 * (g / 2)) >> 6 * (g % 2);
                         iq_or32(o + 32 + 64 * (g / 4) + 4 * r, (uint32_t)((sc & 7) | (sc >> 3 & 7) << 4) << 8 * (g % 4));
-                        for (int l = 0; l < 4; l++)
-                            gp[16 * l + r] = b[4 * g + l];
-                        gp[64 + r] = b[32 + 2 * g];
-                        gp[80 + r] = b[32 + 2 * g + 1];
+                        for (int l = 0; l < 4; l++) {
+                            int q = b[32 + 2 * g + l / 2] >> 4 * (l % 2);
+                            int c = iq1s_code[b[4 * g + l] | (q & 7) << 8];
+                            gp[4 * r + l] = (uint8_t)c;
+                            gp[64 + 4 * r + l] = (uint8_t)(c >> 8);
+                            if (q & 8) iq_or64(gp + 128, 1ull << (4 * r + l));
+                        }
                     }
                     break;
                 }
@@ -503,7 +516,7 @@ static void iq_unpack_group(int type, const uint8_t *o, int g, int8_t v[KQ_ROWS]
             const uint8_t *gp = o + 96 + 128 * g;
             S[r][0] = S[r][1] = 2 * (int)(iq_u32(o + 32 + 4 * r) >> 4 * g & 15) + 1;
             for (int i = 0; i < 32; i++) {
-                int m = (int)(iq2xxs_grid[gp[16 * (i / 8) + r]] >> 8 * (i % 8) & 255);
+                int m = (int)(iq2xxs_grid[gp[4 * r + i / 8]] >> 8 * (i % 8) & 255);
                 v[r][i] = (int8_t)(iq_sgn(gp + 64, r, i) ? -m : m);
             }
             break;
@@ -514,7 +527,7 @@ static void iq_unpack_group(int type, const uint8_t *o, int g, int8_t v[KQ_ROWS]
             S[r][0] = 2 * (int)(sc & 15) + 1;
             S[r][1] = 2 * (int)(sc >> 4 & 15) + 1;
             for (int i = 0; i < 32; i++) {
-                int l = i / 8, idx = gp[16 * l + r] | (gp[64 + r] >> 2 * l & 3) << 8;
+                int l = i / 8, idx = gp[4 * r + l] | (gp[64 + r] >> 2 * l & 3) << 8;
                 int m = (int)((type == GGML_IQ2_XS ? iq2xs_grid[idx] : iq2s_grid[idx]) >> 8 * (i % 8) & 255);
                 v[r][i] = (int8_t)(iq_sgn(gp + 80, r, i) ? -m : m);
             }
@@ -524,7 +537,7 @@ static void iq_unpack_group(int type, const uint8_t *o, int g, int8_t v[KQ_ROWS]
             const uint8_t *gp = o + 96 + 192 * g;
             S[r][0] = S[r][1] = 2 * (int)(iq_u32(o + 32 + 4 * r) >> 4 * g & 15) + 1;
             for (int i = 0; i < 32; i++) {
-                int m = (int)(iq3xxs_grid[gp[16 * (i / 4) + r]] >> 8 * (i % 4) & 255);
+                int t = i / 4, m = (int)(iq3xxs_grid[gp[64 * (t / 4) + 4 * r + t % 4]] >> 8 * (i % 4) & 255);
                 v[r][i] = (int8_t)(iq_sgn(gp + 128, r, i) ? -m : m);
             }
             break;
@@ -533,32 +546,26 @@ static void iq_unpack_group(int type, const uint8_t *o, int g, int8_t v[KQ_ROWS]
             const uint8_t *gp = o + 96 + 208 * g;
             S[r][0] = S[r][1] = 2 * (int)(iq_u32(o + 32 + 4 * r) >> 4 * g & 15) + 1;
             for (int i = 0; i < 32; i++) {
-                int t = i / 4, idx = gp[16 * t + r] | (gp[128 + r] >> t & 1) << 8;
+                int t = i / 4, idx = gp[64 * (t / 4) + 4 * r + t % 4] | (gp[128 + r] >> t & 1) << 8;
                 int m = (int)(iq3s_grid[idx] >> 8 * (i % 4) & 255);
                 v[r][i] = (int8_t)(iq_sgn(gp + 144, r, i) ? -m : m);
             }
             break;
         }
-        case GGML_IQ1_S: {
-            const uint8_t *gp = o + 32 + 96 * g;
-            int qh = kq_u16(gp + 64 + 2 * r), dl = qh & 0x8000 ? -1 : 1;
-            S[r][0] = S[r][1] = 2 * (qh >> 12 & 7) + 1;
+        case GGML_IQ1_S: case GGML_IQ1_M: {
+            // value i = 8 l + j: code (2 bits j of the chunk's code) - 1 = the grid value, v = 8 grid +- 1
+            int m = type == GGML_IQ1_M;
+            const uint8_t *gp = o + (m ? 160 + 136 * g : 112 + 128 * g);
+            if (m) {
+                uint32_t sc = iq_u32(o + 32 + 64 * (g / 4) + 4 * r) >> 8 * (g % 4);
+                S[r][0] = 2 * (int)(sc & 7) + 1;
+                S[r][1] = 2 * (int)(sc >> 4 & 7) + 1;
+            } else
+                S[r][0] = S[r][1] = 2 * (int)(iq_u32(o + 32 + 4 * r) >> 4 * g & 7) + 1;
             for (int i = 0; i < 32; i++) {
-                int l = i / 8;
-                int8_t gv = (int8_t)(iq1s_grid[gp[16 * l + r] | (qh >> 3 * l & 7) << 8] >> 8 * (i % 8));
-                v[r][i] = (int8_t)(8 * gv + dl);
-            }
-            break;
-        }
-        case GGML_IQ1_M: {
-            const uint8_t *gp = o + 160 + 96 * g;
-            uint32_t sc = iq_u32(o + 32 + 64 * (g / 4) + 4 * r) >> 8 * (g % 4);
-            S[r][0] = 2 * (int)(sc & 7) + 1;
-            S[r][1] = 2 * (int)(sc >> 4 & 7) + 1;
-            for (int i = 0; i < 32; i++) {
-                int l = i / 8, q = gp[64 + 16 * (l / 2) + r] >> 4 * (l % 2);
-                int8_t gv = (int8_t)(iq1s_grid[gp[16 * l + r] | (q & 7) << 8] >> 8 * (i % 8));
-                v[r][i] = (int8_t)(8 * gv + (q & 8 ? -1 : 1));
+                int l = i / 8, c = gp[4 * r + l] | gp[64 + 4 * r + l] << 8;
+                int neg = m ? (int)(kq_u64(gp + 128) >> (4 * r + l) & 1) : o[96 + 2 * g + r / 8] >> r % 8 & 1;
+                v[r][i] = (int8_t)(8 * ((c >> 2 * (i % 8) & 3) - 1) + (neg ? -1 : 1));
             }
             break;
         }
@@ -669,15 +676,19 @@ static inline __m512i iq512_sgn(__m512i m, const uint8_t *mp, __m512i B) {
     return _mm512_mask_sub_epi8(_mm512_add_epi8(B, m), _cvtu64_mask64(k), B, m);
 }
 
-// AVX512-VBMI decode (Zen 4, Ice Lake and later; RUNQ_IQ_GATHER: the gathers below instead): the grid indices are
-// looked up in the compact code tables of iq_grids.h (*_code: 2 or 3 bits per value) held in registers, 32 at a time
-// (vpermi2w over 64 entries, a blend tree on the higher index bits; IQ1's 2048 entries: one 16-lane gather of codes per
-// chunk), then each step's codes are cut out of the lane's code word (vpmultishiftqb) and mapped to v + B (vpermb on a
-// 64-byte table that only depends on the code bits), the negative values by a second, masked vpermb on the table of
-// B - |v| (IQ1: of delta -1). The same integers as the gathers' (and iq_unpack_group's) codes. ~3x faster than the
-// gathers on Zen 4 (2.5 gathered elements / ns per core against ~15 table lookups / ns)
-#if defined(__AVX512VBMI__) && !defined(RUNQ_IQ_GATHER)
+// AVX512-VBMI decode (Zen 4, Ice Lake and later; RUNQ_IQ_GATHER: the gathers below instead). The 64 lane-major grid
+// indices of a group are looked up in the byte tables of iq_grids.h (the codes of each grid entry, 2 or 3 bits per
+// value: iq2*_clo / _chi, iq3*_ca / _cb) with vpermi2b over 128 entries and a blend tree on the higher index bits (k8, k9
+// by pext from the hi bytes), 64 lookups per instruction; IQ1's codes are stored (no lookup). Each step's codes are then
+// cut out of its lane (vpmultishiftqb; IQ3: a two-source vpermi2b) and mapped to v + B by vpermb on a 64-byte table that
+// only depends on the code bits, the negative values by a second, masked vpermb on the table of B - |v| (IQ1: of delta
+// -1; IQ3: 2 B - (B + |v|)). The same integers as the gathers' and iq_unpack_group's. 2.6-3.3x the gathers' speed on
+// Zen 4 (~2.5 gathered elements / ns per core; docs/iquants.md)
+#if defined(__AVX512VBMI__) && defined(__BMI2__) && !defined(RUNQ_IQ_GATHER)
 #define RUNQ_IQ_VBMI 1
+// RUNQ_IQ_GATHER=1 in the environment (read by rq_ctx_new: smb_config) selects the gather decode below at run time: the
+// test suite checks that both give the same logits (the gather decode is what AVX-512 CPUs without VBMI run)
+extern int rq_iq_gather;
 
 static inline __m512i iq512_rep4(int a, int b, int c, int d) {
     // a 64-byte vpermb table whose entry i only depends on i % 4
@@ -689,44 +700,27 @@ static inline __m512i iq512_rep8(int a, int b, int c, int d, int e, int f, int g
                                          (uint64_t)e << 32 | (uint64_t)f << 40 | (uint64_t)g << 48 | (uint64_t)h << 56));
 }
 
-static inline __attribute__((always_inline)) __m512i iq512_lutw(const uint16_t *tab, const int n, __m512i idx) {
-    // tab[idx] for the 32 word lanes of idx (< n, n = 256, 512 or 1024)
-    __m512i r[16];
-    for (int p = 0; p < n / 64; p++)
-        r[p] = _mm512_permutex2var_epi16(_mm512_loadu_si512((const void *)(tab + 64 * p)), idx,
-                                         _mm512_loadu_si512((const void *)(tab + 64 * p + 32)));
-    for (int bit = 6, m = n / 64; m > 1; bit++, m /= 2) {
-        __mmask32 k = _mm512_test_epi16_mask(idx, _mm512_set1_epi16((short)(1 << bit)));
+static inline __attribute__((always_inline)) __m512i iq512_lutb(const uint8_t *tab, const int n, __m512i idx, __mmask64 k7,
+                                                                __mmask64 k8, __mmask64 k9) {
+    // tab[i] for the 64 byte lanes, i = the lane's idx byte | its k8 bit << 8 | k9 bit << 9 (n = 256, 512 or 1024 entries;
+    // k7: the idx bytes' bit 7)
+    __m512i r[8];
+    for (int p = 0; p < n / 128; p++)
+        r[p] = _mm512_permutex2var_epi8(_mm512_load_si512((const void *)(tab + 128 * p)), idx,
+                                        _mm512_load_si512((const void *)(tab + 128 * p + 64)));
+    const __mmask64 k[3] = { k7, k8, k9 };
+    for (int lv = 0, m = n / 128; m > 1; lv++, m /= 2)
         for (int q = 0; q < m / 2; q++)
-            r[q] = _mm512_mask_blend_epi16(k, r[2 * q], r[2 * q + 1]);
-    }
+            r[q] = _mm512_mask_blend_epi8(k[lv], r[2 * q], r[2 * q + 1]);
     return r[0];
 }
 
-// vpmultishiftqb controls: byte b of an even lane at bit offset o_b of the qword, of an odd lane at 32 + o_b: 2-bit codes
-// of step 2 l + p of chunk l: o_b = 8 p + 2 b (0x2624222006040200, 0x2e2c2a280e0c0a08); 3-bit: o_b = 3 b (0x2926232009060300)
-
-static inline __m512i iq512_cw(__m512i c, int half) {
-    // word lanes 16 half .. 16 half + 15 (the 16 rows of one chunk or step) as dword lanes
-    return _mm512_cvtepu16_epi32(half ? _mm512_extracti64x4_epi64(c, 1) : _mm512_castsi512_si256(c));
-}
+// vpmultishiftqb controls: byte b of an even lane at bit offset o_b of the qword, of an odd lane at 32 + o_b: the 2-bit
+// codes of step 2 l + p are byte l of the lane in the code bytes p: o_b = 8 l + 2 b (0x2624222006040200 + l 0x0808080808080808)
 
 static inline __m512i iq512_vb(__m512i ms, __m512i lp, __m512i lm, uint64_t k) {
     // lp[code], or lm[code] where k is set (the step's sign / delta bits)
     return _mm512_mask_permutexvar_epi8(_mm512_permutexvar_epi8(ms, lp), _cvtu64_mask64(k), ms, lm);
-}
-
-static inline __m512i iq512_hiw(const uint8_t *p, int s0, int s1, int bits) {
-    // 32 word lanes: (p[r] >> s0) & bits for lanes r < 16, (p[r] >> s1) & bits for lanes 16 + r, shifted to bit 8
-    __m256i h = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)p));
-    __m512i h2 = _mm512_inserti64x4(_mm512_castsi256_si512(h), h, 1);
-    __m512i sh = _mm512_mask_blend_epi16(0xFFFF0000u, _mm512_set1_epi16((short)s0), _mm512_set1_epi16((short)s1));
-    return _mm512_slli_epi16(_mm512_and_si512(_mm512_srlv_epi16(h2, sh), _mm512_set1_epi16((short)bits)), 8);
-}
-
-static inline uint64_t iq_k64(__mmask16 k) {
-    // a lane mask as a byte mask (the 4 bytes of each set lane)
-    return _pdep_u64((uint64_t)_cvtmask16_u32(k), 0x1111111111111111ull) * 15;
 }
 
 static inline __attribute__((always_inline)) int iq512_group_vbmi(const int type, const uint8_t *o, int g, __m512i w[8],
@@ -735,9 +729,12 @@ static inline __attribute__((always_inline)) int iq512_group_vbmi(const int type
     const __m512i n15 = _mm512_set1_epi32(15);
     switch (type) {
     case GGML_IQ2_XXS: case GGML_IQ2_XS: case GGML_IQ2_S: {
+        // the 64 lane-major indices of the group in one vector: the byte tables of the codes of values 0..3 / 4..7
+        // (vpermi2b over 128 entries; the blend tree on index bits 7 (the byte's sign bit), 8, 9 (hi, by pext))
         int xxs = type == GGML_IQ2_XXS;
         const uint8_t *gp = o + (xxs ? 96 + 128 * g : 160 + 144 * g), *sgn = gp + (xxs ? 64 : 80);
-        const uint16_t *tab = xxs ? iq2xxs_code : type == GGML_IQ2_XS ? iq2xs_code : iq2s_code;
+        const uint8_t *clo = xxs ? iq2xxs_clo : type == GGML_IQ2_XS ? iq2xs_clo : iq2s_clo;
+        const uint8_t *chi = xxs ? iq2xxs_chi : type == GGML_IQ2_XS ? iq2xs_chi : iq2s_chi;
         const int n = xxs ? 256 : type == GGML_IQ2_XS ? 512 : 1024;
         if (xxs)
             *S0 = *S1 = iq512_s21(_mm512_and_si512(_mm512_srli_epi32(_mm512_loadu_si512((const void *)(o + 32)), 4 * g), n15));
@@ -746,70 +743,77 @@ static inline __attribute__((always_inline)) int iq512_group_vbmi(const int type
             *S0 = iq512_s21(_mm512_and_si512(sc, n15));
             *S1 = iq512_s21(_mm512_and_si512(_mm512_srli_epi32(sc, 4), n15));
         }
-        __m512i ib = _mm512_loadu_si512((const void *)gp);
-        __m512i i01 = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(ib)), i23 = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(ib, 1));
-        if (!xxs) {
-            i01 = _mm512_or_si512(i01, iq512_hiw(gp + 64, 0, 2, 3));
-            i23 = _mm512_or_si512(i23, iq512_hiw(gp + 64, 4, 6, 3));
+        __m512i idx = _mm512_loadu_si512((const void *)gp);
+        __mmask64 k7 = _mm512_movepi8_mask(idx), k8 = 0, k9 = 0;
+        if (!xxs) { // bit 2 l (+1) of hi[r] -> bit 4 r + l
+            uint64_t h0 = kq_u64(gp + 64), h1 = kq_u64(gp + 72);
+            k8 = _cvtu64_mask64(_pext_u64(h0, 0x5555555555555555ull) | _pext_u64(h1, 0x5555555555555555ull) << 32);
+            k9 = _cvtu64_mask64(_pext_u64(h0, 0xaaaaaaaaaaaaaaaaull) | _pext_u64(h1, 0xaaaaaaaaaaaaaaaaull) << 32);
         }
-        __m512i c[2] = { iq512_lutw(tab, n, i01), iq512_lutw(tab, n, i23) };
+        __m512i c[2] = { iq512_lutb(clo, n, idx, k7, k8, k9), iq512_lutb(chi, n, idx, k7, k8, k9) };
         const __m512i lp = iq512_rep4(51, 68, 86, 43), lm = iq512_rep4(35, 18, 0, 43);
-        const __m512i ms0 = _mm512_set1_epi64(0x2624222006040200ll), ms1 = _mm512_set1_epi64(0x2e2c2a280e0c0a08ll);
         for (int l = 0; l < 4; l++) {
-            __m512i cw = iq512_cw(c[l / 2], l % 2);
-            w[2 * l] = iq512_vb(_mm512_multishift_epi64_epi8(ms0, cw), lp, lm, kq_u64(sgn + 16 * l));
-            w[2 * l + 1] = iq512_vb(_mm512_multishift_epi64_epi8(ms1, cw), lp, lm, kq_u64(sgn + 16 * l + 8));
+            const __m512i ms = _mm512_set1_epi64((long long)(0x2624222006040200ull + 0x0808080808080808ull * l));
+            w[2 * l] = iq512_vb(_mm512_multishift_epi64_epi8(ms, c[0]), lp, lm, kq_u64(sgn + 16 * l));
+            w[2 * l + 1] = iq512_vb(_mm512_multishift_epi64_epi8(ms, c[1]), lp, lm, kq_u64(sgn + 16 * l + 8));
         }
         return 1;
     }
     case GGML_IQ3_XXS: case GGML_IQ3_S: {
+        // per half h the 64 lane-major indices of steps 4 h .. 4 h + 3: byte tables ca (codes of values 0, 1: 6 bits) and
+        // cb (values 2, 3); step 4 h + j = bytes j of ca, ca, cb, cb of the lane (vpermi2b), then B + |v| of the even
+        // bytes' low 3 bits and the odd bytes' high 3 (vpermb, a masked vpermb), the negative ones as 2 B - (B + |v|)
         int xxs = type == GGML_IQ3_XXS;
         const uint8_t *gp = o + 96 + (xxs ? 192 : 208) * g, *sgn = gp + (xxs ? 128 : 144);
+        const uint8_t *ca = xxs ? iq3xxs_ca : iq3s_ca, *cb = xxs ? iq3xxs_cb : iq3s_cb;
+        const int n = xxs ? 256 : 512;
         *S0 = *S1 = iq512_s21(_mm512_and_si512(_mm512_srli_epi32(_mm512_loadu_si512((const void *)(o + 32)), 4 * g), n15));
-        const __m512i lp = xxs ? iq512_rep8(66, 74, 82, 90, 98, 106, 114, 124) : iq512_rep8(16, 18, 20, 22, 24, 26, 28, 30);
-        const __m512i lm = xxs ? iq512_rep8(58, 50, 42, 34, 26, 18, 10, 0) : iq512_rep8(14, 12, 10, 8, 6, 4, 2, 0);
-        const __m512i ms = _mm512_set1_epi64(0x2926232009060300ll);
+        static const int8_t m3x[8] = { 4, 12, 20, 28, 36, 44, 52, 62 };
+        const int Bq = xxs ? 62 : 15;
+        long long od[8];
+        for (int e = 0; e < 8; e++)
+            od[e] = (long long)(0x0101010101010101ull * (uint64_t)(Bq + (xxs ? m3x[e] : 2 * e + 1)));
+        const __m512i lev = xxs ? iq512_rep8(66, 74, 82, 90, 98, 106, 114, 124) : iq512_rep8(16, 18, 20, 22, 24, 26, 28, 30);
+        const __m512i lod = _mm512_setr_epi64(od[0], od[1], od[2], od[3], od[4], od[5], od[6], od[7]);
+        const __m512i b2 = _mm512_set1_epi8((char)(2 * Bq));
+        const __m512i rb = _mm512_setr_epi32(0x40400000, 0x44440404, 0x48480808, 0x4c4c0c0c, 0x50501010, 0x54541414, 0x58581818,
+                                             0x5c5c1c1c, 0x60602020, 0x64642424, 0x68682828, 0x6c6c2c2c, 0x70703030, 0x74743434,
+                                             0x78783838, 0x7c7c3c3c); // byte 4 r + b: 4 r (+ 64 for b >= 2: cb)
+        uint64_t h0 = xxs ? 0 : kq_u64(gp + 128), h1 = xxs ? 0 : kq_u64(gp + 136);
         for (int h = 0; h < 2; h++) {
-            __m512i ib = _mm512_loadu_si512((const void *)(gp + 64 * h));
-            __m512i i0 = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(ib)), i1 = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(ib, 1));
-            if (!xxs) {
-                i0 = _mm512_or_si512(i0, iq512_hiw(gp + 128, 4 * h, 4 * h + 1, 1));
-                i1 = _mm512_or_si512(i1, iq512_hiw(gp + 128, 4 * h + 2, 4 * h + 3, 1));
+            __m512i idx = _mm512_loadu_si512((const void *)(gp + 64 * h));
+            __mmask64 k7 = _mm512_movepi8_mask(idx), k8 = 0;
+            if (!xxs) { // bit 4 h + j of hi[r] -> bit 4 r + j
+                uint64_t m = 0x0f0f0f0f0f0f0f0full << 4 * h;
+                k8 = _cvtu64_mask64(_pext_u64(h0, m) | _pext_u64(h1, m) << 32);
             }
-            __m512i c[2] = { iq512_lutw(xxs ? iq3xxs_code : iq3s_code, xxs ? 256 : 512, i0),
-                             iq512_lutw(xxs ? iq3xxs_code : iq3s_code, xxs ? 256 : 512, i1) };
-            for (int t = 0; t < 4; t++)
-                w[4 * h + t] = iq512_vb(_mm512_multishift_epi64_epi8(ms, iq512_cw(c[t / 2], t % 2)), lp, lm, kq_u64(sgn + 8 * (4 * h + t)));
+            __m512i A = iq512_lutb(ca, n, idx, k7, k8, 0), Bv = iq512_lutb(cb, n, idx, k7, k8, 0);
+            for (int j = 0; j < 4; j++) {
+                __m512i x = _mm512_permutex2var_epi8(A, _mm512_add_epi8(rb, _mm512_set1_epi8((char)j)), Bv);
+                __m512i v = _mm512_mask_permutexvar_epi8(_mm512_permutexvar_epi8(x, lev), _cvtu64_mask64(0xaaaaaaaaaaaaaaaaull), x, lod);
+                w[4 * h + j] = _mm512_mask_sub_epi8(v, _cvtu64_mask64(kq_u64(sgn + 8 * (4 * h + j))), b2, v);
+            }
         }
         return 1;
     }
     case GGML_IQ1_S: case GGML_IQ1_M: {
+        // the codes as IQ2's after its lookup; the delta's sign selects the table (B + 8 grid + 1, or - 1)
+        int m = type == GGML_IQ1_M;
+        const uint8_t *gp = o + (m ? 160 + 136 * g : 112 + 128 * g);
         const __m512i lp = iq512_rep4(2, 10, 18, 9), lm = iq512_rep4(0, 8, 16, 9), m7 = _mm512_set1_epi32(7);
-        const __m512i ms0 = _mm512_set1_epi64(0x2624222006040200ll), ms1 = _mm512_set1_epi64(0x2e2c2a280e0c0a08ll);
-        if (type == GGML_IQ1_S) {
-            const uint8_t *gp = o + 32 + 96 * g;
-            __m512i qh = _mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *)(gp + 64)));
-            *S0 = *S1 = iq512_s21(_mm512_and_si512(_mm512_srli_epi32(qh, 12), m7));
-            uint64_t kd = iq_k64(_mm512_test_epi32_mask(qh, _mm512_set1_epi32(0x8000)));
-            for (int l = 0; l < 4; l++) {
-                __m512i idx = _mm512_or_si512(iq512_u8(gp + 16 * l), _mm512_slli_epi32(_mm512_and_si512(_mm512_srli_epi32(qh, 3 * l), m7), 8));
-                __m512i cw = _mm512_i32gather_epi32(idx, (const void *)iq1s_code, 2); // (the high 16 bits: never read)
-                w[2 * l] = iq512_vb(_mm512_multishift_epi64_epi8(ms0, cw), lp, lm, kd);
-                w[2 * l + 1] = iq512_vb(_mm512_multishift_epi64_epi8(ms1, cw), lp, lm, kd);
-            }
-        } else {
-            const uint8_t *gp = o + 160 + 96 * g;
+        if (m) {
             __m512i sc = _mm512_srli_epi32(_mm512_loadu_si512((const void *)(o + 32 + 64 * (g / 4))), 8 * (g % 4));
             *S0 = iq512_s21(_mm512_and_si512(sc, m7));
             *S1 = iq512_s21(_mm512_and_si512(_mm512_srli_epi32(sc, 4), m7));
-            for (int l = 0; l < 4; l++) {
-                __m512i q = _mm512_srli_epi32(iq512_u8(gp + 64 + 16 * (l / 2)), 4 * (l % 2));
-                __m512i idx = _mm512_or_si512(iq512_u8(gp + 16 * l), _mm512_slli_epi32(_mm512_and_si512(q, m7), 8));
-                uint64_t kd = iq_k64(_mm512_test_epi32_mask(q, _mm512_set1_epi32(8)));
-                __m512i cw = _mm512_i32gather_epi32(idx, (const void *)iq1s_code, 2);
-                w[2 * l] = iq512_vb(_mm512_multishift_epi64_epi8(ms0, cw), lp, lm, kd);
-                w[2 * l + 1] = iq512_vb(_mm512_multishift_epi64_epi8(ms1, cw), lp, lm, kd);
-            }
+        } else
+            *S0 = *S1 = iq512_s21(_mm512_and_si512(_mm512_srli_epi32(_mm512_loadu_si512((const void *)(o + 32)), 4 * g), m7));
+        __m512i c0 = _mm512_loadu_si512((const void *)gp), c1 = _mm512_loadu_si512((const void *)(gp + 64));
+        uint64_t dm = m ? kq_u64(gp + 128) : 0, kd = m ? 0 : _pdep_u64(kq_u16(o + 96 + 2 * g), 0x1111111111111111ull) * 15;
+        for (int l = 0; l < 4; l++) {
+            if (m) kd = _pdep_u64(_pext_u64(dm, 0x1111111111111111ull << l), 0x1111111111111111ull) * 15;
+            const __m512i ms = _mm512_set1_epi64((long long)(0x2624222006040200ull + 0x0808080808080808ull * l));
+            w[2 * l] = iq512_vb(_mm512_multishift_epi64_epi8(ms, c0), lp, lm, kd);
+            w[2 * l + 1] = iq512_vb(_mm512_multishift_epi64_epi8(ms, c1), lp, lm, kd);
         }
         return 1;
     }
@@ -822,7 +826,7 @@ static inline __attribute__((always_inline)) void iq512_group(const int type, co
                                                               __m512i *S0, __m512i *S1, __m512i *M0, __m512i *M1) {
     // group g of a repacked super-block: the 8 steps of biased codes v + B (u8), the sub-block scales (Q2_K: the mins)
 #ifdef RUNQ_IQ_VBMI
-    if (iq512_group_vbmi(type, o, g, w, S0, S1)) return;
+    if (!rq_iq_gather && iq512_group_vbmi(type, o, g, w, S0, S1)) return;
 #endif
     const __m512i B = _mm512_set1_epi8((char)iq_bias(type)), n15 = _mm512_set1_epi32(15);
     switch (type) {
@@ -846,9 +850,10 @@ static inline __attribute__((always_inline)) void iq512_group(const int type, co
     case GGML_IQ2_XXS: {
         const uint8_t *gp = o + 96 + 128 * g;
         *S0 = *S1 = iq512_s21(_mm512_and_si512(_mm512_srli_epi32(_mm512_loadu_si512((const void *)(o + 32)), 4 * g), n15));
+        __m512i ib = _mm512_loadu_si512((const void *)gp);
         for (int l = 0; l < 4; l++) {
             __m512i m0, m1;
-            iq512_g64(iq2xxs_grid, iq512_u8(gp + 16 * l), &m0, &m1);
+            iq512_g64(iq2xxs_grid, _mm512_and_si512(_mm512_srli_epi32(ib, 8 * l), _mm512_set1_epi32(255)), &m0, &m1);
             w[2 * l] = iq512_sgn(m0, gp + 64 + 16 * l, B);
             w[2 * l + 1] = iq512_sgn(m1, gp + 72 + 16 * l, B);
         }
@@ -860,9 +865,9 @@ static inline __attribute__((always_inline)) void iq512_group(const int type, co
         __m512i sc = _mm512_srli_epi32(_mm512_loadu_si512((const void *)(o + 32 + 64 * (g / 4))), 8 * (g % 4));
         *S0 = iq512_s21(_mm512_and_si512(sc, n15));
         *S1 = iq512_s21(_mm512_and_si512(_mm512_srli_epi32(sc, 4), n15));
-        __m512i hi = iq512_u8(gp + 64);
+        __m512i hi = iq512_u8(gp + 64), ib = _mm512_loadu_si512((const void *)gp);
         for (int l = 0; l < 4; l++) {
-            __m512i idx = _mm512_or_si512(iq512_u8(gp + 16 * l),
+            __m512i idx = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi32(ib, 8 * l), _mm512_set1_epi32(255)),
                                           _mm512_slli_epi32(_mm512_and_si512(_mm512_srli_epi32(hi, 2 * l), _mm512_set1_epi32(3)), 8));
             __m512i m0, m1;
             iq512_g64(grid, idx, &m0, &m1);
@@ -874,8 +879,11 @@ static inline __attribute__((always_inline)) void iq512_group(const int type, co
     case GGML_IQ3_XXS: {
         const uint8_t *gp = o + 96 + 192 * g;
         *S0 = *S1 = iq512_s21(_mm512_and_si512(_mm512_srli_epi32(_mm512_loadu_si512((const void *)(o + 32)), 4 * g), n15));
-        for (int t = 0; t < 8; t++)
-            w[t] = iq512_sgn(_mm512_i32gather_epi32(iq512_u8(gp + 16 * t), (const void *)iq3xxs_grid, 4), gp + 128 + 8 * t, B);
+        for (int t = 0; t < 8; t++) {
+            __m512i idx = _mm512_and_si512(_mm512_srli_epi32(_mm512_loadu_si512((const void *)(gp + 64 * (t / 4))), 8 * (t % 4)),
+                                           _mm512_set1_epi32(255));
+            w[t] = iq512_sgn(_mm512_i32gather_epi32(idx, (const void *)iq3xxs_grid, 4), gp + 128 + 8 * t, B);
+        }
         break;
     }
     case GGML_IQ3_S: {
@@ -883,42 +891,37 @@ static inline __attribute__((always_inline)) void iq512_group(const int type, co
         *S0 = *S1 = iq512_s21(_mm512_and_si512(_mm512_srli_epi32(_mm512_loadu_si512((const void *)(o + 32)), 4 * g), n15));
         __m512i hi = iq512_u8(gp + 128);
         for (int t = 0; t < 8; t++) {
-            __m512i idx = _mm512_or_si512(iq512_u8(gp + 16 * t),
-                                          _mm512_slli_epi32(_mm512_and_si512(_mm512_srli_epi32(hi, t), _mm512_set1_epi32(1)), 8));
+            __m512i lo = _mm512_and_si512(_mm512_srli_epi32(_mm512_loadu_si512((const void *)(gp + 64 * (t / 4))), 8 * (t % 4)),
+                                          _mm512_set1_epi32(255));
+            __m512i idx = _mm512_or_si512(lo, _mm512_slli_epi32(_mm512_and_si512(_mm512_srli_epi32(hi, t), _mm512_set1_epi32(1)), 8));
             w[t] = iq512_sgn(_mm512_i32gather_epi32(idx, (const void *)iq3s_grid, 4), gp + 144 + 8 * t, B);
         }
         break;
     }
-    case GGML_IQ1_S: {
-        const uint8_t *gp = o + 32 + 96 * g;
-        __m512i qh = _mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *)(gp + 64)));
-        *S0 = *S1 = iq512_s21(_mm512_and_si512(_mm512_srli_epi32(qh, 12), _mm512_set1_epi32(7)));
-        __mmask16 kd = _mm512_test_epi32_mask(qh, _mm512_set1_epi32(0x8000));
-        __m512i dv = _mm512_mask_blend_epi32(kd, _mm512_set1_epi32(0x01010101), _mm512_set1_epi32(-1));
+    case GGML_IQ1_S: case GGML_IQ1_M: {
+        // (no VBMI) the 2-bit codes of each step spread to bytes by shifts, B + 8 grid by vpshufb, the delta added
+        int m = type == GGML_IQ1_M;
+        const uint8_t *gp = o + (m ? 160 + 136 * g : 112 + 128 * g);
+        const __m512i m7 = _mm512_set1_epi32(7), m3 = _mm512_set1_epi8(3), ff = _mm512_set1_epi32(255);
+        const __m512i lut = _mm512_set1_epi32(0x00110901); // codes 0, 1, 2 -> B + 8 grid = 1, 9, 17
+        const __m512i pos = _mm512_set1_epi32(0x01010101), neg = _mm512_set1_epi32(-1);
+        if (m) {
+            __m512i sc = _mm512_srli_epi32(_mm512_loadu_si512((const void *)(o + 32 + 64 * (g / 4))), 8 * (g % 4));
+            *S0 = iq512_s21(_mm512_and_si512(sc, m7));
+            *S1 = iq512_s21(_mm512_and_si512(_mm512_srli_epi32(sc, 4), m7));
+        } else
+            *S0 = *S1 = iq512_s21(_mm512_and_si512(_mm512_srli_epi32(_mm512_loadu_si512((const void *)(o + 32)), 4 * g), m7));
+        __m512i c[2] = { _mm512_loadu_si512((const void *)gp), _mm512_loadu_si512((const void *)(gp + 64)) };
+        __mmask16 kd = m ? 0 : (__mmask16)kq_u16(o + 96 + 2 * g);
+        uint64_t dm = m ? kq_u64(gp + 128) : 0;
         for (int l = 0; l < 4; l++) {
-            __m512i idx = _mm512_or_si512(iq512_u8(gp + 16 * l),
-                                          _mm512_slli_epi32(_mm512_and_si512(_mm512_srli_epi32(qh, 3 * l), _mm512_set1_epi32(7)), 8));
-            __m512i m0, m1;
-            iq512_g64(iq1s_grid9, idx, &m0, &m1);
-            w[2 * l] = _mm512_add_epi8(m0, dv);
-            w[2 * l + 1] = _mm512_add_epi8(m1, dv);
-        }
-        break;
-    }
-    case GGML_IQ1_M: {
-        const uint8_t *gp = o + 160 + 96 * g;
-        __m512i sc = _mm512_srli_epi32(_mm512_loadu_si512((const void *)(o + 32 + 64 * (g / 4))), 8 * (g % 4));
-        *S0 = iq512_s21(_mm512_and_si512(sc, _mm512_set1_epi32(7)));
-        *S1 = iq512_s21(_mm512_and_si512(_mm512_srli_epi32(sc, 4), _mm512_set1_epi32(7)));
-        for (int l = 0; l < 4; l++) {
-            __m512i q = _mm512_srli_epi32(iq512_u8(gp + 64 + 16 * (l / 2)), 4 * (l % 2));
-            __m512i idx = _mm512_or_si512(iq512_u8(gp + 16 * l), _mm512_slli_epi32(_mm512_and_si512(q, _mm512_set1_epi32(7)), 8));
-            __mmask16 kd = _mm512_test_epi32_mask(q, _mm512_set1_epi32(8));
-            __m512i dv = _mm512_mask_blend_epi32(kd, _mm512_set1_epi32(0x01010101), _mm512_set1_epi32(-1));
-            __m512i m0, m1;
-            iq512_g64(iq1s_grid9, idx, &m0, &m1);
-            w[2 * l] = _mm512_add_epi8(m0, dv);
-            w[2 * l + 1] = _mm512_add_epi8(m1, dv);
+            if (m) kd = (__mmask16)_pext_u64(dm, 0x1111111111111111ull << l); // bit l of each nibble r of dm
+            __m512i dv = _mm512_mask_blend_epi32(kd, pos, neg);
+            for (int p = 0; p < 2; p++) {
+                __m512i x = _mm512_and_si512(_mm512_srli_epi32(c[p], 8 * l), ff);
+                x = _mm512_or_si512(_mm512_or_si512(x, _mm512_slli_epi32(x, 6)), _mm512_or_si512(_mm512_slli_epi32(x, 12), _mm512_slli_epi32(x, 18)));
+                w[2 * l + p] = _mm512_add_epi8(_mm512_shuffle_epi8(lut, _mm512_and_si512(x, m3)), dv);
+            }
         }
         break;
     }

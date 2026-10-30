@@ -45,6 +45,7 @@
 // setting of the kernels, read in their loops (a parameter would change the -Ofast code generation
 // of the exact functions); set by rq_model_load, which rejects a second model with another one
 extern int GS;
+extern int rq_iq_gather; // RUNQ_IQ_GATHER (iquants.h)
 
 // Batched prefill: rows per chunk (-b, at most B_MAX); 0 or 1 = one token at a time through the decode
 // path. Bigger chunks are faster (fewer barriers and weight passes per token): 8 threads, 1,500 /

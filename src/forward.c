@@ -998,6 +998,8 @@ static void smb_config(RqCtx *c) {
     // type; the kernels' prefetch distance in bytes; Q3_K's rows are the 6th value: pf was there first), RUNQ_BD=max,epi,split,seg
     int smb[6] = { 32, 32, 32, 32, SMB_PF, 32 };
     env_ints("RUNQ_SMB", smb, 6);
+    const char *ig = getenv("RUNQ_IQ_GATHER"); // (iquants.h: the gather decode of the i-quants, a test switch; process-wide)
+    rq_iq_gather = ig && atoi(ig) != 0;
     memcpy(c->smb_max, smb, 4 * sizeof(int));
     c->smb_max[SMB_Q3] = smb[5];
     c->smb_pf = smb[4];

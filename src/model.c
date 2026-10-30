@@ -6,6 +6,7 @@
 #include "internal.h"
 
 int GS = 0;
+int rq_iq_gather = 0; // (iquants.h: the AVX-512 i-quant decode by gathers instead of VBMI, RUNQ_IQ_GATHER; a test switch)
 static int gs_models = 0; // loaded models with weights (all of the same group size GS)
 
 void load_fail(LoadErr *e, const char *fmt, ...) {

@@ -11,10 +11,12 @@ formats (the decoders index them with the bits stored in the files), copied valu
   iq1s_grid[2048]                                     uint64: 8 int8 values -1, 0, 1 per entry (IQ1_S and IQ1_M)
   kvalues_iq4nl[16]                                   int8: IQ4_XS's (and IQ4_NL's) non-linear values
 Derived (not in ggml), for the AVX-512 kernels (src/iquants.h):
-  iq1s_grid9[2048]   iq1s_grid with every byte g as 8 g + 9 (1, 9, 17): the biased IQ1_S / IQ1_M codes (gather kernels)
-  *_code             every entry of a grid as small codes, value j at bits B j .. B j + B - 1: its position in the
+  iq1s_code          every entry of a grid as small codes, value j at bits B j .. B j + B - 1: its position in the
                      grid's alphabet (B = 2: IQ2 {8, 25, 43}, IQ1 {-1, 0, 1}; B = 3: IQ3_XXS {4, 12, .., 52, 62},
-                     IQ3_S {1, 3, .., 15}); uint16 (iq1s_code: 2 more zero entries, read by a 4-byte gather)
+                     IQ3_S {1, 3, .., 15}), uint16 (the repacked IQ1 layouts store these instead of indices); the IQ2 / IQ3 codes
+                     only as the byte tables below
+  iq2*_clo, iq2*_chi the IQ2 codes' low and high bytes (values 0..3, 4..7), uint8: vpermi2b tables
+  iq3*_ca, iq3*_cb   the IQ3 codes of values 0, 1 and of 2, 3 (code | code << 3), uint8: vpermi2b tables
 ksigns_iq2xs (the 7 stored sign bits of 8 values, completed with even parity) is not copied: it is the
 expression s | (popcount(s) & 1) << 7 (src/iquants.h), checked here against ggml's table.
 """
@@ -64,25 +66,10 @@ def main():
                 out.append("    " + ", ".join(str(v) for v in row) + ",")
         out.append("};")
         out.append("")
-    g1 = table(src, "iq1s_grid")
-    g9 = []
-    for e in g1:
-        v = 0
-        for j in range(8):
-            b = (e >> 8 * j) & 255
-            b = b - 256 if b > 127 else b
-            v |= (8 * b + 9) << 8 * j
-        g9.append(v)
-    out.append("// derived: iq1s_grid with each byte g as 8 g + 9")
-    out.append("static const uint64_t iq1s_grid9[2048] = {")
-    for i in range(0, 2048, 4):
-        out.append("    " + ", ".join(f"0x{v:016x}" for v in g9[i:i + 4]) + ",")
-    out.append("};")
-    out.append("")
     codes = [  # (name, grid, bytes per entry, bits per value, alphabet, extra zero entries)
         ("iq2xxs_code", "iq2xxs_grid", 8, 2, [8, 25, 43], 0), ("iq2xs_code", "iq2xs_grid", 8, 2, [8, 25, 43], 0),
         ("iq2s_code", "iq2s_grid", 8, 2, [8, 25, 43], 0), ("iq3xxs_code", "iq3xxs_grid", 4, 3, [4, 12, 20, 28, 36, 44, 52, 62], 0),
-        ("iq3s_code", "iq3s_grid", 4, 3, [1, 3, 5, 7, 9, 11, 13, 15], 0), ("iq1s_code", "iq1s_grid", 8, 2, [255, 0, 1], 2)]
+        ("iq3s_code", "iq3s_grid", 4, 3, [1, 3, 5, 7, 9, 11, 13, 15], 0), ("iq1s_code", "iq1s_grid", 8, 2, [255, 0, 1], 0)]
     for cname, gname, nb, bits, alpha, extra in codes:
         vals = []
         for e in table(src, gname):
@@ -94,12 +81,31 @@ def main():
                 c |= alpha.index(byte) << bits * j
             vals.append(c)
         vals += [0] * extra
-        out.append(f"// derived: {gname} as {bits}-bit codes per value (alphabet {alpha})")
-        out.append(f"static const uint16_t {cname}[{len(vals)}] = {{")
-        for i in range(0, len(vals), 12):
-            out.append("    " + ", ".join(f"0x{v:04x}" for v in vals[i:i + 12]) + ",")
-        out.append("};")
-        out.append("")
+        if cname.startswith("iq3"):
+            for half, nm in ((0, "ca"), (1, "cb")):
+                bv = [(v >> 6 * half) & 63 for v in vals]
+                out.append(f"// derived: the codes of values {2 * half}, {2 * half + 1} of {cname}")
+                out.append(f"static const uint8_t {cname[:-5]}_{nm}[{len(bv)}] __attribute__((aligned(64))) = {{")
+                for i in range(0, len(bv), 16):
+                    out.append("    " + ", ".join(f"0x{v:02x}" for v in bv[i:i + 16]) + ",")
+                out.append("};")
+                out.append("")
+        if cname.startswith("iq2"):
+            for half, nm in ((0, "clo"), (1, "chi")):
+                bv = [(v >> 8 * half) & 255 for v in vals]
+                out.append(f"// derived: byte {half} of {cname}")
+                out.append(f"static const uint8_t {cname[:-5]}_{nm}[{len(bv)}] __attribute__((aligned(64))) = {{")
+                for i in range(0, len(bv), 16):
+                    out.append("    " + ", ".join(f"0x{v:02x}" for v in bv[i:i + 16]) + ",")
+                out.append("};")
+                out.append("")
+        if cname == "iq1s_code":
+            out.append(f"// derived: {gname} as {bits}-bit codes per value (alphabet {alpha})")
+            out.append(f"static const uint16_t {cname}[{len(vals)}] = {{")
+            for i in range(0, len(vals), 12):
+                out.append("    " + ", ".join(f"0x{v:04x}" for v in vals[i:i + 12]) + ",")
+            out.append("};")
+            out.append("")
     out.append("#endif // RUNQ_IQ_GRIDS_H")
     print("\n".join(out))
 

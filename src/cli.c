@@ -606,7 +606,7 @@ static void print_memory(const RqModel *m, int seq_len) {
 
 static void error_usage(void) {
     fprintf(stderr, "Usage:   runq <checkpoint> [options]\n");
-    fprintf(stderr, "         checkpoint: a qwen3.c .bin (with its .tokenizer / .template* files) or a GGUF file (Q8_0, Q3_K_M .. Q5_K_M)\n");
+    fprintf(stderr, "         checkpoint: a qwen3.c .bin (with its .tokenizer / .template* files) or a GGUF file (Q8_0, Q3_K_M .. Q5_K_M, i-quant mixes)\n");
     fprintf(stderr, "Example: runq Qwen3-0.6B-Q8_0.gguf -c 4096 -r 1\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");

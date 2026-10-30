@@ -268,8 +268,15 @@ Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M (Qwen3.8-27B Q4_K_M, the same
   today, `iq_rows`; no tiles, no small-batch kernels): Saluki prefills at ~0.72x the 27B Q3_K_M's tok/s (30 / 54 vs
   42 / 74 at 8 / 16 threads). Decode the 16-row block's codes once into a scratch tile (as `kq_unpack_tile`) and run
   more activation rows per pass; maybe 32-row tiles sharing the activation broadcasts.
-- [ ] **NEON kernels for the i-quants** (AArch64 runs `iq_dot`, the generic definition: correct, slow): `tbl` lookups
-  of the byte code tables, the same integer fold.
+- [x] **NEON kernels for the i-quants** (2026-10-30; `iqn_*` in `src/iquants.h`, `make iq-neon-test`): bit-identical to
+  `iq_dot`; Saluki on an M1 Pro (8 threads): decode 0.6 -> 4.7 tok/s, prefill ~1 -> 15.8 tok/s (docs/iquants.md).
+- [ ] **NEON i-quants, faster.** GEMV is instruction-bound (~6 IPC at ~1 instruction per weight, the codebook gathers
+  and the sign masks; 97% of Saluki's decode on an M1 Pro is these kernels). Open: (a) IQ3_S, 0.095 ns/weight vs IQ3_XXS's
+  0.067: its index bit 8 costs ~2.5 scalar instructions per entry; building the 9-bit indices in NEON and moving them over
+  (umov, or a store and loads) was slower; storing them as u16 at load would need a layout of its own (+0.5 bit per
+  weight) or a change of the shared one; (b) a NEON prefill GEMM (decode a 16-row block once into a scratch tile for all
+  activation rows, as `kqn_unpack_tile`), with the AVX-512 one of the item above; (c) gcc on AArch64 Linux (Graviton) is
+  untested (built and checked with Apple clang only).
 - [ ] **The Saluki MTP variant** (`Kujira/Underdog-Saluki-27B-1.0-MTP-GGUF`: Saluki + an MTP block) once S9 runs MTP
   blocks: a self-drafting 7.9 GB 27B.
 - [ ] **More GGUF types**: Q4_0 / Q4_1, IQ4_NL, F16 / BF16 weights (Unsloth's Qwen3.5-0.8B UD-IQ3_XXS has F16 matrices).

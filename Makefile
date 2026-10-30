@@ -29,7 +29,7 @@ HDR = $(wildcard src/*.h)
 Q8  = models/Qwen3-0.6B-q8.bin
 B   = build
 
-.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test api-test tools-test bench-batch bench-verify long-ctx bench-long teacher-force mem-probe bf16dp-test FORCE
+.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test iq-neon-test api-test tools-test bench-batch bench-verify long-ctx bench-long teacher-force mem-probe bf16dp-test FORCE
 
 all: runq
 
@@ -137,10 +137,15 @@ bf16dp-test: $(B)/bf16dp_test $(B)/bf16dp_test-emu
 kq-neon-test: tests/kernels/kq_neon_test.c src/kernels_neon.h src/kquants.h
 	$(CC) $(CFLAGS) $< -o tests/kernels/kq_neon_test && tests/kernels/kq_neon_test
 
+# NEON kernels of Q2_K and the i-quants (iquants.h: iqn_*) vs the generic iq_dot, on random blocks: bit-identical
+# (tests/kernels/iq_neon_test -b [nb]: single-thread ns per weight, NEON and generic)
+iq-neon-test: tests/kernels/iq_neon_test.c src/kernels_neon.h src/iquants.h src/iq_grids.h src/kquants.h
+	$(CC) $(CFLAGS) $< -o tests/kernels/iq_neon_test && tests/kernels/iq_neon_test
+
 generic: runq-generic
 
 clean:
-	rm -rf runq runq-debug runq-generic runq-debug.dSYM tests/kernels/kq_neon_test $(B)
+	rm -rf runq runq-debug runq-generic runq-debug.dSYM tests/kernels/kq_neon_test tests/kernels/iq_neon_test $(B)
 
 # (run_tests.sh builds runq and runq-generic itself, in parallel)
 test:

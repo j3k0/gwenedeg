@@ -50,8 +50,8 @@ stored lane-major, `byte 4 r + l`, so the lookup output already has each row's c
 table for the negative ones). IQ1's 2048-entry book is too big for registers: its indices are replaced by their codes at
 load (2.2 / 2.4 bits per weight instead of 1.56 / 1.75: +0.34 GB on Saluki), so its decode is shifts and `vpermb` only.
 Without VBMI (Skylake-X, Cascade Lake) the AVX-512 kernels gather (IQ1: shifts and `vpshufb`); `RUNQ_IQ_GATHER=1`
-selects that decode at run time (a test switch: the suite checks that both give the same logits). NEON and other CPUs
-run the generic kernel (correct, slow).
+selects that decode at run time (a test switch: the suite checks that both give the same logits). AArch64 with the dot
+product (Apple Silicon, Graviton 2+) runs the NEON kernels below; other CPUs the generic kernel (correct, slow).
 
 Single-thread GEMV, ns per weight (Zen 4, `/var/tmp`-style microbenchmark of `iq_rows`, 1024 x 5120), gathers -> VBMI:
 IQ2_XXS 0.066 -> 0.023, IQ2_XS 0.067 -> 0.028, IQ2_S 0.068 -> 0.034, IQ3_XXS 0.096 -> 0.030, IQ3_S 0.101 -> 0.037,
@@ -60,6 +60,48 @@ IQ1_S / IQ1_M (codes) 0.061 / 0.067 -> 0.017 / 0.020; Q2_K 0.014, IQ4_XS 0.013 (
 
 Batched rows (prefill, verify passes, batched decode) take the same kernel with up to 8 activation rows per pass over a
 decoded group (`iq_rows`; not the K-quants' tiled GEMM nor their small-batch kernels).
+
+## NEON
+
+`iqn_*` in [src/iquants.h](../src/iquants.h), on the same repacked layouts. `sdot` is s8 x s8, so the kernels take the
+signed values v directly (no bias, no c16) and compute the same int32 T_h and the same rounded float fold as `iq_dot`:
+bit-identical logits (`make iq-neon-test`: every type vs `iq_dot` on random blocks, 1 .. 77 activation rows; on Saluki,
+`-m logits` with `-b 1`, `-b 7`, `-b 64`, 3 threads and the generic build give the same sha256). A 16-byte quarter of a
+lane-major 64-byte field is a quad (4 rows x 4 columns), the shape of `sdot` by element, as in kernels_neon.h. Per group
+and quad the 8 steps are decoded into registers, then multiplied with each activation row:
+
+- Q2_K: shifts. IQ4_XS: `tbl` on its 16 values.
+- IQ2_* / IQ3_*: `tbl` reaches 64 bytes and the books are 1-8 KB, so the entries are loaded by scalar index (L1-resident):
+  an IQ2 entry (8 values) stays whole, a register holds chunk l of two rows (`[row 0: values 0..7, row 1: 0..7]`, IQ3:
+  two rows' entries of steps 2 l, 2 l + 1), multiplied by the chunk's 8 activations twice (`sdot` without lane) and the
+  halves added once per sub-block (`addp`); 16 sign bits per register spread by `tbl` + `cmtst`, applied as (a ^ m) - m.
+- IQ1_S / IQ1_M: no lookup. v = 8 c - 8 + delta is affine in the stored code c (0..2), so the kernel takes the dot
+  products of the codes C_h (`tbl` spreads the code bytes, a shift and a mask cut them) and forms
+  T_h = 8 C_h + sum over the chunks l of h of (delta_l - 8) X8_l (X8_l: the sum of the chunk's 8 activations): the
+  same exact integer.
+- Batched rows: up to 8 rows per pass over a decoded group (verify passes, batched decode), 32 for prefill (the decode
+  amortized: 13-30% less time per weight and row than 8 at 64 rows; 64 rows gained ~2% more).
+
+Single thread, M1 Pro (`tests/kernels/iq_neon_test -b [rows [k]]`, 1024 x 5120), ns per weight and activation row:
+
+| type | GEMV (1 row) | generic GEMV | 64 rows | generic, 8 rows |
+|---|---|---|---|---|
+| Q2_K | 0.034 | 0.40 | 0.021 | 0.31 |
+| IQ2_XXS | 0.045 | 0.38 | 0.017 | 0.13 |
+| IQ2_XS / IQ2_S | 0.060 | 0.40 | 0.018 | 0.13 |
+| IQ3_XXS | 0.067 | 1.17 | 0.018 | 0.32 |
+| IQ3_S | 0.095 | 1.43 | 0.019 | 0.39 |
+| IQ1_S | 0.038 | 0.20 | 0.017 | 0.08 |
+| IQ1_M | 0.050 | 0.23 | 0.019 | 0.09 |
+| IQ4_XS | 0.027 | 0.36 | 0.014 | 0.12 |
+
+Saluki on the M1 Pro (32 GB, 8 threads, `-t 0`): decode 0.6 -> **4.7 tok/s** (64 tokens; 4 threads 2.8, 10 threads 4.7),
+prefill ~1.5 (the generic build, 37 tokens) -> **15.8 tok/s** (641 tokens). Decode is the kernels (97% of a token at 1
+thread: 1.39 s, the microbenchmarks weighted by Saluki's types give 1.35 s) and instruction-bound (~6 IPC at ~1
+instruction per weight); 36 GB/s of weights, far from the memory bandwidth. Tried and dropped: one register per step
+(the u64 entries split by `uzp`: IQ2_XXS 0.072 vs 0.053 ns); building IQ3_S's 9-bit indices in NEON and moving them to
+the integer side (`umov` +42%, a store and loads +15%); keeping the pair form's duplicated activations in memory for
+batched rows (+5%).
 
 ## Measurements
 
@@ -97,7 +139,7 @@ the full model's). A 64-token greedy decode at 16 threads measured 14.2-15.1 tok
 ## Not done (TODO.md)
 
 - Prefill: a tiled GEMM for these types (decode once per tile, more activation rows per pass), ~0.72x the Q3_K_M today.
-- NEON kernels for these types (AArch64 runs the generic kernel).
+- NEON: faster GEMV (IQ3_S's index bit 8; TODO.md), a prefill GEMM; gcc on AArch64 Linux untested.
 - IQ4_NL (blocks of 32), TQ1_0 / TQ2_0, and the community MTP variant of Saluki (`Kujira/Underdog-Saluki-27B-1.0-MTP-GGUF`:
   an MTP block for speculative decoding; runq validates but does not run MTP blocks yet, TODO S9).
 - The vision add-on (mmproj files): runq is text only.

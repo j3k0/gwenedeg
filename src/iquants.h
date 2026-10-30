@@ -1,7 +1,7 @@
 /* Low-bit GGUF quants: Q2_K and ggml's i-quants IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS (as in
  * llama.cpp's IQ2_M / IQ3_M / "IQ2-mix" files, e.g. Underdog Saluki 27B 1.0): the block formats, their dequantization,
  * the repacked layouts the matmul kernels read, the arithmetic of a matmul output (the definition below), the generic
- * C kernel and the AVX-512 VNNI one (any build: the generic one; RUNQ_VNNI: iq512_*; NEON: the generic one). Like
+ * C kernel, the AVX-512 VNNI one and the NEON one (any build: the generic one; RUNQ_VNNI: iq512_*; NEON: iqn_*). Like
  * kquants.h for Q3_K .. Q6_K, and on the same activations (int8 xq in groups of 32 with fp32 scales xs), so a matrix
  * of any of these types can sit next to K-quant and Q8_0 ones (a fused q / k / v or gate / up phase mixes them).
  *
@@ -1023,6 +1023,357 @@ static inline void iq512_fns(int type, Iq512Fn *f1, Iq512Fn *f8) {
 }
 #endif // RUNQ_VNNI
 
+// ---------------------------------------------------------------------------- NEON (AArch64 + dot product)
+
+#if defined(RUNQ_NEON) && !defined(RUNQ_IQX)
+#define RUNQ_IQN 1
+// The definition on sdot by element (vdotq_laneq_s32: s8 x s8, so the signed values v directly, no bias and no c16):
+// a 16-byte quarter of a lane-major 64-byte field is one "quad" (rows 4 qd .. 4 qd + 3, dword lane r' = row 4 qd + r'),
+// as in kernels_neon.h. Per group and quad the 8 steps of 4 columns are decoded into registers w[t] (byte 4 r' + b = v of
+// column 4 t + b of row 4 qd + r'), multiplied with the activation bytes 4 t .. 4 t + 3 of the group (T_h, int32 exact),
+// then the float fold of the definition, rows in lanes (no horizontal operation): the same integers and the same rounded
+// float operations as iq_dot, so bit-identical results.
+// Decode: Q2_K shifts; IQ4_XS tbl on its 16 values; IQ2 / IQ3 the codebook entries by scalar-indexed lane loads (the
+// books are 1-8 KB, L1-resident; tbl reaches 64 bytes): an IQ3 entry is one dword lane (4 values), an IQ2 one the lanes
+// of two steps (uzp1 / uzp2 of two rows' entries), the step's 16 sign bits spread to bytes (tbl, tst) and applied as
+// (a ^ m) - m. IQ1: no lookup; v = 8 c - 8 + delta is affine in the stored code c (0..2), so the kernel takes the dot
+// products of the codes, C_h, and forms T_h = 8 C_h + sum over the chunks l of h of (delta_l - 8) X8_l (X8_l: the sum of the
+// chunk's 8 activations), the same exact integer
+
+#if defined(__clang__)
+#define IQN_UNROLL _Pragma("unroll")
+#elif defined(__GNUC__)
+#define IQN_UNROLL _Pragma("GCC unroll 8")
+#else
+#define IQN_UNROLL
+#endif
+
+static inline int32x4_t iqn_u8x4(const uint8_t *p) {
+    // 4 u8 -> int32x4
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(vmovl_u8(vcreate_u8(v)))));
+}
+static inline int32x4_t iqn_s8x4(const uint8_t *p) {
+    // 4 s8 -> int32x4
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return vmovl_s16(vget_low_s16(vmovl_s8(vcreate_s8(v))));
+}
+static inline int32x4_t iqn_s21(uint32x4_t n) { return vreinterpretq_s32_u32(vorrq_u32(vshlq_n_u32(n, 1), vdupq_n_u32(1))); }
+
+static inline uint8x16_t iqn_e2(const uint64_t *grid, unsigned i0, unsigned i1) {
+    // the 8-value entries i0, i1 of an IQ2 book, one per half
+    return vreinterpretq_u8_u64(vcombine_u64(vld1_u64(grid + i0), vld1_u64(grid + i1)));
+}
+static inline uint8x16_t iqn_e4(const uint32_t *grid, unsigned i0, unsigned i1, unsigned i2, unsigned i3) {
+    // the 4-value entries of an IQ3 book, one per dword lane
+#ifdef IQN_E4_LANES
+    uint32x4_t v = vld1q_lane_u32(grid + i0, vdupq_n_u32(0), 0);
+    v = vld1q_lane_u32(grid + i1, v, 1);
+    v = vld1q_lane_u32(grid + i2, v, 2);
+    return vreinterpretq_u8_u32(vld1q_lane_u32(grid + i3, v, 3));
+#else
+    uint64_t a = grid[i0] | (uint64_t)grid[i1] << 32, b = grid[i2] | (uint64_t)grid[i3] << 32;
+    return vreinterpretq_u8_u64(vcombine_u64(vcreate_u64(a), vcreate_u64(b)));
+#endif
+}
+
+static inline int8x16_t iqn_neg(uint8x16_t a, uint8x16_t m) {
+    // a, negated where m = 0xff: (a ^ m) - m (the empty asm keeps clang from turning it into and, cmeq, neg, bsl)
+#if defined(__GNUC__)
+    __asm__("" : "+w"(m));
+#endif
+    return vreinterpretq_s8_u8(vsubq_u8(veorq_u8(a, m), m));
+}
+
+static inline __attribute__((always_inline)) void iqn_quad(const int type, const uint8_t *o, int g, int qd, int8x16_t w[8],
+                                                           int32x4_t *S0, int32x4_t *S1, int32x4_t *M0, int32x4_t *M1,
+                                                           int32x4_t E[4]) {
+    // quad qd of group g of a repacked super-block: the 8 steps w (IQ1: the codes c), the sub-block scales S (Q2_K: the mins
+    // M; IQ1: E[l] = delta - 8 of chunk l, IQ1_S: E[0] for all four)
+    const uint32x4_t n15 = vdupq_n_u32(15);
+    // pair form's sign masks: rows 0, 1 of the quad are the nibbles of byte 2 qd of the step masks of steps 2 l (bytes 0..7
+    // of sm), 2 l + 1 (8..15); the entry bytes [row 0: step 2 l, step 2 l + 1; row 1: the same] (rows 2, 3: byte 2 qd + 1)
+    const uint8x16_t pat = vaddq_u8(vreinterpretq_u8_u32((uint32x4_t){ 0, 0x08080808u, 0, 0x08080808u }), vdupq_n_u8((uint8_t)(2 * qd)));
+    const uint8x16_t pbits = vreinterpretq_u8_u64((uint64x2_t){ 0x0804020108040201ull, 0x8040201080402010ull });
+    switch (type) {
+    case GGML_Q2_K: {
+        const uint8_t *gp = o + 320 + 128 * g;
+        int32x4_t s0 = iqn_u8x4(o + 64 + 32 * g + 4 * qd), s1 = iqn_u8x4(o + 80 + 32 * g + 4 * qd);
+        *S0 = vandq_s32(s0, vdupq_n_s32(15));
+        *S1 = vandq_s32(s1, vdupq_n_s32(15));
+        *M0 = vshrq_n_s32(s0, 4);
+        *M1 = vshrq_n_s32(s1, 4);
+        const uint8x16_t m3 = vdupq_n_u8(3);
+        IQN_UNROLL for (int h = 0; h < 2; h++) {
+            uint8x16_t q = vld1q_u8(gp + 64 * h + 16 * qd);
+            w[4 * h] = vreinterpretq_s8_u8(vandq_u8(q, m3));
+            w[4 * h + 1] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q, 2), m3));
+            w[4 * h + 2] = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q, 4), m3));
+            w[4 * h + 3] = vreinterpretq_s8_u8(vshrq_n_u8(q, 6));
+        }
+        break;
+    }
+    case GGML_IQ2_XXS: case GGML_IQ2_XS: case GGML_IQ2_S: {
+        // pair form: w[2 l] = the entries of chunk l of rows 0, 1 (8 values each), w[2 l + 1] of rows 2, 3
+        int xxs = type == GGML_IQ2_XXS;
+        const uint8_t *gp = o + (xxs ? 96 + 128 * g : 160 + 144 * g), *sgn = gp + (xxs ? 64 : 80);
+        const uint64_t *grid = xxs ? iq2xxs_grid : type == GGML_IQ2_XS ? iq2xs_grid : iq2s_grid;
+        if (xxs)
+            *S0 = *S1 = iqn_s21(vandq_u32(vshlq_u32(vld1q_u32((const uint32_t *)(o + 32 + 16 * qd)), vdupq_n_s32(-4 * g)), n15));
+        else {
+            uint32x4_t sc = vshlq_u32(vld1q_u32((const uint32_t *)(o + 32 + 64 * (g / 4) + 16 * qd)), vdupq_n_s32(-8 * (g % 4)));
+            *S0 = iqn_s21(vandq_u32(sc, n15));
+            *S1 = iqn_s21(vandq_u32(vshrq_n_u32(sc, 4), n15));
+        }
+        uint64_t i01 = kq_u64(gp + 16 * qd), i23 = kq_u64(gp + 16 * qd + 8); // byte 4 r' + l (rows 0, 1; 2, 3)
+        uint32_t hi = xxs ? 0 : iq_u32(gp + 64 + 4 * qd);                       // byte r': bits 2 l, 2 l + 1 = index bits 8, 9
+        IQN_UNROLL for (int l = 0; l < 4; l++) {
+            unsigned a0 = (unsigned)(i01 >> 8 * l & 255), a1 = (unsigned)(i01 >> (32 + 8 * l) & 255);
+            unsigned a2 = (unsigned)(i23 >> 8 * l & 255), a3 = (unsigned)(i23 >> (32 + 8 * l) & 255);
+            if (!xxs) {
+                a0 |= (hi >> 2 * l & 3) << 8;
+                a1 |= (hi >> (8 + 2 * l) & 3) << 8;
+                a2 |= (hi >> (16 + 2 * l) & 3) << 8;
+                a3 |= (hi >> (24 + 2 * l) & 3) << 8;
+            }
+            uint8x16_t sm = vld1q_u8(sgn + 16 * l); // the masks of steps 2 l, 2 l + 1
+            w[2 * l] = iqn_neg(iqn_e2(grid, a0, a1), vtstq_u8(vqtbl1q_u8(sm, pat), pbits));
+            w[2 * l + 1] = iqn_neg(iqn_e2(grid, a2, a3), vtstq_u8(vqtbl1q_u8(sm, vaddq_u8(pat, vdupq_n_u8(1))), pbits));
+        }
+        break;
+    }
+    case GGML_IQ3_XXS: case GGML_IQ3_S: {
+        // pair form as IQ2's, "chunk" l = steps 2 l, 2 l + 1: w[2 l] = [row 0: entries of steps 2 l, 2 l + 1; row 1: the same].
+        // (IQ3_S's index bit 8 merged in scalar code: building the 9-bit indices in NEON (zip with the bits) and moving
+        // them to the integer side by umov, or by a store and loads, was 42% / 15% slower on an M1 Pro)
+        int xxs = type == GGML_IQ3_XXS;
+        const uint8_t *gp = o + 96 + (xxs ? 192 : 208) * g, *sgn = gp + (xxs ? 128 : 144);
+        const uint32_t *grid = xxs ? iq3xxs_grid : iq3s_grid;
+        *S0 = *S1 = iqn_s21(vandq_u32(vshlq_u32(vld1q_u32((const uint32_t *)(o + 32 + 16 * qd)), vdupq_n_s32(-4 * g)), n15));
+        uint32_t hi = xxs ? 0 : iq_u32(gp + 128 + 4 * qd); // byte r': bit t = index bit 8 of step t
+        IQN_UNROLL for (int h = 0; h < 2; h++) {
+            uint64_t i01 = kq_u64(gp + 64 * h + 16 * qd), i23 = kq_u64(gp + 64 * h + 16 * qd + 8); // byte 4 r' + j: step 4 h + j
+            IQN_UNROLL for (int lp = 0; lp < 2; lp++) {
+                int l = 2 * h + lp, j = 2 * lp, t = 2 * l;
+                unsigned a0 = (unsigned)(i01 >> 8 * j & 255), b0 = (unsigned)(i01 >> (8 * j + 8) & 255);
+                unsigned a1 = (unsigned)(i01 >> (32 + 8 * j) & 255), b1 = (unsigned)(i01 >> (40 + 8 * j) & 255);
+                unsigned a2 = (unsigned)(i23 >> 8 * j & 255), b2 = (unsigned)(i23 >> (8 * j + 8) & 255);
+                unsigned a3 = (unsigned)(i23 >> (32 + 8 * j) & 255), b3 = (unsigned)(i23 >> (40 + 8 * j) & 255);
+                if (!xxs) {
+                    a0 |= (hi >> t & 1) << 8;
+                    b0 |= (hi >> (t + 1) & 1) << 8;
+                    a1 |= (hi >> (8 + t) & 1) << 8;
+                    b1 |= (hi >> (9 + t) & 1) << 8;
+                    a2 |= (hi >> (16 + t) & 1) << 8;
+                    b2 |= (hi >> (17 + t) & 1) << 8;
+                    a3 |= (hi >> (24 + t) & 1) << 8;
+                    b3 |= (hi >> (25 + t) & 1) << 8;
+                }
+                uint8x16_t sm = vld1q_u8(sgn + 16 * l);
+                w[2 * l] = iqn_neg(iqn_e4(grid, a0, b0, a1, b1), vtstq_u8(vqtbl1q_u8(sm, pat), pbits));
+                w[2 * l + 1] = iqn_neg(iqn_e4(grid, a2, b2, a3, b3), vtstq_u8(vqtbl1q_u8(sm, vaddq_u8(pat, vdupq_n_u8(1))), pbits));
+            }
+        }
+        break;
+    }
+    case GGML_IQ1_S: case GGML_IQ1_M: {
+        // step 2 l + p: byte l of the lanes of the code bytes p (c_lo, c_hi), spread to the 4 bytes (tbl), 2 bits each
+        int m = type == GGML_IQ1_M;
+        const uint8_t *gp = o + (m ? 160 + 136 * g : 112 + 128 * g);
+        const uint32x4_t m7 = vdupq_n_u32(7);
+        const int32x4_t e0 = vdupq_n_s32(-7);
+        if (m) {
+            uint32x4_t sc = vshlq_u32(vld1q_u32((const uint32_t *)(o + 32 + 64 * (g / 4) + 16 * qd)), vdupq_n_s32(-8 * (g % 4)));
+            *S0 = iqn_s21(vandq_u32(sc, m7));
+            *S1 = iqn_s21(vandq_u32(vshrq_n_u32(sc, 4), m7));
+            // bit 16 qd + 4 r' + l of dm: chunk l of row r' has delta < 0: E = -7 - 2 = -9 there
+            uint32x4_t dm = vdupq_n_u32((uint32_t)(kq_u64(gp + 128) >> 16 * qd & 0xffff));
+            const uint32x4_t b0 = { 1, 1u << 4, 1u << 8, 1u << 12 };
+            IQN_UNROLL for (int l = 0; l < 4; l++)
+                E[l] = vaddq_s32(e0, vshlq_n_s32(vreinterpretq_s32_u32(vtstq_u32(dm, vshlq_u32(b0, vdupq_n_s32(l)))), 1));
+        } else {
+            *S0 = *S1 = iqn_s21(vandq_u32(vshlq_u32(vld1q_u32((const uint32_t *)(o + 32 + 16 * qd)), vdupq_n_s32(-4 * g)), m7));
+            uint32x4_t dm = vdupq_n_u32((uint32_t)kq_u16(o + 96 + 2 * g) >> 4 * qd & 15);
+            const uint32x4_t b0 = { 1, 2, 4, 8 };
+            E[0] = vaddq_s32(e0, vshlq_n_s32(vreinterpretq_s32_u32(vtstq_u32(dm, b0)), 1));
+        }
+        uint8x16_t c[2] = { vld1q_u8(gp + 16 * qd), vld1q_u8(gp + 64 + 16 * qd) };
+        const int8x16_t sh = vreinterpretq_s8_u32(vdupq_n_u32(0xfafcfe00u)); // 0, -2, -4, -6
+        const uint8x16_t m3 = vdupq_n_u8(3);
+        const uint8x16_t base = vreinterpretq_u8_u32((uint32x4_t){ 0x00000000u, 0x04040404u, 0x08080808u, 0x0c0c0c0cu });
+        IQN_UNROLL for (int l = 0; l < 4; l++) {
+            uint8x16_t ix = vaddq_u8(base, vdupq_n_u8((uint8_t)l));
+            w[2 * l] = vreinterpretq_s8_u8(vandq_u8(vshlq_u8(vqtbl1q_u8(c[0], ix), sh), m3));
+            w[2 * l + 1] = vreinterpretq_s8_u8(vandq_u8(vshlq_u8(vqtbl1q_u8(c[1], ix), sh), m3));
+        }
+        break;
+    }
+    case GGML_IQ4_XS: {
+        const uint8_t *gp = o + 192 + 256 * g;
+        *S0 = *S1 = iqn_s8x4(o + 32 + 16 * g + 4 * qd);
+        const int8x16_t kv = vld1q_s8(kvalues_iq4nl);
+        const uint8x16_t m4 = vdupq_n_u8(15);
+        IQN_UNROLL for (int c = 0; c < 4; c++) {
+            uint8x16_t q = vld1q_u8(gp + 64 * c + 16 * qd);
+            w[2 * c] = vqtbl1q_s8(kv, vandq_u8(q, m4));
+            w[2 * c + 1] = vqtbl1q_s8(kv, vshrq_n_u8(q, 4));
+        }
+        break;
+    }
+    }
+}
+
+static inline __attribute__((always_inline)) void iqn_qd(const int type, const int NC, const uint8_t *o, int g8, int qd,
+                                                         float32x4_t Dq, float32x4_t Dmq, int nc, const int8x16_t *x0,
+                                                         const int8x16_t *x1, const float *xsg, const int32_t *X0,
+                                                         const int32_t *X1, const int32x4_t *X8, float32x4_t (*val)[4]) { RQ_FP_EXACT
+    // quad qd of group g8: decode, then the activation rows c < nc: T_h, I, the fold into val[c][qd]
+    const int q2 = type == GGML_Q2_K, i1s = type == GGML_IQ1_S, i1m = type == GGML_IQ1_M;
+    const int pf = type == GGML_IQ2_XXS || type == GGML_IQ2_XS || type == GGML_IQ2_S || type == GGML_IQ3_XXS || type == GGML_IQ3_S;
+    const int per32 = type == GGML_IQ2_XXS || type == GGML_IQ3_XXS || type == GGML_IQ3_S || type == GGML_IQ1_S ||
+                      type == GGML_IQ4_XS;
+        int8x16_t w[8];
+        int32x4_t S0, S1, M0 = vdupq_n_s32(0), M1 = vdupq_n_s32(0), E[4];
+        iqn_quad(type, o, g8, qd, w, &S0, &S1, &M0, &M1, E);
+        for (int c = 0; c < NC; c++) {
+            if (c >= nc) break;
+            int32x4_t z = vdupq_n_s32(0), T0, T1, I;
+            if (pf) { // pair form: lanes (row 0 values 0..3, 4..7, row 1 ...) . the chunk's 8 activations, twice
+                int8x16_t d0 = vreinterpretq_s8_s64(vdupq_laneq_s64(vreinterpretq_s64_s8(x0[c]), 0));
+                int8x16_t d1 = vreinterpretq_s8_s64(vdupq_laneq_s64(vreinterpretq_s64_s8(x0[c]), 1));
+                int8x16_t d2 = vreinterpretq_s8_s64(vdupq_laneq_s64(vreinterpretq_s64_s8(x1[c]), 0));
+                int8x16_t d3 = vreinterpretq_s8_s64(vdupq_laneq_s64(vreinterpretq_s64_s8(x1[c]), 1));
+                T0 = vpaddq_s32(vdotq_s32(vdotq_s32(z, w[0], d0), w[2], d1), vdotq_s32(vdotq_s32(z, w[1], d0), w[3], d1));
+                T1 = vpaddq_s32(vdotq_s32(vdotq_s32(z, w[4], d2), w[6], d3), vdotq_s32(vdotq_s32(z, w[5], d2), w[7], d3));
+            } else {
+                int32x4_t a0 = vdotq_laneq_s32(z, w[0], x0[c], 0), b0 = vdotq_laneq_s32(z, w[1], x0[c], 1);
+                int32x4_t a1 = vdotq_laneq_s32(z, w[4], x1[c], 0), b1 = vdotq_laneq_s32(z, w[5], x1[c], 1);
+                a0 = vdotq_laneq_s32(a0, w[2], x0[c], 2);
+                b0 = vdotq_laneq_s32(b0, w[3], x0[c], 3);
+                a1 = vdotq_laneq_s32(a1, w[6], x1[c], 2);
+                b1 = vdotq_laneq_s32(b1, w[7], x1[c], 3);
+                T0 = vaddq_s32(a0, b0);
+                T1 = vaddq_s32(a1, b1);
+            }
+            if (i1s) // 8 (C_0 + C_1) + (delta - 8) (X_0 + X_1)
+                I = vmulq_s32(S0, vmlaq_n_s32(vshlq_n_s32(vaddq_s32(T0, T1), 3), E[0], X0[c] + X1[c]));
+            else if (i1m) {
+                T0 = vmlaq_laneq_s32(vmlaq_laneq_s32(vshlq_n_s32(T0, 3), E[0], X8[c], 0), E[1], X8[c], 1);
+                T1 = vmlaq_laneq_s32(vmlaq_laneq_s32(vshlq_n_s32(T1, 3), E[2], X8[c], 2), E[3], X8[c], 3);
+                I = vmlaq_s32(vmulq_s32(S0, T0), S1, T1);
+            } else if (per32)
+                I = vmulq_s32(S0, vaddq_s32(T0, T1));
+            else
+                I = vmlaq_s32(vmulq_s32(S0, T0), S1, T1);
+            float32x4_t a = vmulq_f32(vmulq_n_f32(Dq, xsg[c]), vcvtq_f32_s32(I));
+            if (q2) {
+                int32x4_t Mi = vmlaq_n_s32(vmulq_n_s32(M0, X0[c]), M1, X1[c]);
+                a = vsubq_f32(a, vmulq_f32(vmulq_n_f32(Dmq, xsg[c]), vcvtq_f32_s32(Mi)));
+            }
+            val[c][qd] = vaddq_f32(val[c][qd], a);
+        }
+}
+
+static inline __attribute__((always_inline)) void iqn_blk(const int type, const int NC, float *out, size_t ldo,
+                                                          const uint8_t *wb, int nsb, int nc, const int8_t *xq, size_t ldx,
+                                                          const float *xs, size_t ldxs) { RQ_FP_EXACT
+    // iq_dot for nc <= NC activation rows: per group and quad the 8 steps decoded once, then every activation row
+    const int sbb = iq_sb_bytes(type), q2 = type == GGML_Q2_K, i1s = type == GGML_IQ1_S, i1m = type == GGML_IQ1_M;
+    const float cm = iq_dmul(type);
+    float32x4_t val[NC][4];
+    for (int c = 0; c < NC; c++)
+        for (int qd = 0; qd < 4; qd++)
+            val[c][qd] = vdupq_n_f32(0.0f);
+    for (int s = 0; s < nsb; s++) {
+        const uint8_t *o = wb + (size_t)s * sbb;
+        float32x4_t D[4], Dm[4];
+        for (int qd = 0; qd < 4; qd++) {
+            D[qd] = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16((const uint16_t *)(o + 8 * qd))));
+            if (cm != 1.0f) D[qd] = vmulq_n_f32(D[qd], cm); // (exact: a power of 2)
+            Dm[qd] = q2 ? vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16((const uint16_t *)(o + 32 + 8 * qd)))) : vdupq_n_f32(0.0f);
+        }
+        for (int g8 = 0; g8 < 8; g8++) {
+            int g = 8 * s + g8;
+            // the activation rows' group: bytes, scale, Q2_K's sums of 16, IQ1's sums of 8
+            int8x16_t x0[NC], x1[NC];
+            float xsg[NC];
+            int32_t X0[NC], X1[NC];
+            int32x4_t X8[NC];
+            for (int c = 0; c < NC; c++) {
+                if (c >= nc) break;
+                const int8_t *x = xq + c * ldx + 32 * g;
+                x0[c] = vld1q_s8(x);
+                x1[c] = vld1q_s8(x + 16);
+                xsg[c] = xs[c * ldxs + g];
+                if (q2 || i1s) {
+                    X0[c] = vaddlvq_s8(x0[c]);
+                    X1[c] = vaddlvq_s8(x1[c]);
+                }
+                if (i1m) {
+                    int32x4_t a = vpaddlq_s16(vpaddlq_s8(x0[c])), b = vpaddlq_s16(vpaddlq_s8(x1[c])); // sums of 4
+                    X8[c] = vpaddq_s32(a, b);                                                       // sums of 8
+                }
+            }
+            if (NC == 1) { // (the GEMV: the quads unrolled, val and D in registers)
+                IQN_UNROLL for (int qd = 0; qd < 4; qd++)
+                    iqn_qd(type, NC, o, g8, qd, D[qd], Dm[qd], nc, x0, x1, xsg, X0, X1, X8, val);
+            } else
+                for (int qd = 0; qd < 4; qd++)
+                    iqn_qd(type, NC, o, g8, qd, D[qd], Dm[qd], nc, x0, x1, xsg, X0, X1, X8, val);
+        }
+    }
+    for (int c = 0; c < NC; c++) {
+        if (c >= nc) break;
+        for (int qd = 0; qd < 4; qd++)
+            vst1q_f32(out + c * ldo + 4 * qd, val[c][qd]);
+    }
+}
+
+#define IQN_ARGS float *out, size_t ldo, const uint8_t *wb, int nsb, int nc, const int8_t *xq, size_t ldx, const float *xs, \
+                 size_t ldxs
+// activation rows per pass over the decoded groups: up to IQN_NC (verify passes, batched decode) or IQN_NCW (prefill: the
+// decode amortized over more rows; M1 Pro, single thread, 64 rows: 8 -> 32 is 13-30% less time per weight and row, 32 ->
+// 64 ~2%; 16 or 32 at 8 rows ~5% slower than 8)
+#ifndef IQN_NC
+#define IQN_NC 8
+#endif
+#ifndef IQN_NCW
+#define IQN_NCW 32
+#endif
+#define IQN_INST(NAME, TYPE) \
+    static void NAME##_1(IQN_ARGS) { iqn_blk(TYPE, 1, out, ldo, wb, nsb, nc, xq, ldx, xs, ldxs); } \
+    static void NAME##_8(IQN_ARGS) { iqn_blk(TYPE, IQN_NC, out, ldo, wb, nsb, nc, xq, ldx, xs, ldxs); } \
+    static void NAME##_w(IQN_ARGS) { iqn_blk(TYPE, IQN_NCW, out, ldo, wb, nsb, nc, xq, ldx, xs, ldxs); }
+IQN_INST(iqn_q2k, GGML_Q2_K)
+IQN_INST(iqn_i2xxs, GGML_IQ2_XXS)
+IQN_INST(iqn_i2xs, GGML_IQ2_XS)
+IQN_INST(iqn_i2s, GGML_IQ2_S)
+IQN_INST(iqn_i3xxs, GGML_IQ3_XXS)
+IQN_INST(iqn_i3s, GGML_IQ3_S)
+IQN_INST(iqn_i1s, GGML_IQ1_S)
+IQN_INST(iqn_i1m, GGML_IQ1_M)
+IQN_INST(iqn_i4xs, GGML_IQ4_XS)
+typedef void (*IqnFn)(IQN_ARGS);
+
+static inline void iqn_fns(int type, IqnFn *f1, IqnFn *f8, IqnFn *fw) {
+#define IQN_FNS(NAME) do { *f1 = NAME##_1; *f8 = NAME##_8; *fw = NAME##_w; } while (0)
+    switch (type) {
+    case GGML_Q2_K: IQN_FNS(iqn_q2k); break;
+    case GGML_IQ2_XXS: IQN_FNS(iqn_i2xxs); break;
+    case GGML_IQ2_XS: IQN_FNS(iqn_i2xs); break;
+    case GGML_IQ2_S: IQN_FNS(iqn_i2s); break;
+    case GGML_IQ3_XXS: IQN_FNS(iqn_i3xxs); break;
+    case GGML_IQ3_S: IQN_FNS(iqn_i3s); break;
+    case GGML_IQ1_S: IQN_FNS(iqn_i1s); break;
+    case GGML_IQ1_M: IQN_FNS(iqn_i1m); break;
+    default: IQN_FNS(iqn_i4xs); break;
+    }
+#undef IQN_FNS
+}
+#endif // RUNQ_NEON
+
 static void iq_rows(int type, float *out, size_t ldo, const int8_t *xq, size_t ldx, const float *xs, const int32_t *c16,
                     int nb, const uint8_t *kp, int k, int rb0, int rb1) {
     // out[b * ldo + i] = W row i . x row b for the rows i of the 16-row blocks rb0..rb1-1, b < nb (x row b at xq + b * ldx,
@@ -1041,6 +1392,22 @@ static void iq_rows(int type, float *out, size_t ldo, const int8_t *xq, size_t l
         for (int b = 0; b < nb; b += 8)
             f8(out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo, wb, nsb, nb - b < 8 ? nb - b : 8, xq + (size_t)b * ldx, ldx,
                xs + (size_t)b * ldxs, ldxs, c16 + (size_t)b * (k / 16), (size_t)k / 16);
+    }
+#elif defined(RUNQ_IQN)
+    (void)c16;
+    IqnFn f1, f8, fw;
+    iqn_fns(type, &f1, &f8, &fw);
+    for (int rb = rb0; rb < rb1; rb++) {
+        const uint8_t *wb = kp + (size_t)rb * nsb * sbb;
+        if (nb == 1) {
+            f1(out + (size_t)rb * KQ_ROWS, ldo, wb, nsb, 1, xq, ldx, xs, ldxs);
+            continue;
+        }
+        for (int b = 0, n; b < nb; b += n) { // passes of up to IQN_NCW rows, the last <= IQN_NC rows by the narrow kernel
+            n = nb - b < IQN_NCW ? nb - b : IQN_NCW;
+            (n <= IQN_NC ? f8 : fw)(out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo, wb, nsb, n, xq + (size_t)b * ldx, ldx,
+                                    xs + (size_t)b * ldxs, ldxs);
+        }
     }
 #else
     (void)c16;

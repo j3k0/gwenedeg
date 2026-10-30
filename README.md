@@ -424,8 +424,8 @@ and builds mynah-slm, an optional reference engine for comparison (not part of t
 - Qwen3 dense models and dense Qwen3.5 (0.8B and 4B tested; `general.architecture` qwen3 / qwen35, gpt2 tokenizer with the qwen2 /
   qwen35 pre-tokenizer). GGUF Q8_0 / Q3_K_M / Q4_K_M / Q5_K_M and the i-quant mixes (any mix of Q8_0, Q2_K .. Q6_K, IQ1_S, IQ1_M,
   IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS tensors; F32 only for Qwen3.5's `ssm_alpha` / `ssm_beta`, as in
-  Qwen3.8-27B) and qwen3.c's `.bin`. The i-quants have AVX-512 kernels (fastest with AVX512-VBMI) and the generic ones
-  (NEON included); their prefill is ~0.72x the K-quants' (docs/iquants.md). No other quantization types, no MoE, no RoPE scaling,
+  Qwen3.8-27B) and qwen3.c's `.bin`. The i-quants have AVX-512 kernels (fastest with AVX512-VBMI), NEON ones and the
+  generic ones; their prefill is ~0.72x the K-quants' on AVX-512 (docs/iquants.md). No other quantization types, no MoE, no RoPE scaling,
   no images, no Jinja interpreter (the templates are built in: Qwen3's, Qwen3.5's, Qwen3.8's). Qwen3.8-27B: its MTP block
   is not used (not a draft yet: TODO S9); it needs ~17 GB of free RAM (18.65 GiB estimated at the default `-c` 40,960).
 - Fast paths: x86-64 with AVX-512 VNNI (selected at compile time with `-march=native`) and AArch64 with

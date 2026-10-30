@@ -36,6 +36,8 @@
 #include "kernels_neon.h"
 // K-quants (GGUF Q3_K / Q4_K / Q5_K / Q6_K): block formats, repacked layouts, arithmetic, generic kernels
 #include "kquants.h"
+// Q2_K and the i-quants (IQ1_S .. IQ4_XS): block formats, repacked layouts, arithmetic, generic and AVX-512 kernels
+#include "iquants.h"
 // phase synchronization and the parallel region of a decode step / prefill chunk
 #include "threads.h"
 
@@ -104,7 +106,7 @@ typedef struct {
                   // scale + 32 int8, Q8_0_BLOCK bytes; Q3_K .. Q6_K: kquants.h), converted at load
                   // (prepare_weights); or NULL
     int type;     // weights: ggml type, GGML_Q8_0 (also the .bin's group-64 Q8), GGML_Q3_K / Q4_K / Q5_K / Q6_K, GGML_F32
-    uint8_t *kp;  // K-quant weights: repacked (Q3P / Q4P / Q5P / Q6P layout, kquants.h), else NULL
+    uint8_t *kp;  // K-quant weights: repacked (Q3P / Q4P / Q5P / Q6P layout, kquants.h; Q2_K and the i-quants: iquants.h), else NULL
     float *f;     // F32 weights (ssm_alpha / ssm_beta only: Qwen3.8-27B's): the rows copied at load (prepare_weights),
                   // applied to the fp32 activations (forward.c, f32_rows), else NULL
 } QuantizedTensor;

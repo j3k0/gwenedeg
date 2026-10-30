@@ -740,6 +740,10 @@ void embed_row(float *x, const QuantizedTensor *t, int token, int dim) {
         memcpy(x, t->b + e0 * sizeof(float), (size_t)dim * sizeof(float));
         return;
     }
+    if (t->b && iq_type(t->type)) { // Q2_K, i-quants (Saluki: an IQ1_M token_embd): ggml's dequantization (iquants.h)
+        iq_dequant_row(t->type, t->b + (size_t)token * (dim / QK_K) * iq_block_bytes(t->type), dim, x);
+        return;
+    }
     if (t->b && t->type != GGML_Q8_0) {
         // GGUF K-quants (Q3_K .. Q6_K): ggml's dequantization of the row's blocks (dim % 256 == 0). By the tensor's
         // type, not by t->kp: an untied embedding table (Qwen3-8B: Q4_K, output.weight Q6_K) is never
@@ -873,6 +877,10 @@ static inline void matvec_prep(int32_t *corr, float *xf, int32_t *c16, Quantized
 static inline void matvec_rows(float *xout, QuantizedTensor *x, const int32_t *corr, const float *xf, const int32_t *c16,
                                QuantizedTensor *w, int n, int i0, int i1) {
     // xout[i] = W (d,n) row i . x (n,) for i0 <= i < i1 (multiples of 16, as the VNNI blocks)
+    if (w->kp && iq_type(w->type)) { // Q2_K, i-quants (iquants.h: AVX-512 or generic; c16 read by the AVX-512 kernels)
+        iq_rows(w->type, xout, 0, x->q, 0, x->s, c16, 1, w->kp, n, i0 / KQ_ROWS, i1 / KQ_ROWS);
+        return;
+    }
     if (w->kp) { // K-quants, 16-row blocks (kquants.h; AVX-512: kernels_avx512.h)
 #ifdef RUNQ_KQX
         kqx_gemv_rows(w->type, xout, x->q, x->s, xf, c16, w->kp, n, i0 / KQ_ROWS, i1 / KQ_ROWS);
@@ -1012,7 +1020,7 @@ static inline int smb_slot(int type) {
 static inline int smb_use(const RqCtx *c, const QuantizedTensor *w, int nb) {
     // the small-batch kernel for nb rows of w
 #ifdef RUNQ_SMB
-    if (w->kp) return nb <= c->smb_max[smb_slot(w->type)];
+    if (w->kp) return !iq_type(w->type) && nb <= c->smb_max[smb_slot(w->type)]; // (Q2_K, i-quants: iq_rows)
     return w->p && nb <= c->smb_max[SMB_Q8];
 #else
     (void)c; (void)w; (void)nb;
@@ -1030,7 +1038,7 @@ static void gemm_plan(const RqCtx *c, Gemm *g, int nj, const MatJob *job, Quanti
         g->job[j] = job[j];
         g->tiled[j] = 0;
 #ifdef RUNQ_KQX
-        g->tiled[j] = job[j].w->kp != NULL;
+        g->tiled[j] = job[j].w->kp != NULL && !iq_type(job[j].w->type); // (Q2_K, i-quants: blocks over all rows, iq_rows)
 #endif
 #ifdef RUNQ_Q8X
         g->tiled[j] |= job[j].w->p != NULL;
@@ -1099,6 +1107,10 @@ NO_FP_CONTRACT static void gemm_item(const Gemm *g, int it, uint8_t *scr, const 
 #endif
     (void)scr; (void)last;
     int ng = k / GS;
+    if (w->kp && iq_type(w->type)) { // Q2_K, i-quants: one 16-row block over all rows (iquants.h, AVX-512 or generic)
+        iq_rows(w->type, jb->out, jb->ldo, x->q, ldx, x->s, g->c16, nb, w->kp, k, i, i + 1);
+        return;
+    }
     if (w->kp) { // K-quants, generic: one 16-row block over all rows, KQ_NC rows per kq_dot call
         const uint8_t *wb = w->kp + (size_t)i * (k / QK_K) * kq_sb_bytes(w->type);
         for (int b = 0; b < nb; b += KQ_NC) {
@@ -2791,7 +2803,11 @@ static void rows_mm(const RqCtx *c, QuantizedTensor *w, float *out, int ldo, Qua
                     const float *xf, const int32_t *c16, int nb, int k, int i0, int i1) {
     // out[b * ldo + i] = W row i . x row b for i0 <= i < i1 (multiples of 16), b < nb (x row b at x->q +
     // b * ldx; the activation prep of act_prep_row): the small-batch kernel (c: its prefetch distance), else the
-    // decode GEMV per row. Either way each output is the GEMV's (bit-identical)
+    // decode GEMV per row. Either way each output is the GEMV's (bit-identical). Q2_K, i-quants: iq_rows
+    if (w->kp && iq_type(w->type)) {
+        iq_rows(w->type, out, ldo, x->q, ldx, x->s, c16, nb, w->kp, k, i0 / 16, i1 / 16);
+        return;
+    }
 #ifdef RUNQ_SMB
     if (w->kp || w->p) {
         smb_rows(w->kp ? w->type : 0, out, ldo, x->q, ldx, x->s, corr, xf, c16, nb, w->kp ? w->kp : w->p, k, GS, i0 / 16, i1 / 16,

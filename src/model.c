@@ -113,23 +113,24 @@ static void bin_map_weights(RqModel *m, const char *path, LoadErr *e) {
 // ---------------------------------------------------------------------------- GGUF weights
 
 static void gguf_matrix(const Gguf *g, QuantizedTensor *res, const char *name, int d, int k, int f32) {
-    // one matrix (d, k): Q8_0, Q3_K, Q4_K, Q5_K or Q6_K (dispatch per tensor: Q4_K_M mixes them within a role), or F32 if
-    // f32 (only where forward.c's fp32 path takes it: ssm_alpha / ssm_beta), its data in the mapping (q / s / p /
-    // kp / f are set by prepare_weights)
+    // one matrix (d, k): Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, Q2_K or an i-quant (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+    // IQ3_S, IQ4_XS: iquants.h; dispatch per tensor: Q4_K_M or an IQ mix combines them within a role), or F32 if f32 (only
+    // where forward.c's fp32 path takes it: ssm_alpha / ssm_beta), its data in the mapping (q / s / p / kp / f are set by
+    // prepare_weights)
     const GgufTensor *t = gguf_tensor(g, name);
     uint32_t type = t ? t->type : GGML_Q8_0; // (missing: gguf_weight reports it)
     if (type != GGML_Q8_0 && type != GGML_Q3_K && type != GGML_Q4_K && type != GGML_Q5_K && type != GGML_Q6_K &&
-        !(f32 && type == GGML_F32)) {
-        char msg[160];
-        snprintf(msg, sizeof(msg), "tensor %%s has ggml type %u, need Q8_0 (8), Q3_K (11), Q4_K (12), Q5_K (13)%s or Q6_K (14)", type,
-                 f32 ? ", F32 (0)" : "");
+        !iq_type((int)type) && !(f32 && type == GGML_F32)) {
+        char msg[240];
+        snprintf(msg, sizeof(msg), "tensor %%s has ggml type %u, need Q8_0 (8), Q2_K .. Q6_K (10 .. 14), IQ2_XXS (16), IQ2_XS (17), "
+                 "IQ3_XXS (18), IQ1_S (19), IQ3_S (21), IQ2_S (22), IQ4_XS (23)%s or IQ1_M (29)", type, f32 ? ", F32 (0)" : "");
         gguf_fail(g, msg, name);
     }
     res->b = gguf_weight(g, name, type, k, d);
     res->type = (int)type;
     // the repacked layouts: 16-row blocks, 256-column super-blocks (activation groups of 32)
     if (type != GGML_Q8_0 && type != GGML_F32 && (d % KQ_ROWS || k % QK_K || GS != 32))
-        gguf_fail(g, "tensor %s: K-quant shape not supported (rows % 16, columns % 256)", name);
+        gguf_fail(g, "tensor %s: K-quant / i-quant shape not supported (rows % 16, columns % 256)", name);
 }
 
 static void gguf_matrices(RqModel *m, QuantizedTensor **dst, int L, const int *sel, const char *fmt, int d, int k, int f32) {
@@ -370,8 +371,8 @@ static size_t prep_bytes(const QuantizedTensor *t, int d, int k, int pack) {
     size_t sz = (size_t)d * k + (size_t)d * (k / GS) * sizeof(float); // (generic kernels on GGUF Q8_0: q / s arrays)
     if (t->type == GGML_F32) // (the rows as in the file)
         sz = (size_t)d * k * sizeof(float);
-    else if (t->type != GGML_Q8_0) // Q3_K .. Q6_K (GGUF; d % 16 == 0, k % 256 == 0 checked)
-        sz = kq_size(t->type, d, k);
+    else if (t->type != GGML_Q8_0) // Q2_K .. Q6_K, the i-quants (GGUF; d % 16 == 0, k % 256 == 0 checked)
+        sz = lq_size(t->type, d, k);
 #ifdef RUNQ_Q8X
     else if (pack)
         sz = q8x_size(d, k, GS);
@@ -398,7 +399,7 @@ static void prep_item_done(PrepJob *P, int j) {
     const QuantizedTensor *t = it->t;
     if (t->b) {
         drop_cached(P->fd, P->base, t->b, t->type == GGML_F32 ? (size_t)it->d * it->k * sizeof(float)
-                                          : t->type != GGML_Q8_0 ? (size_t)it->d * (it->k / QK_K) * kq_block_bytes(t->type)
+                                          : t->type != GGML_Q8_0 ? (size_t)it->d * (it->k / QK_K) * lq_block_bytes(t->type)
                                                                  : (size_t)it->d * (it->k / 32) * Q8_0_BLOCK);
     } else {
         drop_cached(P->fd, P->base, t->q, (size_t)it->d * it->k);
@@ -453,12 +454,17 @@ static void prepare_worker(void *arg, int tid, int nt) {
             prep_item_done(P, jj);
             continue;
         }
-        if (t->kp) { // Q3_K .. Q6_K: blocks of nr rows (k / 256 each) -> Q3P / Q4P / Q5P / Q6P
-            size_t rowb = (size_t)(k / QK_K) * kq_block_bytes(t->type);
+        if (t->kp) { // Q3_K .. Q6_K: blocks of nr rows (k / 256 each) -> Q3P / Q4P / Q5P / Q6P; Q2_K, i-quants: iquants.h
+            int iq = iq_type(t->type), blkb = lq_block_bytes(t->type);
+            size_t rowb = (size_t)(k / QK_K) * blkb;
             read_at(fd, P->base, bb, nr * rowb, t->b + r0 * rowb);
             for (size_t i = 0; i < nr * (k / QK_K); i++)
-                bad |= !kq_block_ok(t->type, bb + i * kq_block_bytes(t->type));
-            kq_pack_blocks(t->type, t->kp + (size_t)rb0 * (k / QK_K) * kq_sb_bytes(t->type), bb, nb, k);
+                bad |= !(iq ? iq_block_ok(t->type, bb + i * blkb) : kq_block_ok(t->type, bb + i * blkb));
+            uint8_t *dst = t->kp + (size_t)rb0 * (k / QK_K) * lq_sb_bytes(t->type);
+            if (iq)
+                iq_pack_blocks(t->type, dst, bb, nb, k);
+            else
+                kq_pack_blocks(t->type, dst, bb, nb, k);
             prep_item_done(P, jj);
             continue;
         }
@@ -492,7 +498,8 @@ static int prepare_weights(RqModel *m, int fd, int drop, LoadErr *e, char *warni
     //   generic kernels on a GGUF file: its Q8_0 blocks (fp16 scale + 32 int8) into the q / s
     //     arrays the .bin format has (fp16 -> fp32 is exact)
     //   generic kernels on a .bin file: nothing to do, q / s are the mapping
-    //   GGUF Q3_K / Q4_K / Q5_K / Q6_K tensors (any build): repacked into the Q3P / Q4P / Q5P / Q6P layouts of kquants.h
+    //   GGUF Q3_K / Q4_K / Q5_K / Q6_K tensors (any build): repacked into the Q3P / Q4P / Q5P / Q6P layouts of kquants.h,
+    //   Q2_K and the i-quants into the layouts of iquants.h
     // The source rows are read with pread (read_at), not through the mapping: only the norms and
     // the token embedding rows looked up later (the classifier is shared with them) are ever
     // mapped. The destination is pre-faulted in parallel (MADV_POPULATE_WRITE, 2 MB per call).
@@ -1095,7 +1102,9 @@ int rq_dequant_rows(const RqModel *m, const char *name, size_t nlen, long r0, lo
     }
     for (long r = 0; r < nr; r++) {
         embed_row(a + (size_t)r * k, t, (int)(r0 + r), k);
-        if (b)
+        if (b && iq_type(t->type))
+            iq_packed_row(t->type, t->kp, (int)(r0 + r), k, b + (size_t)r * k);
+        else if (b)
             kq_packed_row(t->type, t->kp, (int)(r0 + r), k, b + (size_t)r * k);
     }
     *rows = a;

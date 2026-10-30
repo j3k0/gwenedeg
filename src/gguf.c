@@ -43,7 +43,9 @@ static int gguf_type_bytes(uint32_t type, uint64_t n, uint64_t ne0, uint64_t *by
     // Block sizes / bytes from ggml.c (type_traits); the k-quants for Step 6b's Q4_K_M
     static const struct { uint32_t type, blk, bytes; } tt[] = {
         { 0, 1, 4 }, { 1, 1, 2 }, { 30, 1, 2 }, { 2, 32, 18 }, { 3, 32, 20 }, { 6, 32, 22 }, { 7, 32, 24 },
-        { 8, 32, 34 }, { 10, 256, 84 }, { 11, 256, 110 }, { 12, 256, 144 }, { 13, 256, 176 }, { 14, 256, 210 } };
+        { 8, 32, 34 }, { 10, 256, 84 }, { 11, 256, 110 }, { 12, 256, 144 }, { 13, 256, 176 }, { 14, 256, 210 },
+        { 16, 256, 66 }, { 17, 256, 74 }, { 18, 256, 98 }, { 19, 256, 50 }, { 21, 256, 110 }, { 22, 256, 82 },
+        { 23, 256, 136 }, { 29, 256, 56 } }; // (Q2_K and the i-quants: iquants.h)
     for (size_t i = 0; i < sizeof(tt) / sizeof(tt[0]); i++)
         if (tt[i].type == type) {
             if (ne0 % tt[i].blk) return 0;

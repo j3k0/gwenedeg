@@ -158,6 +158,14 @@ SETS = {
     "3.8-27b-q3km": ("unsloth/Qwen3.8-27B-GGUF", "4a03c640833598c0fb5ddd11e846135e906eb764", "Qwen3.8-27B-GGUF", [
         ("Qwen3.8-27B-Q3_K_M.gguf", 13818690528, "sha256", "7f3b845b563888ec3abc269474cf744bf703a7ce8766dbb7f696c63975facfd7"),
     ]),
+    # Underdog Saluki 27B 1.0: Qwen3.8-27B (qwen35, 64 layers, no MTP block) as ISTA-DASLab's GSQ-RCO mix, retuned for
+    # tool calling, 7.9 GB: Q2_K / IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / Q4_K matrices
+    # (IQ1_M token_embd, IQ3_S output), Q8_0 ssm_alpha / ssm_beta (src/iquants.h). Text only (the mmproj files: not used)
+    "saluki-27b": ("ConwayResearch/Underdog-Saluki-27B-1.0", "5acfd9218fa54731f237eea8b3243d430dd85a69", "Underdog-Saluki-27B-1.0-GGUF", [
+        ("README.md", 4336, "blob", "15a7897d683d01537f625628b7890ed2f96933fa"),
+        ("NOTICE", 590, "blob", "01ef7a81fcc94549b2ae466de36c5d42e6958fb1"),
+        ("Underdog-Saluki-27B-1.0-IQ2-mix.gguf", 7898369152, "sha256", "4a673518b11b1c4445f9b9a9d3c40356f5ba39f6a6260dcb25f3fbfd475d9efb"),
+    ]),
 }
 DEFAULT_SETS = ["hf", "q4km", "q8gguf"]
 # names that stand for several sets

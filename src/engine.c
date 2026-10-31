@@ -25,6 +25,10 @@
  * session or with a compaction's next request) is not truncated: the prefix is copied into the least recently
  * used other idle slot, so that the conversation it holds finds it whole at its next request.
  *
+ * Disk tier (--kv-disk, below "the disk tier"): a slot whose tokens a job would discard is saved to a file first, and
+ * a prompt that continues a saved sequence further than any slot gets it loaded into a slot first (admit plans the
+ * I/O, the engine thread does it between passes without mu); the files outlive the process.
+ *
  * Qwen3.5 / 3.8 (hybrid: the recurrent state cannot be rewound, a slot keeps only checkpointed lengths): each job
  * asks for checkpoints where its conversation's next requests leave the cache (ck_plan_job, --checkpoints per slot,
  * default 4): the prompt's assistant header (a reply sent back differently from what was generated: an empty
@@ -65,7 +69,18 @@ typedef struct {
     unsigned char *allow; // constrained decoding: the token mask (V bytes, all 0 between steps)
     int *list;            // the allowed tokens set in allow
     float *lcopy;         // logprobs: the raw logits of the step (sampling modifies them)
+    unsigned gen, dk_gen; // the disk tier: the contents' generation (+1 per job, per load), the last one saved (or
+                          // given up on, or loaded): gen != dk_gen means the disk has not seen these tokens
 } Slot;
+
+// the disk tier: a saved sequence, <id>.rqseq (+ <id>.draft.rqseq: the draft's, dlen positions, 0: none)
+typedef struct {
+    int id, dlen;
+    int *tok;             // its tokens (f.len)
+    RqSeqFile f;
+    long long bytes;      // both files
+    double used;          // last save / load / hit (rq_now's clock; the mtime's at the start)
+} DiskEnt;
 
 
 struct Engine {
@@ -122,6 +137,16 @@ struct Engine {
     int stop;
     double grace_until;
     unsigned long long passes, rows;
+    // the disk tier (EngineOpts.kv_disk): the directory, its lock, the saved sequences, their bytes and the budget; the
+    // I/O admission planned (under mu: admit), done by the engine thread without mu (dk_run)
+    char *dk_dir;
+    int dk_lock, ndk, dk_cap, dk_next;
+    DiskEnt *dk;
+    long long dk_bytes;
+    double dk_max;
+    struct { int spill, slot, load, L; } plan; // (slots / entry id, -1: none)
+    unsigned long long dk_saves, dk_loads;
+    double dk_save_s, dk_load_s;
 };
 
 // -------------------------------------------------------------------------------------------- jobs
@@ -770,6 +795,322 @@ static int lcp(const int *a, int na, const int *b, int nb) {
 
 static int real_reuse(int L, int n) { return L >= 32 || (L > 0 && 2 * L >= n); }
 
+// ---------------------------------------------------------------------------------------- the disk tier
+// --kv-disk DIR: sequences saved to files (rq_seq_save: their KV blocks, tokens, recurrent state and checkpoints; the
+// same bits back) in DIR/<model fingerprint>-<KV type>/, one directory per server (a lock file). A slot is saved when a
+// job would discard >= --kv-disk-min of its tokens (an LRU eviction, a truncation, a copy over it) and at shutdown,
+// once per change of its contents (Slot.gen); a save that holds an older one's tokens (the same conversation, longer)
+// replaces it. A new job whose prompt shares a longer usable prefix with a saved sequence than with any slot (by a
+// real margin: >= --prefix-copy tokens and 1/8 of what is read) gets it loaded into the least recently used idle
+// slot first (only the blocks up to that prefix are read), then is admitted as for a cached prefix. Saves and loads
+// run between passes, without mu (admit plans them: dk_run), so queueing and /health never wait on the disk; the
+// running jobs do (a 6 GiB sequence: ~2.5 s to save, ~1 s to load at ~2.5 / ~6 GB/s). The files survive a
+// restart (indexed at the start; their mtime orders them). Budget: --kv-disk-max GiB (default half the free space
+// at the start, our files included), and 1 GiB of the file system kept free; the least recently used go first.
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+
+#define DK_RESERVE (1024.0 * 1048576.0) // bytes of the file system kept free
+
+static void start_run(Engine *e, Job *j, int si, int src, int L);
+
+static void dk_path(const Engine *e, int id, int draft, char *buf, size_t n) {
+    snprintf(buf, n, "%s/%d%s.rqseq", e->dk_dir, id, draft ? ".draft" : "");
+}
+
+static double dk_free(const Engine *e) {
+    struct statvfs v;
+    return statvfs(e->dk_dir, &v) ? -1 : (double)v.f_bavail * (double)v.f_frsize;
+}
+
+static void dk_touch(const Engine *e, DiskEnt *d) {
+    // (the LRU order across restarts: the mtime)
+    char p[4096];
+    d->used = rq_now();
+    dk_path(e, d->id, 0, p, sizeof(p));
+    utimensat(AT_FDCWD, p, NULL, 0);
+}
+
+static void dk_remove(Engine *e, int k) {
+    char p[4096];
+    DiskEnt *d = &e->dk[k];
+    dk_path(e, d->id, 0, p, sizeof(p));
+    unlink(p);
+    dk_path(e, d->id, 1, p, sizeof(p));
+    unlink(p);
+    e->dk_bytes -= d->bytes;
+    free(d->tok);
+    e->dk[k] = e->dk[--e->ndk];
+}
+
+static int dk_find(const Engine *e, int id) {
+    for (int k = 0; k < e->ndk; k++)
+        if (e->dk[k].id == id) return k;
+    return -1;
+}
+
+static int dk_fit(Engine *e, double need, int keep_id) {
+    // room for need more bytes (the budget, the file system's reserve): the least recently used entries removed (not
+    // keep_id) until it fits; 0 if it cannot
+    for (;;) {
+        double fr = dk_free(e);
+        if (e->dk_bytes + need <= e->dk_max && (fr < 0 || fr - need >= DK_RESERVE)) return 1;
+        int v = -1;
+        for (int k = 0; k < e->ndk; k++)
+            if (e->dk[k].id != keep_id && (v < 0 || e->dk[k].used < e->dk[v].used)) v = k;
+        if (v < 0) return 0;
+        if (e->o.verbose) fprintf(stderr, "[engine] disk: entry %d removed (%d tokens, %.1f MB): room\n", e->dk[v].id, e->dk[v].f.len, e->dk[v].bytes / 1e6);
+        dk_remove(e, v);
+    }
+}
+
+static int dk_add(Engine *e, int id, double used) {
+    // index <id>.rqseq (and its draft's file); its position in e->dk, or -1 (the files removed if they do not check out;
+    // kept, not indexed, after a read error)
+    char p[4096];
+    DiskEnt d = { id, 0, NULL, { 0 }, 0, used };
+    dk_path(e, id, 0, p, sizeof(p));
+    int rc = rq_seq_file_info(e->m, p, &d.f, &d.tok);
+    if (rc != RQ_OK && rc != RQ_ERR_MISMATCH) {
+        fprintf(stderr, "runq serve: --kv-disk: %s: %s, skipped\n", p, rq_strerror(rc));
+        free(d.tok);
+        if (id >= e->dk_next) e->dk_next = id + 1; // (its id stays taken)
+        return -1;
+    }
+    if (rc != RQ_OK || d.f.kv_type != e->o.kv_type) {
+        fprintf(stderr, "runq serve: --kv-disk: %s: %s, removed\n", p, rc != RQ_OK ? rq_strerror(rc) : "another KV type");
+        free(d.tok);
+        unlink(p);
+        dk_path(e, id, 1, p, sizeof(p));
+        unlink(p);
+        return -1;
+    }
+    d.bytes = d.f.bytes;
+    dk_path(e, id, 1, p, sizeof(p));
+    struct stat st;
+    if (!stat(p, &st)) { // the draft's: used if it is the draft model's and follows these tokens; kept (counted) without one
+        RqSeqFile df;
+        int *dt = NULL;
+        if (e->dm && rq_seq_file_info(e->dm, p, &df, &dt) == RQ_OK && df.kv_type == e->o.kv_type && df.len <= d.f.len &&
+            !memcmp(dt, d.tok, (size_t)df.len * sizeof(int)))
+            d.dlen = df.len;
+        else if (e->dm) {
+            unlink(p);
+            st.st_size = 0;
+        }
+        free(dt);
+        d.bytes += st.st_size;
+    }
+    if (e->ndk == e->dk_cap) {
+        int nc = e->dk_cap ? 2 * e->dk_cap : 16;
+        DiskEnt *n = realloc(e->dk, (size_t)nc * sizeof(DiskEnt));
+        if (!n) {
+            free(d.tok);
+            return -1;
+        }
+        e->dk = n;
+        e->dk_cap = nc;
+    }
+    e->dk[e->ndk] = d;
+    e->dk_bytes += d.bytes;
+    if (id >= e->dk_next) e->dk_next = id + 1;
+    return e->ndk++;
+}
+
+static int dk_open(Engine *e, char *err, size_t errlen) {
+    // the directory (created), its lock, the index of the files there (leftover .tmp files and others' removed)
+    RqModelInfo mi;
+    rq_model_info(e->m, &mi);
+    size_t n = strlen(e->o.kv_disk) + 64;
+    if (!(e->dk_dir = malloc(n))) { snprintf(err, errlen, "out of memory"); return -1; }
+    snprintf(e->dk_dir, n, "%s/%016llx-%s", e->o.kv_disk, mi.fingerprint, rq_kv_name(e->o.kv_type));
+    if ((mkdir(e->o.kv_disk, 0755) && errno != EEXIST) || (mkdir(e->dk_dir, 0755) && errno != EEXIST)) {
+        snprintf(err, errlen, "--kv-disk: cannot create %s: %s", e->dk_dir, strerror(errno));
+        return -1;
+    }
+    char p[4096];
+    snprintf(p, sizeof(p), "%s/lock", e->dk_dir);
+    if ((e->dk_lock = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0644)) < 0 || flock(e->dk_lock, LOCK_EX | LOCK_NB)) {
+        snprintf(err, errlen, "--kv-disk: %s: %s", p, e->dk_lock < 0 ? strerror(errno) : "in use by another runq serve");
+        return -1;
+    }
+    DIR *dir = opendir(e->dk_dir);
+    if (!dir) {
+        snprintf(err, errlen, "--kv-disk: cannot read %s: %s", e->dk_dir, strerror(errno));
+        return -1;
+    }
+    double now = rq_now(), wall = (double)time(NULL);
+    struct dirent *de;
+    while ((de = readdir(dir))) {
+        const char *s = de->d_name;
+        size_t l = strlen(s);
+        char *end;
+        long id = strtol(s, &end, 10);
+        snprintf(p, sizeof(p), "%s/%s", e->dk_dir, s);
+        if (l > 4 && !strcmp(s + l - 4, ".tmp")) unlink(p); // (a save cut short)
+        else if (end != s && id >= 0 && id < (1L << 30) && !strcmp(end, ".rqseq")) {
+            struct stat st;
+            double used = !stat(p, &st) ? now - (wall - (double)st.st_mtime) : now - wall;
+            dk_add(e, (int)id, used);
+        } else if (end != s && !strcmp(end, ".draft.rqseq")) {
+            char q[4096];
+            snprintf(q, sizeof(q), "%s/%ld.rqseq", e->dk_dir, id);
+            if (access(q, F_OK)) unlink(p); // (an orphan)
+        }
+    }
+    closedir(dir);
+    double fr = dk_free(e);
+    e->dk_max = e->o.kv_disk_max > 0 ? e->o.kv_disk_max * 1073741824.0 : fr >= 0 ? 0.5 * (fr + (double)e->dk_bytes) : 16.0 * 1073741824.0;
+    dk_fit(e, 0, -1);
+    return 0;
+}
+
+static void dk_close(Engine *e) {
+    for (int k = 0; k < e->ndk; k++)
+        free(e->dk[k].tok);
+    free(e->dk);
+    e->dk = NULL;
+    e->ndk = 0;
+    if (e->dk_dir && e->dk_lock >= 0) close(e->dk_lock); // (the lock with it)
+    free(e->dk_dir);
+    e->dk_dir = NULL;
+}
+
+static int dk_wants(const Engine *e, const Slot *sl, int keep) {
+    // a job would keep the first keep positions of the slot: are the others worth saving first?
+    int len = rq_seq_len(sl->seq);
+    return e->dk_dir && sl->gen != sl->dk_gen && len >= e->o.kv_disk_min && len - keep >= e->o.kv_disk_min;
+}
+
+static int dk_best(const Engine *e, const int *P, int n, int *best) {
+    // the saved sequence with the longest usable prefix of the prompt (as start_run would keep it: up to n - 1;
+    // Qwen3.5: a checkpointed length); its length, *best = its index (-1: none)
+    int L = 0;
+    *best = -1;
+    for (int k = 0; k < e->ndk; k++) {
+        const DiskEnt *d = &e->dk[k];
+        int c = lcp(d->tok, d->f.len, P, n), u = rq_seq_file_keep(&d->f, c < n - 1 ? c : n - 1);
+        if (u > L) {
+            L = u;
+            *best = k;
+        }
+    }
+    return L;
+}
+
+static void dk_spill(Engine *e, int si, int keep_id) {
+    // save slot si (and its draft's sequence), unless a saved sequence holds these tokens already; entries it holds
+    // the tokens of are replaced (not keep_id: a load to follow)
+    Slot *sl = &e->slot[si];
+    RqSeq *s = sl->seq;
+    const int *t = rq_seq_tokens(s);
+    int len = rq_seq_len(s);
+    char p[4096];
+    sl->dk_gen = sl->gen; // (tried once per generation, whatever happens)
+    if (len < 1) return;
+    for (int k = 0; k < e->ndk; k++) {
+        DiskEnt *d = &e->dk[k];
+        if (rq_seq_file_keep(&d->f, len) == len && lcp(d->tok, d->f.len, t, len) == len) {
+            dk_touch(e, d);
+            return;
+        }
+    }
+    int dl = 0;
+    if (sl->dseq && (dl = rq_seq_len(sl->dseq)) > 0 && rq_seq_common_prefix(sl->dseq, t, len) != dl) dl = 0;
+    double need = (double)rq_seq_save_bytes(s) + (dl ? (double)rq_seq_save_bytes(sl->dseq) : 0);
+    if (!dk_fit(e, need, keep_id)) {
+        if (e->o.verbose) fprintf(stderr, "[engine] disk: slot %d (%d tokens, %.1f MB) not saved: no room\n", si, len, need / 1e6);
+        return;
+    }
+    int id = e->dk_next++;
+    double t0 = rq_now();
+    dk_path(e, id, 0, p, sizeof(p));
+    int rc = rq_seq_save(s, p);
+    if (rc != RQ_OK) {
+        fprintf(stderr, "[engine] disk: slot %d not saved to %s: %s\n", si, p, rq_strerror(rc));
+        return;
+    }
+    if (dl) {
+        dk_path(e, id, 1, p, sizeof(p));
+        if (rq_seq_save(sl->dseq, p) != RQ_OK) dl = 0;
+    }
+    double dt = rq_now() - t0;
+    int k = dk_add(e, id, rq_now());
+    if (k < 0) return;
+    e->dk_saves++;
+    e->dk_save_s += dt;
+    DiskEnt nd = e->dk[k];
+    if (e->o.verbose)
+        fprintf(stderr, "[engine] disk: slot %d saved as entry %d: %d tokens%s, %.1f MB, %.3f s (%.2f GB/s); %d entries, %.2f of %.2f GiB\n", si, id,
+                len, dl ? " + the draft's" : "", nd.bytes / 1e6, dt, nd.bytes / 1e9 / (dt > 0 ? dt : 1e-9), e->ndk,
+                e->dk_bytes / 1073741824.0, e->dk_max / 1073741824.0);
+    for (int j = e->ndk - 1; j >= 0; j--) { // (the older saves of this conversation: a prefix of it, restorable from it)
+        DiskEnt *d = &e->dk[j];
+        if (d->id != id && d->id != keep_id && d->f.len <= len && rq_seq_file_keep(&nd.f, d->f.len) == d->f.len && lcp(d->tok, d->f.len, t, len) == d->f.len) {
+            if (e->o.verbose) fprintf(stderr, "[engine] disk: entry %d (%d tokens) replaced by entry %d\n", d->id, d->f.len, id);
+            dk_remove(e, j);
+        }
+    }
+}
+
+static void dk_load(Engine *e, int si, int id, int L) {
+    // slot si := the saved sequence id's first L positions (and its draft's, as far as they go)
+    int k = dk_find(e, id);
+    if (k < 0) return;
+    Slot *sl = &e->slot[si];
+    DiskEnt *d = &e->dk[k];
+    char p[4096];
+    double t0 = rq_now();
+    dk_path(e, id, 0, p, sizeof(p));
+    int rc = rq_seq_load(sl->seq, p, L);
+    if (rc != RQ_OK) {
+        fprintf(stderr, "[engine] disk: entry %d not loaded: %s (removed)\n", id, rq_strerror(rc));
+        dk_remove(e, k);
+        if (rc == RQ_ERR_IO) sl->gen++, sl->dk_gen = sl->gen; // (the slot is empty then)
+        return;
+    }
+    sl->gen++;
+    sl->dk_gen = sl->gen;
+    sl->used = rq_now();
+    if (sl->dseq) {
+        int dn = d->dlen < rq_seq_len(sl->seq) ? d->dlen : rq_seq_len(sl->seq);
+        dk_path(e, id, 1, p, sizeof(p));
+        if (dn < 1 || rq_seq_load(sl->dseq, p, dn) != RQ_OK) rq_seq_reset(sl->dseq);
+    }
+    double dt = rq_now() - t0;
+    e->dk_loads++;
+    e->dk_load_s += dt;
+    dk_touch(e, d);
+    if (e->o.verbose)
+        fprintf(stderr, "[engine] disk: entry %d -> slot %d: %d of %d tokens%s, %.3f s\n", id, si, rq_seq_len(sl->seq), d->f.len,
+                sl->dseq && rq_seq_len(sl->dseq) ? " + the draft's" : "", dt);
+}
+
+static void dk_run(Engine *e) {
+    // (the engine thread, without mu) the I/O admit planned: a spill, then a load into that slot
+    if (e->plan.spill >= 0) dk_spill(e, e->plan.spill, e->plan.load);
+    if (e->plan.load >= 0) dk_load(e, e->plan.slot, e->plan.load, e->plan.L);
+    e->plan.spill = e->plan.load = e->plan.slot = -1;
+}
+
+static int dk_go(Engine *e, Job *j, int si, int src, int L) {
+    // admit's start_run(e, j, si, src, L), unless the slot's tokens it would discard should be saved first: 2 then
+    // (planned; the job is admitted again after dk_run)
+    Slot *sl = &e->slot[si];
+    int keep = src >= 0 ? 0 : rq_seq_keep(sl->seq, L < j->prompt.n ? L : j->prompt.n - 1);
+    if (keep < 0) keep = 0;
+    if (dk_wants(e, sl, keep)) {
+        e->plan.spill = si;
+        return 2;
+    }
+    start_run(e, j, si, src, L);
+    return 1;
+}
+
 static int prompt_sys_end(const Engine *e, const int *P, int n) {
     // the end of the prompt's leading system block ("<|im_start|>system...<|im_end|>\n": the system prompt and the tools),
     // the position of the next <|im_start|>; -1 if none
@@ -835,6 +1176,7 @@ static void start_run(Engine *e, Job *j, int si, int src, int L) {
     j->slot = si;
     job_unlock(j);
     sl->used = now;
+    sl->gen++; // (the disk tier: new tokens from here on)
     Run *r = calloc(1, sizeof(Run));
     if (!r) {
         job_finish(j, FINISH_NONE, 500, "internal_error", "out of memory");
@@ -952,7 +1294,8 @@ out:
 
 static int admit(Engine *e, Job *j) {
     // (under e->mu) start the job on a slot: 1, or -1 if no slot is idle, 0 if it should wait for a
-    // prefix that a job being prefilled will share with it
+    // prefix that a job being prefilled will share with it, 2 if the disk tier has I/O to do first (e->plan: dk_run,
+    // then the job is admitted again)
     const int *P = j->prompt.v;
     int n = j->prompt.n, ib = -1, li = -1, lru = -1, bb = -1, lb = 0;
     for (int i = 0; i < e->nslot; i++) {
@@ -967,9 +1310,18 @@ static int admit(Engine *e, Job *j) {
         }
     }
     if (lru < 0) return -1;
-    if (j->no_cache) { // (the least recently used slot: keeps the useful caches)
-        start_run(e, j, lru, -1, 0);
-        return 1;
+    if (j->no_cache) // (the least recently used slot: keeps the useful caches)
+        return dk_go(e, j, lru, -1, 0);
+    if (e->ndk && !j->dk_tried) { // a saved sequence shares a longer prefix (by a real margin: it is read whole up to there)
+        int k, Ld = dk_best(e, P, n, &k), have = li > lb ? li : lb, gain = Ld - have;
+        if (k >= 0 && real_reuse(Ld, n) && gain >= (e->o.copy_min > 0 ? e->o.copy_min : 32) && 8 * gain >= Ld) {
+            j->dk_tried = 1;
+            e->plan.spill = dk_wants(e, &e->slot[lru], 0) ? lru : -1;
+            e->plan.slot = lru;
+            e->plan.load = e->dk[k].id;
+            e->plan.L = Ld;
+            return 2;
+        }
     }
     if (e->o.copy_min > 0) {
         int have = li > lb ? li : lb, pend = 0;
@@ -981,10 +1333,7 @@ static int admit(Engine *e, Job *j) {
         }
         // (Qwen3.5: no waiting for a prefix being prefilled: its state is gone once the prefill moves past it)
         if (!e->hybrid && pend >= have + e->o.copy_min && real_reuse(pend, n)) return 0;
-        if (bb >= 0 && lb >= li + e->o.copy_min && real_reuse(lb, n)) {
-            start_run(e, j, lru, bb, lb);
-            return 1;
-        }
+        if (bb >= 0 && lb >= li + e->o.copy_min && real_reuse(lb, n)) return dk_go(e, j, lru, bb, lb);
     }
     if (real_reuse(li, n)) {
         // slot affinity: a slot holding a longer conversation than it would keep (it shares only a prefix, e.g. the system
@@ -993,10 +1342,10 @@ static int admit(Engine *e, Job *j) {
         int lost = rq_seq_len(e->slot[ib].seq) - li, other = -1;
         for (int i = 0; i < e->nslot; i++)
             if (i != ib && !e->slot[i].run && (other < 0 || e->slot[i].used < e->slot[other].used)) other = i;
-        if (e->o.copy_min > 0 && other >= 0 && lost >= e->o.copy_min && lost > li) start_run(e, j, other, ib, li);
-        else start_run(e, j, ib, -1, li);
-    } else start_run(e, j, lru, -1, rq_seq_keep(e->slot[lru].seq, rq_seq_common_prefix(e->slot[lru].seq, P, n)));
-    return 1;
+        if (e->o.copy_min > 0 && other >= 0 && lost >= e->o.copy_min && lost > li) return dk_go(e, j, other, ib, li);
+        return dk_go(e, j, ib, -1, li);
+    }
+    return dk_go(e, j, lru, -1, rq_seq_keep(e->slot[lru].seq, rq_seq_common_prefix(e->slot[lru].seq, P, n)));
 }
 
 // ------------------------------------------------------------------------------------------- a step
@@ -1586,9 +1935,14 @@ static void *engine_main(void *arg) {
             job_release(j);
         }
         e->qn = k;
+        int io = 0;
         for (int i = 0; i < e->qn && e->nrun < e->parallel;) { // FIFO (a job waiting for a shared prefix keeps its place)
             int a = admit(e, e->q[i]);
             if (a < 0) break;
+            if (a == 2) { // (the disk tier's I/O first, then this job again: it keeps its place)
+                io = 1;
+                break;
+            }
             if (a == 0) {
                 i++;
                 continue;
@@ -1599,12 +1953,18 @@ static void *engine_main(void *arg) {
         int stopping = e->stop && now > e->grace_until;
         e->running = e->nrun;
         pthread_mutex_unlock(&e->mu);
+        if (io) dk_run(e);
         if (e->nrun > 0) step(e, stopping);
         reap(e);
         pthread_mutex_lock(&e->mu);
         e->running = e->nrun;
     }
     pthread_mutex_unlock(&e->mu);
+    for (int i = 0; e->dk_dir && i < e->nslot; i++) // the disk tier: what the disk has not seen yet
+        if (e->slot[i].gen != e->slot[i].dk_gen && rq_seq_len(e->slot[i].seq) >= e->o.kv_disk_min) dk_spill(e, i, -1);
+    if (e->dk_dir && (e->dk_saves || e->dk_loads))
+        fprintf(stderr, "[engine] disk: %llu saves (%.2f s), %llu loads (%.2f s); %d entries, %.2f GiB in %s\n", e->dk_saves, e->dk_save_s,
+                e->dk_loads, e->dk_load_s, e->ndk, e->dk_bytes / 1073741824.0, e->dk_dir);
     if (e->o.verbose) {
         fprintf(stderr, "[engine] %llu passes, %llu rows\n", e->passes, e->rows);
         if (e->sp_passes || e->d_passes)
@@ -1642,6 +2002,7 @@ void engine_free(Engine *e) {
     free(e->dsegrun);
     free(e->cand);
     if (e->dc) rq_ctx_free(e->dc);
+    dk_close(e);
     free(e->q);
     pthread_mutex_destroy(&e->mu);
     pthread_cond_destroy(&e->cv);
@@ -1662,6 +2023,9 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
     pthread_cond_init(&e->cv, NULL);
     e->m = m;
     e->o = *o;
+    e->dk_lock = -1;
+    e->plan.spill = e->plan.slot = e->plan.load = -1;
+    if (e->o.kv_disk_min < 1) e->o.kv_disk_min = 1;
     if (e->o.queue < 1) e->o.queue = 1;
     if (e->o.batch < 1) e->o.batch = 1;
     if (e->o.batch > RQ_BATCH_MAX) e->o.batch = RQ_BATCH_MAX;
@@ -1806,6 +2170,10 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
     }
     e->tcal = e->tcost;
     e->dcal = e->dcost;
+    if (o->kv_disk && *o->kv_disk && dk_open(e, err, errlen)) {
+        engine_free(e);
+        return NULL;
+    }
     if (pthread_create(&e->th, NULL, engine_main, e)) {
         snprintf(err, errlen, "cannot start the engine thread");
         engine_free(e);
@@ -1831,6 +2199,11 @@ void engine_describe(Engine *e, char *buf, size_t n) {
              "touched as used; pool budget %.2f GiB, %s), prefill chunks %d / %d tokens per pass (others decoding / not)",
              e->parallel, e->nslot, e->o.ctx, (e->sm.total + e->dsm.total) / 1048576.0, (double)e->sm.kv / e->o.ctx / 1000.0, st, dr,
              ((double)e->sm.total + e->dsm.total) * e->nslot / G, e->o.kv_mem, e->mem_src, e->o.chunk, e->o.batch);
+    if (e->dk_dir) {
+        size_t l = strlen(buf);
+        snprintf(buf + l, n - l, "; disk tier %s: %d saved sequence(s), %.2f of %.2f GiB, slots saved from %d tokens", e->dk_dir, e->ndk,
+                 e->dk_bytes / G, e->dk_max / G, e->o.kv_disk_min);
+    }
 }
 
 static void cost_text(char *b, size_t n, const RqPassCost *c) {

@@ -47,6 +47,13 @@
 extern int GS;
 extern int rq_iq_gather; // RUNQ_IQ_GATHER (iquants.h)
 
+static inline uint64_t fnv1a64(uint64_t h, const void *p, size_t n) {
+    // FNV-1a over n bytes, continuing from h (start: 1469598103934665603)
+    const unsigned char *b = p;
+    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+
 // Batched prefill: rows per chunk (-b, at most B_MAX); 0 or 1 = one token at a time through the decode
 // path. Bigger chunks are faster (fewer barriers and weight passes per token): 8 threads, 1,500 /
 // 3,000 tokens: -b 64 1,237 / 911 tok/s, 128 1,370 / 1,018, 256 1,467 / 1,093, 512 1,547 / 1,112, 1024
@@ -222,6 +229,7 @@ struct RqModel {
     Gguf gguf;                  // gguf.map != NULL: a GGUF file (the mapping below)
     void *data;                 // the file mapping, or NULL
     size_t file_size;
+    uint64_t fp;                // the file's fingerprint (its size, first MiB and last 64 KiB): saved sequences' owner
     int has_weights, has_tok, is_gguf;
     int gs_counted;             // counted in model.c's gs_models (one group size per process)
     char warning[256];          // a load-time warning for the caller to show ("" if none)
@@ -302,6 +310,9 @@ int ctx_vocab(const RqCtx *c);
 // sampler.c
 float random_f32(unsigned long long *state);
 int forward_model_init(RqModel *m); // the derived shape parameters; 0 if the shape is not supported
+
+// forward.c: pre-fault the KV cache blocks of positions 0..n-1 of item it (attention layer it / 2, K / V: it % 2)
+void seq_kv_populate(const RqSeq *s, int n, int it);
 
 // ------------------------------------------------------------------------------------- a sequence
 

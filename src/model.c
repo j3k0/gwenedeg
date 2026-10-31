@@ -884,6 +884,11 @@ static void load_model(RqModel *m, const char *path, const RqModelOpts *o, Loade
     if (map == MAP_FAILED) load_fail(e, "mmap failed!");
     m->data = map;
     m->file_size = (size_t)size;
+    { // (the saved sequences' owner: rq_seq_save; the header, metadata and the last tensor bytes)
+        size_t a = size < (1 << 20) ? (size_t)size : 1 << 20, z = size < (1 << 16) ? (size_t)size : 1 << 16;
+        uint64_t sz = (uint64_t)size;
+        m->fp = fnv1a64(fnv1a64(fnv1a64(1469598103934665603ull, &sz, 8), map, a), (char *)map + size - z, z);
+    }
     Config *c = &m->config;
     uint32_t magic;
     memcpy(&magic, map, 4);
@@ -1051,6 +1056,7 @@ void rq_model_info(const RqModel *m, RqModelInfo *info) {
     info->chat = m->chat;
     info->rope_theta = m->rope_theta;
     info->linear_layers = m->hy.n_lin;
+    info->fingerprint = m->fp;
 }
 
 // ---------------------------------------------------------------------------- test hook

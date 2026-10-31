@@ -30,7 +30,8 @@ Tests (see tests/README.md):
              goldens (q4_*) run in the greedy group
   server     runq serve over HTTP (tests/server_test.py, in the background from the start): endpoints,
              completions == runq -m chat, prefix reuse bitwise, streaming, json_schema constrained
-             decoding, errors, queue / cancellation, fuzzing, shutdown; the tool call parser
+             decoding, errors, queue / cancellation, fuzzing, shutdown; the disk tier (--kv-disk: Qwen3 with a
+             draft, Qwen3.5); the tool call parser
              (build/tools_test, tests/tools_test.c: no model)
   kv         the KV cache types other than the default f16 (-k f32, -k bf16; -k bf16-dot / f16-dot: the bf16
              dot-product attention): logits vs HF (en, code, long2), batched vs sequential, threads and AVX-512 vs
@@ -484,24 +485,31 @@ SERVER_THREADS = 2  # runq serve and its CLI reference runs (in the background f
 
 
 def server_run(a, ex):
-    """Start tests/server_test.py (runq serve over HTTP) on the GGUF Q8_0 file (else the .bin)."""
+    """Start tests/server_test.py (runq serve over HTTP) on the GGUF Q8_0 file (else the .bin); its disk tier group
+    (--disk: the KV cache saved to files) on the same file with the Q4_K_M as the draft, and on Qwen3.5-0.8B"""
     model = a.gguf or a.model
-    return ex.submit(run, [sys.executable, "-I", os.path.join(ROOT, "tests", "server_test.py"), "--runq", a.runq,
-                           "--model", model, "--threads", str(SERVER_THREADS)])
+    st = [sys.executable, "-I", os.path.join(ROOT, "tests", "server_test.py"), "--runq", a.runq, "--threads", str(SERVER_THREADS)]
+    futs = [("", ex.submit(run, st + ["--model", model]))]
+    futs.append(("disk_qwen3", ex.submit(run, st + ["--model", model, "--disk"] + (["--draft", a.q4] if a.q4 else []))))
+    if a.q35:
+        futs.append(("disk_qwen35", ex.submit(run, st + ["--model", a.q35, "--disk"])))
+    return futs
 
 
 def test_server(a, res, fut):
     """tests/server_test.py: runq serve's endpoints, greedy / seeded completions == runq -m chat, prefix
     reuse == fresh prefill (bitwise logprobs), streaming, constrained json_schema outputs, errors, queue,
-    cancellation, fuzzing, shutdown"""
-    p = fut.result()
-    lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
-    for l in lines:
-        ok, rest = l.startswith("PASS "), l[5:]
-        name, _, detail = rest.partition("  ")
-        res.report(ok, f"server/{name.strip()}", detail.strip())
-    if p.returncode not in (0, 1) or not lines:
-        res.report(False, "server/run", f"exit status {p.returncode}: {(p.stdout + p.stderr).decode(errors='replace')[-500:]}")
+    cancellation, fuzzing, shutdown; the disk tier (--kv-disk): saved and loaded == fresh prefill, a restart, refusals"""
+    for tag, fut in fut:
+        p = fut.result()
+        pre = f"server/{tag}/" if tag else "server/"
+        lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
+        for l in lines:
+            ok, rest = l.startswith("PASS "), l[5:]
+            name, _, detail = rest.partition("  ")
+            res.report(ok, f"{pre}{name.strip()}", detail.strip())
+        if p.returncode not in (0, 1) or not lines:
+            res.report(False, f"{pre}run", f"exit status {p.returncode}: {(p.stdout + p.stderr).decode(errors='replace')[-500:]}")
     # the tool call parser and Python-style JSON (tests/tools_test.c, build/tools_test: built by run_tests.sh; no model)
     tt = os.path.join(ROOT, "build", "tools_test")
     if not os.path.exists(tt):

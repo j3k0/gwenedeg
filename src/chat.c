@@ -68,6 +68,8 @@ const char *rq_strerror(int err) {
         case RQ_ERR_CONTEXT: return "context full";
         case RQ_ERR_STATE: return "not possible in this state";
         case RQ_ERR_LOAD: return "cannot load the model";
+        case RQ_ERR_IO: return "file read / write failed";
+        case RQ_ERR_MISMATCH: return "not a saved sequence of this model";
         default: return "unknown error";
     }
 }

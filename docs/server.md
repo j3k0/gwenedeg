@@ -29,6 +29,9 @@ curl -s localhost:8080/v1/chat/completions -d '{"messages": [{"role": "user", "c
 | `--page-cache auto\|drop\|keep` | auto | the model file's page cache after the load (auto: dropped if the file is >= 1/4 of the RAM) |
 | `-b N`, `--chunk N` | 512, 64 | prompt tokens per forward pass when no request is decoding / while others decode |
 | `--prefix-copy N` | 32 | copy a cached prompt prefix into a new request's slot if that saves N tokens (a running request's; an idle slot's that would otherwise be cut, slot affinity below; 0: never) |
+| `--kv-disk DIR` | off | the KV cache's disk tier (below, KV cache on disk): a slot's sequence is saved to `DIR` when a request would discard its tokens (and at shutdown), and loaded back when a prompt continues it, also after a restart; an SSD |
+| `--kv-disk-max GiB` | half the free space at the start | the disk tier's files at most (the least recently used removed first); 1 GiB of the file system is always left free |
+| `--kv-disk-min N` | 1024 | save a slot when a request would discard at least N of its tokens (it holds at least N) |
 | `-k` | f16 | KV cache type (as for the CLI) |
 | `--queue N` | 64 | requests waiting beyond the free running places at most (more: 503, `Retry-After: 1`) |
 | `--max-conns N`, `--max-body B` | 128, 4 MB | connections (more: 503), request body size (more: 413) |
@@ -144,6 +147,38 @@ down), 504. Not supported: tools with Qwen3's templates (400), `tool_choice` req
   generated the position after its `</think>` (content or calls that come back tokenized differently roll back
   there, not to the header) and its end (a retry or another branch after the reply). The slot's other checkpoints
   are dropped first, so new ones never replace these. Measured with pi's sessions below (Agent sessions).
+- **KV cache on disk** (`--kv-disk DIR`): a second tier below the slots, for sequences the pool has no room to keep
+  (e.g. one 96k slot: a compaction's summary request takes it, the next request then prefilled the system block again)
+  and across restarts. A slot is saved (`rq_seq_save`: the KV blocks in use, the tokens, for Qwen3.5 / 3.8 the
+  recurrent state and its checkpoints; with `--draft`, the draft's sequence beside it) when a request is about to
+  discard at least `--kv-disk-min` of its tokens (an eviction, a truncation, a copy over it), once per change of its
+  contents, and every slot at shutdown (SIGTERM). The saved tokens are indexed in memory; a request whose prompt
+  shares a longer usable prefix with a saved sequence than with any slot (by >= `--prefix-copy` tokens and 1/8 of the
+  length read; Qwen3.5 / 3.8: the saved length or a checkpoint) gets that prefix loaded into the least recently used
+  idle slot (that slot saved first if it needs to be; only the blocks up to the prefix are read), then is admitted
+  as for a cached prefix: its prefill starts there. Logits are bit-identical to a fresh prefill (the same bits come
+  back; tested, tests/server_test.py `--disk`). A save that holds an older one's tokens (the same conversation,
+  further on) replaces it. The files are in `DIR/<model fingerprint>-<KV type>/` (`<id>.rqseq`, `<id>.draft.rqseq`;
+  the fingerprint: the model file's size, first MiB and last 64 KiB), one server per directory (a lock file; a
+  second one is refused); at the start, saves cut short (`.tmp`) and files that do not check out (corrupt, another
+  model) are removed, and the rest are indexed with their mtime as their last use. Written as `.tmp`, synced,
+  renamed; O_DIRECT where the file system takes it (the page cache is not filled with them; tmpfs: buffered), one
+  thread per layer and K / V. A file holds the blocks of 256 positions in use: 115 KB per position for the 0.6B
+  (f16), 64 KiB for Qwen3.8-27B (its 16 attention layers; + 150 MiB per recurrent state, ~6.6 GiB for a 98k session
+  with 3 checkpoints). The I/O runs between passes, without the queue's lock (queueing and `/health` never wait for
+  it), but the running requests do: on the dev box's disk (a virtual SSD; `dd` 1.4 GB/s written, 7.3 GB/s read with
+  O_DIRECT), against a prefill of the same context (16 threads, f16, 2026-10-31; the next decode step's logits after
+  the load == the saved sequence's):
+
+  | model, context | prefill | file | save | load |
+  |---|---|---|---|---|
+  | Qwen3-0.6B Q8_0, 16k | 31.1 s (527 tok/s) | 1.91 GB | 0.63 s | 0.26 s (117x faster) |
+  | Qwen3.5-0.8B Q8_0, 32k | 34.9 s (940 tok/s) | 0.43 GB | 0.16 s | 0.08 s (427x) |
+  | Qwen3.5-4B Q8_0, 16k | 44.0 s (372 tok/s) | 0.60 GB | 0.21 s | 0.13 s (334x) |
+
+  Expected on Qwen3.8-27B (not measured yet, TODO): a 90k session prefills in ~35 min (P / 67.5 + 0.19 us x P x P / 2
+  s, above), its ~6.3 GiB file loads in ~1-2 s; the system block after a compaction (~2 of its 12.4 min) in well under
+  a second. To use it there, add `--kv-disk DIR` to the command below (DIR on the SSD, ~7 GiB per session saved).
 - **Constrained decoding** (`response_format: json_schema`), for schemas with a finite set of outputs:
   `enum`, `const`, `boolean`, `null`, `integer` with `minimum` / `maximum` (up to 256 values), objects of
   those (nested; `required`, optional properties; property order as in the schema; no additional
@@ -397,7 +432,8 @@ OMP_NUM_THREADS=16 runq serve models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q3_K_M.gguf -c
   the startup line; the online correction rescales the whole cost, TODO G7 (b)): restart the server if it shows 2.403.
 - **One slot** (`--slots 1 --parallel 1`): a second 96k slot (7.8 GiB + the draft's 1.2) does not fit, so a
   compaction's summary request takes the session's slot and the next request prefills the system block again (~2 min;
-  TODO G5 (b)). `--checkpoints 3`: Qwen3.8 needs the header, the system block's end and the reply's end. `--timeout 0`:
+  TODO G5 (b)), unless `--kv-disk DIR` keeps the session on disk (above, KV cache on disk: the system block then comes
+  back from the file; and the whole session after a restart). `--checkpoints 3`: Qwen3.8 needs the header, the system block's end and the reply's end. `--timeout 0`:
   a compaction's requests prefill for 4-8 min each; the SSE keep-alive comments keep pi's idle timeout from firing.
 
 **pi** (1.4.0; a temporary agent directory, `PI_CODING_AGENT_DIR=DIR`, so `~/.pi` is untouched): `DIR/models.json`
@@ -438,6 +474,8 @@ instruction (Qwen3.8's `xhigh`, its default, reasons longest).
   while decoding; no images, `n > 1`; penalties are ignored.
 - No TLS: bind it to localhost or a trusted network (`--api-key` is a shared secret over plain HTTP).
 - The KV memory is a fixed pool (`--slots` x `-c`, no paging or preemption): a request keeps its slot until it ends.
+  `--kv-disk` keeps idle slots' sequences on disk, but a running request's slot is never swapped out, and the disk's
+  I/O pauses the running requests (seconds for a long sequence).
   With `--draft`, each slot also holds a draft sequence of `-c` positions (counted in the pool).
 - One model per process (and its draft). POSIX only (on Windows the server reports that it is not available).
 

@@ -429,6 +429,11 @@ int rq_seq_common_prefix(const RqSeq *s, const int *tokens, int n) {
 static inline size_t kv_tile(int t, int h, int n_kv, int hd); // (the cache layout, below)
 static void kv_populate_one(const RqSeq *s, const Config *p, int pos0, int n, int it);
 
+void seq_kv_populate(const RqSeq *s, int n, int it) {
+    // (seqfile.c: a load's destination blocks, as rq_seq_copy's) item it = (attention layer, K / V), positions 0..n-1
+    kv_populate_one(s, &s->m->config, 0, n, it);
+}
+
 typedef struct { RqSeq *dst; const RqSeq *src; int n, next; } CopyJob;
 
 static void copy_worker(void *arg, int tid, int nt) {

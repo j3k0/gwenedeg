@@ -274,6 +274,10 @@ trusted network.
 - **Prefix reuse**: a new request takes the idle KV slot with the longest common prefix and prefills
   only the rest, or copies the prefix from a running request. A second chat turn, or a fixed system
   prompt, is not prefilled again.
+- **KV cache on disk** (`--kv-disk DIR`, an SSD): slots whose tokens a request would discard are saved to files,
+  and loaded back (bit-identical) when a prompt continues them, also after a restart: a 96k agent session or a
+  system block survives an eviction and a restart for a few seconds of I/O instead of minutes of prefill
+  ([docs/server.md](docs/server.md), KV cache on disk).
 - **Constrained decoding** for `json_schema` with a finite set of outputs (`enum`, `const`, booleans,
   bounded integers, objects of those, `anyOf` / `oneOf`, `$ref`). Forced tokens are not decoded at all,
   so a classification is a single prefill.
@@ -330,7 +334,9 @@ has three kinds of objects:
 - **RqModel** (`rq_model_load`): hyperparameters, weights (repacked for the kernels at load), tokenizer,
   and chat templates. It is read-only after loading and shared by any number of sequences.
 - **RqSeq** (`rq_seq_new`): one sequence with its own KV cache (capacity and type per sequence), tokens
-  and sampling RNG. `rq_seq_truncate`, `rq_seq_common_prefix` and `rq_seq_copy` handle prefix reuse.
+  and sampling RNG. `rq_seq_truncate`, `rq_seq_common_prefix` and `rq_seq_copy` handle prefix reuse;
+  `rq_seq_save` / `rq_seq_load` write a sequence to a file and read it back (whole or a prefix; the same bits),
+  `rq_seq_file_info` reads a saved one's tokens.
 - **RqCtx** (`rq_ctx_new`): a compute context (activation buffers for up to `max_batch` rows, logits).
   The threads are one process-wide pool (`rq_threads_init`) running one pass at a time: the passes of
   several contexts (e.g. two models with the same activation group size) alternate on one calling thread.

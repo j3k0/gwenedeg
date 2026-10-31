@@ -117,6 +117,7 @@ struct Job {
     int nstop;
     int top_logprobs;           // < 0: no logprobs; else the number of alternatives per token (<= 20)
     int no_cache;               // prefill from position 0 (cache_prompt: false)
+    int dk_tried;               // (engine.c) a load from the disk tier was planned for it once already
     const ToolSet *tools;       // parse tool calls in the reply (tool_choice auto), or NULL
     int single_call;            // parallel_tool_calls: false (stop after the first call)
     unsigned long long call_seed; // the calls' ids
@@ -170,6 +171,12 @@ typedef struct {
     int calib;
     int spec_used;              // requests speculate by default (the cost calibration runs at the start)
     int spec_kmax;              // the default guesses per pass at most (either source): the transient checkpoints counted
+    // the disk tier (engine.c, "the disk tier"): saved sequences in kv_disk/<model fingerprint>-<KV type>/ (NULL: off),
+    // at most kv_disk_max GiB (0: half the free space at the start, our files included), a slot saved when a job would
+    // discard >= kv_disk_min of its tokens (and at shutdown)
+    const char *kv_disk;
+    double kv_disk_max;
+    int kv_disk_min;
 } EngineOpts;
 
 typedef struct Engine Engine;

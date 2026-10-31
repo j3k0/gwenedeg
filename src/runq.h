@@ -39,6 +39,8 @@ enum {
     RQ_ERR_CONTEXT = -3,   // the tokens do not fit in the sequence's capacity (context length)
     RQ_ERR_STATE = -4,     // not possible on this object (e.g. a model loaded without weights)
     RQ_ERR_LOAD = -5,      // model file missing, unreadable, corrupt or unsupported
+    RQ_ERR_IO = -6,        // a file could not be written or read (a saved sequence: rq_seq_save / rq_seq_load)
+    RQ_ERR_MISMATCH = -7,  // not a saved sequence of this model and KV type (another file, model, layout; corrupt)
 };
 const char *rq_strerror(int err);
 double rq_now(void); // monotonic clock, seconds
@@ -91,6 +93,7 @@ typedef struct {
     float rope_theta;      // RoPE base
     int linear_layers;     // Qwen3.5: linear-attention layers, whose recurrent state cannot be rewound (rq_seq_truncate,
                            // rq_seq_checkpoint_at); 0 for Qwen3
+    unsigned long long fingerprint; // of the model file (its size, first MiB, last 64 KiB): the owner of saved sequences
 } RqModelInfo;
 void rq_model_info(const RqModel *m, RqModelInfo *info);
 
@@ -178,6 +181,35 @@ int rq_seq_common_prefix(const RqSeq *s, const int *tokens, int n); // longest c
 // The copied entries are the same bits, so dst continues exactly as src would. Qwen3.5: unless n is src's
 // length, as rq_seq_truncate: src's longest checkpoint <= n, else 0 (rq_seq_len(dst) tells)
 int rq_seq_copy(RqSeq *dst, const RqSeq *src, int n);
+// Sequences on disk (a KV cache tier: runq serve --kv-disk). rq_seq_save writes the sequence's positions
+// 0..len-1 to a file: the KV entries (the blocks of 256 positions in use, as in memory), the tokens, the RNG state;
+// Qwen3.5: the recurrent state and the checkpoints held. Written as path.tmp, synced, then renamed to path (a reader
+// never sees a partial file); O_DIRECT where the file system takes it (the page cache is not filled). The bits are
+// the sequence's: a sequence loaded from the file continues exactly as the saved one would. The file is tied to the
+// model file (a fingerprint of its contents) and the KV type. len >= 1, else RQ_ERR_ARG; RQ_ERR_IO (e.g. no space;
+// nothing is left at path then)
+int rq_seq_save(const RqSeq *s, const char *path);
+long long rq_seq_save_bytes(const RqSeq *s); // the size of the file rq_seq_save(s) would write (0: len 0, or Windows)
+typedef struct {
+    int len;                        // positions saved
+    int kv_type;                    // the sequence's KV type (rq_seq_new)
+    int linear;                     // a model with linear-attention layers (Qwen3.5): only checkpointed lengths kept
+    int n_ck;                       // Qwen3.5: the checkpoints saved, their lengths ascending (0 for Qwen3)
+    int ck[RQ_CHECKPOINTS_MAX];
+    long long bytes;                // the file's size
+} RqSeqFile;
+// a saved sequence's header (and its tokens, if tokens != NULL: *tokens = malloc'd len ints, the caller frees them),
+// checked against the model (the fingerprint, the shape); RQ_ERR_IO (unreadable), RQ_ERR_MISMATCH
+int rq_seq_file_info(const RqModel *m, const char *path, RqSeqFile *info, int **tokens);
+// the length rq_seq_load(dst, path, n) keeps of a saved sequence (as rq_seq_keep: n itself for Qwen3; Qwen3.5: the
+// saved length if n is it, else the longest checkpoint <= n, else 0); n is clamped to [0, len]
+int rq_seq_file_keep(const RqSeqFile *f, int n);
+// dst := the first n positions of a saved sequence (as rq_seq_copy from it: rq_seq_file_keep's length, which
+// rq_seq_len(dst) tells; only the blocks up to it are read); n <= the saved length and dst's capacity, the same model
+// and KV type, else RQ_ERR_ARG / RQ_ERR_MISMATCH. dst's RNG := the saved one; Qwen3.5: the saved checkpoints at or
+// below the kept length come along (the highest ones if dst has fewer slots), dst's pending ones are forgotten.
+// RQ_ERR_IO: dst is then empty
+int rq_seq_load(RqSeq *dst, const char *path, int n);
 void rq_seq_seed(RqSeq *s, unsigned long long seed);
 // the sampling RNG state (xorshift), read / write: a copy of it predicts the sequence's next draws without
 // consuming them (rq_rng_f32 on the copy); e.g. sampling another model's logits with this sequence's next draw

@@ -126,9 +126,18 @@ plus the last reply (met: 46 of 52 tool turns exact, none beyond).
   or an empty reasoning; but the prompt is then not the canonical tokenization and the output depends on what was
   cached: opt-in only, if at all); (b) a pinned system-block cache outside the slot pool for one-slot setups (the 27B
   at 96k has one slot: the summary request takes it and the next request prefills the system block again, ~2 of the
-  12.4 min; ~0.7 GiB for 8k tokens, which the memory above does not have yet); (c) pi-side: a
+  12.4 min; ~0.7 GiB for 8k tokens, which the memory above does not have yet; **in on disk instead**: `--kv-disk DIR`
+  saves the session's slot before the summary request takes it and loads the system block back from the file, and
+  the whole session after a restart: docs/server.md, "KV cache on disk"; tested on the 0.6B / 0.8B, **not measured on
+  the 27B yet**: a 98k session ~6.6 GiB, ~2.5 s to save and ~1 s to load at the dev box's rates); (c) pi-side: a
   `session_before_compact` extension summarizing without reasoning or with a smaller model (pi has no per-task model
   setting); `keepRecentTokens` 8,000 is in the documented setup.
+- [ ] **KV cache on disk: leftovers** (`--kv-disk`, docs/server.md). (a) Measure on the 27B: a compaction with
+  `--kv-disk` (the summary request's eviction, the next request's system block from the file) and a restart in a 90k
+  session; the save's ~2.5 s pause of the running requests. (b) The I/O in the background (a thread of its own, the
+  slot held while it runs) if the pauses show up with several slots running. (c) Load only the blocks past a slot's
+  common prefix with the file (today a load replaces the slot's sequence; the margin rule keeps it from reading much
+  for little). (d) The 8-bit KV cache (G3) halves the files and the I/O.
 - [ ] **G6 leftovers: prompt lookup.** Prompt-lookup drafting is in (`--lookup N [--lookup-min M]`, with or without
   `-D`; exact; docs/qwen38-speculative.md, "Prompt lookup": ~1.5 tokens per pass on agentic replies, 2.8-3.9x on edits
   that return the prompt's code; in the server and chosen per pass since S8 / G7; on the 27B's replay 47% of its guesses

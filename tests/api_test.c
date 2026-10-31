@@ -640,6 +640,110 @@ int main(int argc, char **argv) {
         rq_seq_free(w);
     }
 
+    // 3d. sequences on disk (rq_seq_save / rq_seq_file_info / rq_seq_load): C + 24 decode steps (two attention blocks),
+    // saved with its RNG (and, Qwen3.5, checkpoints at 40 and 260), loaded whole into a fresh sequence: its tokens and
+    // RNG, then 5 more rows == the reference's; loaded to 100 (Qwen3.5: onto 40) and to its 260 and continued == the
+    // reference (only the blocks up to there read); its loaded checkpoints usable (truncate to 40). Refused: a file of
+    // another KV type (MISMATCH), a corrupted token (MISMATCH), a truncated file (MISMATCH), a missing one (IO), n past the
+    // saved length or dst's capacity (ARG), a save into a missing directory (IO, nothing left); an empty sequence (ARG);
+    // the refused loads leave dst as it was
+#ifndef _WIN32
+    {
+        int ok = 1, nu = C.n + 24, *u = malloc((size_t)nu * sizeof(int)), *tk = NULL;
+        float *out = malloc((size_t)64 * V * sizeof(float));
+        memcpy(u, C.v, (size_t)C.n * sizeof(int));
+        memcpy(u + C.n, dC, 24 * sizeof(int)); // (refC: every row of u)
+        const char *td = getenv("TMPDIR");
+        char dir[512], path[600], bad[600];
+        snprintf(dir, sizeof(dir), "%s/api_test_seqXXXXXX", td && *td ? td : "/tmp");
+        if (!mkdtemp(dir)) die("mkdtemp", RQ_ERR_IO);
+        snprintf(path, sizeof(path), "%s/c.rqseq", dir);
+        RqSeq *s = seq_new(0), *t = seq_new(0), *small = seq_new(64);
+        int P = nu - 5; // (saved at P: 5 rows of u left to continue with)
+        rq_seq_seed(s, 0x1234abcdULL);
+        ok &= rq_seq_checkpoint_at(s, 40) == RQ_OK && rq_seq_checkpoint_at(s, 260) == RQ_OK;
+        ok &= rq_prefill(c, s, u, P, RQ_LOGITS_NONE, NULL, NULL) == RQ_OK;
+        unsigned long long rng = *rq_seq_rng(s);
+        double t0 = rq_now();
+        ok &= rq_seq_save(s, path) == RQ_OK && access(path, F_OK) == 0;
+        double ts = rq_now() - t0;
+        RqSeqFile f;
+        ok &= rq_seq_file_info(M, path, &f, &tk) == RQ_OK && f.len == P && f.kv_type == KVT && tk &&
+              !memcmp(tk, u, (size_t)P * sizeof(int)) && f.linear == !!I.linear_layers;
+        if (I.linear_layers) ok &= f.n_ck == 2 && f.ck[0] == 40 && f.ck[1] == 260 && rq_seq_file_keep(&f, 100) == 40;
+        else ok &= f.n_ck == 0 && rq_seq_file_keep(&f, 100) == 100;
+        ok &= rq_seq_file_keep(&f, P) == P && rq_seq_file_keep(&f, P + 9) == P && rq_seq_file_keep(&f, -3) == 0;
+        free(tk);
+        // whole: the tokens, the RNG, 5 more rows; the source too (saving changed nothing)
+        t0 = rq_now();
+        ok &= rq_seq_load(t, path, P) == RQ_OK && rq_seq_len(t) == P && *rq_seq_rng(t) == rng;
+        double tl = rq_now() - t0;
+        ok &= !memcmp(rq_seq_tokens(t), u, (size_t)P * sizeof(int));
+        ok &= rq_prefill(c, t, u + P, 5, RQ_LOGITS_ALL, out, NULL) == RQ_OK && same(out, refC + (size_t)P * V, (size_t)5 * V);
+        ok &= rq_prefill(c, s, u + P, 5, RQ_LOGITS_ALL, out, NULL) == RQ_OK && same(out, refC + (size_t)P * V, (size_t)5 * V);
+        int whole = ok;
+        // part: to 100 (Qwen3.5: the checkpoint at 40), to 260 (Qwen3.5: a checkpoint, in the second block)
+        int k100 = I.linear_layers ? 40 : 100;
+        ok &= rq_seq_load(t, path, 100) == RQ_OK && rq_seq_len(t) == k100 &&
+              rq_prefill(c, t, u + k100, 5, RQ_LOGITS_ALL, out, NULL) == RQ_OK && same(out, refC + (size_t)k100 * V, (size_t)5 * V);
+        ok &= rq_seq_load(t, path, 260) == RQ_OK && rq_seq_len(t) == 260 &&
+              rq_prefill(c, t, u + 260, 5, RQ_LOGITS_ALL, out, NULL) == RQ_OK && same(out, refC + (size_t)260 * V, (size_t)5 * V);
+        if (I.linear_layers) { // the loaded checkpoints: kept, and exact
+            int pos[4];
+            ok &= rq_seq_load(t, path, P) == RQ_OK && rq_seq_checkpoints(t, pos, 4) == 2 && pos[0] == 40 && pos[1] == 260;
+            ok &= ck_cont(c, t, 260, u, refC, out) && ck_cont(c, t, 40, u, refC, out);
+            ok &= rq_seq_set_checkpoints(t, 1) == RQ_OK && rq_seq_load(t, path, P) == RQ_OK && rq_seq_checkpoints(t, pos, 4) == 1 && pos[0] == 260;
+            ok &= rq_seq_load(t, path, 30) == RQ_OK && rq_seq_len(t) == 0;
+            rq_seq_set_checkpoints(t, 2);
+        }
+        int part = ok, tlen = rq_seq_len(t);
+        // refused (dst unchanged: the checks come before any transfer)
+        int e1, e2, e3, e4, e5, e6, e7;
+        int okt = KVT == RQ_KV_F32 ? RQ_KV_F16 : RQ_KV_F32, e;
+        RqSeq *o = rq_seq_new(M, 0, okt, &e);
+        e1 = o ? rq_seq_load(o, path, 10) : -100;
+        rq_seq_free(o);
+        e2 = rq_seq_load(t, path, P + 1);
+        e3 = rq_seq_load(small, path, 100);
+        snprintf(bad, sizeof(bad), "%s/missing.rqseq", dir);
+        e4 = rq_seq_load(t, bad, 10);
+        snprintf(bad, sizeof(bad), "%s/no-dir/x.rqseq", dir);
+        e5 = rq_seq_save(s, bad);
+        rq_seq_reset(small);
+        e6 = rq_seq_save(small, path);
+        // a corrupted token, then a truncated file (copies of the saved one)
+        snprintf(bad, sizeof(bad), "%s/bad.rqseq", dir);
+        FILE *fi = fopen(path, "rb"), *fo = fopen(bad, "wb");
+        long long n = 0;
+        int ch;
+        while (fi && fo && (ch = fgetc(fi)) != EOF) {
+            if (n == 4096 + 4 * 7) ch ^= 1;
+            fputc(ch, fo);
+            n++;
+        }
+        if (fi) fclose(fi);
+        if (fo) fclose(fo);
+        e7 = rq_seq_load(t, bad, 10);
+        int trunc = truncate(path, (off_t)(f.bytes - 4096)) == 0 ? rq_seq_load(t, path, 10) : -100;
+        ok &= e1 == RQ_ERR_MISMATCH && e2 == RQ_ERR_ARG && e3 == RQ_ERR_ARG && e4 == RQ_ERR_IO && e5 == RQ_ERR_IO &&
+              e6 == RQ_ERR_ARG && e7 == RQ_ERR_MISMATCH && trunc == RQ_ERR_MISMATCH && rq_seq_len(t) == tlen;
+        snprintf(bad, sizeof(bad), "%s/no-dir/x.rqseq.tmp", dir);
+        ok &= access(bad, F_OK) != 0;
+        snprintf(d, sizeof(d), "%d positions, %.1f MB: save %.1f ms, load %.1f ms; whole %s, parts %s; errors %d %d %d %d %d %d %d %d",
+                 P, f.bytes / 1e6, ts * 1e3, tl * 1e3, whole ? "ok" : "FAIL", part ? "ok" : "FAIL", e1, e2, e3, e4, e5, e6, e7, trunc);
+        report(ok, "seq_file_bitwise", d);
+        snprintf(bad, sizeof(bad), "%s/bad.rqseq", dir);
+        unlink(bad);
+        unlink(path);
+        rmdir(dir);
+        free(u);
+        free(out);
+        rq_seq_free(s);
+        rq_seq_free(t);
+        rq_seq_free(small);
+    }
+#endif
+
     // 4. rq_generate (greedy) == a hand-written sample / decode loop; stats; the reply limit
     {
         RqSeq *s1 = seq_new(0), *s2 = seq_new(0);

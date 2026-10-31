@@ -1029,6 +1029,11 @@ static void usage(void) {
             "  --chunk <int>       prompt tokens per pass while others decode, default 64\n"
             "  --prefix-copy <int> copy a cached prompt prefix into another slot if that saves this many tokens, default 32\n"
             "                      (0: never)\n"
+            "  --kv-disk <dir>     a disk tier for the KV cache: slots saved to <dir> when their tokens would be discarded\n"
+            "                      (and at shutdown), loaded back when a prompt continues them (also after a restart);\n"
+            "                      an SSD; one server per model and KV type (docs/server.md, \"KV cache on disk\")\n"
+            "  --kv-disk-max <GiB> the disk tier's size at most, default half the free space at the start\n"
+            "  --kv-disk-min <int> save a slot when at least this many of its tokens would be discarded, default 1024\n"
             "  --checkpoints <int> Qwen3.5 / 3.8: recurrent-state checkpoints per slot (the end of the system prompt, the\n"
             "                      assistant header, the turn's first reply, the reply's end), 1..32, default 4\n"
             "  --queue <int>       requests waiting at most (more: 503), default 64\n"
@@ -1064,7 +1069,9 @@ int serve_main(int argc, char **argv) {
     const char *path = argv[1], *name = NULL, *host = "127.0.0.1", *key = NULL;
     int port = 8080, ctx = 8192, kv = RQ_KV_DEFAULT, batch = RQ_BATCH_MAX, slots = 0, queue = 64, conns = 128, threads = 0, verbose = 0, maxtok = 0;
     int parallel = 16, chunk = 64, copy_min = 32, ckpts = 4;
-    const char *draft_path = NULL;
+    const char *draft_path = NULL, *kv_disk = NULL;
+    int kv_disk_min = 1024;
+    double kv_disk_max = 0;
     int spec_k = 3, lookup = -1, lookup_min = 0, spec_mode = -1, calib = 8192;
     float spec_tau = 0;
     long long maxbody = 4 << 20;
@@ -1100,6 +1107,9 @@ int serve_main(int argc, char **argv) {
         else if (!strcmp(f, "--chunk")) chunk = atoi(v);
         else if (!strcmp(f, "--prefix-copy")) copy_min = atoi(v);
         else if (!strcmp(f, "--checkpoints")) ckpts = atoi(v);
+        else if (!strcmp(f, "--kv-disk")) kv_disk = v;
+        else if (!strcmp(f, "--kv-disk-max")) kv_disk_max = atof(v);
+        else if (!strcmp(f, "--kv-disk-min")) kv_disk_min = num_arg(v, 1, 1 << 30);
         else if (!strcmp(f, "--queue")) queue = atoi(v);
         else if (!strcmp(f, "--max-conns")) conns = atoi(v);
         else if (!strcmp(f, "--max-body")) maxbody = atoll(v);
@@ -1119,7 +1129,7 @@ int serve_main(int argc, char **argv) {
         else usage();
     }
     if (port < 0 || port > 65535 || ctx < 16 || slots < 0 || slots > 1024 || parallel < 1 || parallel > 256 || kv_mem < 0 || chunk < 1 ||
-        copy_min < 0 || ckpts < 1 || ckpts > RQ_CHECKPOINTS_MAX || queue < 1 || conns < 1 || maxbody < 1024 || temp < 0 || temp > 2 || topp <= 0 || topp > 1 || topk < 0 || maxtok < 0 || batch < 1)
+        copy_min < 0 || kv_disk_max < 0 || ckpts < 1 || ckpts > RQ_CHECKPOINTS_MAX || queue < 1 || conns < 1 || maxbody < 1024 || temp < 0 || temp > 2 || topp <= 0 || topp > 1 || topk < 0 || maxtok < 0 || batch < 1)
         usage();
     if (batch > RQ_BATCH_MAX) batch = RQ_BATCH_MAX;
 
@@ -1184,7 +1194,7 @@ int serve_main(int argc, char **argv) {
         snprintf(a.model_id, sizeof(a.model_id), "%.*s", (int)n, b);
     }
     EngineOpts eo = { path, ctx, kv, batch, chunk, parallel, slots, kv_mem, copy_min, queue, verbose, ckpts, dm, calib,
-                      a.spec_mode != SPEC_OFF, a.spec_k > a.spec_lookup ? a.spec_k : a.spec_lookup };
+                      a.spec_mode != SPEC_OFF, a.spec_k > a.spec_lookup ? a.spec_k : a.spec_lookup, kv_disk, kv_disk_max, kv_disk_min };
     double t0 = rq_now();
     a.eng = engine_start(m, &eo, err, sizeof(err));
     if (!a.eng) { fprintf(stderr, "runq serve: %s\n", err); return 1; }

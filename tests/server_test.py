@@ -335,8 +335,8 @@ def run_disk(a, t):
     saved, loaded = log1.count("saved as entry"), len(re.findall(r"disk: entry \d+ -> slot", log1))
     rep(rc == 0 and saved >= 3 and loaded >= 2 and "[engine] disk:" in log1 and (not a.draft or "+ the draft's" in log1), "disk/log",
         f"exit {rc}, {saved} saves, {loaded} loads" + ("" if not a.draft else ", the draft's sequence with them"))
-    fs = files()
-    rep(all(f.endswith(".rqseq") for f in fs) and len(fs) >= 1 and len(fs) <= 4 * (2 if a.draft else 1), "disk/files", " ".join(fs))
+    fs = files()  # (one file per conversation: X's, Y's, Z's; the draft's beside each)
+    rep(all(f.endswith(".rqseq") for f in fs) and len(fs) == 3 * (2 if a.draft else 1), "disk/files", " ".join(fs))
     # restart: the conversations come back from the files
     p, port, lg = start(disk)
     desc = open(lg).read()

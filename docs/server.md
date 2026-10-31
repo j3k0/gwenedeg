@@ -157,8 +157,9 @@ down), 504. Not supported: tools with Qwen3's templates (400), `tool_choice` req
   length read; Qwen3.5 / 3.8: the saved length or a checkpoint) gets that prefix loaded into the least recently used
   idle slot (that slot saved first if it needs to be; only the blocks up to the prefix are read), then is admitted
   as for a cached prefix: its prefill starts there. Logits are bit-identical to a fresh prefill (the same bits come
-  back; tested, tests/server_test.py `--disk`). A save that holds an older one's tokens (the same conversation,
-  further on) replaces it. The files are in `DIR/<model fingerprint>-<KV type>/` (`<id>.rqseq`, `<id>.draft.rqseq`;
+  back; tested, tests/server_test.py `--disk`). A save whose tokens extend an older one's (the same conversation,
+  further on) replaces it: one file per conversation (Qwen3.5 / 3.8: the lengths the slot gave up checkpoints for, e.g.
+  the previous reply's end, are given up on disk too). The files are in `DIR/<model fingerprint>-<KV type>/` (`<id>.rqseq`, `<id>.draft.rqseq`;
   the fingerprint: the model file's size, first MiB and last 64 KiB), one server per directory (a lock file; a
   second one is refused); at the start, saves cut short (`.tmp`) and files that do not check out (corrupt, another
   model) are removed, and the rest are indexed with their mtime as their last use. Written as `.tmp`, synced,
@@ -176,9 +177,16 @@ down), 504. Not supported: tools with Qwen3's templates (400), `tool_choice` req
   | Qwen3.5-0.8B Q8_0, 32k | 34.9 s (940 tok/s) | 0.43 GB | 0.16 s | 0.08 s (427x) |
   | Qwen3.5-4B Q8_0, 16k | 44.0 s (372 tok/s) | 0.60 GB | 0.21 s | 0.13 s (334x) |
 
-  Expected on Qwen3.8-27B (not measured yet, TODO): a 90k session prefills in ~35 min (P / 67.5 + 0.19 us x P x P / 2
-  s, above), its ~6.3 GiB file loads in ~1-2 s; the system block after a compaction (~2 of its 12.4 min) in well under
-  a second. To use it there, add `--kv-disk DIR` to the command below (DIR on the SSD, ~7 GiB per session saved).
+  **Qwen3.8-27B** (Q4_K_M, `-c 32768 -k bf16-dot --slots 1 --checkpoints 3`, 16 threads, no draft; 2026-10-31): a
+  27k-token conversation (a 2,838-token system block + a source file) prefilled in 408-418 s; a summary-like request
+  then took the slot (the conversation saved first: 2.41 GB, 0.74-0.80 s); a compaction-like request on the same
+  system prompt got the system block from the file (2,838 tokens, 0.12 s; 3.5 s to its reply instead of ~45 s); the
+  conversation's next turn loaded 27,017-27,065 tokens in 0.58-0.61 s (its reply 4.5-4.9 s after the request instead of
+  ~7 min); after a restart (the shutdown's save 1.9-2.0 s) the same turn loaded in 0.42 s (3.9 s to the reply). Its
+  logprobs == the same request prefilled from nothing (414.5 s), via the disk and after the restart. A file holds 64
+  KiB per position + 150 MiB per recurrent state (1 + 3 checkpoints): ~6.6 GiB for a 98k session, ~2.2 s to save and
+  ~1.6 s to load at these rates. Use: add `--kv-disk DIR --kv-disk-max GiB` to the command below (DIR on the SSD; the
+  budget is a hard cap, the room for a save made before it is written).
 - **Constrained decoding** (`response_format: json_schema`), for schemas with a finite set of outputs:
   `enum`, `const`, `boolean`, `null`, `integer` with `minimum` / `maximum` (up to 256 values), objects of
   those (nested; `required`, optional properties; property order as in the schema; no additional

@@ -128,13 +128,14 @@ plus the last reply (met: 46 of 52 tool turns exact, none beyond).
   at 96k has one slot: the summary request takes it and the next request prefills the system block again, ~2 of the
   12.4 min; ~0.7 GiB for 8k tokens, which the memory above does not have yet; **in on disk instead**: `--kv-disk DIR`
   saves the session's slot before the summary request takes it and loads the system block back from the file, and
-  the whole session after a restart: docs/server.md, "KV cache on disk"; tested on the 0.6B / 0.8B, **not measured on
-  the 27B yet**: a 98k session ~6.6 GiB, ~2.5 s to save and ~1 s to load at the dev box's rates); (c) pi-side: a
+  the whole session after a restart: docs/server.md, "KV cache on disk"; measured on the 27B Q4_K_M at 27k: the system
+  block back in 0.12 s, the session's next turn in 0.6 s instead of ~7 min, == a fresh prefill; a 98k session ~6.6 GiB,
+  ~2.2 s to save, ~1.6 s to load); (c) pi-side: a
   `session_before_compact` extension summarizing without reasoning or with a smaller model (pi has no per-task model
   setting); `keepRecentTokens` 8,000 is in the documented setup.
-- [ ] **KV cache on disk: leftovers** (`--kv-disk`, docs/server.md). (a) Measure on the 27B: a compaction with
-  `--kv-disk` (the summary request's eviction, the next request's system block from the file) and a restart in a 90k
-  session; the save's ~2.5 s pause of the running requests. (b) The I/O in the background (a thread of its own, the
+- [ ] **KV cache on disk: leftovers** (`--kv-disk`, docs/server.md). (a) Measured on the 27B at 27k (Q4_K_M, the
+  Q3_K_M was not on the box): left, a live pi session with a real compaction at ~84k, with the draft (its file beside
+  the target's). (b) The I/O in the background (a thread of its own, the
   slot held while it runs) if the pauses show up with several slots running. (c) Load only the blocks past a slot's
   common prefix with the file (today a load replaces the slot's sequence; the margin rule keeps it from reading much
   for little). (d) The 8-bit KV cache (G3) halves the files and the I/O.

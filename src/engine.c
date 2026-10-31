@@ -799,8 +799,8 @@ static int real_reuse(int L, int n) { return L >= 32 || (L > 0 && 2 * L >= n); }
 // --kv-disk DIR: sequences saved to files (rq_seq_save: their KV blocks, tokens, recurrent state and checkpoints; the
 // same bits back) in DIR/<model fingerprint>-<KV type>/, one directory per server (a lock file). A slot is saved when a
 // job would discard >= --kv-disk-min of its tokens (an LRU eviction, a truncation, a copy over it) and at shutdown,
-// once per change of its contents (Slot.gen); a save that holds an older one's tokens (the same conversation, longer)
-// replaces it. A new job whose prompt shares a longer usable prefix with a saved sequence than with any slot (by a
+// once per change of its contents (Slot.gen); a save whose tokens extend an older one's (the same conversation, further
+// on) replaces it: one file per conversation. A new job whose prompt shares a longer usable prefix with a saved sequence than with any slot (by a
 // real margin: >= --prefix-copy tokens and 1/8 of what is read) gets it loaded into the least recently used idle
 // slot first (only the blocks up to that prefix are read), then is admitted as for a cached prefix. Saves and loads
 // run between passes, without mu (admit plans them: dk_run), so queueing and /health never wait on the disk; the
@@ -1048,9 +1048,12 @@ static void dk_spill(Engine *e, int si, int keep_id) {
         fprintf(stderr, "[engine] disk: slot %d saved as entry %d: %d tokens%s, %.1f MB, %.3f s (%.2f GB/s); %d entries, %.2f of %.2f GiB\n", si, id,
                 len, dl ? " + the draft's" : "", nd.bytes / 1e6, dt, nd.bytes / 1e9 / (dt > 0 ? dt : 1e-9), e->ndk,
                 e->dk_bytes / 1073741824.0, e->dk_max / 1073741824.0);
-    for (int j = e->ndk - 1; j >= 0; j--) { // (the older saves of this conversation: a prefix of it, restorable from it)
+    // the older saves of this conversation (their tokens a prefix of these): one file per conversation. (Qwen3.5: the new
+    // file may not restore every length an older one did, e.g. the end of the previous reply, whose checkpoint the slot
+    // gave up for the new turn's; the slot made that choice in memory already, and the disk keeps to it)
+    for (int j = e->ndk - 1; j >= 0; j--) {
         DiskEnt *d = &e->dk[j];
-        if (d->id != id && d->id != keep_id && d->f.len <= len && rq_seq_file_keep(&nd.f, d->f.len) == d->f.len && lcp(d->tok, d->f.len, t, len) == d->f.len) {
+        if (d->id != id && d->id != keep_id && d->f.len <= len && lcp(d->tok, d->f.len, t, len) == d->f.len) {
             if (e->o.verbose) fprintf(stderr, "[engine] disk: entry %d (%d tokens) replaced by entry %d\n", d->id, d->f.len, id);
             dk_remove(e, j);
         }

@@ -8,7 +8,8 @@
 
 // One file per sequence, every section at a multiple of
 // SF_ALIGN bytes, so that the KV blocks go straight from / to the cache with O_DIRECT (the cache is page-aligned
-// anonymous memory, alloc_big; a block of ATT_P positions is ATT_P x kv_dim x esz bytes, a multiple of 4 KiB):
+// anonymous memory, alloc_big; a block of ATT_P positions is ATT_P / ATT_T x n_kv_heads tiles (kv_tile_bytes: ATT_P
+// x kv_dim x esz bytes for the 16 / 32-bit types), a multiple of 4 KiB for the shapes here; else buffered I/O):
 //   the header (SF_ALIGN bytes: SeqFileHdr), the tokens (len ints)
 //   the KV cache: per attention layer, K then V, its first nblk blocks of ATT_P positions as in memory (kv_tile's
 //   layout; the last block whole: its positions past len hold whatever the cache held, never read before written)
@@ -27,12 +28,17 @@ typedef struct {
     uint64_t model_fp;             // RqModel.fp
     int32_t n_attn, kv_dim, n_kv_heads, head_dim, att_p, att_t, att, kv_esz, n_lin, len, nblk, nck;
     int32_t ck[RQ_SEQ_CK_MAX];     // the checkpoints' lengths, ascending (nck of them)
-    uint64_t ssm_bytes, ssm_stride, blk_bytes; // a state section's bytes / on disk, a KV block's bytes
+    uint64_t ssm_bytes, ssm_stride, blk_bytes; // a state section's bytes / on disk, a K block's bytes (V's: sf_blk_bytes)
     uint64_t off_kv, off_ssm, file_bytes, rng; // (the tokens at SF_ALIGN; the checkpoints after the state)
     uint64_t hash;                 // FNV-1a of this header (hash 0) and the tokens
 } SeqFileHdr;
 
 static inline uint64_t sf_round(uint64_t n) { return (n + SF_ALIGN - 1) / SF_ALIGN * SF_ALIGN; }
+// the header's kv_esz: V's bytes per element, rounded down (4, 2; q8 1, q4 0); a K (kv 0) or V (kv 1) block's bytes (all
+// its kv heads). On disk per attention layer its K blocks, then its V blocks (equal sizes but for q4: the 16 / 32-bit
+// types' files as before)
+static inline int32_t sf_esz(int att, int hd) { return (int32_t)(kv_tile_bytes(att, hd, 1) / ((size_t)ATT_T * hd)); }
+static inline uint64_t sf_blk_bytes(int att, int nkv, int hd, int kv) { return (uint64_t)(ATT_P / ATT_T) * nkv * kv_tile_bytes(att, hd, kv); }
 
 #if !defined _WIN32
 #include <errno.h>
@@ -100,9 +106,10 @@ static void sf_worker(void *arg, int tid, int nt) {
         if (it < nkv) {
             int l = it / 2, kv = it % 2;
             if (!j->wr) seq_kv_populate(s, j->nblk * ATT_P, it);
-            buf = (char *)(kv ? s->value_cache : s->key_cache) + (size_t)l * s->kv_len * m->kv_dim * s->kv_esz;
-            n = (size_t)j->nblk * j->h->blk_bytes;
-            off = j->h->off_kv + (uint64_t)it * (uint64_t)j->h->nblk * j->h->blk_bytes;
+            buf = (char *)(kv ? s->value_cache : s->key_cache) + seq_kvb(s, (size_t)l * s->kv_len * m->kv_dim, kv);
+            uint64_t bk = j->h->blk_bytes, bv = sf_blk_bytes(j->h->att, j->h->n_kv_heads, j->h->head_dim, 1);
+            n = (size_t)j->nblk * (kv ? bv : bk);
+            off = j->h->off_kv + (uint64_t)j->h->nblk * ((uint64_t)l * (bk + bv) + (kv ? bk : 0));
         } else {
             buf = j->st[it - nkv];
             n = j->h->ssm_stride;
@@ -133,16 +140,16 @@ static void sf_header(const RqSeq *s, SeqFileHdr *h) {
     h->att_p = ATT_P;
     h->att_t = ATT_T;
     h->att = s->att;
-    h->kv_esz = (int32_t)s->kv_esz;
+    h->kv_esz = sf_esz(s->att, m->config.head_dim);
     h->n_lin = m->hy.on ? m->hy.n_lin : 0;
     h->len = s->len;
     h->nblk = (s->len + ATT_P - 1) / ATT_P;
     h->nck = m->hy.on ? rq_seq_checkpoints(s, h->ck, RQ_SEQ_CK_MAX) : 0;
     h->ssm_bytes = s->ssm_bytes;
     h->ssm_stride = sf_round(s->ssm_bytes);
-    h->blk_bytes = (uint64_t)ATT_P * m->kv_dim * s->kv_esz;
+    h->blk_bytes = sf_blk_bytes(s->att, m->config.n_kv_heads, m->config.head_dim, 0);
     h->off_kv = SF_ALIGN + sf_round((uint64_t)s->len * sizeof(int));
-    h->off_ssm = h->off_kv + 2 * (uint64_t)m->n_attn * h->nblk * h->blk_bytes;
+    h->off_ssm = h->off_kv + (uint64_t)m->n_attn * h->nblk * (h->blk_bytes + sf_blk_bytes(s->att, m->config.n_kv_heads, m->config.head_dim, 1));
     h->file_bytes = h->off_ssm + (m->hy.on ? (uint64_t)(1 + h->nck) * h->ssm_stride : 0);
     h->rng = s->rng;
 }
@@ -153,8 +160,8 @@ static int sf_check(const RqModel *m, const SeqFileHdr *h, uint64_t size) {
     SeqFileHdr w;
     if (memcmp(h->magic, sf_magic, 8) || h->version != SF_VERSION || h->endian != 0x01020304 || h->model_fp != m->fp ||
         h->n_attn != m->n_attn || h->kv_dim != m->kv_dim || h->n_kv_heads != m->config.n_kv_heads ||
-        h->head_dim != m->config.head_dim || h->att_p != ATT_P || h->att_t != ATT_T || !kv_type_ok(h->att) ||
-        h->kv_esz != ((h->att & ~KV_DOT) == KV_F32 ? 4 : 2) || h->n_lin != (m->hy.on ? m->hy.n_lin : 0) ||
+        h->head_dim != m->config.head_dim || h->att_p != ATT_P || h->att_t != ATT_T || !kv_type_fits(h->att, h->head_dim) ||
+        h->kv_esz != sf_esz(h->att, h->head_dim) || h->n_lin != (m->hy.on ? m->hy.n_lin : 0) ||
         h->len < 1 || h->len > (m->ctx_max > m->config.seq_len ? m->ctx_max : m->config.seq_len) || h->nblk != (h->len + ATT_P - 1) / ATT_P ||
         h->nck < 0 || h->nck > RQ_SEQ_CK_MAX || (!m->hy.on && h->nck) ||
         h->ssm_bytes != (m->hy.on ? (uint64_t)m->hy.n_lin * m->ssm_layer * sizeof(float) : 0))
@@ -164,9 +171,9 @@ static int sf_check(const RqModel *m, const SeqFileHdr *h, uint64_t size) {
     // the derived fields: as sf_header computes them for this shape
     memset(&w, 0, sizeof(w));
     w.ssm_stride = sf_round(h->ssm_bytes);
-    w.blk_bytes = (uint64_t)ATT_P * h->kv_dim * h->kv_esz;
+    w.blk_bytes = sf_blk_bytes(h->att, h->n_kv_heads, h->head_dim, 0);
     w.off_kv = SF_ALIGN + sf_round((uint64_t)h->len * sizeof(int));
-    w.off_ssm = w.off_kv + 2 * (uint64_t)h->n_attn * h->nblk * w.blk_bytes;
+    w.off_ssm = w.off_kv + (uint64_t)h->n_attn * h->nblk * (w.blk_bytes + sf_blk_bytes(h->att, h->n_kv_heads, h->head_dim, 1));
     w.file_bytes = w.off_ssm + (m->hy.on ? (uint64_t)(1 + h->nck) * w.ssm_stride : 0);
     if (h->ssm_stride != w.ssm_stride || h->blk_bytes != w.blk_bytes || h->off_kv != w.off_kv ||
         h->off_ssm != w.off_ssm || h->file_bytes != w.file_bytes || size != h->file_bytes)

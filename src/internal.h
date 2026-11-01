@@ -30,6 +30,7 @@
     #include <sys/mman.h>
 #endif
 #include "runq.h"
+#include "kvtype.h"   // the KV cache types (RQ_KV_*): element formats, tile sizes
 // AVX-512 VNNI kernels (defines RUNQ_VNNI when built for AVX-512 VNNI without -DRUNQ_GENERIC)
 #include "kernels_avx512.h"
 // NEON K-quant kernels (AArch64 with the dot product extension; defines RUNQ_NEON, RUNQ_KQX)
@@ -65,10 +66,6 @@ static inline uint64_t fnv1a64(uint64_t h, const void *p, size_t n) {
 #define RQ_SEQ_CK 2
 #define RQ_SEQ_CK_MAX RQ_CHECKPOINTS_MAX
 
-// KV cache element type: fp32, bf16 or f16 (16-bit: half the bytes; layouts in kernels_avx512.h); KV_DOT: the flag of
-// the bf16 dot-product attention in a sequence's attention type (RqSeq.att: RQ_KV_BF16_DOT = KV_BF16 | KV_DOT, ...)
-enum { KV_F32 = RQ_KV_F32, KV_BF16 = RQ_KV_BF16, KV_F16 = RQ_KV_F16, KV_DOT = 4 };
-static inline int kv_type_ok(int t) { return (t >= KV_F32 && t <= KV_F16) || t == (KV_BF16 | KV_DOT) || t == (KV_F16 | KV_DOT); }
 
 // ---------------------------------------------------------------------------------------- the model
 
@@ -329,14 +326,15 @@ struct RqSeq {
     int cap;            // positions
     int kv_len;         // cap rounded up to whole attention blocks (ATT_P positions: the cache layout)
     int att_nb;         // attention blocks of ATT_P positions in kv_len
-    int kvt;            // cache element type: KV_F32, KV_BF16, KV_F16
+    int kvt;            // cache element type: KV_F32, KV_BF16, KV_F16, KV_Q8, KV_Q4
     int att;            // the attention's type (rq_seq_new's kv_type): kvt, | KV_DOT for the bf16 dot products (the
                         // attention calls and the K / V stores take it: a bf16-dot cache has its own V layout)
-    size_t kv_esz;      // bytes per cache element: 4 or 2
+    size_t kv_tb[2];    // bytes per cache tile of K / V (kv_tile_bytes): offsets in bytes = seq_kvb(elements, K / V)
+    size_t kv_te;       // elements per tile (ATT_T x head_dim)
     size_t kv_size;     // elements per cache
     // kv cache: per layer kv_len / ATT_T tiles of ATT_T positions x n_kv_heads, layout in
     // kernels_avx512.h (attention)
-    void *key_cache;    // (layer, kv_len, kv_dim) elements: float, or bf16 / f16 (uint16_t) by kvt
+    void *key_cache;    // (layer, kv_len, kv_dim) elements: float, or bf16 / f16 (uint16_t), or q8 / q4 tiles by kvt
     void *value_cache;  // (layer, kv_len, kv_dim)
     int len;            // positions in the cache
     int *tokens;        // [cap]: the token at each position
@@ -356,5 +354,9 @@ struct RqSeq {
     CkPass ckw;         // the checkpoints the pass in progress takes (n 0: none)
     unsigned long long rng; // sampling (xorshift)
 };
+
+// bytes of a cache offset of e elements (a whole number of tiles: layers, blocks of ATT_P positions, kv_tile) in the
+// K (kv 0) or V (kv 1) cache
+static inline size_t seq_kvb(const RqSeq *s, size_t e, int kv) { return e / s->kv_te * s->kv_tb[kv]; }
 
 #endif // RUNQ_INTERNAL_H

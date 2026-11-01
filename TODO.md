@@ -102,11 +102,14 @@ plus the last reply (met: 46 of 52 tool turns exact, none beyond).
 - [ ] **G3 leftovers: memory beyond the Q3_K_M.** (The quality gate is done: the Q3_K_M is the agentic file, the
   Q4_K_M the reference and the choice where it fits; docs/qwen38-speculative.md, G3.) The ~2 GiB to spare are thin on a
   shared box, and the Q4_K_M at 96k with its draft needs ~3 GiB more:
-  - An 8-bit KV cache: V first (its bf16 rounding was harmless), then K, which needs per-tile scales: |K| reaches
-    ~500 and bf16 K alone already cost +4.4% KL against HF fp32. Each variant judged by the KL measurement of the 16-bit
-    types and G2's checks (its baseline: the 16-bit numbers of "KV cache with f16 K and bf16 V", Performance);
-    generic, AVX-512 and NEON kernels on one definition. Halves the KV (3 GiB at 96k) and its read per token (at 98k
-    the decode step's attention part reads 6.4 GB in ~63 ms at 16 threads: ~100 GB/s, the bound there).
+  - The 8-bit / 4-bit KV cache is in (`-k q8`, `q4` = 8-bit K + 4-bit V, `q4k4`, each also `-dot`; docs/kv-quant.md):
+    K and V Hadamard-rotated (instead of per-tile scales: the scales stay per position, so no path dependence),
+    per-32-dim bf16 scales; the Q4_K_M at 98k 22.37 -> 19.56 GiB with `q8-dot`; KL on Qwen3.5-0.8B: `q8` +5% (the
+    16-bit types' range), `q4` ~6x, `q4k4` ~7x; Qwen3 cannot take 4-bit K. Left: (a) G2's retrieval at ~84k on the
+    27B with `q8-dot` / `q4k4-dot`, and the KL between its f16 and quantized caches (runq vs runq); (b) a fused kernel
+    (each block is dequantized into scratch first: at decode as many instructions as the attention's; int8 K against
+    a quantized q with VNNI, the scales per ATT_DC chunk, V's folded into the softmax weights); decode at 64k on
+    Saluki is only ~5-20% faster today; (c) NEON's own conversion (it runs the generic C one).
   - The draft's own cost: its sequence at 96k (1.23 GiB) and its attention there. Its guesses never change the output,
     so it can run on a shorter recent window (measure the acceptance lost). At long context the server used only the
     lookup in the replay (G7 (a)): if a live session confirms the draft adds nothing past ~32k, a draft window of ~32k

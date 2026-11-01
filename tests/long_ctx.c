@@ -127,7 +127,7 @@ int main(int argc, char **argv) {
     if (w) fprintf(stderr, "%s\n", w);
     RqModelOpts o = { 0 };
     o.ctx_len = cap;
-    o.kv_bytes = kvt == RQ_KV_F32 ? 4 : 2;
+    o.kv_bits = rq_kv_bits(kvt);
     double t0 = rq_now();
     RqModel *m = rq_model_load(path, &o, err, sizeof(err));
     if (!m) { fprintf(stderr, "long_ctx: %s\n", err); return 1; }

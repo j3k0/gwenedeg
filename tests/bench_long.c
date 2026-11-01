@@ -141,7 +141,7 @@ int main(int argc, char **argv) {
     int extra = (preps ? P : 0) > rmax ? (preps ? P : 0) : rmax, cap = lmax + extra + 1, e;
     RqModelOpts o = { 0 };
     o.ctx_len = cap;
-    o.kv_bytes = kvt == RQ_KV_F32 ? 4 : 2;
+    o.kv_bits = rq_kv_bits(kvt);
     o.mem = mem;
     double t0 = rq_now();
     RqModel *m = rq_model_load(path, &o, err, sizeof(err));

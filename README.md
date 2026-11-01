@@ -65,7 +65,7 @@ CLI options (`./runq` without arguments prints them all):
 | `-r 0\|1` | thinking off (default; Qwen3.8: on) / on |
 | `-e xhigh\|high\|medium\|low` | reasoning effort with thinking (Qwen3.8's template; default xhigh, high = xhigh) |
 | `-m MODE` | `chat` (default), `generate` (raw completion), `tokenize`; test hooks `logits`, `dequant`, `render` |
-| `-k f16\|bf16\|f32\|bf16-dot\|f16-dot` | KV cache type, default f16 (half the memory of f32, as accurate); `bf16-dot`: a bf16 cache with the bf16 dot-product attention, ~1.7x faster attention at long context, opt-in (below) |
+| `-k f16\|bf16\|f32\|bf16-dot\|f16-dot\|q8\|q4\|q4k4` (+ `-dot`) | KV cache type, default f16 (half the memory of f32, as accurate); `bf16-dot`: a bf16 cache with the bf16 dot-product attention, ~1.7x faster attention at long context, opt-in (below); `q8` / `q4` / `q4k4`: 8-bit, 8-bit K + 4-bit V, 4-bit K + V (0.53 / 0.41 / 0.28 of f16's memory; `q4k4` for Qwen3.5 / 3.8 only; below) |
 | `-b N` | prefill chunk size, default 512 (`-b 1`: token by token) |
 | `--mem GiB` | memory budget of the load check (below), default MemAvailable; `0` or `force`: no check. Given, prints the estimate (a `[memory]` line) |
 | `--page-cache auto\|drop\|keep` | the model file's page cache after the load; `auto` (default) drops it if the file is >= 1/4 of the RAM |
@@ -244,6 +244,14 @@ divergence from HF fp32 (28-45k tokens of prose and code) +0.3% on Qwen3.5-0.8B 
 cache: f16 -0.7%), but +5.4% on Qwen3-0.6B and +2.9% on Qwen3-1.7B (about a bf16 cache's +3.9% / +2.8%; f16 +2.1% /
 +0.5%): Qwen3 has attention in every layer, Qwen3.5 / 3.8 in one of four. `f16-dot` keeps the f16 cache and rounds it
 again when read (~1.5x: slower, and no more accurate than `bf16-dot`).
+
+**Smaller caches: `-k q8`, `q4`, `q4k4`** (opt-in, each also as `-dot` with the bf16 dot-product attention): K and V
+Walsh-Hadamard rotated and quantized per 32 dims of a position, 8-bit (`q8`), 8-bit K + 4-bit V (`q4`), 4-bit both
+(`q4k4`), bit-exact across batches, threads and builds like the other types. Qwen3.8-27B at 98k: KV 6.0 GiB (f16) ->
+3.19 / 2.44 / 1.69 GiB, so the Q4_K_M with its draft fits where f16 did not. KL from HF fp32: `q8` within the 16-bit
+types' range on Qwen3.5-0.8B (+5%; Qwen3-0.6B +56%, below the Q8_0 weights' own), `q4` ~5-6x the baseline, `q4k4` ~7x
+on Qwen3.5 but unusable on Qwen3 (4-bit K: top-1 50%). Decode at 64k on Saluki ~5-20% faster with the `-dot` types,
+`q4k4-dot` the most (the weights dominate a step). Measurements and definition: [docs/kv-quant.md](docs/kv-quant.md).
 
 ## Server
 

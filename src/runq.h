@@ -67,7 +67,8 @@ typedef struct {
     int no_tokenizer;   // only the weights (rq_dequant_rows)
     double mem;         // the memory check, before any weight is read (rq_model_mem): the estimate must fit in this many
                         // GiB; 0 = in MemAvailable (Linux /proc/meminfo; no check where it is unknown), < 0 = no check
-    int kv_bytes;       // bytes per KV cache value of the sequence the check counts (0: 2, f16 / bf16; 4: f32)
+    int kv_bits;        // bits per KV cache value of the sequence the check counts, K and V averaged (rq_kv_bits of its
+                        // type: 32 f32, 16 f16 / bf16, 8 q8, 6 q4, 4 q4k4; 0: 16)
     int page_cache;     // the file's page cache after the repack (the loader reads it with pread): 0 = dropped
                         // if the file is >= 1/4 of the RAM, 1 = dropped, -1 = kept
     int checkpoints;    // Qwen3.5: the checkpoint slots of the sequence the check counts (rq_seq_set_checkpoints; 0: the
@@ -109,7 +110,7 @@ typedef struct {
 typedef struct {
     size_t weights;     // the weights in memory: repacked (or the mapped file a .bin on the generic kernels runs from), norms
     size_t runtime;     // the tokenizer, the file's metadata, a compute context of RQ_BATCH_MAX rows (rq_ctx_new)
-    RqSeqMem seq;       // one sequence of the context length (RqModelOpts.ctx_len / kv_bytes)
+    RqSeqMem seq;       // one sequence of the context length (RqModelOpts.ctx_len / kv_bits)
     size_t total;       // weights + runtime + seq.total: what the check counts
     double budget;      // what it was checked against (bytes; 0: no check)
     int budget_src;     // 0 none, 1 MemAvailable, 2 RqModelOpts.mem
@@ -128,10 +129,18 @@ typedef struct RqSeq RqSeq;
 // on the exactly converted values. bf16-dot / f16-dot (opt-in, runq --attn bf16): the bf16 dot-product attention (q,
 // K, the softmax weights and V rounded to bf16, the products as vdpbf16ps does them: ~2x the attention rate on an
 // AVX512_BF16 CPU, less accurate; definition in kernels_avx512.h), on a bf16 cache (its own V layout) or an f16 cache
-// (as f16, rounded again to bf16 when read: slower, a double rounding). Every path of the sequence uses its type
-enum { RQ_KV_F32 = 0, RQ_KV_BF16 = 1, RQ_KV_F16 = 2, RQ_KV_BF16_DOT = 5, RQ_KV_F16_DOT = 6, RQ_KV_DEFAULT = RQ_KV_F16 };
-const char *rq_kv_name(int kv_type);   // "f32", "bf16", "f16", "bf16-dot", "f16-dot"
+// (as f16, rounded again to bf16 when read: slower, a double rounding). q8 / q4 / q4k4 (TODO G3): an 8-bit cache, 8-bit
+// K with 4-bit V, 4-bit K and V (int8, or Q4_0's 16 levels, per 32 dims of a position with a bf16 scale; K and V stored
+// Walsh-Hadamard rotated, q rotated alike and the output back: definition in forward.c, "8-bit / 4-bit KV cache";
+// docs/kv-quant.md): ~0.53 / ~0.41 / ~0.28 of the f16 cache's bytes; q8 / q4 / q4k4: the fp32 attention on the
+// dequantized values, -dot: the bf16 dot-product attention on them. head_dim a power of two. q4k4's 4-bit K: for
+// Qwen3.5 / 3.8 (KL there ~ q4's); Qwen3's 4-bit K is unusable. Every path of the sequence uses its type
+enum { RQ_KV_F32 = 0, RQ_KV_BF16 = 1, RQ_KV_F16 = 2, RQ_KV_Q8 = 3, RQ_KV_BF16_DOT = 5, RQ_KV_F16_DOT = 6, RQ_KV_Q8_DOT = 7,
+       RQ_KV_Q4 = 8, RQ_KV_Q4K4 = 9, RQ_KV_Q4_DOT = 12, RQ_KV_Q4K4_DOT = 13, RQ_KV_DEFAULT = RQ_KV_F16 };
+const char *rq_kv_name(int kv_type);   // "f32", "bf16", "f16", "bf16-dot", "f16-dot", "q8", "q8-dot", "q4", "q4-dot", "q4k4", ...
 int rq_kv_parse(const char *name);     // the type, or RQ_ERR_ARG
+int rq_kv_bits(int kv_type);           // bits per cache value, K and V averaged, scales not counted (RqModelOpts.kv_bits):
+                                       // 32, 16, 8, 6 (q4) or 4 (q4k4); 0 if not a type
 
 // capacity: positions (0 = the model's seq_len); the KV cache is address space, touched as used
 RqSeq *rq_seq_new(const RqModel *m, int capacity, int kv_type, int *err);

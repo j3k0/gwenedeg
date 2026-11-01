@@ -199,7 +199,17 @@ Q4_KERNELS = [(THREADS_PROMPT, SEQ), (THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_L
 # KV cache types other than the default (f16, Step 7b), on the .bin (group kv): logits vs HF (-b 64 on
 # KV_LOGITS + pooled, the same thresholds; long2 past one attention block), batched vs sequential (en
 # -b 7, long2 -b 64), threads (long2 -b 64, 8 vs 3) and AVX-512 vs generic (en -b 1, long2 -b 64), bitwise
-KV_TYPES = ["f32", "bf16", "bf16-dot", "f16-dot"]  # (-dot: the bf16 dot-product attention, TODO G4 (b))
+KV_TYPES = ["f32", "bf16", "bf16-dot", "f16-dot", "q8", "q8-dot", "q4", "q4-dot"]  # (-dot: the bf16 dot-product attention,
+# TODO G4 (b); q8 / q4: the 8-bit cache, 8-bit K + 4-bit V, TODO G3, docs/kv-quant.md. q4k4 (4-bit K) is not here: it is
+# unusable on Qwen3 (KL ~1000x the 8-bit's, docs/kv-quant.md), measured on Qwen3.5 by scripts/kl_kv.py instead)
+# Thresholds of the lossy cache types vs HF, set from their measured values (docs/kv-quant.md, the KV table): the 8-bit
+# dot-product attention's one position below COS_POS_MIN (0.978) and its mean 0.99485, and q4 / q4-dot's 4-bit V (pooled
+# cos 0.9949 / 0.9956, top-1 87-92%). Still bounds against garbage (top-1, pos 0 and per-position floors); a regression
+# below these fails. The 8-bit (q8) and 16-bit types keep TH_Q8.
+TH_KVQ8_DOT = dict(cos_mean=0.99, cos_pos=0.97, cos_pos0=COS_POS0_MIN, top1=TOP1_MIN, top1_all=TOP1_ALL_MIN,
+                   cos_all=COS_ALL_MIN, top5=TOP5_MIN)
+TH_KVQ4 = dict(cos_mean=0.99, cos_pos=0.95, cos_pos0=COS_POS0_MIN, top1=TOP1_MIN, top1_all=0.85, cos_all=0.99, top5=TOP5_MIN)
+KV_TH = {"q8-dot": TH_KVQ8_DOT, "q4": TH_KVQ4, "q4-dot": TH_KVQ4}
 BF16DP_LANES = str(1 << 22)  # bf16dp_test's random lanes per distribution (default 2^24: ~4x as long)
 KV_LOGITS = [THREADS_PROMPT, "code"]
 KV_BATCHED = [(THREADS_PROMPT, BATCH_CHUNKS[0]), (BATCH_LONG3, BATCH)]
@@ -397,7 +407,9 @@ def prefetch_all(a, tmp, only, fg, bg):
             sub(fg, q4, qt, n, c, THREADS_LONG if nd != THREADS_LONG else 8)
 
 
-API_THREADS = {"bin": 3, "gguf": 4, "q4": 4, "pair": 4, "dot": 4}  # the API test's runs (in the background from the start)
+API_THREADS = {"bin": 3, "gguf": 4, "q4": 4, "pair": 4, "dot": 4, "kvq": 4, "kvq-dot": 4}  # the API test's runs (in the
+# background from the start)
+API_KVQ = {"kvq": "q4", "kvq-dot": "q4k4-dot"}  # the 8 / 4-bit caches (TODO G3): q8 K + q4 V, fp32 attention; q4 K + V, dot
 # the batched passes again (api_test --digest: their logits hashes only) at other thread counts (Q4_K_M, else
 # the .bin; 8 and 16 threads: the short passes) and on the generic build (--digest-small, 3 threads: the short
 # passes of the .bin and Q4_K_M; the long ones' generic attention: chat/long_context_generic): the same DIGEST
@@ -422,6 +434,8 @@ def api_runs(a, ex, gx):
     gen = a.api_test + "-generic"
     if a.gguf:
         main["dot"] = ex.submit(run, [a.api_test, a.gguf, "--kv-type", "bf16-dot"], API_THREADS["dot"])
+        for tag, kv in API_KVQ.items():
+            main[tag] = ex.submit(run, [a.api_test, a.gguf, "--kv-type", kv], API_THREADS[tag])
     # the sampler's top-k draws == tests/sampler_ref.py's numpy replay, both builds (one thread each)
     main["sampler"] = ex.submit(run, [sys.executable, "-I", os.path.join(ROOT, "tests", "sampler_ref.py"), "--runq", a.runq,
                                       "--api-test", a.api_test] + (["--api-test", gen] if os.path.exists(gen) else []) +
@@ -432,9 +446,10 @@ def api_runs(a, ex, gx):
             if m and tag != "gguf":
                 dg[(tag, "generic")] = gx.submit(run, [gen, m, "--digest-small"], API_GENERIC_THREADS)
     if a.gguf:
-        dg[("dot", "t16")] = ex.submit(run, [a.api_test, a.gguf, "--digest-small", "--kv-type", "bf16-dot"], 16)
-        if os.path.exists(gen):
-            dg[("dot", "generic")] = gx.submit(run, [gen, a.gguf, "--digest-small", "--kv-type", "bf16-dot"], API_GENERIC_THREADS)
+        for tag, kv in [("dot", "bf16-dot")] + list(API_KVQ.items()):
+            dg[(tag, "t16")] = ex.submit(run, [a.api_test, a.gguf, "--digest-small", "--kv-type", kv], 16)
+            if os.path.exists(gen):
+                dg[(tag, "generic")] = gx.submit(run, [gen, a.gguf, "--digest-small", "--kv-type", kv], API_GENERIC_THREADS)
     tag, m = ("q4", a.q4) if a.q4 else ("bin", a.model)
     for t in API_DIGEST_THREADS:
         mode = ["--digest"] + n65.get(tag, []) if t == 1 else ["--digest-small"]
@@ -673,7 +688,7 @@ def test_logits(a, res, tmp, chunk=SEQ, prefix="logits", only=None, th=TH_Q8, su
             print(f"      {r[0]:<7} {r[1]:<3} {r[2]:.4f}    {r[3]:.5f}   {r[4]:.5f}   {r[5]:>2}/{r[1]:<4} {r[6]:.3f}")
 
 
-def test_logits_long(a, res, tmp, prefix="logits_long"):
+def test_logits_long(a, res, tmp, prefix="logits_long", th=TH_Q8):
     # positions past the first attention block (256): the block partial results and their
     # combination vs HF fp32 (golden/logits_long: every 4th position from 248 of long2), Q8_0 thresholds
     g = np.load(os.path.join(GOLDEN, "logits_long", f"{BATCH_LONG3}.npz"))
@@ -689,10 +704,10 @@ def test_logits_long(a, res, tmp, prefix="logits_long"):
     pos = g["positions"]
     cos, top1, top5 = logit_metrics({**{k: g[k] for k in g.files}, "ids": pos}, logits[pos])
     why = []
-    if not cos.mean() >= COS_MEAN_MIN: why.append(f"cos mean < {COS_MEAN_MIN}")
-    if not cos.min() >= COS_POS_MIN: why.append(f"cos min < {COS_POS_MIN} at pos {int(pos[cos.argmin()])}")
-    if not top1.mean() >= TOP1_MIN: why.append(f"top1 < {TOP1_MIN}")
-    if not top5.mean() >= TOP5_MIN: why.append(f"top5 < {TOP5_MIN}")
+    if not cos.mean() >= th["cos_mean"]: why.append(f"cos mean < {th['cos_mean']}")
+    if not cos.min() >= th["cos_pos"]: why.append(f"cos min < {th['cos_pos']} at pos {int(pos[cos.argmin()])}")
+    if not top1.mean() >= th["top1"]: why.append(f"top1 < {th['top1']}")
+    if not top5.mean() >= th["top5"]: why.append(f"top5 < {th['top5']}")
     res.report(not why, tname, f"n={len(ids)}, positions {int(pos[0])}..{int(pos[-1])} step 4 ({len(pos)}): cos mean "
                f"{cos.mean():.5f} min {cos.min():.5f} | top1 {int(top1.sum())}/{len(pos)} | top5 {top5.mean():.3f}"
                + ("  <- " + "; ".join(why) if why else ""))
@@ -1259,8 +1274,9 @@ def test_kv(a, res, tmp):
     for kv in KV_TYPES:
         v, d = argparse.Namespace(**{**vars(a), "extra": ["-k", kv]}), os.path.join(tmp, f"kv_{kv}")
         os.makedirs(d, exist_ok=True)
-        test_logits(v, res, d, BATCH, f"kv_{kv}_logits", only=KV_LOGITS)
-        test_logits_long(v, res, d, f"kv_{kv}_logits_long")
+        th = KV_TH.get(kv, TH_Q8)
+        test_logits(v, res, d, BATCH, f"kv_{kv}_logits", only=KV_LOGITS, th=th)
+        test_logits_long(v, res, d, f"kv_{kv}_logits_long", th=th)
         for name, chunk in KV_BATCHED:
             same, detail = same_files(logits_file(v, d, name, texts[name], SEQ), logits_file(v, d, name, texts[name], chunk))
             res.report(same, f"kv_{kv}_batched/{name}_b{chunk}", f"-k {kv} -b {chunk} vs -b {SEQ}: {detail}")

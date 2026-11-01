@@ -1016,7 +1016,9 @@ static void usage(void) {
             "  --api-key <key>     require 'Authorization: Bearer <key>' (not on /health)\n"
             "  --name <id>         model id in /v1/models and responses, default: the file name\n"
             "  -c, --ctx <int>     context (positions) per sequence, default 8192\n"
-            "  -k <type>           KV cache type f16|bf16|f32|bf16-dot|f16-dot, default f16 (-dot: bf16 dot-product attention)\n"
+            "  -k <type>           KV cache type f16|bf16|f32|bf16-dot|f16-dot|q8|q4|q4k4 (+ -dot), default f16 (-dot: bf16\n"
+            "                      dot-product attention; q8: 8-bit cache, q4: 8-bit K + 4-bit V, q4k4: 4-bit K + V\n"
+            "                      (Qwen3.5 / 3.8 only); docs/kv-quant.md)\n"
             "  --parallel <int>    requests running at once (batched in each forward pass), default 16\n"
             "  --slots <int>       sequences in the pool: running requests + prefix caches, default parallel + 4\n"
             "  --kv-mem <GiB>      memory of the pool at most (slots x (KV cache of ctx positions + recurrent state and its\n"
@@ -1140,7 +1142,7 @@ int serve_main(int argc, char **argv) {
     char err[512];
     // (positions up to -c: the default cap of 40,960 would clamp a larger -c; the memory check counts one sequence of -c
     // positions, the pool is bounded by --kv-mem)
-    RqModelOpts mo = { ctx, 0, 0, mem, kv == RQ_KV_F32 ? 4 : 2, page_cache, ckpts };
+    RqModelOpts mo = { ctx, 0, 0, mem, rq_kv_bits(kv), page_cache, ckpts };
     RqModel *m = rq_model_load(path, &mo, err, sizeof(err));
     if (!m) { fprintf(stderr, "%s\n", err); return 1; }
     App a;

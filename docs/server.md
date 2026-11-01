@@ -32,7 +32,7 @@ curl -s localhost:8080/v1/chat/completions -d '{"messages": [{"role": "user", "c
 | `--kv-disk DIR` | off | the KV cache's disk tier (below, KV cache on disk): a slot's sequence is saved to `DIR` when a request would discard its tokens (and at shutdown), and loaded back when a prompt continues it, also after a restart; an SSD |
 | `--kv-disk-max GiB` | half the free space at the start | the disk tier's files at most (the least recently used removed first); 1 GiB of the file system is always left free |
 | `--kv-disk-min N` | 1024 | save a slot when a request would discard at least N of its tokens (it holds at least N) |
-| `-k` | f16 | KV cache type (as for the CLI) |
+| `-k` | f16 | KV cache type (as for the CLI): `q8-dot` / `q4-dot` / `q4k4-dot` shrink the pool's slots (and the draft's) to 0.53 / 0.41 / 0.28 of f16's KV ([kv-quant.md](kv-quant.md)) |
 | `--queue N` | 64 | requests waiting beyond the free running places at most (more: 503, `Retry-After: 1`) |
 | `--max-conns N`, `--max-body B` | 128, 4 MB | connections (more: 503), request body size (more: 413) |
 | `--timeout S` | 600 | per request incl. queueing (504; 0 = none) |
@@ -427,6 +427,9 @@ OMP_NUM_THREADS=16 runq serve models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q3_K_M.gguf -c
   there (it fits at 96k only without the draft and with ~1 GiB to spare, or with the draft up to ~64k). The price:
   the Q3_K_M disagrees with the API's model on ~3.5% / 5.5% of the tokens (thinking off / on; Q4_K_M 1.6% / 3.1%),
   +2.7% perplexity, KL 0.03 from the Q4_K_M on agentic replies (G3).
+- **The Q4_K_M at 98k with the draft**: `-k q8-dot` (an 8-bit cache, [kv-quant.md](kv-quant.md)) takes the estimate
+  from 22.37 to 19.56 GiB (the draft's KV shrinks alike); KL on Qwen3.5-0.8B within the 16-bit types' range. Saluki
+  with `-k q4k4-dot`: 10.37 GiB at 98k (f16 14.69), the fastest decode at long context.
 - **`-k bf16-dot`**: the attention's dot products in bf16 (the KV cache is as big as f16's): at 98k a 2,560-token
   chunk prefills in 86 s instead of 123 (16 threads), decode 4-7% faster; within f16's noise on Qwen3.5 / 3.8 (KL), and
   the 27B's retrieval of a fact ~84k tokens back passes with it (TODO G2).

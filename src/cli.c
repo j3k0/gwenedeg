@@ -633,10 +633,13 @@ static void error_usage(void) {
     fprintf(stderr, "  -n <int>    max new tokens per response, 0 (default) = unlimited\n");
     fprintf(stderr, "  -b <int>    prefill chunk size (batched prompt processing), default %d, max %d;\n", RQ_BATCH_MAX, RQ_BATCH_MAX);
     fprintf(stderr, "              0 or 1 = one token at a time\n");
-    fprintf(stderr, "  -k <string> KV cache type: f32|bf16|f16|bf16-dot|f16-dot, default %s (16-bit: half the memory and bandwidth);\n", rq_kv_name(RQ_KV_DEFAULT));
+    fprintf(stderr, "  -k <string> KV cache type: f32|bf16|f16|bf16-dot|f16-dot|q8|q4|q4k4 (+ -dot), default %s (16-bit: half the memory and bandwidth);\n", rq_kv_name(RQ_KV_DEFAULT));
     fprintf(stderr, "              bf16-dot / f16-dot: that cache with the bf16 dot-product attention (q, K, V and the softmax weights\n");
     fprintf(stderr, "              rounded to bf16, the products as vdpbf16ps: ~1.7x the prefill attention at long context on AVX512_BF16\n");
     fprintf(stderr, "              CPUs; less accurate, see the README; bf16-dot is the faster one)\n");
+    fprintf(stderr, "              q8: an 8-bit cache, q4: 8-bit K + 4-bit V, q4k4: 4-bit K + V (Hadamard-rotated, per-32 scales;\n");
+    fprintf(stderr, "              ~0.53 / 0.41 / 0.28 of f16's memory; q4k4 for Qwen3.5 / 3.8 only), the fp32 attention; q8-dot,\n");
+    fprintf(stderr, "              q4-dot, q4k4-dot: with the bf16 dot-product attention (docs/kv-quant.md)\n");
     fprintf(stderr, "  --mem <GiB> refuse the load (before reading the weights) if its estimate (weights + runtime + the KV cache of -c\n");
     fprintf(stderr, "              positions) does not fit, default MemAvailable; 0 or force = no check; given: prints it ([memory])\n");
     fprintf(stderr, "  --page-cache auto|drop|keep  the model file's page cache after the load: auto (default) drops it if the file\n");
@@ -821,7 +824,7 @@ int main(int argc, char *argv[]) {
 
     // the model (weights, tokenizer, templates); -m dequant: the weights only
     int dequant = strcmp(mode, "dequant") == 0;
-    RqModelOpts o = { ctx_length, 0, dequant, mem, kv_type == RQ_KV_F32 ? 4 : 2, page_cache };
+    RqModelOpts o = { ctx_length, 0, dequant, mem, rq_kv_bits(kv_type), page_cache };
     RqModel *m = rq_model_load(checkpoint_path, &o, err, sizeof(err));
     if (!m) die(err);
     RqModelInfo info;

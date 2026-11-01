@@ -1,0 +1,8 @@
+{
+  "name": "gwenedeg",
+  "engineVersion": "v0.21.11",
+  "sdk": {
+    "source": "python"
+  },
+  "source": ".dagger"
+}

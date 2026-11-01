@@ -228,6 +228,36 @@ vs the f32 cache +8-10% / +17-22% / +23-29% after 451 / 1,500 / 3,000-token prom
 - The Step 11 fixes (RoPE theta, rmsnorm, the untied embedding) are shared C code, but untested on the Mac (NEON,
   clang): its goldens need a re-run.
 
+## CI with Dagger (`dagger check`)
+
+The fast suite also runs in containers through [Dagger](https://dagger.io) (v0.21.11; module `gwenedeg`: `dagger.json`,
+`.dagger/src/gwenedeg/main.py`), with every step cached by the content of its inputs:
+
+```sh
+dagger check                         # build + test (= make test) in parallel; a cache hit returns in ~3 s
+dagger check -l                      # list the checks (gwenedeg:build, gwenedeg:test)
+dagger check test                    # one of them
+dagger call test --only=server,api   # a subset of check.py's groups (cached per subset), prints the report
+dagger call test --threads=12        # another OMP_NUM_THREADS (another cache entry)
+dagger call build export --path=build-ci   # the binaries on the host
+dagger check --progress=dots         # compact output (agents, logs); --progress=plain: every step's log
+```
+
+- Inputs (allow-lists in `main.py`): `Makefile`, `src/`, `tests/` (not `tests/README.md`), and from `models/` only the
+  files of `make test`'s groups (~3.5 GB of it; a missing one is skipped with a note, as on the host). Docs, benchmarks,
+  logs, `build/`, `.venv`, `*.key` never reach the engine, so editing them reruns nothing. Changing `tests/*.py` reruns
+  the tests on the cached build; changing `src/` rebuilds, then reruns the tests; touching a file without changing it
+  reruns nothing (content hashes, not mtimes).
+- Toolchain: `debian:trixie-slim` pinned by digest, gcc 14.2, Python 3.13 + Debian's numpy. The build is `-march=native`
+  as on the host; the host CPU's model and flags are in the build's cache key, so a shared cache (several runners,
+  Dagger Cloud) never hands a binary built for another CPU.
+- Only passing results are cached; a failure reruns next time. A pass of a load-sensitive check (the tokenizer speed
+  check) is cached like any other.
+- The engine keeps its cache in a Docker volume. `~/.config/dagger/engine.json` sets its garbage collector to this
+  box (the default policy keeps 20% of the disk free and would prune everything on a nearly full disk):
+  `reservedSpace` 8 GB, `maxUsedSpace` 12 GB, `minFreeSpace` 3 GB. `dagger core engine local-cache entry-set
+  disk-space-bytes` shows its size, `dagger core engine local-cache prune` empties it.
+
 ## Design notes and rejected experiments
 
 Measured alternatives that were not kept, plus the limits they ran into, where the source comments do not already

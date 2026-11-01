@@ -905,6 +905,19 @@ static void post_chat(App *a, HttpConn *c, HttpReq *r) {
         send_err(a, c, r, 400, msg, NULL, "invalid_json");
         return;
     }
+    // the request's model: absent (or null) for the served one, else exactly its id (--name); render (serve_render)
+    // does not check it
+    const Js *mv = json_get(json_root(doc), "model");
+    if (mv && mv->t != JS_NULL && !json_str_eq(mv, a->model_id)) {
+        char msg[512];
+        int str = mv->t == JS_STR;
+        if (str) snprintf(msg, sizeof(msg), "The model '%.200s' does not exist (this server's: '%.200s')", mv->s, a->model_id);
+        else snprintf(msg, sizeof(msg), "'model' must be a string (this server's: '%.200s')", a->model_id);
+        json_free(doc);
+        if (str) send_err(a, c, r, 404, msg, "model", "model_not_found");
+        else send_err(a, c, r, 400, msg, "model", NULL);
+        return;
+    }
     Chat ch;
     memset(&ch, 0, sizeof(ch));
     ReqErr e;

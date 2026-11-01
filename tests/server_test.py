@@ -935,7 +935,7 @@ def run_all(a, t, port, ref, slow, logname):
 
     # ------------------------------------------------------------------ json_schema
     def classify(prompt, rf, **kw):
-        return chat(port, dict({"model": "classifier", "messages": [{"role": "system", "content": RUBRIC},
+        return chat(port, dict({"model": "test-model", "messages": [{"role": "system", "content": RUBRIC},
                                 {"role": "user", "content": "\nClassify this message:\n" + prompt}], "response_format": rf}, **kw))
     outs, ok, detail, tier_seq = [], True, "", {}
     for seed in range(8):
@@ -1093,7 +1093,9 @@ def run_all(a, t, port, ref, slow, logname):
     U = [{"role": "user", "content": "hi"}]
     err("malformed_json", 400, "invalid_json", raw=b'{"messages": [}')
     err("invalid_utf8", 400, "invalid_json", raw=b'{"messages": [{"role": "user", "content": "\xff"}]}')
-    err("missing_messages", 400, body={"model": "x"})
+    err("missing_messages", 400, body={"model": "test-model"})
+    err("model_other", 404, "model_not_found", body={"model": "other", "messages": U})
+    err("model_not_string", 400, body={"model": 3, "messages": U})
     err("empty_messages", 400, body={"messages": []})
     err("bad_role", 400, body={"messages": [{"role": "tool", "content": "x"}]})
     err("image_part", 400, body={"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]})

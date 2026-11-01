@@ -19,7 +19,7 @@ curl -s localhost:8080/v1/chat/completions -d '{"messages": [{"role": "user", "c
 |---|---|---|
 | `--host`, `--port` | 127.0.0.1, 8080 | `--port 0`: any free port (printed: `listening on http://...`) |
 | `--api-key KEY` | none | require `Authorization: Bearer KEY` (not on `/health`) |
-| `--name ID` | the file name | the model id in `/v1/models` and responses (the request's `model` is accepted whatever it is) |
+| `--name ID` | the file name | the model id in `/v1/models` and responses; a request's `model` must be this id or absent (else 404 `model_not_found`, or 400 if not a string) |
 | `-c`, `--ctx N` | 8192 | positions per sequence (the context limit of a request) |
 | `--parallel N` | 16 | requests running at once (their rows batched in each forward pass); more wait in the queue |
 | `--slots N` | parallel + 4 | sequences in the pool: one per running request, the idle ones keep their tokens as prefix caches |
@@ -236,7 +236,7 @@ model_list:
         tiers: { SIMPLE: small-model, MEDIUM: small-model, COMPLEX: big-model, REASONING: big-model }
   - model_name: runq-judge
     litellm_params:
-      model: openai/runq                       # any name
+      model: openai/runq                       # openai/<the server's --name>
       api_base: http://127.0.0.1:8080/v1
       api_key: none
       temperature: 0

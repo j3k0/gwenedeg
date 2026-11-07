@@ -1,7 +1,6 @@
 #!/bin/bash
 
 CONFIG="$1"
-CONFIG="${CONFIG:-saluki}"
 BIND_HOST="$(tailscale ip --4)"
 
 # defaults
@@ -9,9 +8,10 @@ NAME=qwen3.8-27b
 DRAFT_MODEL=models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf
 MODEL=models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q3_K_M.gguf
 # MODEL=models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
-KV_CACHE_TYPE=bf16-dot
+KV_CACHE_TYPE=q8-dot
 PARALLEL=1
 BIND_PORT=8417
+# CONTEXT=65536
 CONTEXT=98304
 
 KV_DISK="./kv-cache"
@@ -24,13 +24,39 @@ if [ "$CONFIG" = "saluki" ]; then
   KV_CACHE_TYPE=q8-dot
   PARALLEL=2
   BIND_PORT=8418
+elif [ "$CONFIG" = "qwen3.8-27b-q4" ]; then
+  MODEL=models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
+  KV_CACHE_TYPE=q8-dot
+elif [ "$CONFIG" = "qwen3.8-27b-q3" ]; then
+  MODEL=models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q3_K_M.gguf
+  KV_CACHE_TYPE=q8-dot
+elif [ "$CONFIG" = "qwopus" ]; then
+  # Qwopus3.8-27B-Flash-V2 (Qwen3.8-27B fine-tune): its MTP block is validated but not run yet (TODO S9),
+  # so the Qwen3.5-0.8B drafter stays (identical vocabulary)
+  MODEL=models/Qwopus3.8-27B-Flash-V2-GGUF/Qwopus3.8-27B-Flash-V2-MTP-Q4_K_M.gguf
+  NAME=qwopus3.8-27b
+  KV_CACHE_TYPE=q8-dot
+else
+  echo "Usage: $0 <config>"
+  echo "Config:"
+  echo "- saluki"
+  echo "- qwen3.8-27b-q3"
+  echo "- qwen3.8-27b-q4"
+  echo "- qwopus"
+  echo "Env: KV=<type> overrides the KV cache type (q8-dot, q4-dot, q4k4-dot, ...); PAR=<n> the parallel requests"
 fi
+
+# KV cache override, e.g. KV=q4-dot ./launch-server saluki
+KV_CACHE_TYPE="${KV:-$KV_CACHE_TYPE}"
+# parallel requests (= slots) override, e.g. PAR=3 ./launch-server saluki
+PARALLEL="${PAR:-$PARALLEL}"
 
 # /runq serve $MODEL -c 98304 -k bf16-dot --draft $DRAFT_MODEL --slots 2 --parallel 2 --checkpoints 3 --spec-calibrate 32768 --timeout 0 --port $BIND_PORT --host $BIND_HOST --name qwen3.8-27b
 
 mkdir -p "$KV_DISK"
 ./runq serve "$MODEL" \
   --ctx "$CONTEXT" \
+  --timeout 0 \
   -G 5 --tau 0.4 \
   -k "$KV_CACHE_TYPE" \
   --draft "$DRAFT_MODEL" \

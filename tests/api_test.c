@@ -2403,9 +2403,18 @@ static int mtp_main(int argc, char **argv) {
         ok &= rq_model_mem(view, &vm) == RQ_OK && vm.weights > 0 && vm.runtime > 0 && !memcmp(&mem0, &mem1, sizeof(mem0));
         ok &= rq_seq_mem(view, 4096, RQ_KV_F16, &sm) == RQ_OK && sm.state == 0 && sm.checkpoints == 0 &&
               sm.kv == (size_t)2 * 4096 * vi.n_kv_heads * vi.head_dim * 2 + 4096 * 4;
+        // what a one-row pass reads (RqModelMem.read, the cost model's): the model's own = its weights; the view's: + the
+        // classifier (more than its block on these files), less with a vocabulary subset (the same block)
+        RqMtpOpts so = { 1000, -1 };
+        RqModel *sv = rq_mtp_load(M, &so, err, sizeof(err));
+        RqModelMem svm;
+        ok &= mem0.read == mem0.weights && vm.read > 2 * vm.weights && sv && rq_model_mem(sv, &svm) == RQ_OK &&
+              svm.weights == vm.weights && svm.read > svm.weights && svm.read < vm.read;
         snprintf(d, sizeof(d), "info (1 layer, no linear ones, a fingerprint of its own), estimate weights %.1f MiB + runtime "
-                 "%.1f + %zu bytes per position (f16), the target's unchanged", vm.weights / 1048576.0, vm.runtime / 1048576.0,
-                 (sm.kv - 4096 * 4) / 4096);
+                 "%.1f + %zu bytes per position (f16), the target's unchanged; a pass reads %.1f MiB (vocab 1000: %.1f; the "
+                 "model's %.1f = its weights)", vm.weights / 1048576.0, vm.runtime / 1048576.0, (sm.kv - 4096 * 4) / 4096,
+                 vm.read / 1048576.0, sv ? svm.read / 1048576.0 : 0.0, mem0.read / 1048576.0);
+        rq_model_free(sv);
         report(ok, "mtp_load/info", d);
         // the block's matrices by their names (rq_dequant_rows: from the file's blocks and the repacked layout)
         ok = 1;

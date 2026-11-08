@@ -661,6 +661,16 @@ static void model_mem(RqModel *m, int kv_type, int ck) {
             for (int l = 0; l < mt[i].n; l++)
                 wb += prep_bytes(mt[i].t + l, mt[i].d, mt[i].k, pack);
     o->weights = wb + norm_floats(m) * sizeof(float);
+    o->read = o->weights;
+    if (m->mtp_of) { // (a view's pass also reads the target's classifier rows it computes and one token_embd row)
+        const RqModel *t = m->mtp_of;
+        const QuantizedTensor *e = t->weights.q_tokens;
+        PrepMat tm[16];
+        int tp = prep_pack(tm, prep_mats(t, tm), NULL, 0), dim = m->config.dim, nv = m->config.vocab_size;
+        int rows = m->cls_n[1] ? m->cls_n[0] + m->cls_n[1] : nv;
+        o->read += (size_t)((double)prep_bytes(t->weights.wcls, nv, dim, tp) * rows / nv);
+        o->read += e->type == GGML_Q8_0 ? (size_t)dim / 32 * Q8_0_BLOCK : (size_t)dim / QK_K * lq_block_bytes(e->type);
+    }
     // the tokenizer (vocab, lengths, scores, added; its hash table; the strings: within the metadata's size), the
     // file's metadata (GGUF: mapped and read by the tokenizer; .bin: the .tokenizer file, about), a compute
     // context, the process (code, thread stacks, heap: measured ~8 MiB)

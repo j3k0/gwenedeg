@@ -1260,6 +1260,125 @@ The cheapest mitigations, in order:
   `runq serve` with Qwen3.5-4B Q8_0 (~290 tok/s of prefill at 8 threads: an 18k-token request in ~1-2 min, its reply in
   ~1 min, instead of ~12-17 min), memory permitting: not next to the 27B Q4_K_M at 96k (G3).
 
+## The MTP drafter (S9)
+
+The 27B's own MTP block (`blk.64`) as the guess source (TODO S9; loading it as a view model and its forward pass:
+[Loader](#loader-the-mtp-block-and-the-f32-matrices); the loop: S9b). Its acceptance needs the 27B (S9d); its costs
+do not.
+
+### Costs on a full-width synthetic file (TODO S9w, measured 2026-11-08)
+
+**Tool.** `tests/make_synth_wide.py --cls 4|6` writes `build/synth-wide/synth-q38-wide-cls{4,6}.gguf` (2.7 / 3.1 GB,
+one at a time, deleted after): the 27B's hyper-parameters from the IQ3_S-mtp file's header (no tensor data read), a
+4-layer trunk of its layer pattern (3 linear + 1 attention: the 27B's 64 layers are 16 times this; Unsloth's Q4_K /
+Q5_K / Q6_K mix per role), the MTP block `blk.4` all Q6_K (332.3 MiB as stored, IQ3_S-mtp's), `token_embd` Q4_K, the
+248,320-row classifier Q4_K (`-cls4`, as IQ3_S-mtp) or Q6_K (`-cls6`, as Unsloth's Q4_K_M), the 0.8B's tokenizer (=
+the 27B's tokens, merges and types: checked), random K-quant blocks with fixed scales. `build/bench_mtp FILE`
+(`make bench-mtp`, `tests/bench_mtp.c`): the target's and three views' sequences (`--mtp-vocab` 0 = full, 151,643,
+100,000) filled by `rq_seq_fill_synthetic`, then per KV type and L: a guess (a 1-row view segment with `h_in` and
+its logits, as the loop's guesses 2..k), the catch-up segments of a + 1 rows (no logits, and with the last row's:
+the round's first guess riding in it), and the prompt (a 512-row target chunk without logits, the same with every
+row's hidden state, the MTP's chunk over it); each followed by a truncation back to L, reps rotated (15; prompt 3).
+Under the bench lock, 8 threads, box load 3-9 (other jobs); medians, ms. The 1k medians move by ~15% between runs
+(full, `-cls4`: 8.0 / 9.4 / 9.5 ms in three runs; best 6.9-7.8).
+
+**Per guess** (a pass reads, `RqModelMem.read`: `-cls4` 1,036.5 / 764.4 / 618.6 MiB for full / 151,643 / 100,000;
+`-cls6` 1,339.6 / 949.9 / 741.0), f16 / q8 MTP KV:
+
+| file | L | full | 151,643 | 100,000 | `rq_pass_cost_default` (full / 100,000) |
+|---|---|---|---|---|---|
+| `-cls4` (IQ3_S-mtp) | 1,024 | 9.45 / 7.67 | 7.09 / 6.13 | 5.96 / 5.16 | 7.82 / 4.69 |
+| | 16,384 | 8.94 / 9.57 | 7.39 / 7.70 | 6.11 / 6.53 | 8.60 / 5.47 |
+| | 49,152 | 9.97 / 10.23 | 8.21 / 8.98 | 7.61 / 8.26 | 10.28 / 7.15 |
+| | 98,304 | 11.94 / 14.86 | 10.38 / 13.31 | 9.33 / 12.07 | 12.80 / 9.67 |
+| `-cls6` (Unsloth) | 1,024 | 8.95 / 9.12 | 6.71 / 6.79 | 6.04 / 5.49 | 10.09 / 5.60 |
+| | 16,384 | 9.83 / 10.80 | 7.60 / 8.11 | 6.51 / 6.78 | 10.87 / 6.39 |
+| | 49,152 | 11.63 / 14.03 | 8.97 / 11.12 | 7.64 / 9.62 | 12.55 / 8.07 |
+| | 98,304 | 14.43 / 17.01 | 11.64 / 14.48 | 10.13 / 12.95 | 15.07 / 10.59 |
+
+- **Cheaper than estimated at short context:** the plan's ~104 GB/s gave 10.6 / 6.4 ms (IQ3_S-mtp full / 100k) and
+  13.3 / 7.1 (Unsloth); measured ~8-9.5 / ~5.2-6.0 and ~9-10 / ~5.5-6.5: a one-row pass streams the classifier at
+  ~115-130 GB/s (Q4_K) and ~150 GB/s (Q6_K, fewer operations per byte). The 100k subset is about the 0.8B draft's
+  step (5.1-6.5 ms); at 98k it is half of it (9.3 vs 19 ms).
+- **The MTP attention:** ~45 ns per position at f16 (4 KiB: ~90 GB/s with its arithmetic), +2.5-3.5 ms per guess at
+  98k. **A q8 MTP cache is slower** for these 1-row passes (+2.5-3 ms at 98k: its dequantization costs more than the
+  halved read), the opposite of the plan's guess (8.4 vs 10.3 ms); it saves 2 KiB per position (~190 MiB at 96k), so
+  f16 is the MTP's cache unless memory says otherwise.
+- **The cost model** (`rq_pass_cost_default(view)`, TODO S9w): `RqModelMem.read` (the block + norms + the classifier
+  rows the view computes + an embedding row; a loaded model's `read` = its weights, so its default is unchanged) at
+  the loaded models' 60 GB/s and 0.3 TFLOPS gave +100 .. +185%; a view now takes 140 GB/s for the weights (no
+  per-pass term) and 80 GB/s for its KV entries with the arithmetic overlapped (a further row's attention as the
+  first's, as the catch-up rows below measure): **within -21% .. +13%** of every measured guess above (both files,
+  f16 and q8, 1k-98k).
+
+**Catch-up rows** (`-cls4`, f16; a + 1 rows without logits; `-cls6` within ~0.6 ms of them):
+
+| L | a = 0 | 1 | 2 | 3 | 4 | 5 | 6 | a = 0 / 3 / 6 with the last row's logits |
+|---|---|---|---|---|---|---|---|---|
+| 1,024 | 3.15 | 3.41 | 3.42 | 3.50 | 3.80 | 4.10 | 4.40 | 9.22 / 9.96 / 11.09 |
+| 16,384 | 3.62 | 4.66 | 5.13 | 5.84 | 6.71 | 7.65 | 8.75 | 8.82 / 11.51 / 14.77 |
+| 49,152 | 5.00 | 7.85 | 9.27 | 11.20 | 13.50 | 15.92 | 18.86 | 9.86 / 16.66 / 23.74 |
+| 98,304 | 7.35 | 11.70 | 15.56 | 19.42 | 23.52 | 27.77 | 33.40 | 11.94 / 23.88 / 37.77 |
+
+A round's first MTP pass carries the a + 1 rows the last verify accepted: at short context ~+0.25 ms per extra row
+(the block's read is shared), at 98k ~+4 ms per row (each row's attention is its own, as for the target's verify rows).
+A non-MTP round (lookup, plain) pays f(a + 1) alone: ~3-3.5 ms at short context, ~3% of a target step.
+
+**The prompt** (a 512-row chunk; the 4-layer trunk's time x 16 for the 27B's 64 layers: 11.8 / 16.0 / 25.9 / 40.7 s per
+chunk at 1k / 16k / 49k / 98k, f16, `-cls4`; the real Q3_K_M 27B at 8 threads, f16, G0 (b): 15.9 s at 16k and 40.2 s at
+98k, so the extrapolation holds for a Q3_K / Q4_K trunk):
+
+| L | the MTP's chunk (ms) | + the MTP | + every row's hidden state |
+|---|---|---|---|
+| 1,024 | 224 (f16) / 238 (q8) | +1.9% / +2.0% | within +-0.1% (noise) |
+| 16,384 | 502 / 529 | +3.1% / +3.2% | |
+| 49,152 | 1,105 / 1,204 | +4.3% / +4.4% | |
+| 98,304 | 2,029 / 2,216 | +5.0% / +5.1% | |
+
+(`-cls6`: the same within 0.1 points.) A cold 96k prefill (the chunks' mean over 0..96k) costs **+4.3%** (f16 and q8),
+more than the plan's ~+3%: at long context the chunk is attention-bound and the MTP adds a 17th attention layer
+(1/16 of the trunk's attention). Windowed MTP attention (S9e) would remove most of it. The hidden rows cost nothing
+measurable (+2-10 ms of 0.7-2.7 s, inside the noise).
+
+**Expected tok/s on IQ3_S-mtp** (short context, k = 3, thinking on; section 7's model with these costs): a round is
+the target's 4-row verify (~120 ms: 1.32 x its ~91 ms step), the MTP's first pass (the catch-up rows + the first guess:
+a guess + ~0.4 ms) and 2 more guesses; tokens per round 1 + p + p^2 + p^3 (per-guess acceptance p, geometric). The 0.8B
+at S7's measured 2.30 tokens per pass in 120 + 4 x 5.1 ms: **16.4 tok/s** (2.30 is p ~0.64 at k = 3 in this model; the
+plan's "p ~0.575" is the k = 6 equivalent). Per guess g from `-cls4` at 1k-16k f16 across the runs:
+
+| `--mtp-vocab` | g (ms) | round (ms) | p 0.60 | p 0.70 | p 0.75 | even with the 0.8B at p | +10% at p |
+|---|---|---|---|---|---|---|---|
+| full | 9.0 | 147.4 | 14.8 (-10%) | 17.2 (+5%) | 18.6 (+13%) | 0.67 | 0.73 |
+| 151,643 | 6.8 | 140.8 | 15.5 (-6%) | 18.0 (+10%) | 19.4 (+19%) | 0.64 | 0.70 |
+| 100,000 | 5.7 | 137.5 | 15.8 (-3%) | 18.4 (+12%) | 19.9 (+21%) | 0.62 | 0.69 |
+
+So the go line of S9d (+10% over the 0.8B) needs p >= ~0.69 with the 100k subset (>= 0.73 with the full vocabulary);
+llama.cpp's MTP vs 0.8B acceptance (54% vs 33% of drafted, TODO S9) suggests ~0.7. Long context favours the MTP: at
+98k a guess costs 9.3-12 ms against the 0.8B's 19, but the catch-up rows' attention (~4 ms per accepted guess) eats
+part of it.
+
+**Vocabulary coverage on pi's sessions** (the subset's other question; `scripts/lookup_accept.py sessions`: 384
+recorded sessions, ~/.pi/agent/sessions, rendered as Qwen3.8's template renders them and tokenized with the 27B's
+tokenizer (= Qwen3.5's `tokenizer.json`, checked against runq's), 368 streams, 24.2M tokens, 13,400 replies; the
+replies were written by the models pi drove, not by the 27B). The share of tokens with id < N or an added token:
+
+| tokens | count | 16,384 | 32,768 | 65,536 | 100,000 | 151,643 |
+|---|---|---|---|---|---|---|
+| replies | 6,780,501 | 87.57% | 93.37% | 98.06% | 99.899% | 99.901% |
+| reasoning | 1,355,991 | 86.49 | 92.69 | 97.77 | 99.851 | 99.851 |
+| prose | 711,236 | 87.02 | 93.16 | 97.93 | 99.667 | 99.668 |
+| template / XML syntax | 490,294 | 96.64 | 98.96 | 99.08 | 100.000 | 100.000 |
+| tool-call arguments | 2,732,240 | 86.19 | 92.57 | 97.95 | 99.957 | 99.958 |
+| edits (old / new text) | 631,953 | 86.52 / 87.50 | 92.69 / 93.18 | 98.12 / 98.22 | 99.908 / 99.914 | 99.910 / 99.920 |
+| written files | 858,787 | 89.15 | 94.21 | 98.31 | 99.916 | 99.918 |
+| everything (prompts too) | 24,166,426 | 88.03 | 93.57 | 97.99 | 99.890 | 99.898 |
+
+As on the 27B's own answers of the 2026-10-27 measurement (`logs/specmeas-2026-10-27`, 35,330 tokens: 99.82% at
+100,000, 98.3% at 65,536): **100,000 covers 99.9%** of the
+replies, and 151,643 adds almost nothing (0.002%); the last 0.1% (ids 151,643-248,043: mostly non-English text and
+symbols) needs the full vocabulary, so the subset stays an option. The 0.83% added tokens (`<|im_end|>`, `<think>`,
+`<tool_call>`, ...) are always in it.
+
 ## Not now
 
 DFlash 2 (a 2B block-diffusion drafter: a new architecture, a 4 GB BF16 download); multi-VM splits (~10-30% over

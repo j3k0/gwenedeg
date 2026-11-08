@@ -360,7 +360,9 @@ file's MTP block a model of its own, a view sharing the target's weights and tok
 states from `RqSegment.hidden` through its `RqSegment.h_in`: the drafter of TODO S9), `rq_tokenize`, `rq_detok_push`
 (incremental, UTF-8 safe) and `rq_chat_render`. Errors come back as `RQ_ERR_*` codes and messages; the
 library never prints or exits. `RqModelOpts.mem` / `.page_cache` set the load's memory check and page-cache policy
-(Memory, above); `rq_model_mem` and `rq_seq_mem` return the estimates (the server sizes its slot pool with the latter).
+(Memory, above); `rq_model_mem` and `rq_seq_mem` return the estimates (the server sizes its slot pool with the latter;
+`RqModelMem.read`, the weights a one-row pass reads, is what `rq_pass_cost_default` prices: a model's weights, an MTP
+view's block plus the target's classifier rows it computes).
 
 ```c
 rq_threads_init(0);

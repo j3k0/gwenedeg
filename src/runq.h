@@ -138,6 +138,8 @@ typedef struct {
     size_t total;       // weights + runtime + seq.total: what the check counts
     double budget;      // what it was checked against (bytes; 0: no check)
     int budget_src;     // 0 none, 1 MemAvailable, 2 RqModelOpts.mem
+    size_t read;        // the weights a one-row pass reads (rq_pass_cost_default): = weights for a loaded model; an MTP
+                        // view (rq_mtp_load): its block + norms, the target's classifier rows it computes, an embedding row
 } RqModelMem;
 int rq_model_mem(const RqModel *m, RqModelMem *mem);
 // the memory of one sequence (as rq_seq_new(m, capacity, kv_type) allocates it, checkpoints included); RQ_ERR_ARG

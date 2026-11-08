@@ -417,17 +417,27 @@ double rq_pass_cost(const RqPassCost *pc, int rows, double pos_first, double pos
 void rq_pass_cost_default(const RqModel *m, RqPassCost *pc) {
     // without a calibration: the weights read at ~60 GB/s, the KV entries of a position at ~60 GB/s plus their
     // arithmetic at ~0.3 TFLOPS (8 threads on the dev box), f(R) as measured on Qwen3-1.7B / 8B (S2: ~0.07 per row up
-    // to 5 rows, then ~0.12); rough, but every quantity scales with the model as the measured ones do
+    // to 5 rows, then ~0.12); rough, but every quantity scales with the model as the measured ones do. The weights: what
+    // a one-row pass reads (RqModelMem.read: an MTP view's block + the target's classifier rows it computes). An MTP view
+    // (TODO S9w, its 1-row passes on Qwen3.8-27B-wide synthetic files at 8 threads, 1k-96k positions, Q4_K and Q6_K
+    // classifiers): mostly one large classifier, read at ~140 GB/s with no per-pass term, and its one attention layer at
+    // ~80 GB/s with the arithmetic overlapped, a further row's as the first's (within -24% .. +14% of the measured time
+    // there; the 60 GB/s / 0.3 TFLOPS above: 2-3x it)
     static const double f[] = { 1, 1.08, 1.15, 1.25, 1.35, 1.45, 1.65, 2.1, 2.6 };
     memset(pc, 0, sizeof(*pc));
     RqModelMem mm;
     RqSeqMem sm;
-    double w = rq_model_mem(m, &mm) == RQ_OK ? (double)mm.weights : 1e9;
+    double w = rq_model_mem(m, &mm) == RQ_OK ? (double)(mm.read ? mm.read : mm.weights) : 1e9;
     const Config *p = &m->config;
     double kvb = rq_seq_mem(m, 4096, RQ_KV_F16, &sm) == RQ_OK ? (double)sm.kv / 4096 : 1e5;
-    pc->t_w = w / 60e9 + 1e-3;
-    pc->att_x = 4.0 * m->n_attn * p->n_heads * p->head_dim / 0.3e12; // (a row's arithmetic)
-    pc->att = kvb / 60e9 + pc->att_x;                                  // (+ the read of the KV entries)
+    if (m->mtp_of) {
+        pc->t_w = w / 140e9;
+        pc->att = pc->att_x = kvb / 80e9;
+    } else {
+        pc->t_w = w / 60e9 + 1e-3;
+        pc->att_x = 4.0 * m->n_attn * p->n_heads * p->head_dim / 0.3e12; // (a row's arithmetic)
+        pc->att = kvb / 60e9 + pc->att_x;                                  // (+ the read of the KV entries)
+    }
     pc->n = COST_NR;
     for (int i = 0; i < COST_NR; i++) {
         pc->r[i] = cost_rows[i];

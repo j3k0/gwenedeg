@@ -91,6 +91,8 @@ build/long_ctx MODEL -I IDS -P p1,p2 -o OUT [-V] [-g N]   # logits at positions 
 build/long_ctx MODEL -I IDS -A -o OUT [-k KV]   # every row's logits of the ids, streamed per 512-row chunk (-m logits' format; scripts/kl_kv.py)
 .venv/bin/python -I scripts/kl_kv.py --hf DIR --gguf FILE [--kv f32,f16,bf16,bf16-dot,f16-dot]   # KL vs the HF checkpoint in fp32 per KV type (not a test; ~1-10 min per 3,500-token piece)
 build/bench_long MODEL [-L 16384,32768,65536,98304] [-R 2,4,8] [-P 2560] [-D DRAFT [-C 8192] [-W MS,F2,.. -A 16]]   # decode / verify / prefill-chunk times at long context on a synthetic cache; -D: speculation's choice by position (G7) from them and from the calibrated cost model (make bench-long; not a test)
+.venv/bin/python -I tests/make_synth_wide.py --cls 4|6   # build/synth-wide/synth-q38-wide-cls{4,6}.gguf (2.7 / 3.1 GB): Qwen3.8-27B's dimensions, a 4-layer trunk, its MTP block and classifier sizes, random weights (TODO S9w; one at a time, delete after)
+build/bench_mtp MODEL [-L 1024,16384,49152,98304] [-V 0,100000,151643] [-k f16,q8] [-r 9] [-p 3]   # the MTP drafter's costs on such a file: a guess per vocabulary subset vs rq_pass_cost_default, the catch-up rows, the prompt's share extrapolated to 64 layers (make bench-mtp; not a test)
 build/teacher_force MODEL IN OUT | -l IN OUT   # a draft's argmax / the prompt lookup at given positions of token streams (make teacher-force; scripts/lookup_accept.py; not a test)
 .venv/bin/python -I scripts/bench_lookup.py TARGET [--draft DRAFT]   # tok/s: plain / -G / --lookup / combined on code-editing prompts (not a test; under the bench lock)
 tests/server_test.py --runq ./runq --model MODEL [--threads 4] [--slow] [-v]   # runq serve alone (~6 s; 2 threads ~11 s)
@@ -497,8 +499,10 @@ The load-time estimate (README, Memory; `src/model.c`, `model_mem`) against the 
 loads the model, then fills a sequence of CTX positions (Qwen3.5: with its checkpoints taken), and prints the estimate's
 parts, the load's peak RSS and the peak RSS with the context full; `--mtp` (TODO S9a): then the MTP view
 (`rq_mtp_load`) with a context and a sequence of CTX positions filled the same way, its estimate against the RSS it
-adds (a second line; the first is unchanged, and so is the target's estimate: the block is not in it). 2026-10-27, 8
-threads, CTX 2048:
+adds (a second line; the first is unchanged, and so is the target's estimate: the block is not in it), and since S9w
+what a one-row pass of each reads (`RqModelMem.read`, the cost model's: the view's block + the target's classifier,
+the model's = its weights; `api_test --mtp`'s `mtp_load/info` checks both, and that a vocabulary subset reads less).
+2026-10-27, 8 threads, CTX 2048:
 
 | file | weights + runtime + sequence (estimate, MiB) | load peak RSS | peak RSS, context full | estimate vs it |
 |---|---|---|---|---|

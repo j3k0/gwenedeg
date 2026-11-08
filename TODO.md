@@ -60,10 +60,17 @@ Steps:
     prompts, 96-192 tokens). Small sample; details `/home/jeko/JC/lcb_timebox/mtp/results.md`. llama.cpp's speed there
     is no guide (plain 3.5 tok/s vs runq's 11 on the same IQ3_S; its verify batch costs ~k steps, so no draft helped).
     Published, GPU: Qwopus3.8-27B-Flash-V2 card 80.7% (MTP) vs 66.1% base; Qwen3.5-27B n 1/2/3 -> 49/66/74%.
-  - **Expected here (estimate):** if MTP's lead carries over (runq's 0.8B ~0.55-0.65 -> MTP ~0.75), with ~9.5 vs
-    6.5 ms per guess, roughly +20-30% tok/s thinking on; plus memory: no 0.8B weights nor its 708.7 MiB draft
-    sequence per slot, against one attention layer's KV per slot. Larger k may pay more with MTP's higher acceptance:
-    sweep k (and tau) as at S8.
+  - **Expected here (costs measured at S9w, 2026-11-08, on full-width synthetic files, 8 threads; acceptance still
+    to measure, S9d):** a guess (a one-row MTP pass) costs ~9 ms with the full vocabulary and ~5.7 ms with
+    `--mtp-vocab 100000` on IQ3_S-mtp (Q4_K classifier) at short context, 11.9 / 9.3 ms at 98k (f16 MTP cache; q8 is
+    slower there); Unsloth's Q6_K classifier ~9-10 / ~6. On IQ3_S-mtp at k = 3, thinking on, against the 0.8B's 16.4
+    tok/s (S7's 2.30 tokens per pass): p 0.70 / 0.75 per guess gives 18.4 / 19.9 tok/s (+12 / +21%) with the 100k
+    subset, 17.2 / 18.6 (+5 / +13%) with the full vocabulary; even at p ~0.62 (subset) / ~0.67 (full), +10% at ~0.69
+    / ~0.73. The 100k subset covers 99.9% of pi sessions' reply tokens (99.82% of the 27B's own answers). Prompt: the
+    MTP follows every chunk, +1.9% at short context, +5.0% at 98k, +4.3% for a cold 96k prefill. Memory: no 0.8B
+    weights nor its 708.7 MiB draft sequence per slot, against one attention layer's KV (4 KiB per position) per slot.
+    Larger k may pay more with MTP's higher acceptance: sweep k (and tau) as at S8. Tables:
+    docs/qwen38-speculative.md, "The MTP drafter (S9)".
   - **Test files:** `models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (ISTA-DASLab, 12.1 GB, sha256
     58fd8267...; downloaded). Its `blk.64` (15 tensors: attn q/k/v/output, ffn gate/up/down, `nextn.eh_proj` all Q6_K;
     norms incl. `nextn.enorm` / `hnorm` / `shared_head_norm` F32) is a full block with its own FFN. Its trunk's

@@ -8,7 +8,8 @@
  * --cold: drops the file's page cache first (posix_fadvise DONTNEED: clean pages nobody maps). --mtp: then the model's
  * MTP block as a model of its own (rq_mtp_load, TODO S9) with a context and a sequence of CTX positions filled the
  * same way (h input zeros): a second line, its estimate against the growth of the RSS (VmRSS before / after; the
- * estimate does not count what it shares with the model). Threads: OMP_NUM_THREADS. `make mem-probe` builds it */
+ * estimate does not count what it shares with the model) and the weights a one-row pass reads (RqModelMem.read: the
+ * block + the classifier; the model's own = its weights). Threads: OMP_NUM_THREADS. `make mem-probe` builds it */
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <stdio.h>
@@ -113,8 +114,9 @@ int main(int argc, char **argv) {
         for (int i = n; i < cap; i++) rq_decode(vc, vs, tok[i], NULL);
         double r1 = status_mib("VmRSS");
         printf("%s, ctx %d, MTP block: load %.2f s | estimate MiB: weights %.1f, runtime %.1f, sequence %.1f, total %.1f | RSS growth "
-               "%.1f MiB (estimate %+.1f%%)\n", path, cap, tv, vm.weights / M, vm.runtime / M, vm.seq.total / M, vm.total / M, r1 - r0,
-               100.0 * (vm.total / M - (r1 - r0)) / (r1 - r0));
+               "%.1f MiB (estimate %+.1f%%) | a pass reads %.1f MiB of weights (the model's: %.1f)\n", path, cap, tv, vm.weights / M,
+               vm.runtime / M, vm.seq.total / M, vm.total / M, r1 - r0, 100.0 * (vm.total / M - (r1 - r0)) / (r1 - r0), vm.read / M,
+               mm.read / M);
         rq_ctx_free(vc);
         rq_seq_free(vs);
         rq_model_free(v);

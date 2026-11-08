@@ -36,6 +36,12 @@ elif [ "$CONFIG" = "qwopus" ]; then
   MODEL=models/Qwopus3.8-27B-Flash-V2-GGUF/Qwopus3.8-27B-Flash-V2-MTP-Q4_K_M.gguf
   NAME=qwopus3.8-27b
   KV_CACHE_TYPE=q8-dot
+elif [ "$CONFIG" = "ista-iq3s" ]; then
+  # ISTA-DASLab Qwen3.8-27B GSQ-RCO IQ3_S (3.5 bpw, 11.8 GB), its BF16 ssm_alpha / ssm_beta rewritten as F32
+  # (runq takes them as F32 only; lcb_timebox/tools/gguf_bf16_to_f32.py, exact)
+  MODEL=models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-f32ssm.gguf
+  NAME=qwen3.8-27b-iq3s
+  KV_CACHE_TYPE=q8-dot
 else
   echo "Usage: $0 <config>"
   echo "Config:"
@@ -43,6 +49,7 @@ else
   echo "- qwen3.8-27b-q3"
   echo "- qwen3.8-27b-q4"
   echo "- qwopus"
+  echo "- ista-iq3s"
   echo "Env: KV=<type> overrides the KV cache type (q8-dot, q4-dot, q4k4-dot, ...); PAR=<n> the parallel requests"
 fi
 

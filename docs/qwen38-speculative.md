@@ -141,6 +141,29 @@ checkpoints))", the script's estimate below.
   matrix, validates `blk.64` and refuses at the memory check ("needs ~14.11 GiB (weights 10.86, runtime 0.31, a
   sequence of 40960 positions: KV cache 2.50 + recurrent state 150 MiB x (1 + 2 checkpoints))", 0.03 s, 12 MB peak
   RSS), where it refused `blk.0.ssm_alpha.weight`'s type 30 before.
+- **The MTP block as a model of its own** (TODO S9a, 2026-11-08; `rq_mtp_load`, `src/model.c`; the forward passes'
+  view branches, `src/forward.c`): a "view" of the loaded target, an `RqModel` of one gated full-attention layer
+  (`hy.on = 0`, `gated = 1`: plain KV cache sequences, truncatable anywhere, no state or checkpoints) that shares the
+  target's mapping, GGUF directory, tokenizer, `token_embd` and classifier (`borrowed`: freed only by the target, so
+  its contexts, sequences and the view go first) and owns the block's 8 matrices, converted when it is built
+  (`prepare_weights` on them, read with `pread` from the file reopened by its path) and its 7 norms (`shared_head_norm`
+  is its final norm). Its row q: `x = eh_proj [rmsnorm(embed(x_q), enorm) | rmsnorm(h, hnorm)]` (the 2 dim input row in
+  the decode / batched `xb` / `xq` rows: `xs >= 2 dim` on a view; h = `RqSegment.h_in`'s row, NULL zeros), then the
+  layer exactly as a trunk attention layer, then `shared_head_norm` and the classifier: rows `[0, vocab)` and the added
+  tokens' (`RqMtpOpts.vocab`, whole 16-row blocks of the repacked classifier as two matrices of their own: no copy,
+  the other logits -inf). Everything else (the attention, KV types, seqfile) is the model's code. The target's hidden
+  rows come from the new `RqSegment.hidden` (every row's final hidden state after `output_norm`, the row its logits
+  are computed from; rows without logits get their residual and the final norm only; logits, cache and state
+  unchanged). The plain path is unchanged: `tests/compare_bins.sh` identical (792 jobs), the target's estimate does
+  not count the view. Its estimate: the 8 matrices + norms (synthetic 9.4 MiB, 0.8B 22.0; the 27B files 251-332 MiB
+  as stored), a context (no tokenizer or metadata: the target's) and one sequence (4 KiB per position at f16 on the
+  27B, 2 KiB on the synthetic file). Checked (q35 group): the block vs `tests/ref_qwen35.py`'s `mtp_forward`
+  (`q35/synth-q35-27b-mtp/mtp_ref/*`: cos mean 0.9980-0.9993, min 0.988; the four convention mutations fail it), the
+  hidden rows and the view's results on every path bitwise (`q35/synth/hidden_rows`, `mtp_paths*`, across threads and
+  builds), the refusals (`mtp_load/*`). On the real 0.8B-mtp (opt-in, `models/3.5-0.8b-mtp/*`): cos 0.9997 vs the
+  reference, and teacher-forced (the prompt's own tokens, h of the previous position) the block's top-1 is the next
+  token at 53% of `all`'s rows (45/85; 83% on `long2`, 29-71% on the short prompts), where the untrained synthetic
+  block scores ~0: the post-`output_norm` hidden state, `[e | h]` and h_{q-1} are the trained convention.
 
 ### A real small MTP: Qwen3.5-0.8B-mtp (TODO S9.0b, 2026-11-08)
 

@@ -99,7 +99,8 @@ typedef struct {
     int vdim;      // nv dv: the output gate z and the input of the output projection (2048)
     int n_lin;     // linear-attention layers (18 of 24)
     int nextn;     // MTP blocks (<arch>.nextn_predict_layers, either architecture: the last nextn of block_count, not
-                   // counted in Config.n_layers; Qwen3.8-27B: 1, blk.64): qwen35 with 1 is loaded as RqModel.mtp, else refused
+                   // counted in Config.n_layers; Qwen3.8-27B: 1, blk.64): qwen35 with 1 is validated as RqModel.mtp (a
+                   // model of its own: rq_mtp_load), else refused
 } Hybrid;
 
 typedef struct {
@@ -121,8 +122,10 @@ typedef struct {
 // main layers): a full-attention layer (its own attn_* / ffn_* / norms) + nextn.eh_proj (dim, 2 dim) and the norms
 // nextn.enorm / hnorm / shared_head_norm (dim); it shares token_embd and output with the main model. Validated at load
 // (names, shapes, types: the file is untrusted) from the tensor directory only: nothing of it is read, converted or
-// counted in the memory estimate; the forward passes never use it (for the MTP drafter, TODO S9). The matrices are
-// as gguf_matrices maps them (b, type in the mapping; Q8_0 / Q3_K .. Q6_K), the norms point into the mapping
+// counted in the target's memory estimate, and the target's forward passes never use it. rq_mtp_load makes it a model
+// of its own (an MTP view: RqModel.mtp_of, the drafter of TODO S9), which converts these matrices into its own buffer
+// and copies the norms. The matrices are as gguf_matrix maps them (b, type in the mapping; Q8_0, the K-quants, the
+// i-quants), the norms point into the mapping
 typedef struct {
     int layer;                  // blk.<layer>: the block's index in the file (= Config.n_layers), -1 if none
     QuantizedTensor wq, wk, wv, wo, w1, w2, w3; // attn_q ([q | gate] per head), attn_k / v, attn_output, ffn_gate / down / up
@@ -164,6 +167,9 @@ typedef struct {
     float *ssm_a;          // (nv): -exp(A_log)
     float *ssm_dt;         // (nv): the dt bias
     float *ssm_norm;       // (dv): the gated RMSNorm's weight (shared by the heads)
+    // an MTP view's input (rq_mtp_load; NULL otherwise): x = eh_proj [rmsnorm(embedding, enorm) | rmsnorm(h, hnorm)]
+    QuantizedTensor *eh_proj; // (dim, 2 dim)
+    float *enorm, *hnorm;  // (dim) each
     // one allocation holding the matmul weights converted at load (prepare_weights): VNNI build:
     // repacked (QuantizedTensor.p); generic kernels on a GGUF file: q / s arrays; else NULL
     uint8_t *packed;
@@ -242,7 +248,8 @@ struct RqModel {
     float rope_log_theta;       // (float)ln(rope_theta), the form rope_row uses
     int rope_dim;               // rotated dims per head (Qwen3: head_dim; Qwen3.5: 64 of 256, the rest passes through)
     Hybrid hy;                  // Qwen3.5's hybrid layers (hy.on), else all 0
-    MtpBlock mtp;               // an MTP block (mtp.layer >= 0; with weights only), not used by the forward passes
+    MtpBlock mtp;               // an MTP block (mtp.layer >= 0; with weights only), not used by the model's forward passes
+                                // (an MTP view's: rq_mtp_load)
     int n_attn;                 // attention layers: the KV cache's layers (Qwen3: n_layers)
     int *kv_layer;              // [n_layers]: the layer's attention layer index (KV cache, attention weights), or -1
     int *lin_layer;             // [n_layers]: the layer's linear-attention layer index (state, weights), or -1
@@ -258,6 +265,18 @@ struct RqModel {
     // .template.with-system[-and-thinking]); tmpl_missing: the .bin side file that could not be read
     char user_tmpl[2][TMPL_MAX], sys_tmpl[2][TMPL_MAX];
     char tmpl_missing[2][TMPL_MAX + 64];
+    // MTP views (rq_mtp_load: the MTP block as a one-layer model; model.c): mtp_of is the target (NULL for a loaded file),
+    // whose mapping, GGUF directory, tokenizer, token_embd and classifier the view shares (borrowed: never freed by it);
+    // its own: the block's converted matrices (weights.wq .. w3 of one layer, eh_proj), its norms, the layer maps
+    const RqModel *mtp_of;
+    int borrowed;
+    int gated;                  // the attention's output gate ([q | gate] per head in attn_q): hy.on for a loaded file, 1 for a view
+    // the classifier rows a view computes (RqMtpOpts.vocab): cls_n[1] == 0: all of them (the model's own path); else
+    // rows cls_lo[r] .. cls_lo[r] + cls_n[r] - 1 for r = 0, 1 (whole 16-row blocks; cls_lo[0] = 0, the second range
+    // ends at vocab_size), each as a matrix of its own (cls_part: wcls's repacked rows from there on); the others -inf
+    int cls_n[2], cls_lo[2];
+    QuantizedTensor cls_part[2];
+    char *path;                 // the file (a copy: rq_mtp_load reads the block from it), NULL for a view
 };
 
 // floats of a thread's attention score scratch for the batched passes (forward.c's attention_kv / attention_part,
@@ -311,6 +330,11 @@ int forward_model_init(RqModel *m); // the derived shape parameters; 0 if the sh
 
 // forward.c: pre-fault the KV cache blocks of positions 0..n-1 of item it (attention layer it / 2, K / V: it % 2)
 void seq_kv_populate(const RqSeq *s, int n, int it);
+// forward.c: rq_prefill (its chunking: token by token through the decode path if the context's max_batch <= 1, else
+// rq_forward_batch chunks) with every row's final hidden state into hidden (n x dim floats; NULL: none) and an MTP
+// view's h input rows h_in (n x dim; NULL: zeros; RQ_ERR_ARG on another model): the same logits, cache and state as
+// without them (the speculative loop's MTP drafter, spec.c; tests/api_test.c --mtp)
+int fw_rows(RqCtx *c, RqSeq *s, const int *tokens, int n, int mode, float *out, float **logits, float *hidden, const float *h_in);
 
 // ------------------------------------------------------------------------------------- a sequence
 

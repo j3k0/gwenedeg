@@ -1,12 +1,14 @@
 /* mem_probe: the load-time memory estimate (rq_model_mem) against the measured memory, and the model file's page
  * cache after the load (TODO P4; tests/README.md, Memory). Linux (/proc/self/status, mincore).
- *   build/mem_probe MODEL CTX [--cold] [--page-cache auto|drop|keep] [-k f16|bf16|f32]
+ *   build/mem_probe MODEL CTX [--cold] [--page-cache auto|drop|keep] [-k f16|bf16|f32] [--mtp]
  * Loads MODEL with a context of CTX positions (no memory check), then prints one line: the load time, the
  * estimate's parts, the peak RSS of the load (VmHWM) against weights + runtime, the file's bytes in the page cache
  * after the load (mincore of a fresh mapping), and the peak RSS after filling a sequence of CTX positions (a prefill
  * in chunks of 512, the last 8 decoded; for Qwen3.5 with its checkpoints taken) against the whole estimate.
- * --cold: drops the file's page cache first (posix_fadvise DONTNEED: clean pages nobody maps). Threads:
- * OMP_NUM_THREADS. `make mem-probe` builds it */
+ * --cold: drops the file's page cache first (posix_fadvise DONTNEED: clean pages nobody maps). --mtp: then the model's
+ * MTP block as a model of its own (rq_mtp_load, TODO S9) with a context and a sequence of CTX positions filled the
+ * same way (h input zeros): a second line, its estimate against the growth of the RSS (VmRSS before / after; the
+ * estimate does not count what it shares with the model). Threads: OMP_NUM_THREADS. `make mem-probe` builds it */
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <stdio.h>
@@ -48,13 +50,14 @@ static double cached_mib(const char *path) {
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: mem_probe MODEL CTX [--cold] [--page-cache auto|drop|keep] [-k f16|bf16|f32]\n");
+        fprintf(stderr, "usage: mem_probe MODEL CTX [--cold] [--page-cache auto|drop|keep] [-k f16|bf16|f32] [--mtp]\n");
         return 2;
     }
     const char *path = argv[1];
-    int ctx = atoi(argv[2]), cold = 0, page_cache = 0, kv = RQ_KV_DEFAULT;
+    int ctx = atoi(argv[2]), cold = 0, page_cache = 0, kv = RQ_KV_DEFAULT, mtp = 0;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--cold")) cold = 1;
+        else if (!strcmp(argv[i], "--mtp")) mtp = 1;
         else if (!strcmp(argv[i], "--page-cache") && i + 1 < argc) {
             const char *v = argv[++i];
             page_cache = !strcmp(v, "drop") ? 1 : !strcmp(v, "keep") ? -1 : 0;
@@ -95,6 +98,27 @@ int main(int argc, char **argv) {
            "context full %.1f MiB (estimate %+.1f%%)\n",
            path, cap, tl, mm.weights / M, mm.runtime / M, mm.seq.total / M, mm.seq.kv / M, mm.seq.state / M, mm.seq.checkpoints,
            mm.total / M, h0, 100.0 * ((mm.weights + mm.runtime) / M - h0) / h0, c0, c1, h1, 100.0 * (mm.total / M - h1) / h1);
+    if (mtp) { // the MTP view: its estimate (f16 KV, as rq_mtp_load checks) against the RSS it adds
+        double r0 = status_mib("VmRSS"), t1 = rq_now();
+        RqMtpOpts mo = { 0, -1 };
+        RqModel *v = rq_mtp_load(m, &mo, err, sizeof err);
+        if (!v) { fprintf(stderr, "%s\n", err); return 1; }
+        double tv = rq_now() - t1;
+        RqModelMem vm;
+        rq_model_mem(v, &vm);
+        RqSeq *vs = rq_seq_new(v, 0, RQ_KV_F16, &e);
+        RqCtx *vc = rq_ctx_new(v, RQ_BATCH_MAX, 0, &e);
+        if (!vs || !vc) { fprintf(stderr, "out of memory\n"); return 1; }
+        if (rq_prefill(vc, vs, tok, n, RQ_LOGITS_LAST, NULL, NULL) != RQ_OK) { fprintf(stderr, "MTP prefill failed\n"); return 1; }
+        for (int i = n; i < cap; i++) rq_decode(vc, vs, tok[i], NULL);
+        double r1 = status_mib("VmRSS");
+        printf("%s, ctx %d, MTP block: load %.2f s | estimate MiB: weights %.1f, runtime %.1f, sequence %.1f, total %.1f | RSS growth "
+               "%.1f MiB (estimate %+.1f%%)\n", path, cap, tv, vm.weights / M, vm.runtime / M, vm.seq.total / M, vm.total / M, r1 - r0,
+               100.0 * (vm.total / M - (r1 - r0)) / (r1 - r0));
+        rq_ctx_free(vc);
+        rq_seq_free(vs);
+        rq_model_free(v);
+    }
     free(tok);
     rq_ctx_free(c);
     rq_seq_free(s);

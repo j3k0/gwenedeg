@@ -396,7 +396,13 @@ FAMILY = [
     # (IQ_MINI). Measured vs the golden: cos mean 0.99994-0.99998, min 0.99989, top-1 62/62 (the int8 activations only);
     # the entry takes ~12 min (8 threads), most of it the generic build's kernels runs
     ("saluki-27b", "Underdog-Saluki-27B-1.0-GGUF/Underdog-Saluki-27B-1.0-IQ2-mix.gguf", "qwen3.8", [("saluki-27b", "ref")]),
+    # Qwen3.5-0.8B with its MTP block kept (scripts/make_mtp_08b.sh, TODO S9.0b; docs/qwen38-speculative.md): the MTP
+    # drafter's checks only (MTP_ONLY: the block vs tests/ref_qwen35.py's mtp_forward, its teacher-forced top-1; its main
+    # model is the Q8_0 file's but 7 ssm_a ulps, covered by 3.5-0.8b-q8)
+    ("3.5-0.8b-mtp", "Qwen3.5-0.8B-MTP-GGUF/Qwen3.5-0.8B-mtp-Q8_0.gguf", "qwen3.5", []),
 ]
+# FAMILY tags with only the MTP checks (mtp_ref_run; their thresholds: MTP_TH)
+MTP_ONLY = {"3.5-0.8b-mtp"}
 # files checked against MemAvailable first (runq's own estimate at the default context, api_test's, + BIG_MARGIN GiB
 # for the logits files in TMPDIR and the server's slots): skipped with a note if it does not fit. Their runs go one
 # at a time (the models group runs its files in turn); GWENEDEG_TEST_MEM (GiB) stands in for MemAvailable
@@ -572,6 +578,14 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
         t0 = time.time()
         d = os.path.join(tmp, "models", tag)
         os.makedirs(d, exist_ok=True)
+        if tag in MTP_ONLY:
+            if not a.api_test:
+                print(f"      {tag}: skipped (no api_test)")
+                continue
+            for ok, name, det in mtp_ref_run(a, model, d, texts, f"{prefix}/{tag}", *MTP_TH[tag], nd):
+                res.report(ok, name, det)
+            print(f"      ({tag}: {time.time() - t0:.1f} s)")
+            continue
 
         def lf(name, chunk, threads=nd, runq=a.runq, sfx=""):
             path = os.path.join(d, f"{name}_b{chunk}_t{threads}{sfx}.bin")
@@ -821,6 +835,109 @@ def q35_bf16_run(a, d, tmp, texts):
         ok = p.returncode == 1 and "tensor blk.0.ffn_gate.weight has ggml type 30, need Q8_0 (8)" in err and "BF16" not in err
         out.append((ok, "q35/synth/bad_bf16_role", f"BF16 ffn_gate refused (BF16 only for ssm_alpha / ssm_beta): exit status "
                     f"{p.returncode}: {err[-200:]!r}"))
+    return out
+
+
+# The MTP drafter (TODO S9a): the MTP view (rq_mtp_load) teacher-forced on a prompt (api_test --mtp-dump: the target's
+# hidden rows, shifted by one, as its h input) vs tests/ref_qwen35.py's mtp_forward on the file (cos / top-1 over a
+# 4,096-row classifier subset, as logits_ref), and for a trained block its top-1 at row q vs the prompt's token q + 1.
+# synth-q35-27b-mtp / -f32 (the block cut out of the 0.8B, untrained: its top-1 vs the next token is ~0) measured cos
+# mean 0.99924 / 0.99866 / 0.99799 (en, code, long2), min 0.98802, top-1 305/338 (-f32: 0.99928 / 0.99858 / 0.99802,
+# 0.99245, 302/338): the int8 activations, as the main model's logits_ref; bounds ~2x the error. The four mutations
+# of tests/README.md (concat swapped, h before output_norm, no hnorm, h unshifted) fail them. The real 0.8B-mtp
+# (models group tag 3.5-0.8b-mtp): cos mean 0.99975 / 0.99970 / 0.99969, min 0.99857, top-1 324/338; top-1 vs the next
+# token 0.529 on all (45/85), 0.828 on long2 (246/297: it repeats all), bounds ~0.75x
+TH_MTP_SYNTH = dict(cos_mean=0.996, cos_pos=0.975, top1=0.8)
+TH_MTP_08B = dict(cos_mean=0.9994, cos_pos=0.997, top1=0.85)
+MTP_TOP1 = {"all": 0.40, "long2": 0.62}
+MTP_TH = {"3.5-0.8b-mtp": (TH_MTP_08B, MTP_TOP1)}  # (MTP_ONLY's: thresholds, top-1 minimums)
+
+
+def mtp_dump(api_test, model, text, path, threads, chunk=64):
+    """api_test --mtp-dump: the MTP view's logits teacher-forced on text (runq -m logits' format) into path"""
+    tp = path + ".txt"
+    with open(tp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    p = run([api_test, "--mtp-dump", model, tp, path, "-b", str(chunk)], threads)
+    os.remove(tp)
+    if p.returncode != 0:
+        raise RuntimeError(f"api_test --mtp-dump failed: {p.stderr.decode(errors='replace')[-400:]}")
+    return path
+
+
+def mtp_ref_run(a, model, tmp, texts, pre, th, top1=None, threads=SYNTH_THREADS):
+    """the MTP block of model vs the numpy reference (pre/mtp_ref/*) and, for a trained block, its top-1 vs the next token
+    (top1: {prompt: min fraction}, pre/mtp_top1/*): [(ok, name, detail)]. The logits files are reduced to the reference's
+    classifier rows and the top-1 hits, then removed"""
+    import ref_qwen35 as R35
+    out = []
+    f = G.GgufFile(model)
+    sub = np.sort(np.random.default_rng(0).choice(f.tensors["token_embd.weight"][0][1], 4096, replace=False))
+    got = {}
+    for n in dict.fromkeys(Q35_SYNTH_REF + list(top1 or {})):
+        path = os.path.join(tmp, f"mtp_{os.path.basename(model)[:-5]}_{n}.bin")
+        try:
+            mtp_dump(a.api_test, model, texts[n], path, threads)
+        except RuntimeError as e:
+            return [(False, f"{pre}/mtp_ref/{n}", str(e))]
+        ids, lg = read_logits(path)
+        hit = lg[:-1].argmax(1) == ids[1:]
+        got[n] = (ids, lg[:, sub].copy(), bool(np.isfinite(lg[:, sub]).all()), int(hit.sum()), len(hit))
+        del lg
+        os.remove(path)
+    w = R35.GgufWeights(f)
+    with np.errstate(all="ignore"):
+        _, xs = R35.forward(w, [got[n][0].tolist() for n in Q35_SYNTH_REF], rows=sub[:1], hidden=True)
+        refs = R35.mtp_forward(w, [got[n][0].tolist() for n in Q35_SYNTH_REF], xs, rows=sub)
+    t1 = []
+    for n, ref in zip(Q35_SYNTH_REF, refs):
+        ids, lg, finite = got[n][:3]
+        if not finite:
+            out.append((False, f"{pre}/mtp_ref/{n}", "non-finite logits"))
+            continue
+        c = cos_rows(lg, ref)
+        top = lg.argmax(1) == ref.argmax(1)
+        t1.extend(top.tolist())
+        why = []
+        if not c.mean() >= th["cos_mean"]: why.append(f"cos mean < {th['cos_mean']}")
+        if not c.min() >= th["cos_pos"]: why.append(f"cos min < {th['cos_pos']} at pos {int(c.argmin())}")
+        out.append((not why, f"{pre}/mtp_ref/{n}", f"n={len(ids)}: the MTP block's logits (h = the target's, shifted by one) "
+                    f"vs ref_qwen35.mtp_forward: cos mean {c.mean():.5f} min {c.min():.5f}, top1 {int(top.sum())}/{len(top)}"
+                    + ("  <- " + "; ".join(why) if why else "")))
+    if t1:
+        out.append((bool(np.mean(t1) >= th["top1"]), f"{pre}/mtp_ref/top1_pooled", f"{int(np.sum(t1))}/{len(t1)} (min {th['top1']})"))
+    for n, mn in (top1 or {}).items():
+        k, m = got[n][3:5]
+        out.append((k >= mn * m, f"{pre}/mtp_top1/{n}", f"teacher-forced: the MTP's top-1 at row q == the prompt's token q + 1 at "
+                    f"{k}/{m} rows ({k / m:.3f}, min {mn})"))
+    return out
+
+
+def q35_mtp_api_run(a, d):
+    """api_test --mtp on synth-q35-27b-mtp.gguf (hidden_rows, mtp_paths, mtp_load: the hidden rows and the MTP view on
+    every path; refusals: synth-q35-27b.gguf (no block), synth-q35-27b-mtpbad.gguf (an optional nextn tensor)); its
+    digest at 3 threads (--quick) and of the generic build (--quick, which passes too) == its: [(ok, name, detail)]"""
+    import re
+    mtp, base, bad = (os.path.join(d, f"synth-q35-27b{x}.gguf") for x in ("-mtp", "", "-mtpbad"))
+    if not (a.api_test and os.path.exists(mtp)):
+        return []
+    dig = lambda p: (re.findall(r"^mtp digest: ([0-9a-f]+)$", p.stdout.decode(errors="replace"), re.M) or [None])[0]  # noqa: E731
+    lines = lambda p: [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]  # noqa: E731
+    p = run([a.api_test, "--mtp", mtp] + [x for f, o in ((base, "--plain"), (bad, "--optional")) if os.path.exists(f) for x in (o, f)],
+            SYNTH_THREADS)
+    out = [(l.startswith("PASS "), f"q35/synth/{l[5:].partition('  ')[0].strip()}", l[5:].partition("  ")[2].strip()) for l in lines(p)]
+    if p.returncode not in (0, 1) or not out or dig(p) is None:
+        out.append((False, "q35/synth/mtp_api", f"exit status {p.returncode}: {(p.stdout + p.stderr).decode(errors='replace')[-300:]}"))
+    for exe, th, name in ((a.api_test, 3, "threads"), (a.api_test + "-generic", SYNTH_GEN_THREADS, "generic")):
+        if not os.path.exists(exe):
+            continue
+        q = run([exe, "--mtp", mtp, "--quick"], th)
+        ls = lines(q)
+        bad_ = [l[5:].split("  ")[0] for l in ls if l.startswith("FAIL ")]
+        ok = q.returncode == 0 and ls and not bad_ and dig(q) is not None and dig(q) == dig(p)
+        out.append((ok, f"q35/synth/mtp_digest_{name}", f"{'the generic build' if name == 'generic' else 'the AVX-512 build'}, {th} "
+                    f"threads, --quick: digest {dig(q)} == {dig(p)} ({SYNTH_THREADS} threads), {len(ls) - len(bad_)}/{len(ls)} passed"
+                    + (f"; failed: {', '.join(bad_)}" if bad_ else "")))
     return out
 
 
@@ -1113,7 +1230,9 @@ def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
     synth = [ex.submit(q35_synth_run, a, os.path.join(t, "synth"), os.path.join(sd, fn), texts, full)
              for fn, full in Q35_SYNTH.items() if os.path.exists(os.path.join(sd, fn))] + [ex.submit(q35_bad_run, a, sd)] + \
         [ex.submit(q35_mtp_run, a, sd, os.path.join(t, "synth"), texts), ex.submit(q35_server38, a, sd),
-         ex.submit(q35_bf16_run, a, sd, os.path.join(t, "synth"), texts)] + \
+         ex.submit(q35_bf16_run, a, sd, os.path.join(t, "synth"), texts), ex.submit(q35_mtp_api_run, a, sd)] + \
+        [ex.submit(mtp_ref_run, a, os.path.join(sd, fn), os.path.join(t, "synth"), texts, f"q35/{fn[:-5]}", TH_MTP_SYNTH)
+         for fn in ("synth-q35-27b-mtp.gguf", "synth-q35-27b-f32.gguf") if a.api_test and os.path.exists(os.path.join(sd, fn))] + \
         [ex.submit(render_run, a.runq, os.path.join(sd, fn), "qwen3.8", f"q35/synth/render_{fn[10:-5]}")
          for fn in ("synth-tok-qwen3.8.gguf", "synth-tok-qwen3.8-hf.gguf")] + \
         ([ex.submit(q35_two_run, a, sd)] if a.api_test else []) if sd else []

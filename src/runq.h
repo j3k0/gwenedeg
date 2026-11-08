@@ -81,6 +81,26 @@ typedef struct {
 RqModel *rq_model_load(const char *path, const RqModelOpts *opts, char *err, size_t errlen);
 void rq_model_free(RqModel *m);
 
+// The MTP (multi-token prediction) block of a loaded qwen35 model (nextn_predict_layers 1: blk.<n_layers>, e.g.
+// Qwen3.8-27B's blk.64) as a model of its own, for the speculative loop's guesses (TODO S9, docs/qwen38-speculative.md):
+// one gated full-attention layer whose input row is eh_proj([enorm(embedding) | hnorm(h)]), h = the target's final
+// hidden state at the previous position (RqSegment.hidden of the target's pass, given as the view's RqSegment.h_in),
+// and whose output goes through shared_head_norm and the target's classifier: row q (token x_q, h_{q-1}) predicts
+// x_{q+1}. Its block is converted here (the target's load only validated it, and its estimate does not count it). It
+// shares the target's mapping, tokenizer, token_embd and classifier: free its contexts, sequences and the view itself
+// before the target. rq_seq_* / rq_ctx_* / the forward passes / seqfile take it as any model (its sequences: one
+// attention layer's KV cache, truncatable anywhere); rq_model_info: n_layers 1, linear_layers 0, a fingerprint of its
+// own; rq_model_mem: the block's weights, a context's buffers and one sequence (not the target's tokenizer / metadata).
+// NULL with the reason in err ("no MTP block", "optional MTP tensors (nextn.embed_tokens / shared_head_head) not
+// supported", the memory estimate as rq_model_load's)
+typedef struct {
+    int vocab;   // classifier rows 0..vocab-1 and the added tokens (the tokenizer's first added id..vocab_size-1), both
+                 // rounded out to 16-row blocks; the logits of the other rows are -inf. 0 (or a vocab reaching the
+                 // added ones): all
+    double mem;  // as RqModelOpts.mem: the view's estimate must fit in this many GiB; 0 = MemAvailable, < 0 = no check
+} RqMtpOpts;
+RqModel *rq_mtp_load(const RqModel *target, const RqMtpOpts *o, char *err, size_t errlen);
+
 typedef struct {
     int dim, hidden_dim, n_layers, n_heads, n_kv_heads, head_dim, vocab_size;
     int seq_len;           // context length (the ctx_len cap applied)
@@ -276,11 +296,18 @@ int rq_prefill(RqCtx *c, RqSeq *s, const int *tokens, int n, int mode, float *ou
 // at most max_batch rows in total. Each segment selects its logits rows (none, the last, all); the
 // selected rows' logits go to out in row order (rows x vocab_size floats); with exactly one row
 // selected and out == NULL, to the context's buffer. *logits (if not NULL) = where they went
+// Each segment may also ask for every row's final hidden state (hidden) and, on an MTP view's sequence (rq_mtp_load),
+// give each row's h input (h_in)
 typedef struct {
     RqSeq *seq;
     const int *tokens;
     int n;
     int logits; // RQ_LOGITS_NONE / LAST / ALL
+    float *hidden;      // optional: every row's final hidden state (after the final norm: output_norm for a model,
+                        // shared_head_norm for an MTP view; the row the logits are computed from), n x dim floats;
+                        // NULL: none. Independent of logits (the logits, cache and state are the same either way)
+    const float *h_in;  // an MTP view's sequence: per row the target's final hidden state at the previous position
+                        // (n x dim floats); NULL: zeros. Must be NULL for other models (RQ_ERR_ARG)
 } RqSegment;
 int rq_forward_batch(RqCtx *c, const RqSegment *seg, int nseg, float *out, float **logits);
 

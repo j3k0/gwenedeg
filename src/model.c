@@ -211,7 +211,7 @@ static size_t norm_floats(const RqModel *m) {
     const Config *p = &m->config;
     const Hybrid *hy = &m->hy;
     return (size_t)2 * p->n_layers * p->dim + p->dim + (size_t)2 * m->n_attn * p->head_dim +
-           (size_t)hy->n_lin * (hy->conv * hy->conv_dim + 2 * hy->nv + hy->dv);
+           (size_t)hy->n_lin * (hy->conv * hy->conv_dim + 2 * hy->nv + hy->dv) + (m->mtp_of ? (size_t)2 * p->dim : 0); // (a view: + enorm, hnorm)
 }
 
 static void gguf_copy_norms(RqModel *m) {
@@ -341,6 +341,13 @@ static int prep_mats(const RqModel *m, PrepMat *mt) {
     const Hybrid *hy = &m->hy;
     int L = p->n_layers, dim = p->dim, hid = p->hidden_dim, NA = m->n_attn, NL = hy->n_lin;
     int qd = p->n_heads * p->head_dim, kvd = p->n_kv_heads * p->head_dim;
+    if (m->mtp_of) { // an MTP view: its block's 7 matrices and eh_proj (token_embd and the classifier are the target's)
+        PrepMat v[] = {
+            { w->wq, 1, p->n_heads * m->qh, dim }, { w->wk, 1, kvd, dim }, { w->wv, 1, kvd, dim }, { w->wo, 1, dim, qd },
+            { w->w1, 1, hid, dim }, { w->w2, 1, dim, hid }, { w->w3, 1, hid, dim }, { w->eh_proj, 1, dim, 2 * dim } };
+        memcpy(mt, v, sizeof(v));
+        return sizeof(v) / sizeof(v[0]);
+    }
     PrepMat t[] = {
         { w->wq, NA, p->n_heads * m->qh, dim }, { w->wk, NA, kvd, dim }, { w->wv, NA, kvd, dim }, { w->wo, NA, dim, qd },
         { w->w1, L, hid, dim }, { w->w2, L, dim, hid }, { w->w3, L, hid, dim }, { w->wcls, 1, p->vocab_size, dim },
@@ -660,8 +667,11 @@ static void model_mem(RqModel *m, int kv_type, int ck) {
     size_t V = m->config.vocab_size, cap = 1;
     while (cap < 2 * V) cap <<= 1;
     size_t meta = m->is_gguf ? m->gguf.data_off : 16 * V;
-    o->runtime = V * (sizeof(char *) + 3 * sizeof(int)) + cap * 8 + 2 * meta +
-                 ctx_mem(m, RQ_BATCH_MAX, m->config.seq_len, rq_threads()) + ((size_t)8 << 20);
+    if (m->mtp_of) // (an MTP view: a context only; the tokenizer, the metadata and the process are the target's)
+        o->runtime = ctx_mem(m, RQ_BATCH_MAX, m->config.seq_len, rq_threads());
+    else
+        o->runtime = V * (sizeof(char *) + 3 * sizeof(int)) + cap * 8 + 2 * meta +
+                     ctx_mem(m, RQ_BATCH_MAX, m->config.seq_len, rq_threads()) + ((size_t)8 << 20);
     seq_mem(m, m->config.seq_len, kv_type, ck, &o->seq);
     o->total = o->weights + o->runtime + o->seq.total;
 }
@@ -894,6 +904,9 @@ static void load_model(RqModel *m, const char *path, const RqModelOpts *o, Loade
     LoadErr *e = &ld->e;
     FILE *file = ld->file = fopen(path, "rb");
     if (!file) load_fail(e, "Couldn't open checkpoint %s", path);
+    size_t pl = strlen(path) + 1; // (a copy: rq_mtp_load opens the file again)
+    if (!(m->path = malloc(pl))) load_fail(e, "malloc failed!");
+    memcpy(m->path, path, pl);
     int64_t size = file_size_of(file);
     if (size < 256) load_fail(e, "File %s is too small for a checkpoint", path);
     void *map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fileno(file), 0);
@@ -941,6 +954,7 @@ static void load_model(RqModel *m, const char *path, const RqModelOpts *o, Loade
         c->seq_len = o->ctx_len;
     else if (o->ctx_len == 0 && c->seq_len > RQ_CTX_DEFAULT_MAX) // (Qwen3: 40,960 = the cap; 2507: 262,144)
         c->seq_len = RQ_CTX_DEFAULT_MAX;
+    m->gated = m->hy.on; // (Qwen3.5's attention layers are gated)
     if (!forward_model_init(m))
         load_fail(e, "unsupported model shape (heads %d / %d, head_dim %d, dim %d, hidden %d, GS %d%s)", c->n_heads,
                   c->n_kv_heads, c->head_dim, c->dim, c->hidden_dim, GS, m->hy.on ? ", linear attention" : "");
@@ -1025,6 +1039,22 @@ void rq_model_free(RqModel *m) {
     if (!m) return;
     TransformerWeights *w = &m->weights;
     if (m->gs_counted) gs_models--;
+    if (m->borrowed) { // an MTP view: its own parts only (never the target's: it may be gone already)
+        free(w->wq);
+        free(w->wk);
+        free(w->wv);
+        free(w->wo);
+        free(w->w1);
+        free(w->w2);
+        free(w->w3);
+        free(w->eh_proj);
+        free_big(w->packed, w->packed_size);
+        free(w->norms);
+        free(m->kv_layer);
+        free(m->lin_layer);
+        free(m);
+        return;
+    }
     {
         free(w->q_tokens);
         free(w->wq);
@@ -1049,7 +1079,184 @@ void rq_model_free(RqModel *m) {
     free(m->lin_layer);
     free_tokenizer(&m->tok);
     unmap_file(m);
+    free(m->path);
     free(m);
+}
+
+// ---------------------------------------------------------------------------- the MTP block as a model
+
+static QuantizedTensor rows_from(const QuantizedTensor *t, int r0, int k) {
+    // the converted matrix t (k columns) from row r0 on (a multiple of 16) as a matrix of its own: the same buffer from
+    // there (the repacked layouts are whole 16-row blocks one after the other; the generic Q8_0 arrays row by row)
+    QuantizedTensor s = *t;
+    size_t rb = (size_t)r0 / 16;
+    s.b = NULL; // (the file's blocks: not used by the kernels)
+    if (t->kp)
+        s.kp = t->kp + rb * (k / QK_K) * lq_sb_bytes(t->type);
+#ifdef RUNQ_Q8X
+    else if (t->p)
+        s.p = t->p + rb * (k / GS) * Q8X_GROUP(GS);
+#endif
+    else {
+        s.q = t->q + (size_t)r0 * k;
+        s.s = t->s + (size_t)r0 * (k / GS);
+    }
+    return s;
+}
+
+typedef struct { LoadErr e; FILE *file; } MtpLoader; // (the file opened to read the block, closed after a failure too)
+
+static void mtp_build(RqModel *v, const RqMtpOpts *o, MtpLoader *ld) {
+    // the view's own parts (rq_mtp_load; v is a copy of the target with the shared parts): the layer maps, the block's
+    // matrices (from the target's MtpBlock: validated at its load), the shape parameters, the classifier ranges, the
+    // memory check, then (the first tensor data read) the norms and the conversion of the 8 matrices
+    LoadErr *e = &ld->e;
+    const RqModel *t = v->mtp_of;
+    const MtpBlock *x = &t->mtp;
+    TransformerWeights *w = &v->weights;
+    const Config *p = &v->config;
+    int dim = p->dim, hd = p->head_dim, V = p->vocab_size;
+    const char *path = t->path ? t->path : "model";
+    if (!(v->kv_layer = malloc(sizeof(int))) || !(v->lin_layer = malloc(sizeof(int)))) load_fail(e, "malloc failed!");
+    v->kv_layer[0] = 0;
+    v->lin_layer[0] = -1;
+    QuantizedTensor **dst[] = { &w->wq, &w->wk, &w->wv, &w->wo, &w->w1, &w->w2, &w->w3, &w->eh_proj };
+    const QuantizedTensor *src[] = { &x->wq, &x->wk, &x->wv, &x->wo, &x->w1, &x->w2, &x->w3, &x->eh_proj };
+    for (size_t i = 0; i < sizeof(dst) / sizeof(dst[0]); i++) {
+        if (!(*dst[i] = calloc(1, sizeof(QuantizedTensor)))) load_fail(e, "malloc failed!");
+        (*dst[i])->b = src[i]->b;
+        (*dst[i])->type = src[i]->type;
+        if (src[i]->type != GGML_Q8_0) v->kq = 1; // (the target's kq covers its embedding and classifier)
+    }
+    if (!forward_model_init(v)) load_fail(e, "%s: MTP block of an unsupported shape", path);
+    if (v->xs < 2 * dim) v->xs = 2 * dim; // (the input row [e | h] in the batched xb / xq rows and decode's xb / xq)
+    // the classifier rows (RqMtpOpts.vocab): [0, vocab) and the added tokens, in whole 16-row blocks
+    v->cls_n[0] = V;
+    v->cls_lo[0] = v->cls_lo[1] = v->cls_n[1] = 0;
+    if (o->vocab < 0) load_fail(e, "bad MTP vocabulary %d", o->vocab);
+    if (o->vocab > 0) {
+        if (!t->has_tok) load_fail(e, "%s: an MTP vocabulary subset needs the tokenizer (its added tokens)", path);
+        int first = V;
+        for (int i = 0; i < t->tok.n_added; i++)
+            first = t->tok.added[i] < first ? t->tok.added[i] : first;
+        int hi = o->vocab < V ? (o->vocab + 15) / 16 * 16 : V, lo1 = first / 16 * 16;
+        if (hi < lo1) {
+            v->cls_n[0] = hi;
+            v->cls_lo[1] = lo1;
+            v->cls_n[1] = V - lo1;
+            for (int r = 0; r < 2; r++)
+                v->cls_part[r] = rows_from(w->wcls, v->cls_lo[r], dim);
+        }
+    }
+    // the memory check (RqMtpOpts.mem; a sequence of the context length, f16), before any of the block is read
+    RqModelMem *mm = &v->mem;
+    model_mem(v, KV_F16, 0);
+    double avail = o->mem < 0 ? -1 : o->mem > 0 ? o->mem * 1073741824.0 : rq_mem_available();
+    if (avail >= 0) {
+        mm->budget = avail;
+        mm->budget_src = o->mem > 0 ? 2 : 1;
+        char what[96];
+        snprintf(what, sizeof(what), o->mem > 0 ? "the budget of %.2f GiB" : "MemAvailable (%.2f GiB)", GIB(avail));
+        if ((double)mm->total > avail)
+            load_fail(e, "%s: the MTP block needs ~%.2f GiB (weights %.2f, runtime %.2f, a sequence of %d positions: KV cache "
+                      "%.2f), more than %s: not loaded", path, GIB(mm->total), GIB(mm->weights), GIB(mm->runtime), p->seq_len,
+                      GIB(mm->seq.kv), what);
+    }
+    // the norms (the view's layer 0, its final norm = shared_head_norm, the input's enorm / hnorm)
+    float *f = w->norms = malloc(norm_floats(v) * sizeof(float));
+    if (!f) load_fail(e, "malloc failed!");
+    struct { float **d; const float *s; int n; } nm[] = {
+        { &w->rms_att_weight, x->attn_norm, dim }, { &w->rms_ffn_weight, x->ffn_norm, dim }, { &w->rms_final_weight, x->head_norm, dim },
+        { &w->q_norm_weights, x->q_norm, hd }, { &w->k_norm_weights, x->k_norm, hd }, { &w->enorm, x->enorm, dim }, { &w->hnorm, x->hnorm, dim } };
+    for (size_t i = 0; i < sizeof(nm) / sizeof(nm[0]); i++) {
+        *nm[i].d = f;
+        memcpy(f, nm[i].s, nm[i].n * sizeof(float));
+        f += nm[i].n;
+    }
+    // the matrices, read with pread from the file (else from the mapping: read_at), page cache dropped as at the
+    // target's load by default (a file of >= 1/4 of the RAM)
+    RqModelOpts po = { 0 };
+    ld->file = t->path ? fopen(t->path, "rb") : NULL;
+    prepare_weights(v, ld->file ? fileno(ld->file) : -1, drop_page_cache(t, &po), e, v->warning, sizeof(v->warning));
+    if (ld->file) fclose(ld->file);
+    ld->file = NULL;
+    mem_warn(v);
+}
+
+static int mtp_guarded(RqModel *v0, const RqMtpOpts *o0, MtpLoader *ld0) {
+    // mtp_build with its error exit (as load_guarded): 0 after a load_fail
+    RqModel *volatile v = v0;
+    const RqMtpOpts *volatile o = o0;
+    MtpLoader *volatile ld = ld0;
+    if (setjmp(ld->e.jb))
+        return 0;
+    mtp_build(v, o, ld);
+    return 1;
+}
+
+RqModel *rq_mtp_load(const RqModel *target, const RqMtpOpts *opts, char *err, size_t errlen) {
+    static const RqMtpOpts defaults = { 0, 0 };
+    char dummy[8];
+    if (!err || errlen == 0) {
+        err = dummy;
+        errlen = sizeof(dummy);
+    }
+    err[0] = 0;
+    if (!target || !target->has_weights) {
+        snprintf(err, errlen, "model loaded without weights");
+        return NULL;
+    }
+    const char *path = target->path ? target->path : "model";
+    if (target->mtp_of || target->mtp.layer < 0 || !target->is_gguf) {
+        snprintf(err, errlen, "%s: no MTP block", path);
+        return NULL;
+    }
+    for (int i = 0; i < 2; i++) { // (llama.cpp's optional per-block embedding / head: a layout not handled here)
+        char name[96];
+        snprintf(name, sizeof(name), "blk.%d.nextn.%s.weight", target->mtp.layer, i ? "shared_head_head" : "embed_tokens");
+        if (gguf_tensor(&target->gguf, name)) {
+            snprintf(err, errlen, "%s: optional MTP tensors (nextn.embed_tokens / shared_head_head) not supported (%s)", path, name);
+            return NULL;
+        }
+    }
+    RqModel *v = malloc(sizeof(RqModel));
+    MtpLoader *ld = calloc(1, sizeof(MtpLoader));
+    if (!v || !ld) {
+        free(v);
+        free(ld);
+        snprintf(err, errlen, "malloc failed!");
+        return NULL;
+    }
+    // a copy of the target (config, rope, tokenizer, mapping, GGUF directory, templates, sampling: shared), then the
+    // view's own fields
+    *v = *target;
+    v->mtp_of = target;
+    v->borrowed = 1;
+    v->gs_counted = 0;
+    v->path = NULL;
+    v->warning[0] = 0;
+    memset(&v->weights, 0, sizeof(v->weights));
+    v->weights.q_tokens = target->weights.q_tokens;
+    v->weights.wcls = target->weights.wcls;
+    v->kv_layer = v->lin_layer = NULL;
+    memset(&v->hy, 0, sizeof(v->hy)); // (plain KV cache sequences: no state, no checkpoints)
+    memset(&v->mem, 0, sizeof(v->mem));
+    v->gated = 1;
+    v->config.n_layers = 1;
+    v->n_attn = 1;
+    v->fp = fnv1a64(target->fp, "mtp", 3); // (saved sequences: not the target's)
+    ld->e.msg = err;
+    ld->e.len = errlen;
+    int ok = mtp_guarded(v, opts ? opts : &defaults, ld);
+    if (ld->file) fclose(ld->file);
+    free(ld);
+    if (!ok) {
+        rq_model_free(v);
+        return NULL;
+    }
+    gs_models++; // (a model with weights of the same group size)
+    v->gs_counted = 1;
+    return v;
 }
 
 void rq_model_info(const RqModel *m, RqModelInfo *info) {
@@ -1104,7 +1311,17 @@ int rq_dequant_rows(const RqModel *m, const char *name, size_t nlen, long r0, lo
         { "blk.%d.ssm_out.weight", w->wso, hy->n_lin ? L : 0, m->lin_layer, dim, hy->vdim } };
     const QuantizedTensor *t = NULL;
     int d = 0, k = 0;
-    for (size_t i = 0; i < sizeof(mt) / sizeof(mt[0]) && !t; i++) {
+    if (m->mtp_of) { // an MTP view: its block's matrices only, by their names in the file (blk.<layer>.*)
+        const char *role[] = { "attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_down", "ffn_up", "nextn.eh_proj" };
+        QuantizedTensor *vt[] = { w->wq, w->wk, w->wv, w->wo, w->w1, w->w2, w->w3, w->eh_proj };
+        int vd[] = { p->n_heads * m->qh, kvd, kvd, dim, hid, dim, hid, dim }, vk[] = { dim, dim, dim, qd, dim, hid, dim, 2 * dim };
+        for (int i = 0; i < 8 && !t; i++) {
+            char nm[96];
+            snprintf(nm, sizeof(nm), "blk.%d.%s.weight", m->mtp.layer, role[i]);
+            if (strlen(nm) == nlen && !memcmp(nm, name, nlen)) { t = vt[i]; d = vd[i]; k = vk[i]; }
+        }
+    }
+    for (size_t i = m->mtp_of ? sizeof(mt) / sizeof(mt[0]) : 0; i < sizeof(mt) / sizeof(mt[0]) && !t; i++) {
         if (i == 1 && p->shared_classifier) continue; // (no output.weight: tied)
         for (int l = 0; l < mt[i].n && !t; l++) {
             int li = mt[i].sel ? mt[i].sel[l] : l;

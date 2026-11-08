@@ -25,7 +25,9 @@ static const char *pf_name[PF_N] = { "norm+quant+resid", "gemm qkv", "qk-norm+ro
 
 static void smb_config(RqCtx *c); // (RUNQ_SMB, RUNQ_BD: below)
 
-typedef struct { RqSeq *seq; int b0, n, pos0; } PfSeg; // rows b0..b0+n-1 of a batched pass: seq's positions pos0..
+// rows b0..b0+n-1 of a batched pass: seq's positions pos0..; the segment's logits mode, its hidden rows' output and its
+// MTP view's h input rows (RqSegment.hidden / h_in, NULL: none / zeros)
+typedef struct { RqSeq *seq; int b0, n, pos0, logits; float *hid; const float *hin; } PfSeg;
 
 struct RqCtx {
     RqModel *m;         // (read-only)
@@ -129,7 +131,7 @@ int forward_model_init(RqModel *m) {
     m->all_heads_dim = p->n_heads * p->head_dim;
     m->kv_dim = p->n_kv_heads * p->head_dim;
     m->kv_mul = p->n_heads / p->n_kv_heads;
-    m->qh = (hy->on ? 2 : 1) * p->head_dim;
+    m->qh = (m->gated ? 2 : 1) * p->head_dim;
     m->xs = p->dim > m->all_heads_dim ? p->dim : m->all_heads_dim;
     m->xs = hy->vdim > m->xs ? hy->vdim : m->xs; // (the linear layers' output: the input of their projection)
     m->att_scale = 1.0f / sqrtf(p->head_dim);
@@ -2440,14 +2442,97 @@ static inline QuantizedTensor qsub(QuantizedTensor *t, int i0) {
 #define PH_END rq_publish(S, k_ + 1); } } rq_wait(S, ++k_); }
 #define PH_END_NOEPI PH_EPILOGUE PH_END
 
+// --------------------------------------------------------------------------- MTP views, hidden rows
+
+// An MTP view (rq_mtp_load, TODO S9) runs the passes below as a one-layer model; it differs in its input row and its
+// classifier only (per-phase branches, outside the inner loops):
+//   input: x = eh_proj [rmsnorm(embedding, enorm) | rmsnorm(h, hnorm)] (h: the row's RqSegment.h_in, NULL zeros): the
+//     2 dim input row in decode's xb / xq or the batched xb_b / xq_b row (RqModel.xs >= 2 dim on a view), quantized,
+//     then the eh_proj GEMV / GEMM / rows into x, then layer 0's attention rmsnorm + quantize as for a model's
+//     embedding; one phase more in decode (the GEMV), two in the batched passes
+//   classifier: a subset (RqModel.cls_n[1] != 0): the two row ranges' matrices (cls_part) over their 16-row blocks
+//     one after the other, the other rows -inf (cls_fill, after the pass)
+// The hidden rows (RqSegment.hidden, any model): the row the logits are computed from (the final rmsnorm's output),
+// copied; a row without logits gets its residual and the final rmsnorm only (hidden_row). Each through the same
+// functions in every path, so the bits do not depend on the path
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline)) // (one copy for every path)
+#endif
+static void mtp_in_row(const RqModel *m, float *cat, int token, const float *h) {
+    // an MTP view's input row [rmsnorm(embedding of token, enorm) | rmsnorm(h, hnorm)] (h NULL: zeros), 2 dim floats
+    const TransformerWeights *w = &m->weights;
+    int dim = m->config.dim;
+    embed_row(cat, w->q_tokens, token, dim);
+    rmsnorm(cat, cat, w->enorm, dim);
+    if (h)
+        rmsnorm(cat + dim, (float *)h, w->hnorm, dim);
+    else
+        memset(cat + dim, 0, dim * sizeof(float));
+}
+
+static inline int cls_blocks(const RqModel *m) { return (m->cls_n[0] + 15) / 16 + (m->cls_n[1] + 15) / 16; } // (a subset's)
+
+static void rows_mm(const RqCtx *c, QuantizedTensor *w, float *out, int ldo, QuantizedTensor *x, int ldx, const int32_t *corr,
+                    const float *xf, const int32_t *c16, int nb, int k, int i0, int i1); // (below)
+
+static void cls_sub_rows(const RqCtx *c, float *out, int ldo, QuantizedTensor *x, int ldx, const int32_t *corr, const float *xf,
+                         const int32_t *c16, int nb, int lo, int hi) {
+    // an MTP view's classifier subset, blocks lo..hi-1 of its cls_blocks (range 0's 16-row blocks, then range 1's):
+    // out[b * ldo + i] for their rows i, b < nb (rows_mm on each range's matrix: the GEMV's results)
+    const RqModel *m = c->m;
+    for (int r = 0, b0 = 0; r < 2; r++) {
+        int nbr = (m->cls_n[r] + 15) / 16, a = lo > b0 ? lo - b0 : 0, e = hi - b0 < nbr ? hi - b0 : nbr;
+        if (a < e)
+            rows_mm(c, (QuantizedTensor *)&m->cls_part[r], out + m->cls_lo[r], ldo, x, ldx, corr, xf, c16, nb, m->config.dim,
+                    a * 16, e * 16 < m->cls_n[r] ? e * 16 : m->cls_n[r]);
+        b0 += nbr;
+    }
+}
+
+static void cls_fill(const RqModel *m, float *lg, int n) {
+    // n logits rows of an MTP view's subset: the rows it does not compute -inf (an argmax or softmax over the whole
+    // vocabulary never takes them)
+    int V = m->config.vocab_size;
+    for (int j = 0; j < n; j++)
+        for (int i = m->cls_n[0]; i < m->cls_lo[1]; i++)
+            lg[(size_t)j * V + i] = -INFINITY;
+}
+
+static inline float *row_hidden(const RqCtx *c, int b) {
+    // row b of a batched pass: where its hidden state goes (its segment's RqSegment.hidden), or NULL
+    const PfSeg *s = &c->seg[c->row_seg[b]];
+    return s->hid ? s->hid + (size_t)(b - s->b0) * c->m->config.dim : NULL;
+}
+
+static inline const float *row_hin(const RqCtx *c, int b) {
+    // row b of a batched pass on an MTP view: its h input (RqSegment.h_in), or NULL (zeros)
+    const PfSeg *s = &c->seg[c->row_seg[b]];
+    return s->hin ? s->hin + (size_t)(b - s->b0) * c->m->config.dim : NULL;
+}
+
+static void hidden_row(RqCtx *c, int b) {
+    // after the last layer: row b's hidden state if its segment wants it and the row has no logits (those copy the
+    // normed row they quantize): its residual, then the final rmsnorm into the caller's row (no quantize, no classifier)
+    const PfSeg *s = &c->seg[c->row_seg[b]];
+    float *h = row_hidden(c, b);
+    if (!h || s->logits == RQ_LOGITS_ALL || (s->logits == RQ_LOGITS_LAST && b == s->b0 + s->n - 1)) return;
+    const RqModel *m = c->m;
+    int dim = m->config.dim;
+    float *x = c->x_b + (size_t)b * dim, *xb = c->xb_b + (size_t)b * m->xs;
+    for (int i = 0; i < dim; i++)
+        x[i] += xb[i];
+    rmsnorm(h, x, m->weights.rms_final_weight, dim);
+}
+
 // ---------------------------------------------------------------------------------------- decode
 
-typedef struct { RqCtx *c; RqSeq *s; int pos; float *logits; } DecodeJob;
+typedef struct { RqCtx *c; RqSeq *s; int pos; float *logits, *hidden; } DecodeJob;
 
 // phases of a decode job: per layer 4 (qkv + attention, wo, w1 + w3, w2), the classifier, the KV
-// tile pre-fault every ATT_T positions; dependency counters: per (layer, kv head) its qkv items
-// done, and its attention blocks done
-static int decode_phases(const Config *p) { return 4 * p->n_layers + 2; }
+// tile pre-fault every ATT_T positions (an MTP view: + its eh_proj GEMV); dependency counters: per (layer, kv head) its
+// qkv items done, and its attention blocks done
+static int decode_phases(const RqModel *m) { return 4 * m->config.n_layers + 2 + (m->mtp_of != NULL); }
 static int decode_counters(const RqModel *m) { return 2 * m->config.n_layers * m->config.n_kv_heads + dn_counters(m); }
 
 static void decode_norm(RqCtx *c, const Config *p, const TransformerWeights *w, int l, int resid) {
@@ -2495,8 +2580,15 @@ static void decode_worker(void *arg, int tid, int nt) {
             kv_populate_one(s, p, pos, 1, it);
         PH_END_NOEPI
     }
+    if (m->mtp_of) { // an MTP view: x = eh_proj [e | h] (quantized into xq by decode_step); epilogue: layer 0's rmsnorm + quantize
+        PH_BEGIN(dim / 16, 1)
+            matvec_rows(c->x, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->eh_proj, 2 * dim, lo * 16, hi * 16);
+        PH_EPILOGUE
+            decode_norm(c, p, w, 0, 0);
+        PH_END
+    }
 
-    // forward all the layers (layer 0's attention rmsnorm + quantize: done by decode_step)
+    // forward all the layers (layer 0's attention rmsnorm + quantize: done by decode_step, an MTP view's above)
     for (int l = 0; l < p->n_layers; l++) {
         int al = m->kv_layer[l], li = m->lin_layer[l];
         if (li >= 0) {
@@ -2605,7 +2697,7 @@ static void decode_worker(void *arg, int tid, int nt) {
                     att_combine(ov[r], nb, pv[r], pst, hd);
             }
             att_o_unrot(s->att, ov, kv_mul, hd);
-            if (hy->on)
+            if (m->gated)
                 for (int r = 0; r < kv_mul; r++)
                     attn_gate(ov[r], qv[r] + hd, hd);
             int i0 = g * kv_mul * hd;
@@ -2645,16 +2737,22 @@ static void decode_worker(void *arg, int tid, int nt) {
         PH_END_NOEPI
 
         // final matmul to get the output of the ffn; epilogue: its residual, then the next layer's
-        // attention rmsnorm + quantize (or the final rmsnorm for the classifier; none without logits)
+        // attention rmsnorm + quantize (or the final rmsnorm for the classifier and the hidden state; none without)
         PH_BEGIN(dim / 16, 1)
             matvec_rows(c->xb, &c->hq, c->hq_corr, c->hq_xf, c->hq_c16, w->w2 + l, hidden, lo * 16, hi * 16);
         PH_EPILOGUE
-            if (l + 1 < p->n_layers || job->logits)
+            if (l + 1 < p->n_layers || job->logits || job->hidden)
                 decode_norm(c, p, w, l + 1, 1);
+            if (l + 1 == p->n_layers && job->hidden) // (the normed row in x)
+                memcpy(job->hidden, c->x, dim * sizeof(float));
         PH_END
     }
 
-    if (job->logits) { // classifier into logits
+    if (job->logits && m->cls_n[1]) { // an MTP view's classifier subset
+        PH_BEGIN(cls_blocks(m), 8)
+            cls_sub_rows(c, job->logits, 0, &c->xq, 0, c->xq_corr, c->xq_xf, c->xq_c16, 1, lo, hi);
+        PH_END_NOEPI
+    } else if (job->logits) { // classifier into logits
         int nblk = (p->vocab_size + 15) / 16;
         PH_BEGIN(nblk, 8)
             matvec_rows(job->logits, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wcls, dim, lo * 16,
@@ -2663,9 +2761,10 @@ static void decode_worker(void *arg, int tid, int nt) {
     }
 }
 
-static int decode_step(RqCtx *c, RqSeq *s, int token, float *logits) {
+static int decode_step(RqCtx *c, RqSeq *s, int token, float *logits, float *hidden, const float *h_in) {
     // token at position s->len (checked by the caller); logits NULL skips the final rmsnorm +
     // classifier (prompt tokens whose logits are discarded); the KV cache is filled either way.
+    // hidden: the final hidden state (dim floats) too; h_in: an MTP view's h input (NULL: zeros).
     // One parallel job for the whole token (decode_worker), in phases (threads.h), 4 per layer:
     //   [q, k, v, one item per head, with its QK-norm + RoPE and the K/V cache store; attention per
     //   kv head (once the 4 items of its heads are done: dependency counters) + quantize] ->
@@ -2676,16 +2775,24 @@ static int decode_step(RqCtx *c, RqSeq *s, int token, float *logits) {
     //   (same results)
     const Config *p = &c->m->config;
     int pos = s->len;
-    // the token embedding into x
-    embed_row(c->x, c->m->weights.q_tokens, token, p->dim);
-    rope_row(c->rope, c->m->rope_dim, pos, c->m->rope_log_theta);
-    decode_norm(c, p, &c->m->weights, 0, 0); // layer 0's attention rmsnorm + quantize
+    if (c->m->mtp_of) { // an MTP view: its input row [e | h] into xb, quantized for the eh_proj GEMV (decode_worker)
+        mtp_in_row(c->m, c->xb, token, h_in);
+        quantize(&c->xq, c->xb, 2 * p->dim);
+        matvec_prep(c->xq_corr, c->xq_xf, c->xq_c16, &c->xq, 0, 2 * p->dim);
+        rope_row(c->rope, c->m->rope_dim, pos, c->m->rope_log_theta);
+    } else {
+        // the token embedding into x
+        embed_row(c->x, c->m->weights.q_tokens, token, p->dim);
+        rope_row(c->rope, c->m->rope_dim, pos, c->m->rope_log_theta);
+        decode_norm(c, p, &c->m->weights, 0, 0); // layer 0's attention rmsnorm + quantize
+    }
 
-    if (rq_begin(&c->sync, decode_phases(p), decode_counters(c->m), rq_nthreads(), rq_spin_dec) != 0)
+    if (rq_begin(&c->sync, decode_phases(c->m), decode_counters(c->m), rq_nthreads(), rq_spin_dec) != 0)
         return ctx_fail(c, RQ_ERR_NOMEM, "malloc failed!");
-    DecodeJob job = { c, s, pos, logits };
+    DecodeJob job = { c, s, pos, logits, hidden };
     ck_plan(s, pos, 1);
     rq_parallel(decode_worker, &job);
+    if (logits && c->m->cls_n[1]) cls_fill(c->m, logits, 1);
     s->tokens[pos] = token;
     seq_grow(s, pos + 1);
     ck_done(s);
@@ -2698,7 +2805,7 @@ int rq_decode(RqCtx *c, RqSeq *s, int token, float **logits) {
     if (e != RQ_OK) return e;
     if (token < 0 || token >= c->m->config.vocab_size) return ctx_fail(c, RQ_ERR_ARG, "token %d out of range", token);
     if (s->len >= s->cap) return ctx_fail(c, RQ_ERR_CONTEXT, "sequence full (%d positions)", s->cap);
-    e = decode_step(c, s, token, logits ? c->logits : NULL);
+    e = decode_step(c, s, token, logits ? c->logits : NULL, NULL, NULL);
     if (logits) *logits = e == RQ_OK ? c->logits : NULL;
     return e;
 }
@@ -2726,9 +2833,11 @@ typedef struct {
     int npop;    // segments starting a new KV cache tile (pop_seg)
     int nsp;     // row blocks (single rows) whose attention is split over its blocks (rb_sp, att_sp)
     int nbmax;   // blocks of ATT_P positions of the longest split row (att_sp layout)
+    int nhid;    // rows that want their hidden state without logits (hidden_row: a phase of its own)
 } PrefillJob;
 
-static int prefill_phases(const Config *p) { return 10 * p->n_layers + 4; } // (a linear layer: 10 with its 3 recurrence phases)
+// (a linear layer: 10 with its 3 recurrence phases; the hidden rows without logits: 1; an MTP view's input: 2)
+static int prefill_phases(const RqModel *m, int nhid) { return 10 * m->config.n_layers + 4 + (nhid > 0) + 2 * (m->mtp_of != NULL); }
 
 #ifdef RUNQ_PROFILE
 #define PPROF(i) do { if (tid == 0) PROF(c, i); } while (0)
@@ -2766,6 +2875,42 @@ static void prefill_worker(void *arg, int tid, int nt) {
     float *conv = c->att_conv + (size_t)tid * 2 * ATT_P * hd;
     Gemm G;
 
+    if (m->mtp_of) {
+        // an MTP view: per row its input [e | h] into xb_b (2 dim), quantized, RoPE cos / sin, KV tile pre-faults; the
+        // eh_proj GEMM into x_b; layer 0's attention rmsnorm + quantize per row
+        PH_BEGIN(n + 2 * m->n_attn * job->npop, 1)
+        for (int b = lo; b < hi; b++) {
+            if (b >= n) {
+                const PfSeg *sg = &seg[c->pop_seg[(b - n) / (2 * m->n_attn)]];
+                kv_populate_one(sg->seq, p, sg->pos0, sg->n, (b - n) % (2 * m->n_attn));
+                continue;
+            }
+            QuantizedTensor xq = qrow(&c->xq_b, b, xs);
+            mtp_in_row(m, c->xb_b + (size_t)b * xs, c->row_tok[b], row_hin(c, b));
+            rope_row(c->rope_b + (size_t)b * hd, rd, c->row_pos[b], m->rope_log_theta);
+            quantize(&xq, c->xb_b + (size_t)b * xs, 2 * dim);
+            act_prep_row(&xq, 2 * dim, c->bq_corr, c->bq_xf, c->bq_c16, b);
+        }
+        PH_END_NOEPI
+        MatJob eh = { c->x_b, dim, w->eh_proj, dim };
+        gemm_plan(c, &G, 1, &eh, &c->xq_b, xs, n, 2 * dim, c->bq_corr, c->bq_xf, c->bq_c16, nt);
+        {
+            const void *last = NULL;
+            PH_BEGIN_U(G.it0[G.nj], G.chunk, G.unit)
+            for (int it = lo; it < hi; it++)
+                gemm_item(&G, it, scr, &last);
+            PH_END_NOEPI
+        }
+        PH_BEGIN(n, rch)
+        for (int b = lo; b < hi; b++) {
+            float *x = c->x_b + (size_t)b * dim, *xb = c->xb_b + (size_t)b * xs;
+            QuantizedTensor xq = qrow(&c->xq_b, b, xs);
+            rmsnorm(xb, x, w->rms_att_weight, dim);
+            quantize(&xq, xb, dim);
+            act_prep_row(&xq, dim, c->bq_corr, c->bq_xf, c->bq_c16, b);
+        }
+        PH_END_NOEPI
+    } else {
     // embeddings, RoPE cos / sin per row, layer 0's attention rmsnorm + quantize; KV tile pre-faults
     PH_BEGIN(n + 2 * m->n_attn * job->npop, 1)
     for (int b = lo; b < hi; b++) {
@@ -2783,6 +2928,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
         act_prep_row(&xq, dim, c->bq_corr, c->bq_xf, c->bq_c16, b);
     }
     PH_END_NOEPI
+    }
     PPROF(PF_NORM);
 
     for (int l = 0; l < p->n_layers; l++) {
@@ -2963,7 +3109,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
                 continue;
             for (int b = b0; b < b1; b++) {
                 QuantizedTensor xq = qrow(&c->xq_b, b, xs);
-                if (hy->on) // (the gate: after every kv head of the row is done)
+                if (m->gated) // (the gate: after every kv head of the row is done)
                     for (int h = 0; h < p->n_heads; h++)
                         attn_gate(c->xb_b + (size_t)b * xs + h * hd, c->q_b + (size_t)b * qd + h * qh + hd, hd);
                 quantize(&xq, c->xb_b + (size_t)b * xs, all_heads_dim);
@@ -3033,21 +3179,33 @@ static void prefill_worker(void *arg, int tid, int nt) {
         // (its residual add is done in the next layer's first phase, or below)
     }
 
+    if (job->nhid) { // the hidden states of rows without logits (the others: below, with their final rmsnorm)
+        PH_BEGIN(n, rch)
+        for (int b = lo; b < hi; b++)
+            hidden_row(c, b);
+        PH_END_NOEPI
+    }
+
     if (job->gemv) {
         // one row's logits: its residual, final rmsnorm + classifier by the decode path's GEMV
         int r = c->sel_row[0];
         PH_BEGIN(1, 1)
-            float *x = c->x_b + (size_t)r * dim, *xb = c->xb_b + (size_t)r * xs;
+            float *x = c->x_b + (size_t)r * dim, *xb = c->xb_b + (size_t)r * xs, *h = row_hidden(c, r);
             for (int i = 0; i < dim; i++)
                 x[i] += xb[i];
             rmsnorm(c->x, x, w->rms_final_weight, dim);
+            if (h)
+                memcpy(h, c->x, dim * sizeof(float));
             quantize(&c->xq, c->x, dim);
             matvec_prep(c->xq_corr, c->xq_xf, c->xq_c16, &c->xq, 0, dim);
         PH_END_NOEPI
-        int nblk = (p->vocab_size + 15) / 16, cc = nblk / (8 * nt) > 1 ? nblk / (8 * nt) : 1;
+        int nblk = m->cls_n[1] ? cls_blocks(m) : (p->vocab_size + 15) / 16, cc = nblk / (8 * nt) > 1 ? nblk / (8 * nt) : 1;
         PH_BEGIN(nblk, cc)
-            matvec_rows(job->out, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wcls, dim, lo * 16,
-                        hi * 16 < p->vocab_size ? hi * 16 : p->vocab_size);
+            if (m->cls_n[1]) // (an MTP view's classifier subset)
+                cls_sub_rows(c, job->out, 0, &c->xq, 0, c->xq_corr, c->xq_xf, c->xq_c16, 1, lo, hi);
+            else
+                matvec_rows(job->out, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wcls, dim, lo * 16,
+                            hi * 16 < p->vocab_size ? hi * 16 : p->vocab_size);
         PH_END_NOEPI
         PPROF(PF_CLS);
     } else if (job->nsel > 0) {
@@ -3057,17 +3215,23 @@ static void prefill_worker(void *arg, int tid, int nt) {
         PH_BEGIN(nsel, sch)
         for (int j = lo; j < hi; j++) {
             int b = c->sel_row[j];
-            float *x = c->x_b + (size_t)b * dim, *xb = c->xb_b + (size_t)b * xs;
+            float *x = c->x_b + (size_t)b * dim, *xb = c->xb_b + (size_t)b * xs, *h = row_hidden(c, b);
             QuantizedTensor xq = qrow(&c->xq_b, j, xs);
             for (int i = 0; i < dim; i++)
                 x[i] += xb[i];
             rmsnorm(xb, x, w->rms_final_weight, dim);
+            if (h)
+                memcpy(h, xb, dim * sizeof(float));
             quantize(&xq, xb, dim);
             act_prep_row(&xq, dim, c->bq_corr, c->bq_xf, c->bq_c16, j);
         }
         PH_END_NOEPI
-        MatJob cls = { job->out, p->vocab_size, w->wcls, p->vocab_size };
-        gemm_plan(c, &G, 1, &cls, &c->xq_b, xs, nsel, dim, c->bq_corr, c->bq_xf, c->bq_c16, nt);
+        MatJob cls[2] = { { job->out, p->vocab_size, w->wcls, p->vocab_size } };
+        int ncj = 1;
+        if (m->cls_n[1]) // an MTP view's classifier subset: its two ranges' matrices
+            for (ncj = 0; ncj < 2; ncj++)
+                cls[ncj] = (MatJob) { job->out + m->cls_lo[ncj], p->vocab_size, (QuantizedTensor *)&m->cls_part[ncj], m->cls_n[ncj] };
+        gemm_plan(c, &G, ncj, cls, &c->xq_b, xs, nsel, dim, c->bq_corr, c->bq_xf, c->bq_c16, nt);
         {
             const void *last = NULL;
             PH_BEGIN_U(G.it0[G.nj], G.chunk, G.unit)
@@ -3156,9 +3320,11 @@ typedef struct {
     int epi;     // the norms as phase epilogues (else phases of their own)
     int split;   // attention split over blocks of ATT_P positions (row_it0: items of row blocks 0..rb-1 per kv head)
     int nbmax;   // blocks of the longest row (att_sp layout)
+    int nhid;    // rows that want their hidden state without logits (hidden_row: with the last layer's norms)
 } BatchDecJob;
 
-static int bd_phases(const RqModel *m, int epi) { return ((epi ? 4 : 6) + m->hy.on) * m->config.n_layers + 4; } // (+ Qwen3.5's quantization)
+// (+ Qwen3.5's quantization; an MTP view's input: + 2)
+static int bd_phases(const RqModel *m, int epi) { return ((epi ? 4 : 6) + m->hy.on) * m->config.n_layers + 4 + 2 * (m->mtp_of != NULL); }
 // per layer: per kv head its q / k / v items done, its QK-norm + RoPE + stores done; per row block its kv heads'
 // attention done; per (row block, kv head) its blocks done (split attention); (row blocks <= rows n)
 static int bd_counters(int nkv, int n, int nv) { // (nv: Qwen3.5's value heads: a linear layer needs 1 + 2 nv)
@@ -3184,6 +3350,21 @@ static void bd_norm_row(RqCtx *c, const Config *p, const TransformerWeights *w, 
     rmsnorm(xb, x, (float *)wt, dim);
     quantize(&xq, xb, dim);
     act_prep_row(&xq, dim, c->bq_corr, c->bq_xf, c->bq_c16, dst);
+}
+
+static void bd_last_row(RqCtx *c, const Config *p, const TransformerWeights *w, int j, int nsel) {
+    // the last layer's norm item j: j < nsel the final rmsnorm of logits row j (row sel_row[j]) into xq_b row j
+    // (bd_norm_row), and its hidden state if its segment wants it (the normed row); else row j - nsel's hidden state
+    // alone (hidden_row: if it wants one and has no logits)
+    if (j >= nsel) {
+        hidden_row(c, j - nsel);
+        return;
+    }
+    int b = c->sel_row[j];
+    bd_norm_row(c, p, w, b, p->n_layers, 1, j);
+    float *h = row_hidden(c, b);
+    if (h)
+        memcpy(h, c->xb_b + (size_t)b * c->m->xs, p->dim * sizeof(float));
 }
 
 static void batch_decode_worker(void *arg, int tid, int nt) {
@@ -3227,6 +3408,33 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
     int npop = 0, NA = m->n_attn;
     for (int b = 0; b < n; b++)
         npop += c->row_pos[b] % ATT_T == 0;
+    if (m->mtp_of) {
+        // an MTP view: per row its input [e | h] into xb_b (2 dim), quantized, RoPE cos / sin, the pre-faults; the
+        // eh_proj rows into x_b; layer 0's attention rmsnorm + quantize per row
+        PH_BEGIN(n + 2 * NA * npop, 1)
+        for (int it = lo; it < hi; it++) {
+            if (it >= n) {
+                int q = (it - n) / (2 * NA), b = 0;
+                for (;; b++)
+                    if (c->row_pos[b] % ATT_T == 0 && q-- == 0) break;
+                kv_populate_one(seg[c->row_seg[b]].seq, p, c->row_pos[b], 1, (it - n) % (2 * NA));
+                continue;
+            }
+            QuantizedTensor xq = qrow(&c->xq_b, it, xs);
+            mtp_in_row(m, c->xb_b + (size_t)it * xs, c->row_tok[it], row_hin(c, it));
+            rope_row(c->rope_b + (size_t)it * hd, rd, c->row_pos[it], m->rope_log_theta);
+            quantize(&xq, c->xb_b + (size_t)it * xs, 2 * dim);
+            act_prep_row(&xq, 2 * dim, c->bq_corr, c->bq_xf, c->bq_c16, it);
+        }
+        PH_END_NOEPI
+        PH_BEGIN(dim / 16, 1)
+            rows_mm(c, w->eh_proj, c->x_b, dim, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, 2 * dim, lo * 16, hi * 16);
+        PH_END_NOEPI
+        PH_BEGIN(n, 1)
+        for (int b = lo; b < hi; b++)
+            bd_norm_row(c, p, w, b, 0, 0, b);
+        PH_END_NOEPI
+    } else {
     PH_BEGIN(n + 2 * NA * npop, 1)
     for (int it = lo; it < hi; it++) {
         if (it >= n) {
@@ -3241,6 +3449,7 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
         bd_norm_row(c, p, w, it, 0, 0, it);
     }
     PH_END_NOEPI
+    }
     PPROF(PF_NORM);
 
     for (int l = 0; l < p->n_layers; l++) {
@@ -3385,7 +3594,7 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
             // the row block's last kv head: its rows' attention output quantized for wo (xq_b: every qkv item is done)
             for (int b = b0; b < b1; b++) {
                 QuantizedTensor xq = qrow(&c->xq_b, b, xs);
-                if (hy->on)
+                if (m->gated)
                     for (int h = 0; h < nh; h++)
                         attn_gate(c->xb_b + (size_t)b * xs + h * hd, c->q_b + (size_t)b * qd + h * qh + hd, hd);
                 quantize(&xq, c->xb_b + (size_t)b * xs, ahd);
@@ -3447,14 +3656,17 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
         PPROF(PF_BDFFN13);
 
         // w2; its residual + the next layer's attention rmsnorm (the last layer: the final rmsnorm of the
-        // rows with logits, into xq_b rows 0..nsel-1) + quantize
-        int last = l + 1 == p->n_layers, nr = last ? job->nsel : n;
+        // rows with logits, into xq_b rows 0..nsel-1, and the hidden rows: bd_last_row) + quantize
+        int last = l + 1 == p->n_layers, nr = last ? job->nsel + (job->nhid ? n : 0) : n;
         if (job->epi) {
             PH_BEGIN(dim / 16, 1)
                 rows_mm(c, w->w2 + l, c->xb_b, xs, &c->hq_b, hidden, c->bh_corr, c->bh_xf, c->bh_c16, n, hidden, lo * 16, hi * 16);
             PH_EPILOGUE
                 for (int j = 0; j < nr; j++)
-                    bd_norm_row(c, p, w, last ? c->sel_row[j] : j, l + 1, 1, j);
+                    if (last)
+                        bd_last_row(c, p, w, j, job->nsel);
+                    else
+                        bd_norm_row(c, p, w, j, l + 1, 1, j);
             PH_END
             PPROF(PF_FFN2);
         } else {
@@ -3465,7 +3677,10 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
             if (nr > 0) {
                 PH_BEGIN(nr, 1)
                 for (int j = lo; j < hi; j++)
-                    bd_norm_row(c, p, w, last ? c->sel_row[j] : j, l + 1, 1, j);
+                    if (last)
+                        bd_last_row(c, p, w, j, job->nsel);
+                    else
+                        bd_norm_row(c, p, w, j, l + 1, 1, j);
                 PH_END_NOEPI
                 PPROF(PF_NORM);
             }
@@ -3474,16 +3689,19 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
 
     if (job->nsel > 0) { // classifier over the rows with logits (xq_b rows 0..nsel-1)
         // (a vocabulary that is not a multiple of 16: the generic kernels' last block is partial, as in decode)
-        int nblk = (p->vocab_size + 15) / 16, cc = nblk / (8 * nt) > 1 ? nblk / (8 * nt) : 1;
+        int nblk = m->cls_n[1] ? cls_blocks(m) : (p->vocab_size + 15) / 16, cc = nblk / (8 * nt) > 1 ? nblk / (8 * nt) : 1;
         PH_BEGIN(nblk, cc)
-            rows_mm(c, w->wcls, job->out, p->vocab_size, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, job->nsel, dim, lo * 16,
-                    hi * 16 < p->vocab_size ? hi * 16 : p->vocab_size);
+            if (m->cls_n[1]) // (an MTP view's classifier subset)
+                cls_sub_rows(c, job->out, p->vocab_size, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, job->nsel, lo, hi);
+            else
+                rows_mm(c, w->wcls, job->out, p->vocab_size, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, job->nsel, dim, lo * 16,
+                        hi * 16 < p->vocab_size ? hi * 16 : p->vocab_size);
         PH_END_NOEPI
         PPROF(PF_CLS);
     }
 }
 
-static int batch_decode(RqCtx *c, int n, int nseg, int nrb, int nsel, float *out) {
+static int batch_decode(RqCtx *c, int n, int nseg, int nrb, int nsel, int nhid, float *out) {
     // rq_forward_batch's plan (segments of at most bd_seg rows, row blocks) -> batch_decode_worker; the row
     // blocks' attention split over blocks of ATT_P positions if the (row block, kv head) items alone are few
     // for the threads
@@ -3493,7 +3711,7 @@ static int batch_decode(RqCtx *c, int n, int nseg, int nrb, int nsel, float *out
         int nbk = (c->row_pos[b] + 1 + ATT_P - 1) / ATT_P;
         nbmax = nbk > nbmax ? nbk : nbmax;
     }
-    BatchDecJob job = { c, n, nseg, nrb, nsel, out, n <= c->bd_epi, nbmax > 1 && nrb * nkv < c->bd_split * nt, nbmax };
+    BatchDecJob job = { c, n, nseg, nrb, nsel, out, n <= c->bd_epi, nbmax > 1 && nrb * nkv < c->bd_split * nt, nbmax, nhid };
     if (job.split) {
         size_t need = (size_t)n * p->n_heads * nbmax * ATT_PSTRIDE(p->head_dim);
         if (need > c->att_sp_n) {
@@ -3522,7 +3740,7 @@ int rq_forward_batch(RqCtx *c, const RqSegment *sg, int nseg, float *out, float 
     // bd_max rows in all), else prefill_worker
     const RqModel *m = c->m;
     const Config *p = &m->config;
-    int ar = m->att_rows, n = 0, ntile = 0, nrb = 0, nsel = 0, any_all = 0, segmax = 0;
+    int ar = m->att_rows, n = 0, ntile = 0, nrb = 0, nsel = 0, any_all = 0, segmax = 0, nhid = 0;
     c->err[0] = 0;
     if (logits) *logits = NULL;
     if (c->nb_max <= 1) return ctx_fail(c, RQ_ERR_STATE, "context without batch buffers (max_batch %d)", c->nb_max);
@@ -3542,10 +3760,14 @@ int rq_forward_batch(RqCtx *c, const RqSegment *sg, int nseg, float *out, float 
         for (int j = 0; j < sg[i].n; j++)
             if (sg[i].tokens[j] < 0 || sg[i].tokens[j] >= p->vocab_size)
                 return ctx_fail(c, RQ_ERR_ARG, "token %d out of range", sg[i].tokens[j]);
+        if (sg[i].h_in && !m->mtp_of)
+            return ctx_fail(c, RQ_ERR_ARG, "rq_forward_batch: segment %d: h_in on a model that is not an MTP view", i);
         n += sg[i].n;
         segmax = sg[i].n > segmax ? sg[i].n : segmax;
         nsel += sg[i].logits == RQ_LOGITS_ALL ? sg[i].n : sg[i].logits == RQ_LOGITS_LAST;
         any_all |= sg[i].logits == RQ_LOGITS_ALL;
+        if (sg[i].hidden) // (the rows without logits: hidden_row)
+            nhid += sg[i].logits == RQ_LOGITS_ALL ? 0 : sg[i].n - (sg[i].logits == RQ_LOGITS_LAST);
     }
     int gemv = nsel == 1 && !any_all && !out;
     if (nsel > 0 && !out && !gemv) return ctx_fail(c, RQ_ERR_ARG, "logits of %d rows need an output buffer", nsel);
@@ -3559,6 +3781,9 @@ int rq_forward_batch(RqCtx *c, const RqSegment *sg, int nseg, float *out, float 
         s->b0 = n;
         s->n = sg[i].n;
         s->pos0 = s->seq->len;
+        s->logits = sg[i].logits;
+        s->hid = sg[i].hidden;
+        s->hin = sg[i].h_in;
         for (int j = 0; j < s->n; j++) {
             c->row_tok[n + j] = sg[i].tokens[j];
             c->row_pos[n + j] = s->pos0 + j;
@@ -3585,12 +3810,12 @@ int rq_forward_batch(RqCtx *c, const RqSegment *sg, int nseg, float *out, float 
     for (int i = 0; i < nseg; i++) // (Qwen3.5: a checkpoint this pass reaches)
         ck_plan(c->seg[i].seq, c->seg[i].pos0, c->seg[i].n);
     if (n <= c->bd_max && segmax <= c->bd_seg) { // short segments only: batch_decode_worker
-        int e = batch_decode(c, n, nseg, nrb, nsel, out);
+        int e = batch_decode(c, n, nseg, nrb, nsel, nhid, out);
         if (e != RQ_OK) return e;
     } else {
         int e = prefill_plan(c, nseg, nrb);
         if (e < 0) return e;
-        PrefillJob job = { c, n, nseg, ntile, nrb, nsel, gemv, out, 0, e, 1 };
+        PrefillJob job = { c, n, nseg, ntile, nrb, nsel, gemv, out, 0, e, 1, nhid };
         for (int i = 0; i < nseg; i++) { // segments starting a new cache tile; the longest split row
             const PfSeg *s = &c->seg[i];
             if (s->pos0 % ATT_T == 0 || (s->pos0 + s->n - 1) / ATT_T != s->pos0 / ATT_T)
@@ -3610,10 +3835,11 @@ int rq_forward_batch(RqCtx *c, const RqSegment *sg, int nseg, float *out, float 
             }
         }
         PROF_START(c);
-        if (rq_begin(&c->sync, prefill_phases(p), p->n_layers * (nrb + job.nsp * p->n_kv_heads), rq_nthreads(), rq_spin_pf) != 0)
+        if (rq_begin(&c->sync, prefill_phases(m, nhid), p->n_layers * (nrb + job.nsp * p->n_kv_heads), rq_nthreads(), rq_spin_pf) != 0)
             return ctx_fail(c, RQ_ERR_NOMEM, "malloc failed!");
         rq_parallel(prefill_worker, &job);
     }
+    if (nsel && m->cls_n[1]) cls_fill(m, out, nsel);
     for (int i = 0; i < nseg; i++) {
         RqSeq *s = c->seg[i].seq;
         memcpy(s->tokens + s->len, sg[i].tokens, sg[i].n * sizeof(int));
@@ -3624,16 +3850,17 @@ int rq_forward_batch(RqCtx *c, const RqSegment *sg, int nseg, float *out, float 
     return RQ_OK;
 }
 
-int rq_prefill(RqCtx *c, RqSeq *s, const int *tokens, int n, int mode, float *out, float **logits) {
+int fw_rows(RqCtx *c, RqSeq *s, const int *tokens, int n, int mode, float *out, float **logits, float *hidden, const float *h_in) {
     // tokens[0..n-1] at positions len.. in chunks of nb_max (> 1) rows, or one token at a time
-    // through the decode path (nb_max <= 1); the same results either way
+    // through the decode path (nb_max <= 1); the same results either way (rq_prefill: hidden, h_in NULL)
     const Config *p = &c->m->config;
-    int V = p->vocab_size, e = ctx_check_seq(c, s);
+    int V = p->vocab_size, dim = p->dim, e = ctx_check_seq(c, s);
     c->err[0] = 0;
     if (logits) *logits = NULL;
     if (e != RQ_OK) return e;
     if (n < 1 || mode < RQ_LOGITS_NONE || mode > RQ_LOGITS_ALL || (mode == RQ_LOGITS_ALL && !out))
         return ctx_fail(c, RQ_ERR_ARG, "bad prefill arguments (n %d, mode %d)", n, mode);
+    if (h_in && !c->m->mtp_of) return ctx_fail(c, RQ_ERR_ARG, "h_in on a model that is not an MTP view");
     if (s->len + n > s->cap) return ctx_fail(c, RQ_ERR_CONTEXT, "%d tokens at position %d: past the capacity %d", n, s->len, s->cap);
     for (int i = 0; i < n; i++)
         if (tokens[i] < 0 || tokens[i] >= V) return ctx_fail(c, RQ_ERR_ARG, "token %d out of range", tokens[i]);
@@ -3641,7 +3868,8 @@ int rq_prefill(RqCtx *c, RqSeq *s, const int *tokens, int n, int mode, float *ou
     if (c->nb_max <= 1) {
         for (int i = 0; i < n && e == RQ_OK; i++) {
             int want = mode == RQ_LOGITS_ALL || (mode == RQ_LOGITS_LAST && i == n - 1);
-            e = decode_step(c, s, tokens[i], want ? c->logits : NULL);
+            e = decode_step(c, s, tokens[i], want ? c->logits : NULL, hidden ? hidden + (size_t)i * dim : NULL,
+                            h_in ? h_in + (size_t)i * dim : NULL);
             if (mode == RQ_LOGITS_ALL && e == RQ_OK)
                 memcpy(out + (size_t)i * V, c->logits, V * sizeof(float));
         }
@@ -3650,11 +3878,16 @@ int rq_prefill(RqCtx *c, RqSeq *s, const int *tokens, int n, int mode, float *ou
         int nb = c->nb_max;
         for (int i = 0; i < n && e == RQ_OK; i += nb) {
             int k = n - i < nb ? n - i : nb;
-            RqSegment sg = { s, tokens + i, k, mode == RQ_LOGITS_ALL ? RQ_LOGITS_ALL : mode == RQ_LOGITS_LAST && i + k == n ? RQ_LOGITS_LAST : RQ_LOGITS_NONE };
+            RqSegment sg = { s, tokens + i, k, mode == RQ_LOGITS_ALL ? RQ_LOGITS_ALL : mode == RQ_LOGITS_LAST && i + k == n ? RQ_LOGITS_LAST : RQ_LOGITS_NONE,
+                             hidden ? hidden + (size_t)i * dim : NULL, h_in ? h_in + (size_t)i * dim : NULL };
             e = rq_forward_batch(c, &sg, 1, mode == RQ_LOGITS_ALL ? out + (size_t)i * V : NULL, &lg);
         }
         lg = mode == RQ_LOGITS_ALL ? out : lg;
     }
     if (logits && e == RQ_OK) *logits = lg;
     return e;
+}
+
+int rq_prefill(RqCtx *c, RqSeq *s, const int *tokens, int n, int mode, float *out, float **logits) {
+    return fw_rows(c, s, tokens, n, mode, out, logits, NULL, NULL);
 }

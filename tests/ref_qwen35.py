@@ -27,8 +27,15 @@ pre-norm shape (x += mixer(rmsnorm(x)); x += ffn(rmsnorm(x)), SwiGLU), where the
 
 Norm weights: HF's Qwen3_5RMSNorm computes x * (1 + w); llama.cpp's converter stores 1 + w in the GGUF (attn_norm,
 post_attention_norm, output_norm, attn_q_norm, attn_k_norm), so all norms here are x * w on the stored values.
-The gated norm (ssm_norm) has no + 1 in either. The MTP head and the vision tower are not part of the text model (a GGUF
-MTP block, `nextn_predict_layers`, is skipped).
+The gated norm (ssm_norm) has no + 1 in either. The vision tower is not part of the text model; a GGUF MTP block
+(`nextn_predict_layers` 1: blk.<layers>) is not part of forward(), mtp_forward() runs it (written from llama.cpp
+cf34d31's src/models/qwen35.cpp graph_mtp, the reference of TODO S9):
+
+  MTP block (multi-token prediction; one per file, sharing token_embd and the classifier), row q of a prompt:
+    h = rmsnorm(x_final, output_norm)      the main model's final hidden state (the row its logits come from)
+    z = eh_proj [rmsnorm(embed(id_q), enorm) | rmsnorm(h_{q-1}, hnorm)]    h_{-1} = 0
+    the block: a gated full-attention layer + SwiGLU FFN (the main layers' form), on z at the prompt's positions
+    logits = classifier(rmsnorm(.., shared_head_norm))     row q predicts id_{q+1} (teacher-forced on the prompt)
 
 Weights: GgufWeights(GgufFile) (ggml's dequantization, tests/ggufmini.py) or HfWeights(model dir) (the
 safetensors, converted to the GGUF names and values as llama.cpp's convert_hf_to_gguf.py does, except the value
@@ -40,6 +47,7 @@ the embedding rows it needs and the classifier in chunks; HfWeights reads the sa
 no torch): 1.3 GB peak for 4B (make_model_ref.py, incl. the logits).
 
 forward(w, prompts, rows=None) -> list of float32 (n_i, len(rows) or vocab) logits per prompt (all positions).
+mtp_forward(w, prompts, xs, rows=None) -> the same for the MTP block, xs: forward(.., hidden=True)'s second result.
 forward_long(w, ids, positions) -> float32 (len(positions), vocab): one long prompt (tens of thousands of tokens),
 memory-frugal (rows in chunks, attention in query blocks with an exact softmax), the logits at some rows only
 (tests/make_long_ref.py, TODO G2).
@@ -63,6 +71,7 @@ class GgufWeights:
         assert kv.get("general.architecture") == a, "not a qwen35 GGUF"
         self.c = {  # (an MTP block, nextn_predict_layers: the last of block_count, not part of the main model)
             "layers": int(kv[f"{a}.block_count"]) - int(kv.get(f"{a}.nextn_predict_layers", 0)),
+            "nextn": int(kv.get(f"{a}.nextn_predict_layers", 0)),
             "dim": int(kv[f"{a}.embedding_length"]),
             "heads": int(kv[f"{a}.attention.head_count"]), "kv_heads": int(kv[f"{a}.attention.head_count_kv"]),
             "hd": int(kv[f"{a}.attention.key_length"]), "theta": float(kv[f"{a}.rope.freq_base"]),
@@ -450,8 +459,9 @@ def forward_rows(w, xs, rows=None, chunk=16384):
     return outs
 
 
-def forward(w, prompts, rows=None, chunk=16384, verbose=False):
-    """w: GgufWeights / HfWeights; prompts: lists of token ids; rows: classifier rows to compute (None: all)"""
+def forward(w, prompts, rows=None, chunk=16384, verbose=False, hidden=False):
+    """w: GgufWeights / HfWeights; prompts: lists of token ids; rows: classifier rows to compute (None: all); hidden:
+    also the final residual streams (before output_norm: mtp_forward's input), (logits, xs)"""
     c = w.c
     xs = [w.take("token_embd.weight", p).astype(np.float32) for p in prompts]
     for l in range(c["layers"]):
@@ -470,4 +480,41 @@ def forward(w, prompts, rows=None, chunk=16384, verbose=False):
         del lw, ffn
         if verbose:
             print(f"  layer {l} ({'linear' if is_linear(c, l) else 'full'})", flush=True)
+    if hidden:
+        return forward_rows(w, xs, rows, chunk), xs
     return forward_rows(w, xs, rows, chunk)
+
+
+def mtp_forward(w, prompts, xs, rows=None, chunk=16384):
+    """the MTP block (blk.<layers>, nextn_predict_layers 1) teacher-forced on each prompt (token ids) with the main
+    model's final residual streams xs (forward(.., hidden=True)): row q's input is (id_q, h_{q-1}), h = rmsnorm(x,
+    output_norm), h_{-1} = 0; its logits predict id_{q+1}. Classifier rows as forward's"""
+    c = w.c
+    assert c.get("nextn") == 1, "no MTP block (nextn_predict_layers 1)"
+    L, p = c["layers"], f"blk.{c['layers']}."
+    lw = _LayerCache(w)
+    on, en, hn = w.vec("output_norm.weight"), lw.vec(p + "nextn.enorm.weight"), lw.vec(p + "nextn.hnorm.weight")
+    an, fn = lw.vec(p + "attn_norm.weight"), lw.vec(p + "post_attention_norm.weight")
+    eh = lw.mat(p + "nextn.eh_proj.weight")                         # (dim, 2 dim): [e | h] -> dim
+    ffn = {r: lw.mat(p + r + ".weight") for r in ("ffn_gate", "ffn_up", "ffn_down")}
+    hs = []
+    for ids, x in zip(prompts, xs):
+        h = _rmsnorm(x, on).astype(np.float32)
+        hp = np.concatenate([np.zeros((1, h.shape[1]), np.float32), h[:-1]])
+        e = w.take("token_embd.weight", ids).astype(np.float32)
+        z = (np.concatenate([_rmsnorm(e, en), _rmsnorm(hp, hn)], -1) @ eh.T).astype(np.float32)
+        z = z + _full_attn(lw, c, L, _rmsnorm(z, an), np.arange(z.shape[0]))
+        g = _rmsnorm(z, fn)
+        z = z + (_silu(g @ ffn["ffn_gate"].T) * (g @ ffn["ffn_up"].T)) @ ffn["ffn_down"].T
+        hs.append(_rmsnorm(z.astype(np.float32), lw.vec(p + "nextn.shared_head_norm.weight")).astype(np.float32))
+    name = "token_embd.weight" if c["tied"] else "output.weight"
+    if rows is not None:
+        W = w.take(name, rows)
+        return [h @ W.T for h in hs]
+    V = c["vocab"]
+    outs = [np.empty((h.shape[0], V), np.float32) for h in hs]
+    for r0 in range(0, V, chunk):
+        W = w.chunk(name, r0, min(chunk, V - r0))
+        for h, o in zip(hs, outs):
+            o[:, r0:r0 + W.shape[0]] = h @ W.T
+    return outs

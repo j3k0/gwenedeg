@@ -355,7 +355,9 @@ next to decode rows; short segments, e.g. decode rows or a speculative verify pa
 take the decode-rows worker: 4 rows of one sequence cost ~1.2-1.3x a decode step, docs/qwen38-speculative.md). On top of them sit `rq_sample` / `rq_sample_batch` (temperature, top-p, an optional
 token mask), `rq_generate` (the chat loop with per-token callbacks; built on `rq_gen_start` / `rq_gen_step`, one
 token at a time, for loops that feed the tokens themselves), `rq_generate_spec` (the same with a draft model:
-speculative decoding, the output exactly `rq_generate`'s; `rq_spec_run` is its loop alone), `rq_tokenize`, `rq_detok_push`
+speculative decoding, the output exactly `rq_generate`'s; `rq_spec_run` is its loop alone; `rq_mtp_load` makes a qwen35
+file's MTP block a model of its own, a view sharing the target's weights and tokenizer, fed the target's final hidden
+states from `RqSegment.hidden` through its `RqSegment.h_in`: the drafter of TODO S9), `rq_tokenize`, `rq_detok_push`
 (incremental, UTF-8 safe) and `rq_chat_render`. Errors come back as `RQ_ERR_*` codes and messages; the
 library never prints or exits. `RqModelOpts.mem` / `.page_cache` set the load's memory check and page-cache policy
 (Memory, above); `rq_model_mem` and `rq_seq_mem` return the estimates (the server sizes its slot pool with the latter).

@@ -36,7 +36,22 @@
  * and the lookup index (rq_lookup_*) against a brute-force search on synthetic sequences.
  *   tests/api_test MODEL --sample LOGITS_FILE < PLAN
  * rq_sample on the rows of a -m logits file, with the settings and RNG states of PLAN's lines ("T P K ROW
- * SEED..."): SAMPLE lines for tests/sampler_ref.py (the sampler's exact order replayed in numpy: top-k). */
+ * SEED..."): SAMPLE lines for tests/sampler_ref.py (the sampler's exact order replayed in numpy: top-k).
+ *   tests/api_test --mtp TARGET [--quick] [--plain MODEL_WITHOUT_BLOCK] [--optional MODEL_WITH_OPTIONAL_NEXTN]
+ * The MTP drafter's parts (TODO S9a): hidden_rows: RqSegment.hidden of every row of the target == the decode path's
+ * (-b 1), from short segments (the batched decode rows), long chunks (prefill: rows with all / the last / no logits),
+ * mixed passes; the logits with and without it equal. mtp_paths: the MTP view (rq_mtp_load) fed the target's hidden
+ * rows shifted by one (h_in) gives the same logits and hidden rows batched, alone, through decode and mixed; h_in NULL
+ * == zeros; a vocabulary subset == the full vocabulary on its rows, -inf elsewhere; truncate + refeed == straight.
+ * mtp_load: no block / optional nextn tensors / the memory budget refused, a second view, views loaded and freed
+ * twice, h_in on the target refused, a view's sequence on the target's context refused, its info / estimate / matrix
+ * names. Prints "mtp digest: HEX" (the target's hidden rows and the view's logits and hidden rows of one prompt: the
+ * same for any thread count, build and --quick). --quick: fewer variants (the generic build)
+ *   tests/api_test --mtp-dump MODEL TEXTFILE OUT.bin [-b N] [--vocab N]
+ * The MTP view's logits teacher-forced on TEXTFILE's tokens (raw text, as runq -m logits): the target's prefill with
+ * hidden rows, then the view's over the same tokens with h shifted by one (row 0: zeros), every row's logits, in
+ * runq -m logits' format (int32 n, vocab, ids[n], float32 logits[n][vocab]); -b: the chunk (1: the decode path),
+ * --vocab: RqMtpOpts.vocab. For tests/check_models.py's mtp_ref (vs tests/ref_qwen35.py mtp_forward) and mtp_top1 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -298,6 +313,8 @@ static int gen_verify_loop(RqCtx *c, RqSeq *s, const int *p, int np, const RqSam
 static void batch_tests(RqCtx *c, RqTokens A, RqTokens B, RqTokens C, const float *refB, int only_digest);
 static int two_main(int argc, char **argv);
 static int spec_main(int argc, char **argv);
+static int mtp_main(int argc, char **argv);
+static int mtp_dump_main(int argc, char **argv);
 
 static int sample_main(int argc, char **argv) {
     // api_test MODEL --sample LOGITS_FILE < PLAN: rq_sample on rows of a -m logits file (int32 n, vocab, ids[n],
@@ -350,6 +367,8 @@ int main(int argc, char **argv) {
     int only_digest = 0;
     if (argc > 1 && !strcmp(argv[1], "--two")) return two_main(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "--spec")) return spec_main(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "--mtp")) return mtp_main(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "--mtp-dump")) return mtp_dump_main(argc, argv);
     if (argc > 3 && !strcmp(argv[2], "--sample")) return sample_main(argc, argv);
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--digest")) only_digest = 1;
@@ -364,6 +383,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv] [--kv-type TYPE]\n"
                         "       api_test --two MODEL_A MODEL_B [--gs MODEL_OTHER_GROUP_SIZE]\n"
                         "       api_test --spec TARGET DRAFT [--quick] [--other MODEL_OTHER_VOCABULARY]\n"
+                        "       api_test --mtp TARGET [--quick] [--plain MODEL_WITHOUT_BLOCK] [--optional MODEL_WITH_OPTIONAL_NEXTN]\n"
+                        "       api_test --mtp-dump MODEL TEXTFILE OUT.bin [-b N] [--vocab N]\n"
                         "       api_test MODEL --sample LOGITS_FILE < PLAN (lines: T P K ROW SEED...)\n");
         return 2;
     }
@@ -2087,4 +2108,455 @@ static int spec_main(int argc, char **argv) {
     rq_model_free(SD);
     rq_model_free(M);
     return failed;
+}
+
+// ---------------------------------------------------------------------------------------- api_test --mtp
+
+// src/internal.h's fw_rows (the library's hook for the MTP drafter; linked from its objects): rq_prefill with every row's
+// final hidden state (hidden, n x dim; NULL: none) and an MTP view's h input rows (h_in; NULL: zeros)
+int fw_rows(RqCtx *c, RqSeq *s, const int *tokens, int n, int mode, float *out, float **logits, float *hidden, const float *h_in);
+
+static int D; // the model's dim
+
+static RqSeq *mt_seq(RqModel *m) {
+    int e;
+    RqSeq *s = rq_seq_new(m, 0, RQ_KV_DEFAULT, &e);
+    if (!s) die("rq_seq_new", e);
+    return s;
+}
+
+static RqCtx *mt_ctx(RqModel *m, int nb) {
+    int e;
+    RqCtx *c = rq_ctx_new(m, nb, 0, &e);
+    if (!c) die("rq_ctx_new", e);
+    return c;
+}
+
+static int mt_ref(RqCtx *c1, RqSeq *s, const int *t, int n, const float *h_in, float *out, float *hid, uint64_t *lh) {
+    // the reference: t on s (emptied) through the decode path (c1: max_batch 1), every row's logits (out, n x V; lh: their
+    // hashes) and hidden state
+    rq_seq_reset(s);
+    int e = fw_rows(c1, s, t, n, RQ_LOGITS_ALL, out, NULL, hid, h_in);
+    for (int i = 0; i < n && e == RQ_OK; i++)
+        lh[i] = hash_f(out + (size_t)i * V, V);
+    return e;
+}
+
+static int mt_segs(RqCtx *c, RqSeq *s, const int *t, int n, int k, const int *modes, int nmodes, const float *h_in, float *hid,
+                   uint64_t *lh, float *out) {
+    // t on s (emptied) in rq_forward_batch passes of k rows, pass j with the logits mode modes[j % nmodes], every row's
+    // hidden state into hid (NULL: none), h_in rows (NULL: zeros); lh[r]: row r's logits hash, 0 without logits
+    int e = RQ_OK;
+    rq_seq_reset(s);
+    for (int i = 0, j = 0; i < n && e == RQ_OK; i += k, j++) {
+        int r = n - i < k ? n - i : k, mode = modes[j % nmodes];
+        RqSegment sg = { s, t + i, r, mode, hid ? hid + (size_t)i * D : NULL, h_in ? h_in + (size_t)i * D : NULL };
+        float *lg = NULL;
+        e = rq_forward_batch(c, &sg, 1, mode == RQ_LOGITS_ALL ? out : NULL, &lg);
+        for (int q = 0; q < r; q++)
+            lh[i + q] = e == RQ_OK && mode == RQ_LOGITS_ALL ? hash_f(out + (size_t)q * V, V) : 0;
+        if (e == RQ_OK && mode == RQ_LOGITS_LAST) lh[i + r - 1] = hash_f(lg, V);
+    }
+    return e;
+}
+
+static int mt_eq(const uint64_t *ref, const uint64_t *lh, const float *hr, const float *h, int n) {
+    // the rows' logits (where computed) and hidden states (h NULL: not asked for) equal the reference's
+    for (int i = 0; i < n; i++)
+        if (lh[i] && lh[i] != ref[i]) return 0;
+    return !h || same(hr, h, (size_t)n * D);
+}
+
+static int mt_mixed(RqCtx *c, RqSeq *a, RqSeq *b, const int *t, int pa, int ka, int pb, const float *h_in, float *hid,
+                    const uint64_t *lhR, const float *hR, float *out) {
+    // one pass with two sequences of t: a (its first pa rows fed before) ka rows with every row's hidden state and the
+    // last one's logits, b (pb rows before) one row with its logits, no hidden state; each == the reference's rows
+    rq_seq_reset(a);
+    rq_seq_reset(b);
+    int e = fw_rows(c, a, t, pa, RQ_LOGITS_NONE, NULL, NULL, NULL, h_in);
+    if (e == RQ_OK) e = fw_rows(c, b, t, pb, RQ_LOGITS_NONE, NULL, NULL, NULL, h_in);
+    RqSegment sg[2] = { { a, t + pa, ka, RQ_LOGITS_LAST, hid, h_in ? h_in + (size_t)pa * D : NULL },
+                        { b, t + pb, 1, RQ_LOGITS_LAST, NULL, h_in ? h_in + (size_t)pb * D : NULL } };
+    if (e == RQ_OK) e = rq_forward_batch(c, sg, 2, out, NULL);
+    return e == RQ_OK && hash_f(out, V) == lhR[pa + ka - 1] && hash_f(out + V, V) == lhR[pb] && same(hid, hR + (size_t)pa * D, (size_t)ka * D);
+}
+
+static int mt_paths(RqModel *m, RqCtx *c1, RqCtx *c64, const int *t, int n, const float *h_in, int quick, const uint64_t *lhR,
+                    const float *hR, char *d, size_t dn) {
+    // the passes of model m (the target, or the view with h_in) == the reference (decode path: lhR, hR)
+    RqSeq *s = mt_seq(m), *s2 = mt_seq(m);
+    float *hid = malloc((size_t)n * D * sizeof(float)), *out = malloc((size_t)64 * V * sizeof(float));
+    uint64_t *lh = malloc((size_t)n * sizeof(uint64_t));
+    const int all[] = { RQ_LOGITS_ALL }, last[] = { RQ_LOGITS_LAST }, mix3[] = { RQ_LOGITS_ALL, RQ_LOGITS_LAST, RQ_LOGITS_NONE },
+              mix3b[] = { RQ_LOGITS_LAST, RQ_LOGITS_NONE, RQ_LOGITS_ALL };
+    struct { const char *name; int k; const int *modes; int nm, hid, q; } cs[] = {
+        { "chunks of 64 (all / last / no logits)", 64, mix3, 3, 1, 1 }, { "chunks of 64 without hidden", 64, all, 1, 0, 0 },
+        { "chunks of 33 (last / none / all)", 33, mix3b, 3, 1, 0 }, { "segments of 7 (batched decode rows)", 7, mix3b, 3, 1, 1 },
+        { "segments of 16", 16, mix3, 3, 1, 0 }, { "rows one at a time", 1, last, 1, 1, 0 } };
+    int ok = 1;
+    size_t dl = strlen(d);
+    for (size_t i = 0; i < sizeof(cs) / sizeof(cs[0]); i++) {
+        if (quick && !cs[i].q) continue;
+        memset(hid, 0xff, (size_t)n * D * sizeof(float)); // (NaN: every row must be written)
+        int e = mt_segs(c64, s, t, n, cs[i].k, cs[i].modes, cs[i].nm, h_in, cs[i].hid ? hid : NULL, lh, out);
+        int okk = e == RQ_OK && mt_eq(lhR, lh, hR, cs[i].hid ? hid : NULL, n);
+        snprintf(d + dl, dn - dl, "%s%s%s", dl ? ", " : "", cs[i].name, okk ? "" : " DIFFER");
+        dl = strlen(d);
+        ok &= okk;
+    }
+    { // the decode path without hidden rows (the logits)
+        float *o = malloc((size_t)n * V * sizeof(float));
+        rq_seq_reset(s);
+        int okk = fw_rows(c1, s, t, n, RQ_LOGITS_ALL, o, NULL, NULL, h_in) == RQ_OK;
+        for (int i = 0; i < n && okk; i++) okk &= hash_f(o + (size_t)i * V, V) == lhR[i];
+        free(o);
+        snprintf(d + dl, dn - dl, ", decode without hidden%s", okk ? "" : " DIFFER");
+        dl = strlen(d);
+        ok &= okk;
+    }
+    { // mixed passes: prefill_worker (a 30-row segment next to a decode row), batch_decode_worker (5 rows + 1)
+        int okk = mt_mixed(c64, s, s2, t, 40, 30, 60, h_in, hid, lhR, hR, out);
+        okk &= mt_mixed(c64, s, s2, t, 21, 5, 70, h_in, hid, lhR, hR, out);
+        snprintf(d + dl, dn - dl, ", mixed passes%s", okk ? "" : " DIFFER");
+        ok &= okk;
+    }
+    free(hid);
+    free(out);
+    free(lh);
+    rq_seq_free(s);
+    rq_seq_free(s2);
+    return ok;
+}
+
+static int neg_inf(float x) { // (by its bits: -Ofast assumes finite values, a comparison with -inf is folded away)
+    uint32_t u;
+    memcpy(&u, &x, 4);
+    return u == 0xff800000u;
+}
+
+static int mt_subset(RqModel *view, RqCtx *c64, const int *t, int n, const float *h_in, const float *full, int quick, char *d, size_t dn) {
+    // a vocabulary subset (RqMtpOpts.vocab 1000): every path's logits == the full vocabulary's (full) on rows [0, 1008)
+    // and from the added tokens' block on, -inf between; the hidden states equal (they do not depend on the subset)
+    (void)c64;
+    char err[512];
+    RqMtpOpts o = { 1000, -1 };
+    RqModel *sv = rq_mtp_load(M, &o, err, sizeof(err));
+    if (!sv) { snprintf(d, dn, "rq_mtp_load(vocab 1000): %s", err); return 0; }
+    RqCtx *s1 = mt_ctx(sv, 1), *s64 = mt_ctx(sv, 64);
+    RqSeq *s = mt_seq(sv);
+    float *out = malloc((size_t)n * V * sizeof(float)), *ho = malloc((size_t)n * D * sizeof(float)), *hf = malloc((size_t)n * D * sizeof(float));
+    int fa = V; // the first added token at or past 1008
+    for (int i = V - 1; i >= 1008; i--)
+        if (rq_token_is_added(M, i)) fa = i;
+    int ok = 1, lo1 = -1;
+    struct { RqCtx *c; int k; } runs[] = { { s1, 0 }, { s64, 64 }, { s64, 7 } };
+    for (int r = 0; r < (quick ? 2 : 3); r++) {
+        rq_seq_reset(s);
+        int e = RQ_OK;
+        if (!runs[r].k) e = fw_rows(runs[r].c, s, t, n, RQ_LOGITS_ALL, out, NULL, ho, h_in);
+        for (int i = 0; runs[r].k && i < n && e == RQ_OK; i += runs[r].k) {
+            int k = n - i < runs[r].k ? n - i : runs[r].k;
+            RqSegment sg = { s, t + i, k, RQ_LOGITS_ALL, ho + (size_t)i * D, h_in + (size_t)i * D };
+            e = rq_forward_batch(runs[r].c, &sg, 1, out + (size_t)i * V, NULL);
+        }
+        ok &= e == RQ_OK;
+        if (r == 0) { // the full view's hidden states, for comparison
+            RqSeq *f = mt_seq(view);
+            RqCtx *fc = mt_ctx(view, 1);
+            ok &= fw_rows(fc, f, t, n, RQ_LOGITS_NONE, NULL, NULL, hf, h_in) == RQ_OK;
+            rq_ctx_free(fc);
+            rq_seq_free(f);
+        }
+        ok &= same(ho, hf, (size_t)n * D);
+        for (int q = 0; q < n && ok; q++) {
+            const float *a = out + (size_t)q * V, *b = full + (size_t)q * V;
+            int i = 0;
+            while (i < 1008 && a[i] == b[i]) i++;
+            ok &= i == 1008;
+            while (i < V && neg_inf(a[i])) i++;
+            if (lo1 < 0) lo1 = i;
+            ok &= i == lo1 && lo1 % 16 == 0 && lo1 <= fa && lo1 > fa - 16 && !memcmp(a + i, b + i, (size_t)(V - i) * sizeof(float));
+        }
+    }
+    snprintf(d, dn, "vocab 1000: rows [0, 1008) and [%d, %d) == the full vocabulary's, -inf between (first added token %d), "
+             "decode / chunks of 64%s%s", lo1, V, fa, quick ? "" : " / segments of 7", ok ? "" : " DIFFER");
+    free(out);
+    free(ho);
+    free(hf);
+    rq_seq_free(s);
+    rq_ctx_free(s1);
+    rq_ctx_free(s64);
+    rq_model_free(sv);
+    return ok;
+}
+
+static int mtp_main(int argc, char **argv) {
+    const char *path = NULL, *plain = NULL, *optional = NULL;
+    int quick = 0, bad = 0;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--quick")) quick = 1;
+        else if (!strcmp(argv[i], "--plain") && i + 1 < argc) plain = argv[++i];
+        else if (!strcmp(argv[i], "--optional") && i + 1 < argc) optional = argv[++i];
+        else if (argv[i][0] == '-' || path) bad = 1;
+        else path = argv[i];
+    }
+    if (bad || !path) {
+        fprintf(stderr, "usage: api_test --mtp TARGET [--quick] [--plain MODEL_WITHOUT_BLOCK] [--optional MODEL_WITH_OPTIONAL_NEXTN]\n");
+        return 2;
+    }
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    rq_threads_init(0);
+    char err[512], d[1024];
+    if (!(M = rq_model_load(path, NULL, err, sizeof(err)))) { printf("FAIL setup  %s\n", err); return 1; }
+    rq_model_info(M, &I);
+    V = I.vocab_size;
+    D = I.dim;
+    RqModelMem mem0, mem1;
+    rq_model_mem(M, &mem0);
+    RqMtpOpts mo = { 0, -1 };
+    RqModel *view = rq_mtp_load(M, &mo, err, sizeof(err));
+    if (!view) { printf("FAIL setup  rq_mtp_load: %s\n", err); return 1; }
+    RqCtx *c1 = mt_ctx(M, 1), *c64 = mt_ctx(M, 64), *v1 = mt_ctx(view, 1), *v64 = mt_ctx(view, 64);
+    RqTokens T = toks("The old lighthouse stood at the edge of the cliff, its lamp turning slowly through the fog. Every "
+                      "night the keeper climbed the spiral stairs, trimmed the wick, polished the brass and wrote the "
+                      "weather into his log: wind from the west, rain, a ship far out heading north. In the morning he "
+                      "walked down to the village for bread and news, and the children asked him about the storms.");
+    int n = T.n;
+    float *hR = malloc((size_t)n * D * sizeof(float)), *Hs = calloc((size_t)n * D, sizeof(float));
+    float *vhR = malloc((size_t)n * D * sizeof(float)), *full = malloc((size_t)n * V * sizeof(float));
+    uint64_t *lhR = malloc((size_t)n * sizeof(uint64_t)), *vlhR = malloc((size_t)n * sizeof(uint64_t));
+    RqSeq *s = mt_seq(M), *vs = mt_seq(view);
+
+    // the digest (every mode, build, thread count): the target's hidden rows (chunks of 64, no logits), then the view
+    // over them (h shifted by one): its logits and hidden rows
+    {
+        uint64_t dg = 0;
+        float *out = malloc((size_t)n * V * sizeof(float));
+        int e = fw_rows(c64, s, T.v, n, RQ_LOGITS_NONE, NULL, NULL, hR, NULL);
+        memcpy(Hs + D, hR, (size_t)(n - 1) * D * sizeof(float));
+        if (e == RQ_OK) e = fw_rows(v64, vs, T.v, n, RQ_LOGITS_ALL, out, NULL, vhR, Hs);
+        if (e != RQ_OK) die("the digest's passes", e);
+        dg = tw_mix(hash_f(hR, (size_t)n * D), hash_f(vhR, (size_t)n * D));
+        for (int i = 0; i < n; i++)
+            dg = tw_mix(dg, hash_f(out + (size_t)i * V, V));
+        printf("mtp digest: %016llx\n", (unsigned long long)dg);
+        free(out);
+    }
+
+    // hidden_rows: the target's
+    {
+        float *o = malloc((size_t)n * V * sizeof(float)), *h = malloc((size_t)n * D * sizeof(float));
+        int e = mt_ref(c1, s, T.v, n, NULL, o, h, lhR);
+        int ok = e == RQ_OK && same(h, hR, (size_t)n * D);
+        snprintf(d, sizeof(d), "%d rows: decode == chunks of 64 without logits", n);
+        free(o);
+        free(h);
+        char d2[768] = "";
+        ok &= mt_paths(M, c1, c64, T.v, n, NULL, quick, lhR, hR, d2, sizeof(d2));
+        size_t dl = strlen(d);
+        snprintf(d + dl, sizeof(d) - dl, ", %s", d2);
+        report(ok, "hidden_rows", d);
+    }
+    // mtp_paths: the view fed the target's hidden rows shifted by one
+    {
+        int e = mt_ref(v1, vs, T.v, n, Hs, full, vhR, vlhR);
+        char d2[768] = "";
+        int ok = e == RQ_OK && mt_paths(view, v1, v64, T.v, n, Hs, quick, vlhR, vhR, d2, sizeof(d2));
+        report(ok, "mtp_paths", d2);
+        // h_in NULL == zeros (decode, chunks)
+        float *z = calloc((size_t)n * D, sizeof(float)), *o = malloc((size_t)n * V * sizeof(float));
+        uint64_t *l0 = malloc((size_t)n * sizeof(uint64_t)), *l1 = malloc((size_t)n * sizeof(uint64_t));
+        ok = mt_ref(v1, vs, T.v, n, NULL, o, NULL, l0) == RQ_OK && mt_ref(v1, vs, T.v, n, z, o, NULL, l1) == RQ_OK &&
+             !memcmp(l0, l1, (size_t)n * sizeof(uint64_t));
+        int mode[] = { RQ_LOGITS_ALL };
+        ok &= mt_segs(v64, vs, T.v, n, 64, mode, 1, NULL, NULL, l1, o) == RQ_OK && !memcmp(l0, l1, (size_t)n * sizeof(uint64_t));
+        ok &= memcmp(l0, vlhR, (size_t)n * sizeof(uint64_t)) != 0; // (and the h input matters)
+        report(ok, "mtp_paths/h_in_null", "h_in NULL == explicit zeros (decode, chunks of 64), != the target's hidden rows");
+        // truncate + refeed == straight (a plain KV cache: any length)
+        int okt = 1;
+        for (int P = 1; P < n; P += quick ? 50 : 23) {
+            rq_seq_reset(vs);
+            okt &= fw_rows(v64, vs, T.v, n, RQ_LOGITS_NONE, NULL, NULL, NULL, Hs) == RQ_OK && rq_seq_keep(vs, P) == P &&
+                   rq_seq_truncate(vs, P) == RQ_OK && rq_seq_len(vs) == P;
+            float *h = malloc((size_t)(n - P) * D * sizeof(float));
+            okt &= fw_rows(P % 2 ? v64 : v1, vs, T.v + P, n - P, RQ_LOGITS_ALL, o, NULL, h, Hs + (size_t)P * D) == RQ_OK;
+            for (int i = 0; i < n - P && okt; i++) okt &= hash_f(o + (size_t)i * V, V) == vlhR[P + i];
+            okt &= same(h, vhR + (size_t)P * D, (size_t)(n - P) * D);
+            free(h);
+        }
+        report(okt, "mtp_paths/truncate", quick ? "truncated at lengths 1 and 51, fed again (chunks of 64 / decode) == straight"
+                                                 : "truncated at every 23rd length and fed again (chunks of 64 / decode) == straight");
+        ok = mt_subset(view, v64, T.v, n, Hs, full, quick, d, sizeof(d));
+        report(ok, "mtp_paths/vocab_subset", d);
+        free(z);
+        free(o);
+        free(l0);
+        free(l1);
+    }
+    // mtp_load
+    {
+        RqModelInfo vi;
+        rq_model_info(view, &vi);
+        RqModelMem vm;
+        RqSeqMem sm;
+        rq_model_mem(M, &mem1);
+        int ok = vi.n_layers == 1 && vi.linear_layers == 0 && vi.fingerprint != I.fingerprint && vi.vocab_size == V && vi.dim == D;
+        ok &= rq_model_mem(view, &vm) == RQ_OK && vm.weights > 0 && vm.runtime > 0 && !memcmp(&mem0, &mem1, sizeof(mem0));
+        ok &= rq_seq_mem(view, 4096, RQ_KV_F16, &sm) == RQ_OK && sm.state == 0 && sm.checkpoints == 0 &&
+              sm.kv == (size_t)2 * 4096 * vi.n_kv_heads * vi.head_dim * 2 + 4096 * 4;
+        snprintf(d, sizeof(d), "info (1 layer, no linear ones, a fingerprint of its own), estimate weights %.1f MiB + runtime "
+                 "%.1f + %zu bytes per position (f16), the target's unchanged", vm.weights / 1048576.0, vm.runtime / 1048576.0,
+                 (sm.kv - 4096 * 4) / 4096);
+        report(ok, "mtp_load/info", d);
+        // the block's matrices by their names (rq_dequant_rows: from the file's blocks and the repacked layout)
+        ok = 1;
+        d[0] = 0;
+        const char *role[] = { "nextn.eh_proj", "attn_q", "ffn_down" };
+        for (int i = 0; i < 3; i++) {
+            char nm[96];
+            float *rows = NULL, *packed = NULL;
+            int nc = 0, np = 0;
+            snprintf(nm, sizeof(nm), "blk.%d.%s.weight", I.n_layers, role[i]);
+            int e = rq_dequant_rows(view, nm, strlen(nm), 0, 16, &rows, &packed, &nc, &np, err, sizeof(err));
+            int okk = e == RQ_OK && nc == (i == 0 ? 2 * D : i == 2 ? I.hidden_dim : D) && (!np || same(rows, packed, (size_t)16 * nc));
+            for (int j = 0; okk && j < 16 * nc; j++) okk &= rows[j] == rows[j];
+            size_t dl = strlen(d);
+            snprintf(d + dl, sizeof(d) - dl, "%s%s %d cols%s%s", dl ? ", " : "", nm, nc, np ? " (== repacked)" : "", okk ? "" : " BAD");
+            ok &= okk;
+            free(rows);
+            free(packed);
+        }
+        report(ok, "mtp_load/dequant", d);
+        // refusals: no block, optional nextn tensors, the memory budget; h_in on the target; a view's sequence on the
+        // target's context
+        ok = 1;
+        d[0] = 0;
+        if (plain) {
+            RqModel *x = rq_model_load(plain, NULL, err, sizeof(err));
+            RqModel *y = x ? rq_mtp_load(x, NULL, err, sizeof(err)) : NULL;
+            ok &= x && !y && strstr(err, "no MTP block");
+            snprintf(d, sizeof(d), "%s; ", err);
+            rq_model_free(y);
+            rq_model_free(x);
+        }
+        if (optional) {
+            RqModel *x = rq_model_load(optional, NULL, err, sizeof(err));
+            RqModel *y = x ? rq_mtp_load(x, NULL, err, sizeof(err)) : NULL;
+            ok &= x && !y && strstr(err, "optional MTP tensors (nextn.embed_tokens / shared_head_head) not supported");
+            size_t dl = strlen(d);
+            snprintf(d + dl, sizeof(d) - dl, "%s; ", err);
+            rq_model_free(y);
+            rq_model_free(x);
+        }
+        RqMtpOpts tiny = { 0, 1e-6 };
+        RqModel *y = rq_mtp_load(M, &tiny, err, sizeof(err));
+        ok &= !y && strstr(err, "needs ~") && strstr(err, "not loaded");
+        size_t dl = strlen(d);
+        snprintf(d + dl, sizeof(d) - dl, "%s", err);
+        RqModel *z = rq_mtp_load(view, NULL, err, sizeof(err));
+        ok &= !z && strstr(err, "no MTP block"); // (a view has none)
+        RqSegment sg = { s, T.v, 3, RQ_LOGITS_NONE, NULL, Hs };
+        rq_seq_reset(s);
+        ok &= rq_forward_batch(c64, &sg, 1, NULL, NULL) == RQ_ERR_ARG && fw_rows(c64, s, T.v, 3, RQ_LOGITS_NONE, NULL, NULL, NULL, Hs) == RQ_ERR_ARG &&
+              fw_rows(c1, s, T.v, 3, RQ_LOGITS_NONE, NULL, NULL, NULL, Hs) == RQ_ERR_ARG && rq_seq_len(s) == 0;
+        rq_seq_reset(vs);
+        ok &= rq_decode(c1, vs, T.v[0], NULL) == RQ_ERR_ARG && rq_decode(v1, s, T.v[0], NULL) == RQ_ERR_ARG;
+        report(ok, "mtp_load/refused", d);
+        // a second view of the same target, and views loaded and freed twice: the same results; the target's after
+        ok = 1;
+        RqModel *v2 = rq_mtp_load(M, NULL, err, sizeof(err));
+        for (int k = 0; k < 2 && ok; k++) {
+            RqModel *w = rq_mtp_load(M, NULL, err, sizeof(err));
+            RqCtx *wc = w ? rq_ctx_new(w, 8, 0, NULL) : NULL;
+            RqSeq *ws = w ? rq_seq_new(w, 64, RQ_KV_DEFAULT, NULL) : NULL;
+            float *lg = NULL;
+            ok &= wc && ws && fw_rows(wc, ws, T.v, 5, RQ_LOGITS_LAST, NULL, &lg, NULL, Hs) == RQ_OK && hash_f(lg, V) == vlhR[4];
+            rq_ctx_free(wc);
+            rq_seq_free(ws);
+            rq_model_free(w);
+        }
+        ok &= v2 != NULL;
+        rq_model_free(v2);
+        float *lg;
+        rq_seq_reset(s);
+        ok &= fw_rows(c64, s, T.v, 9, RQ_LOGITS_LAST, NULL, &lg, NULL, NULL) == RQ_OK && hash_f(lg, V) == lhR[8];
+        report(ok, "mtp_load/twice", "a second view; views loaded, run and freed twice (== the first view); the target unchanged");
+    }
+    free(hR);
+    free(Hs);
+    free(vhR);
+    free(full);
+    free(lhR);
+    free(vlhR);
+    rq_tokens_free(&T);
+    rq_seq_free(vs);
+    rq_seq_free(s);
+    rq_ctx_free(v1);
+    rq_ctx_free(v64);
+    rq_ctx_free(c1);
+    rq_ctx_free(c64);
+    rq_model_free(view); // (before the target: it shares its mapping, tokenizer and classifier)
+    rq_model_free(M);
+    return failed;
+}
+
+static int mtp_dump_main(int argc, char **argv) {
+    // api_test --mtp-dump MODEL TEXTFILE OUT.bin [-b N] [--vocab N] (the head of this file)
+    const char *path[3] = { NULL, NULL, NULL };
+    int nb = 64, vocab = 0, bad = 0, np = 0;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "-b") && i + 1 < argc) nb = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--vocab") && i + 1 < argc) vocab = atoi(argv[++i]);
+        else if (argv[i][0] == '-' || np == 3) bad = 1;
+        else path[np++] = argv[i];
+    }
+    if (bad || np < 3) {
+        fprintf(stderr, "usage: api_test --mtp-dump MODEL TEXTFILE OUT.bin [-b N] [--vocab N]\n");
+        return 2;
+    }
+    rq_threads_init(0);
+    char err[512];
+    if (!(M = rq_model_load(path[0], NULL, err, sizeof(err)))) { fprintf(stderr, "%s\n", err); return 1; }
+    rq_model_info(M, &I);
+    V = I.vocab_size;
+    D = I.dim;
+    RqMtpOpts mo = { vocab, -1 };
+    RqModel *view = rq_mtp_load(M, &mo, err, sizeof(err));
+    if (!view) { fprintf(stderr, "%s\n", err); return 1; }
+    FILE *f = fopen(path[1], "rb");
+    char *text = NULL;
+    long len = 0;
+    if (f && !fseek(f, 0, SEEK_END) && (len = ftell(f)) >= 0 && !fseek(f, 0, SEEK_SET) && (text = malloc(len + 1)) &&
+        fread(text, 1, len, f) == (size_t)len)
+        text[len] = 0;
+    else { fprintf(stderr, "can't read %s\n", path[1]); return 1; }
+    fclose(f);
+    RqTokens t = { 0 };
+    if (rq_tokenize(M, text, len, &t) != RQ_OK || t.n < 1) { fprintf(stderr, "no tokens\n"); return 1; }
+    int n = t.n, e;
+    RqCtx *c = mt_ctx(M, nb), *vc = mt_ctx(view, nb);
+    RqSeq *s = rq_seq_new(M, n, RQ_KV_DEFAULT, &e), *vs = s ? rq_seq_new(view, n, RQ_KV_DEFAULT, &e) : NULL;
+    float *H = calloc((size_t)(n + 1) * D, sizeof(float)), *out = malloc((size_t)n * V * sizeof(float));
+    if (!vs || !H || !out) { fprintf(stderr, "out of memory\n"); return 1; }
+    // the target's hidden rows into H + D (row q's at H + (q + 1) D): the view's row q takes h_{q-1} = H + q D, row 0 zeros
+    if ((e = fw_rows(c, s, t.v, n, RQ_LOGITS_NONE, NULL, NULL, H + D, NULL)) != RQ_OK ||
+        (e = fw_rows(vc, vs, t.v, n, RQ_LOGITS_ALL, out, NULL, NULL, H)) != RQ_OK) {
+        fprintf(stderr, "%s: %s\n", rq_strerror(e), rq_ctx_error(vc));
+        return 1;
+    }
+    FILE *o = fopen(path[2], "wb");
+    int32_t hd[2] = { n, V };
+    int ok = o && fwrite(hd, 4, 2, o) == 2 && fwrite(t.v, 4, n, o) == (size_t)n && fwrite(out, sizeof(float), (size_t)n * V, o) == (size_t)n * V;
+    if (!o || fclose(o) != 0 || !ok) { fprintf(stderr, "can't write %s\n", path[2]); return 1; }
+    free(H);
+    free(out);
+    free(text);
+    rq_tokens_free(&t);
+    rq_seq_free(vs);
+    rq_seq_free(s);
+    rq_ctx_free(vc);
+    rq_ctx_free(c);
+    rq_model_free(view);
+    rq_model_free(M);
+    return 0;
 }

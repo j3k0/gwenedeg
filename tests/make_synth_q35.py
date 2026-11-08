@@ -44,8 +44,11 @@ synth-q35-iq.gguf (~200 MB): synth-q35-27b.gguf with its matrices requantized (t
 synth-q35-r2-bf16.gguf, synth-q35-r2-bf16w.gguf, synth-q35-r2-bf16bad.gguf (~87 MB each; TODO S9.1): synth-q35-r2.gguf with
   ssm_alpha / ssm_beta in BF16 (its Q8_0 rows dequantized and rounded to bf16, nearest even), as the IQ3_S-mtp 27B file
   has them, resp. the same values as F32 (the twin: runq widens BF16 at load, so their logits are equal, bitwise),
-  resp. the BF16 file with blk.0.ffn_gate in BF16 too (a role that must stay refused). Built last, from
-  synth-q35-r2.gguf, without random numbers (the other files' bytes do not change).
+  resp. the BF16 file with blk.0.ffn_gate in BF16 too (a role that must stay refused). Built from synth-q35-r2.gguf,
+  without random numbers (the other files' bytes do not change).
+synth-q35-27b-mtpbad.gguf (TODO S9a): synth-q35-27b-mtp.gguf + an optional MTP tensor of llama.cpp's layout,
+  blk.8.nextn.shared_head_head.weight (16 zero Q8_0 rows: only its presence matters), which rq_mtp_load refuses (the
+  main model loads as before). Built last, from synth-q35-27b-mtp.gguf, without random numbers.
 synth-tok-qwen3.8.gguf, synth-tok-qwen3.8-hf.gguf (~8 MB): tokenizer-only files (the 0.8B's tokenizer and metadata, a
   token_embd entry of an unknown type without data) with Qwen3.8's template: the 27B GGUF's (Unsloth's) resp. Qwen's
   own (qwen3.8-hf.jinja): `runq -m render` vs tests/golden/chat_render.json (needs the Q8_0 source only).
@@ -74,6 +77,7 @@ DIM, FFN, LAYERS = 256, 512, 6
 MODELS = {"synth-q35-r2.gguf": (4, 8), "synth-q35-r3.gguf": (2, 6)}  # (key heads, value heads)
 R2_BF16 = {"synth-q35-r2-bf16.gguf": "bf16", "synth-q35-r2-bf16w.gguf": "wide",
            "synth-q35-r2-bf16bad.gguf": "bad"}  # file: build_bf16's mode
+M27_MTPBAD = "synth-q35-27b-mtpbad.gguf"
 BAD = ["bad-q35-nv.gguf", "bad-q35-hadamard.gguf", "bad-q35-nextn.gguf"]
 
 
@@ -346,6 +350,17 @@ def build_bf16(src, path, mode):
     G.write_gguf(path, kvs, t)
 
 
+def build_mtpbad(src, path):
+    """synth-q35-27b-mtp.gguf (src) + blk.8.nextn.shared_head_head.weight (llama.cpp's optional per-block head: refused by
+    rq_mtp_load), 16 zero Q8_0 rows of dim columns"""
+    f = G.GgufFile(src)
+    kvs = [(k, G.raw_kv(G.GV_STR, "gwenedeg-synth-q35-27b (MTP block with an optional nextn tensor)") if k == "general.name" else raw)
+           for k, raw in f.kv_raw]
+    t = [(name, f.tensors[name][0], f.tensors[name][1], np.ascontiguousarray(f.tensor_bytes(name)).tobytes()) for name in f.order]
+    t.append((f"blk.{L27}.nextn.shared_head_head.weight", (D27, 16), G.Q8_0, bytes(16 * G.row_bytes(G.Q8_0, D27))))
+    G.write_gguf(path, kvs, t)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--src", default=SRC)
@@ -371,7 +386,7 @@ def main():
     if q4:
         st = os.stat(q4)
         stamp.update(src_q4=os.path.abspath(q4), size_q4=st.st_size, mtime_q4=int(st.st_mtime))
-    names = list(MODELS) + BAD + list(TOK38) + ([M27, M27_MTP, M27_F32, M27_IQ] if q4 else []) + list(R2_BF16)
+    names = list(MODELS) + BAD + list(TOK38) + ([M27, M27_MTP, M27_F32, M27_IQ, M27_MTPBAD] if q4 else []) + list(R2_BF16)
     sp = os.path.join(a.out, "stamp.json")
     if not a.force and os.path.exists(sp) and all(os.path.exists(os.path.join(a.out, n)) for n in names):
         with open(sp) as fh:
@@ -390,7 +405,7 @@ def main():
     build_bad(f, os.path.join(a.out, BAD[2]), {"qwen35.nextn_predict_layers": (G.GV_U32, int(f.kv["qwen35.block_count"]))})
     for n, t in TOK38.items():
         build_tok(f, os.path.join(a.out, n), template(t), BOS38 if t == "qwen3.8" else None)
-    for n in (M27, M27_MTP, M27_F32, M27_IQ):
+    for n in (M27, M27_MTP, M27_F32, M27_IQ, M27_MTPBAD):
         if os.path.exists(os.path.join(a.out, n)):
             os.remove(os.path.join(a.out, n))
     if q4:
@@ -399,8 +414,10 @@ def main():
         build_27b(f, f4, os.path.join(a.out, M27_MTP), True)
         build_27b(f, f4, os.path.join(a.out, M27_F32), True, True)
         build_iq(os.path.join(a.out, M27), os.path.join(a.out, M27_IQ))
-    for n, mode in R2_BF16.items():  # (last)
+    for n, mode in R2_BF16.items():
         build_bf16(os.path.join(a.out, "synth-q35-r2.gguf"), os.path.join(a.out, n), mode)
+    if q4:  # (last)
+        build_mtpbad(os.path.join(a.out, M27_MTP), os.path.join(a.out, M27_MTPBAD))
     with open(sp, "w") as fh:
         json.dump(stamp, fh)
     print(a.out)

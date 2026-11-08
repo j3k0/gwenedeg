@@ -696,8 +696,12 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
 # an IQ1_M embedding, an IQ3_S classifier: src/iquants.h): measured cos mean 0.9973 / 0.9982 / 0.9966, min 0.9874, top-1
 # 280/338 (the int8 activations on 1.5- to 4-bit weights, as synth-q35-27b); bitwise: the gather and VBMI AVX-512 decodes
 # and the generic kernel give the same logits (RUNQ_IQ_GATHER=1: iq_synth_run, with the dequantization checks)
+# synth-q35-r2-bf16.gguf: synth-q35-r2 with BF16 alpha / beta (TODO S9.1: widened to F32 at load, fp32 activations
+# there): measured cos mean 0.99964 / 0.99980 / 0.99963, min 0.99690, top-1 325/338 (synth-q35-r2's Q8_0 ones 0.99967 /
+# 0.99981 / 0.99962, 0.99711, 321/338); bitwise as synth-q35-r2, and its logits == its F32 twin's (q35_bf16_run)
 Q35_SYNTH = {"synth-q35-r2.gguf": True, "synth-q35-r3.gguf": False, "synth-q35-27b.gguf": True,
-             "synth-q35-27b-f32.gguf": True, "synth-q35-iq.gguf": True}  # file: full api_test (else digests)
+             "synth-q35-27b-f32.gguf": True, "synth-q35-iq.gguf": True,
+             "synth-q35-r2-bf16.gguf": False}  # file: full api_test (else digests)
 Q35_SYNTH_REF = ["en", "code", "long2"]
 TH_Q35_SYNTH = dict(cos_mean=0.999, cos_pos=0.99, top1=0.8)
 TH_Q35_SYNTH_KQ = {"synth-q35-27b": dict(cos_mean=0.993, cos_pos=0.95, top1=0.7),
@@ -780,6 +784,43 @@ def q35_mtp_run(a, d, tmp, texts):
     out.append((ok, "q35/synth-q35-27b-f32/chat_qwen38", f"-e low -y: the first prompt ({len(want)} tokens) == -m render, the "
                 f"second turn prefills {len(turn2)} tokens (<|im_end|>\\n + its user turn), the reply opens in <think>"
                 + ("" if ok else f"  <- rc {p.returncode}, prompts {np_}, {len(ids)} cached, {err[-200:]!r}")))
+    return out
+
+
+def q35_bf16_run(a, d, tmp, texts):
+    """synth-q35-r2-bf16.gguf (BF16 ssm_alpha / ssm_beta, widened to F32 at load) vs its twin synth-q35-r2-bf16w.gguf (the
+    same values stored F32): -m logits bitwise equal (-b 1, -b 64; the generic build -b 7, also == the AVX-512 build's);
+    -m dequant of its BF16 rows == ggufmini, bitwise; synth-q35-r2-bf16bad.gguf (BF16 in another role, ffn_gate) refused:
+    [(ok, name, detail)]"""
+    import hashlib
+    out = []
+    bf, wide, bad = (os.path.join(d, f"synth-q35-r2-{x}.gguf") for x in ("bf16", "bf16w", "bf16bad"))
+    if not (os.path.exists(bf) and os.path.exists(wide)):
+        return out
+    pre = "q35/synth-q35-r2-bf16"
+
+    def h(exe, m, b, th):
+        path = os.path.join(tmp, f"bf16_{os.path.basename(m)}_{b}_{th}{'_gen' if exe == a.generic else ''}.bin")
+        logits_run(exe, m, texts["en"], path, b, th)
+        with open(path, "rb") as fh:
+            x = hashlib.sha256(fh.read()).hexdigest()
+        os.remove(path)
+        return x
+    for b in (1, 64):
+        ok = h(a.runq, bf, b, SYNTH_THREADS) == h(a.runq, wide, b, SYNTH_THREADS)
+        out.append((ok, f"{pre}/logits_eq_b{b}", f"-m logits -b {b}: BF16 file == its F32 twin: " + ("bit-identical" if ok else "DIFFER")))
+    if a.generic:
+        hs = [h(a.generic, bf, 7, 3), h(a.generic, wide, 7, 3), h(a.runq, bf, 7, 3)]
+        ok = hs[0] == hs[1] == hs[2]
+        out.append((ok, f"{pre}/logits_eq_generic", "-m logits -b 7, generic build: BF16 file == its F32 twin == the AVX-512 "
+                    "build's: " + ("bit-identical" if ok else f"DIFFER (twin {hs[0] == hs[1]}, AVX-512 {hs[0] == hs[2]})")))
+    out += dequant_vs_mini(a.runq, bf, [("blk.0.ssm_alpha.weight", 0, 8), ("blk.5.ssm_beta.weight", 3, 5)], f"{pre}/dequant")
+    if os.path.exists(bad):
+        p = run([a.runq, bad, "-n", "1", "-i", "hi"], 1)
+        err = p.stderr.decode(errors="replace").strip()
+        ok = p.returncode == 1 and "tensor blk.0.ffn_gate.weight has ggml type 30, need Q8_0 (8)" in err and "BF16" not in err
+        out.append((ok, "q35/synth/bad_bf16_role", f"BF16 ffn_gate refused (BF16 only for ssm_alpha / ssm_beta): exit status "
+                    f"{p.returncode}: {err[-200:]!r}"))
     return out
 
 
@@ -1071,7 +1112,8 @@ def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
     os.makedirs(os.path.join(t, "synth"), exist_ok=True)
     synth = [ex.submit(q35_synth_run, a, os.path.join(t, "synth"), os.path.join(sd, fn), texts, full)
              for fn, full in Q35_SYNTH.items() if os.path.exists(os.path.join(sd, fn))] + [ex.submit(q35_bad_run, a, sd)] + \
-        [ex.submit(q35_mtp_run, a, sd, os.path.join(t, "synth"), texts), ex.submit(q35_server38, a, sd)] + \
+        [ex.submit(q35_mtp_run, a, sd, os.path.join(t, "synth"), texts), ex.submit(q35_server38, a, sd),
+         ex.submit(q35_bf16_run, a, sd, os.path.join(t, "synth"), texts)] + \
         [ex.submit(render_run, a.runq, os.path.join(sd, fn), "qwen3.8", f"q35/synth/render_{fn[10:-5]}")
          for fn in ("synth-tok-qwen3.8.gguf", "synth-tok-qwen3.8-hf.gguf")] + \
         ([ex.submit(q35_two_run, a, sd)] if a.api_test else []) if sd else []

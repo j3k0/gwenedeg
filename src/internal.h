@@ -110,10 +110,11 @@ typedef struct {
     const uint8_t *b; // GGUF weights: the blocks in the file mapping (Q8_0: per 32 values an fp16
                   // scale + 32 int8, Q8_0_BLOCK bytes; Q3_K .. Q6_K: kquants.h), converted at load
                   // (prepare_weights); or NULL
-    int type;     // weights: ggml type, GGML_Q8_0 (also the .bin's group-64 Q8), GGML_Q3_K / Q4_K / Q5_K / Q6_K, GGML_F32
+    int type;     // weights: ggml type, GGML_Q8_0 (also the .bin's group-64 Q8), GGML_Q3_K / Q4_K / Q5_K / Q6_K, GGML_F32,
+                  // GGML_BF16
     uint8_t *kp;  // K-quant weights: repacked (Q3P / Q4P / Q5P / Q6P layout, kquants.h; Q2_K and the i-quants: iquants.h), else NULL
-    float *f;     // F32 weights (ssm_alpha / ssm_beta only: Qwen3.8-27B's): the rows copied at load (prepare_weights),
-                  // applied to the fp32 activations (forward.c, f32_rows), else NULL
+    float *f;     // F32 / BF16 weights (ssm_alpha / ssm_beta only: Qwen3.8-27B's): the rows copied at load (prepare_weights;
+                  // BF16 widened to F32, exact), applied to the fp32 activations (forward.c, f32_rows), else NULL
 } QuantizedTensor;
 
 // The MTP (multi-token prediction) block of a qwen35 file with nextn_predict_layers 1 (Qwen3.8-27B's blk.64, after the
@@ -184,7 +185,7 @@ RQ_NORETURN void load_fail(LoadErr *e, const char *fmt, ...);
 // from the metadata, Q8_0 / Q3_K / Q4_K / Q5_K / Q6_K / F32 tensors from the mapped file (layout: gguf.c)
 #define GGUF_MAGIC 0x46554747u // "GGUF"
 enum { GV_U8, GV_I8, GV_U16, GV_I16, GV_U32, GV_I32, GV_F32, GV_BOOL, GV_STR, GV_ARR, GV_U64, GV_I64, GV_F64, GV_N };
-enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q8_0 = 8 }; // tensor types (ggml numbering) used here
+enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q8_0 = 8, GGML_BF16 = 30 }; // tensor types (ggml numbering) used here
 #define Q8_0_BLOCK 34 // ggml block_q8_0: fp16 scale d, int8 qs[32]; value = qs[i] * d
 
 typedef struct { const char *key; uint64_t key_len, off, n; uint32_t type, arr_type; } GgufKV; // off: value / first element

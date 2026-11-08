@@ -127,6 +127,20 @@ checkpoints))", the script's estimate below.
   -b 1 / 7 / 64 / 512, 4 vs 3 threads, AVX-512 vs generic, `api_test` 28/28 (batched decode rows == alone,
   checkpoints) and its digests across builds. Cost for the 27B (estimated): 2 x 48 x 5120 x 4 B = 1.9 MB per linear
   layer, 94 MB per token (0.6% of the 16.8 GB read per token).
+- **BF16 `ssm_alpha` / `ssm_beta`** (TODO S9.1, 2026-11-08; ISTA-DASLab's `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` and
+  `...IQ3_S.gguf` store them as BF16, ggml type 30): accepted for the same two roles and **widened to F32 at load**
+  (`prepare_worker`: the rows read into the upper half of their F32 place and widened in place, `u32 = u16 << 16`,
+  exact; then the same inf / NaN check). After the load they are F32 rows like the others, so `f32_rows` and every
+  path are unchanged: a BF16 file's logits equal those of the same file with the values stored as F32, bitwise. The
+  estimate counts them as F32 (what is resident); `-m dequant` widens them the same way. A BF16 matrix in any other
+  role stays refused. No rewrite of the file is needed any more (`...IQ3_S-f32ssm.gguf`, 11.8 GB, was made for
+  that; deleting it is the user's call). Checked on `synth-q35-r2-bf16.gguf` vs its F32 twin `-bf16w`
+  (`q35/synth-q35-r2-bf16/*`: `logits_eq_b1` / `_b64` / `_generic` bitwise, `logits_ref` vs `tests/ref_qwen35.py`
+  cos mean 0.99964 / 0.99980 / 0.99963, min 0.99690, top-1 325/338, the bitwise invariants, `dequant/*` ==
+  ggufmini) and `q35/synth/bad_bf16_role`. The real file's header: `runq ...IQ3_S-mtp.gguf --mem 0.01` now maps every
+  matrix, validates `blk.64` and refuses at the memory check ("needs ~14.11 GiB (weights 10.86, runtime 0.31, a
+  sequence of 40960 positions: KV cache 2.50 + recurrent state 150 MiB x (1 + 2 checkpoints))", 0.03 s, 12 MB peak
+  RSS), where it refused `blk.0.ssm_alpha.weight`'s type 30 before.
 
 ### A real small MTP: Qwen3.5-0.8B-mtp (TODO S9.0b, 2026-11-08)
 

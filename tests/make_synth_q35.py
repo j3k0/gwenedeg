@@ -41,6 +41,11 @@ synth-q35-iq.gguf (~200 MB): synth-q35-27b.gguf with its matrices requantized (t
   i-quants (src/iquants.h), the types mixed within each role over the layers and within the fused phases (q / k / v,
   gate / up, qkv / z), as in Underdog Saluki 27B's file: every one of the nine types in several roles, an IQ1_M
   token_embd and an IQ3_S output (Saluki's), ssm_alpha / ssm_beta Q8_0 (Saluki's). Built from synth-q35-27b.gguf.
+synth-q35-r2-bf16.gguf, synth-q35-r2-bf16w.gguf, synth-q35-r2-bf16bad.gguf (~87 MB each; TODO S9.1): synth-q35-r2.gguf with
+  ssm_alpha / ssm_beta in BF16 (its Q8_0 rows dequantized and rounded to bf16, nearest even), as the IQ3_S-mtp 27B file
+  has them, resp. the same values as F32 (the twin: runq widens BF16 at load, so their logits are equal, bitwise),
+  resp. the BF16 file with blk.0.ffn_gate in BF16 too (a role that must stay refused). Built last, from
+  synth-q35-r2.gguf, without random numbers (the other files' bytes do not change).
 synth-tok-qwen3.8.gguf, synth-tok-qwen3.8-hf.gguf (~8 MB): tokenizer-only files (the 0.8B's tokenizer and metadata, a
   token_embd entry of an unknown type without data) with Qwen3.8's template: the 27B GGUF's (Unsloth's) resp. Qwen's
   own (qwen3.8-hf.jinja): `runq -m render` vs tests/golden/chat_render.json (needs the Q8_0 source only).
@@ -67,6 +72,8 @@ SRC = os.path.join(ROOT, "models", "Qwen3.5-0.8B-GGUF", "Qwen3.5-0.8B-Q8_0.gguf"
 OUT = os.path.join(ROOT, "build", "synth-q35")
 DIM, FFN, LAYERS = 256, 512, 6
 MODELS = {"synth-q35-r2.gguf": (4, 8), "synth-q35-r3.gguf": (2, 6)}  # (key heads, value heads)
+R2_BF16 = {"synth-q35-r2-bf16.gguf": "bf16", "synth-q35-r2-bf16w.gguf": "wide",
+           "synth-q35-r2-bf16bad.gguf": "bad"}  # file: build_bf16's mode
 BAD = ["bad-q35-nv.gguf", "bad-q35-hadamard.gguf", "bad-q35-nextn.gguf"]
 
 
@@ -315,6 +322,30 @@ def build_iq(src, path):
     G.write_gguf(path, kvs, t)
 
 
+def bf16_bits(x):
+    """float32 values (finite) -> their bf16 bits, rounded to nearest even (uint16)"""
+    u = np.ascontiguousarray(x, dtype="<f4").view("<u4").astype(np.uint64)
+    return ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype("<u2")
+
+
+def build_bf16(src, path, mode):
+    """synth-q35-r2.gguf (src) with ssm_alpha / ssm_beta BF16 (mode "bf16"), the same values F32 ("wide"), or BF16 with
+    blk.0.ffn_gate BF16 too ("bad")"""
+    f = G.GgufFile(src)
+    title = {"bf16": "BF16 ssm_alpha / ssm_beta", "wide": "BF16 ssm_alpha / ssm_beta widened to F32",
+             "bad": "BF16 ssm_alpha / ssm_beta and ffn_gate.0"}[mode]
+    kvs = [(k, G.raw_kv(G.GV_STR, f"gwenedeg-synth-q35-r2 ({title})") if k == "general.name" else raw) for k, raw in f.kv_raw]
+    t = []
+    for name in f.order:
+        ne, ty, _ = f.tensors[name]
+        data = f.tensor_bytes(name)
+        if name.split(".")[2:3] in (["ssm_alpha"], ["ssm_beta"]) or (mode == "bad" and name == "blk.0.ffn_gate.weight"):
+            b = bf16_bits(G.dequant(ty, data, int(ne[1]), int(ne[0])))
+            data, ty = ((b.astype("<u4") << 16).view("<f4"), G.F32) if mode == "wide" else (b, G.BF16)
+        t.append((name, ne, ty, np.ascontiguousarray(data).tobytes()))
+    G.write_gguf(path, kvs, t)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--src", default=SRC)
@@ -340,7 +371,7 @@ def main():
     if q4:
         st = os.stat(q4)
         stamp.update(src_q4=os.path.abspath(q4), size_q4=st.st_size, mtime_q4=int(st.st_mtime))
-    names = list(MODELS) + BAD + list(TOK38) + ([M27, M27_MTP, M27_F32, M27_IQ] if q4 else [])
+    names = list(MODELS) + BAD + list(TOK38) + ([M27, M27_MTP, M27_F32, M27_IQ] if q4 else []) + list(R2_BF16)
     sp = os.path.join(a.out, "stamp.json")
     if not a.force and os.path.exists(sp) and all(os.path.exists(os.path.join(a.out, n)) for n in names):
         with open(sp) as fh:
@@ -368,6 +399,8 @@ def main():
         build_27b(f, f4, os.path.join(a.out, M27_MTP), True)
         build_27b(f, f4, os.path.join(a.out, M27_F32), True, True)
         build_iq(os.path.join(a.out, M27), os.path.join(a.out, M27_IQ))
+    for n, mode in R2_BF16.items():  # (last)
+        build_bf16(os.path.join(a.out, "synth-q35-r2.gguf"), os.path.join(a.out, n), mode)
     with open(sp, "w") as fh:
         json.dump(stamp, fh)
     print(a.out)

@@ -5,9 +5,9 @@ a GGUF v2 / v3 file (layout: src/gguf.c), the tensor data as numpy views of a me
 write_gguf(path, kvs, tensors): a GGUF v3 file from (key, raw value bytes) pairs (raw_kv / copied spans)
 and (name, ne, ggml type, data bytes) tuples.
 dequant(type, data, nrows, ncols): Q8_0 / Q2_K .. Q6_K / the i-quants (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
-IQ3_S, IQ4_XS) / F32 rows to float32 with ggml's expressions (dequantize_row_q8_0 / _q3_K / .. / _iq4_xs: the same float32
-operations as gguf-py, bit for bit; checked against tests/golden/dequant; the i-quant codebooks are read from
-src/iq_grids.h). Used by tests/make_synth.py (the synthetic models), tests/ref_forward.py (the numpy reference forward
+IQ3_S, IQ4_XS) / F32 / F16 / BF16 rows to float32 with ggml's expressions (dequantize_row_q8_0 / _q3_K / .. / _iq4_xs:
+the same float32 operations as gguf-py, bit for bit; checked against tests/golden/dequant; the i-quant codebooks are read
+from src/iq_grids.h). Used by tests/make_synth.py (the synthetic models), tests/ref_forward.py (the numpy reference forward
 pass) and tests/check_models.py.
 """
 import os
@@ -19,14 +19,14 @@ import numpy as np
 GV_U8, GV_I8, GV_U16, GV_I16, GV_U32, GV_I32, GV_F32, GV_BOOL, GV_STR, GV_ARR, GV_U64, GV_I64, GV_F64 = range(13)
 _SCALAR = {GV_U8: "<B", GV_I8: "<b", GV_U16: "<H", GV_I16: "<h", GV_U32: "<I", GV_I32: "<i", GV_F32: "<f",
            GV_BOOL: "<?", GV_U64: "<Q", GV_I64: "<q", GV_F64: "<d"}
-F32, F16, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K = 0, 1, 8, 11, 12, 13, 14
+F32, F16, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, BF16 = 0, 1, 8, 11, 12, 13, 14, 30
 Q2_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M = 10, 16, 17, 18, 19, 21, 22, 23, 29
 IQ_TYPES = (Q2_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M)  # (src/iquants.h)
-BLOCK = {F32: (1, 4), F16: (1, 2), Q8_0: (32, 34), Q3_K: (256, 110), Q4_K: (256, 144), Q5_K: (256, 176),
+BLOCK = {F32: (1, 4), F16: (1, 2), BF16: (1, 2), Q8_0: (32, 34), Q3_K: (256, 110), Q4_K: (256, 144), Q5_K: (256, 176),
          Q6_K: (256, 210), Q2_K: (256, 84), IQ2_XXS: (256, 66), IQ2_XS: (256, 74), IQ3_XXS: (256, 98), IQ1_S: (256, 50),
          IQ3_S: (256, 110), IQ2_S: (256, 82), IQ4_XS: (256, 136), IQ1_M: (256, 56)}  # values, bytes
-TYPE_NAME = {F32: "F32", F16: "F16", Q8_0: "Q8_0", Q3_K: "Q3_K", Q4_K: "Q4_K", Q5_K: "Q5_K", Q6_K: "Q6_K", Q2_K: "Q2_K",
-             IQ2_XXS: "IQ2_XXS", IQ2_XS: "IQ2_XS", IQ3_XXS: "IQ3_XXS", IQ1_S: "IQ1_S", IQ3_S: "IQ3_S", IQ2_S: "IQ2_S",
+TYPE_NAME = {F32: "F32", F16: "F16", BF16: "BF16", Q8_0: "Q8_0", Q3_K: "Q3_K", Q4_K: "Q4_K", Q5_K: "Q5_K", Q6_K: "Q6_K",
+             Q2_K: "Q2_K", IQ2_XXS: "IQ2_XXS", IQ2_XS: "IQ2_XS", IQ3_XXS: "IQ3_XXS", IQ1_S: "IQ1_S", IQ3_S: "IQ3_S", IQ2_S: "IQ2_S",
              IQ4_XS: "IQ4_XS", IQ1_M: "IQ1_M"}
 
 
@@ -319,6 +319,8 @@ def dequant(typ, data, nrows, ncols):
         return data.view(np.float32).reshape(nrows, ncols).copy()
     if typ == F16:
         return data.view(np.float16).astype(np.float32).reshape(nrows, ncols)
+    if typ == BF16:  # (the upper half of a float32: exact)
+        return (data.view("<u2").astype(np.uint32) << 16).view(np.float32).reshape(nrows, ncols)
     if typ == Q8_0:
         blk = data.reshape(-1, 34)
         d = _f16(blk[:, 0:2]).reshape(-1, 1)

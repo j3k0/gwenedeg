@@ -113,30 +113,33 @@ static void bin_map_weights(RqModel *m, const char *path, LoadErr *e) {
 
 // ---------------------------------------------------------------------------- GGUF weights
 
+static int fp_type(int type) { return type == GGML_F32 || type == GGML_BF16; } // (stored as F32 rows: QuantizedTensor.f)
+
 static void gguf_matrix(const Gguf *g, QuantizedTensor *res, const char *name, int d, int k, int f32) {
     // one matrix (d, k): Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, Q2_K or an i-quant (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
-    // IQ3_S, IQ4_XS: iquants.h; dispatch per tensor: Q4_K_M or an IQ mix combines them within a role), or F32 if f32 (only
-    // where forward.c's fp32 path takes it: ssm_alpha / ssm_beta), its data in the mapping (q / s / p / kp / f are set by
-    // prepare_weights)
+    // IQ3_S, IQ4_XS: iquants.h; dispatch per tensor: Q4_K_M or an IQ mix combines them within a role), or F32 / BF16 if
+    // f32 (only where forward.c's fp32 path takes it: ssm_alpha / ssm_beta; BF16 is widened to F32 at load, exact: the
+    // IQ3_S-mtp 27B file's), its data in the mapping (q / s / p / kp / f are set by prepare_weights)
     const GgufTensor *t = gguf_tensor(g, name);
     uint32_t type = t ? t->type : GGML_Q8_0; // (missing: gguf_weight reports it)
     if (type != GGML_Q8_0 && type != GGML_Q3_K && type != GGML_Q4_K && type != GGML_Q5_K && type != GGML_Q6_K &&
-        !iq_type((int)type) && !(f32 && type == GGML_F32)) {
-        char msg[240];
+        !iq_type((int)type) && !(f32 && fp_type((int)type))) {
+        char msg[260];
         snprintf(msg, sizeof(msg), "tensor %%s has ggml type %u, need Q8_0 (8), Q2_K .. Q6_K (10 .. 14), IQ2_XXS (16), IQ2_XS (17), "
-                 "IQ3_XXS (18), IQ1_S (19), IQ3_S (21), IQ2_S (22), IQ4_XS (23)%s or IQ1_M (29)", type, f32 ? ", F32 (0)" : "");
+                 "IQ3_XXS (18), IQ1_S (19), IQ3_S (21), IQ2_S (22), IQ4_XS (23)%s or IQ1_M (29)", type,
+                 f32 ? ", F32 (0), BF16 (30)" : "");
         gguf_fail(g, msg, name);
     }
     res->b = gguf_weight(g, name, type, k, d);
     res->type = (int)type;
     // the repacked layouts: 16-row blocks, 256-column super-blocks (activation groups of 32)
-    if (type != GGML_Q8_0 && type != GGML_F32 && (d % KQ_ROWS || k % QK_K || GS != 32))
+    if (type != GGML_Q8_0 && !fp_type((int)type) && (d % KQ_ROWS || k % QK_K || GS != 32))
         gguf_fail(g, "tensor %s: K-quant / i-quant shape not supported (rows % 16, columns % 256)", name);
 }
 
 static void gguf_matrices(RqModel *m, QuantizedTensor **dst, int L, const int *sel, const char *fmt, int d, int k, int f32) {
     // the matrices (d, k) of layers 0..L-1 (fmt: name with the layer number, or a plain name for L = 1), those
-    // with sel[l] >= 0 into (*dst)[sel[l]] (sel NULL: all, into (*dst)[l]): gguf_matrix (f32: F32 accepted too)
+    // with sel[l] >= 0 into (*dst)[sel[l]] (sel NULL: all, into (*dst)[l]): gguf_matrix (f32: F32 / BF16 accepted too)
     const Gguf *g = &m->gguf;
     int n = 0;
     for (int l = 0; l < L; l++)
@@ -149,7 +152,7 @@ static void gguf_matrices(RqModel *m, QuantizedTensor **dst, int L, const int *s
         char name[96];
         snprintf(name, sizeof(name), fmt, l0);
         gguf_matrix(g, &res[l], name, d, k, f32);
-        if (res[l].type != GGML_Q8_0 && res[l].type != GGML_F32)
+        if (res[l].type != GGML_Q8_0 && !fp_type(res[l].type))
             m->kq = 1;
     }
 }
@@ -280,7 +283,7 @@ static void gguf_map_weights(RqModel *m) {
     gguf_matrices(m, &w->w1, L, NULL, "blk.%d.ffn_gate.weight", p->hidden_dim, dim, 0);
     gguf_matrices(m, &w->w2, L, NULL, "blk.%d.ffn_down.weight", dim, p->hidden_dim, 0);
     gguf_matrices(m, &w->w3, L, NULL, "blk.%d.ffn_up.weight", p->hidden_dim, dim, 0);
-    if (NL) { // (alpha / beta: F32 in Qwen3.8-27B's file, [48, 5120]; forward.c's fp32 path, f32_rows)
+    if (NL) { // (alpha / beta: F32 in Qwen3.8-27B's file, [48, 5120], BF16 in the IQ3_S-mtp one; forward.c's fp32 path, f32_rows)
         gguf_matrices(m, &w->wqkv, L, m->lin_layer, "blk.%d.attn_qkv.weight", hy->conv_dim, dim, 0);
         gguf_matrices(m, &w->wz, L, m->lin_layer, "blk.%d.attn_gate.weight", hy->vdim, dim, 0);
         gguf_matrices(m, &w->wa, L, m->lin_layer, "blk.%d.ssm_alpha.weight", hy->nv, dim, 1);
@@ -370,7 +373,7 @@ static int prep_pack(const PrepMat *mt, int nm, char *warning, size_t wlen) {
 static size_t prep_bytes(const QuantizedTensor *t, int d, int k, int pack) {
     // a matrix's place in the packed buffer (64-byte multiples)
     size_t sz = (size_t)d * k + (size_t)d * (k / GS) * sizeof(float); // (generic kernels on GGUF Q8_0: q / s arrays)
-    if (t->type == GGML_F32) // (the rows as in the file)
+    if (fp_type(t->type)) // (the rows as in the file; BF16 widened)
         sz = (size_t)d * k * sizeof(float);
     else if (t->type != GGML_Q8_0) // Q2_K .. Q6_K, the i-quants (GGUF; d % 16 == 0, k % 256 == 0 checked)
         sz = lq_size(t->type, d, k);
@@ -400,6 +403,7 @@ static void prep_item_done(PrepJob *P, int j) {
     const QuantizedTensor *t = it->t;
     if (t->b) {
         drop_cached(P->fd, P->base, t->b, t->type == GGML_F32 ? (size_t)it->d * it->k * sizeof(float)
+                                          : t->type == GGML_BF16 ? (size_t)it->d * it->k * sizeof(uint16_t)
                                           : t->type != GGML_Q8_0 ? (size_t)it->d * (it->k / QK_K) * lq_block_bytes(t->type)
                                                                  : (size_t)it->d * (it->k / 32) * Q8_0_BLOCK);
     } else {
@@ -446,7 +450,17 @@ static void prepare_worker(void *arg, int tid, int nt) {
         if (r0 + nr > (size_t)job[jj].d) nr = job[jj].d - r0;
         if (t->f) { // F32: the rows as they are; a value inf / NaN is a corrupt file (as a Q8_0 scale)
             float *dst = t->f + r0 * k;
-            read_at(fd, P->base, dst, nr * k * sizeof(float), t->b + r0 * k * sizeof(float));
+            if (t->type == GGML_BF16) { // BF16: read into the upper half of dst, widened in place (u16 << 16: exact;
+                // value i is read before it is written at 4 i, and 4 i + 4 <= 2 nr k + 2 (i + 1) for i < nr k - 1)
+                size_t n = nr * k;
+                uint16_t *src = (uint16_t *)dst + n;
+                read_at(fd, P->base, src, n * sizeof(uint16_t), t->b + r0 * k * sizeof(uint16_t));
+                for (size_t i = 0; i < n; i++) {
+                    uint32_t u = (uint32_t)src[i] << 16;
+                    memcpy(dst + i, &u, 4);
+                }
+            } else
+                read_at(fd, P->base, dst, nr * k * sizeof(float), t->b + r0 * k * sizeof(float));
             for (size_t i = 0; i < nr * k; i++) {
                 uint32_t u;
                 memcpy(&u, dst + i, 4);
@@ -553,7 +567,7 @@ static int prepare_weights(RqModel *m, int fd, int drop, LoadErr *e, char *warni
     for (j = 0; j < nt; j++) {
         QuantizedTensor *t = job[j].t;
         size_t nq = (size_t)job[j].d * job[j].k;
-        if (t->type == GGML_F32)
+        if (fp_type(t->type))
             t->f = (float *)(w->packed + job[j].off);
         else if (t->type != GGML_Q8_0)
             t->kp = w->packed + job[j].off;
@@ -1110,6 +1124,15 @@ int rq_dequant_rows(const RqModel *m, const char *name, size_t nlen, long r0, lo
         return RQ_ERR_NOMEM;
     }
     for (long r = 0; r < nr; r++) {
+        if (t->type == GGML_BF16) { // (BF16 alpha / beta: widened as at load, prepare_worker)
+            for (int i = 0; i < k; i++) {
+                uint16_t h;
+                memcpy(&h, t->b + ((size_t)(r0 + r) * k + i) * sizeof(uint16_t), 2);
+                uint32_t u = (uint32_t)h << 16;
+                memcpy(a + (size_t)r * k + i, &u, 4);
+            }
+            continue;
+        }
         embed_row(a + (size_t)r * k, t, (int)(r0 + r), k);
         if (b && iq_type(t->type))
             iq_packed_row(t->type, t->kp, (int)(r0 + r), k, b + (size_t)r * k);

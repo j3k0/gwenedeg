@@ -128,6 +128,35 @@ checkpoints))", the script's estimate below.
   checkpoints) and its digests across builds. Cost for the 27B (estimated): 2 x 48 x 5120 x 4 B = 1.9 MB per linear
   layer, 94 MB per token (0.6% of the 16.8 GB read per token).
 
+### A real small MTP: Qwen3.5-0.8B-mtp (TODO S9.0b, 2026-11-08)
+
+The synthetic block above is cut out of the 0.8B and not trained: exact, but its guesses are never right. For the
+MTP drafter's acceptance checks (opt-in, models group tag `3.5-0.8b-mtp`, added with the checks in S9a; `make test`
+neither needs nor uses it) `scripts/make_mtp_08b.sh` builds
+`models/Qwen3.5-0.8B-MTP-GGUF/Qwen3.5-0.8B-mtp-Q8_0.gguf` (833,591,904 bytes, sha256 `9b7cc887...a32802f3`;
+Unsloth's 0.8B GGUFs drop the block): HF `Qwen/Qwen3.5-0.8B` at revision 2fc06364715b967f1860aea9cf38778875588b17
+(BF16, `mtp_num_hidden_layers` 1), converted by llama.cpp cf34d31's `convert_hf_to_gguf.py` with its own gguf-py,
+`--outtype q8_0`, without `--no-mtp` (the download, 1.75 GB, goes to `/var/tmp/s9-hf` and is deleted after).
+
+- The block: `blk.24`, 15 tensors (attention q / k / v / output, ffn gate / up / down, `nextn.eh_proj` (1024, 2048)
+  all Q8_0; `attn_norm`, `post_attention_norm`, `attn_q_norm` / `attn_k_norm`, `nextn.enorm` / `hnorm` /
+  `shared_head_norm` F32), `block_count` 25, `nextn_predict_layers` 1, tied output (no `output.weight`), no optional
+  `nextn.embed_tokens` / `shared_head_head`. runq (5f8b572) validates the block and loads the file.
+- Against Unsloth's `Qwen3.5-0.8B-Q8_0.gguf`: 313 of its 320 tensors are byte-identical (every Q8_0 matrix among
+  them); the 7 others are `ssm_a` (F32, 16 values, `-exp(A_log)` computed by the converter)
+  of layers 8, 9, 12, 13, 16, 20, 21, one value each off by one ulp (a torch version difference). Metadata: new
+  `nextn_predict_layers`, `attention.recurrent_layers`, `add_bos_token` / `add_eos_token` (false), `normalizer.nfc`,
+  `clean_spaces`; `padding_token_id` 248044 (Unsloth: 248055); no Unsloth / imatrix keys. Neither the padding id nor
+  the new keys are read by runq.
+- Logits (`runq -m logits`, en / code / zh / chat / count / all / long2, -b 64, en also -b 1): **not bitwise** equal
+  to Unsloth's, tokens identical; cos mean 0.99975-0.99990, min 0.99887 (long2), top-1 equal except 2 positions of
+  all / long2 (the same two: top-1 / top-2 margins 0.064 and 0.026). With the 7 `ssm_a` tensors' bytes copied from
+  Unsloth's file the logits are **bitwise identical** on all of them: the whole difference is those 7 ulps, carried
+  through the recurrence and the int8 activations.
+- The chat template differs from Unsloth's in one place: Unsloth's iterates `tool_call.arguments` as a mapping
+  (`is mapping`, keys), Qwen's uses `is defined` and `|items`. runq does not interpret the template (both files are
+  the built-in `qwen3.5` variant): `-m render` of the 30 qwen3.5 golden cases is identical on both files.
+
 ## Memory and disk
 
 - Weights: repacked into anonymous memory; the loader `pread`s the file, so it also passes through the page cache,

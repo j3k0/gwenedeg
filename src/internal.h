@@ -273,7 +273,7 @@ struct RqModel {
     int gated;                  // the attention's output gate ([q | gate] per head in attn_q): hy.on for a loaded file, 1 for a view
     // the classifier rows a view computes (RqMtpOpts.vocab): cls_n[1] == 0: all of them (the model's own path); else
     // rows cls_lo[r] .. cls_lo[r] + cls_n[r] - 1 for r = 0, 1 (whole 16-row blocks; cls_lo[0] = 0, the second range
-    // ends at vocab_size), each as a matrix of its own (cls_part: wcls's repacked rows from there on); the others -inf
+    // ends at vocab_size), each as a matrix of its own (cls_part: wcls's repacked rows from there on); the others RQ_LOGIT_OFF
     int cls_n[2], cls_lo[2];
     QuantizedTensor cls_part[2];
     char *path;                 // the file (a copy: rq_mtp_load reads the block from it), NULL for a view

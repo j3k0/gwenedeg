@@ -93,10 +93,14 @@ void rq_model_free(RqModel *m);
 // own; rq_model_mem: the block's weights, a context's buffers and one sequence (not the target's tokenizer / metadata).
 // NULL with the reason in err ("no MTP block", "optional MTP tensors (nextn.embed_tokens / shared_head_head) not
 // supported", the memory estimate as rq_model_load's)
+// The logit of a row outside an MTP view's vocabulary subset (RqMtpOpts.vocab): finite, not -inf (the builds assume
+// finite math: -Ofast / -ffast-math; clang calls an infinity there undefined), far below any real logit: an argmax never
+// takes it, expf(it - max) is 0, it / temperature stays finite down to a temperature of 1e-8
+#define RQ_LOGIT_OFF (-1e30f)
 typedef struct {
     int vocab;   // classifier rows 0..vocab-1 and the added tokens (the tokenizer's first added id..vocab_size-1), both
-                 // rounded out to 16-row blocks; the logits of the other rows are -inf. 0 (or a vocab reaching the
-                 // added ones): all
+                 // rounded out to 16-row blocks; the logits of the other rows are RQ_LOGIT_OFF. 0 (or a vocab reaching
+                 // the added ones): all
     double mem;  // as RqModelOpts.mem: the view's estimate must fit in this many GiB; 0 = MemAvailable, < 0 = no check
 } RqMtpOpts;
 RqModel *rq_mtp_load(const RqModel *target, const RqMtpOpts *o, char *err, size_t errlen);

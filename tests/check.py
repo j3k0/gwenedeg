@@ -99,6 +99,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import check_models  # noqa: E402  (groups synth and models: tests/check_models.py)
 import check_long  # noqa: E402  (group long: tests/check_long.py)
 import check_spec  # noqa: E402  (group spec: tests/check_spec.py)
+import procslots  # noqa: E402  (GWENEDEG_TEST_PROCS: tests/procslots.py)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GOLDEN = os.path.join(ROOT, "tests", "golden")
@@ -283,7 +284,7 @@ def run(cmd, threads=None, **kw):
     env = dict(os.environ)
     if threads is not None:
         env["OMP_NUM_THREADS"] = str(threads)
-    return subprocess.run(cmd, env=env, capture_output=True, **kw)
+    return procslots.run(cmd, env=env, capture_output=True, **kw)
 
 
 def runq_tokenize(a, text, timing=False):
@@ -992,7 +993,7 @@ def chat_case(a, tmp, vocab, d, name, args, users, chk):
         env = dict(os.environ, RUNQ_CHAT_DUMP=prefix)
         if threads:
             env["OMP_NUM_THREADS"] = str(threads)
-        return subprocess.run([runq, a.model, "-t", "0", "-c", CTX, "-s", "1"] + args,
+        return procslots.run([runq, a.model, "-t", "0", "-c", CTX, "-s", "1"] + args,
                               input=("\n".join(users) + "\n").encode(), env=env, capture_output=True)
     tname = f"chat/{name}"
     prefix = os.path.join(tmp, f"chat_{name}")
@@ -1128,7 +1129,7 @@ def templates_start(a, tmp, ex):
     def chat_ids(model, tag, args):
         prefix = os.path.join(tmp, f"tmpl_{tag}")
         env = dict(os.environ, RUNQ_CHAT_DUMP=prefix, OMP_NUM_THREADS="2")
-        p = subprocess.run([a.runq, model, "-t", "0", "-c", CTX, "-n", "1", "-i", "Hi there"] + args, env=env, capture_output=True)
+        p = procslots.run([a.runq, model, "-t", "0", "-c", CTX, "-n", "1", "-i", "Hi there"] + args, env=env, capture_output=True)
         if p.returncode != 0:
             raise RuntimeError(f"runq chat failed: {p.stderr.decode(errors='replace')[-300:]}")
         return [int(x) for x in open(prefix + ".ids").read().split()][:-1]  # (minus the 1 reply token)

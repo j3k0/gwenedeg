@@ -18,8 +18,9 @@
 """
 import concurrent.futures as cf
 import os
-import subprocess
 import sys
+
+import procslots  # (GWENEDEG_TEST_PROCS; tests/ is on sys.path: imported by check.py)
 
 SPEC_THREADS = 4  # per runq / api_test process (the runs go 3 at a time, in the background from the start)
 GEN_THREADS = 3
@@ -68,7 +69,7 @@ Q35_CASES = [("q35_chat_think", ["-m", "chat", "-r", "1", "-t", "0", "-n", "48"]
 def run(cmd, threads, stdin=None, env=None):
     e = dict(os.environ, **(env or {}))
     e["OMP_NUM_THREADS"] = str(threads)
-    return subprocess.run(cmd, env=e, capture_output=True, input=stdin)
+    return procslots.run(cmd, env=e, capture_output=True, input=stdin)
 
 
 def no_timing(err):

@@ -44,6 +44,7 @@ ROOT = os.path.dirname(HERE)
 GOLDEN = os.path.join(HERE, "golden")
 sys.path.insert(0, HERE)
 import ggufmini as G  # noqa: E402
+import procslots  # noqa: E402  (GWENEDEG_TEST_PROCS)
 import ref_forward as R  # noqa: E402
 
 SYNTH_THREADS = 4         # the synth runs (in the background from the start, next to the rest of the suite)
@@ -61,7 +62,7 @@ def run(cmd, threads=None, env=None, **kw):
     e = dict(os.environ, **(env or {}))
     if threads is not None:
         e["OMP_NUM_THREADS"] = str(threads)
-    return subprocess.run(cmd, env=e, capture_output=True, **kw)
+    return procslots.run(cmd, env=e, capture_output=True, **kw)
 
 
 def read_logits(path):

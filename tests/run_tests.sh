@@ -14,6 +14,8 @@
 #        GGUF (GGUF Q8_0 file for the gguf tests, default models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf;
 #        skipped if missing), Q4 (GGUF Q4_K_M file for the q4 tests, default
 #        models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf; skipped if missing).
+#        GWENEDEG_TEST_PROCS=N: at most N test processes at a time (tests/procslots.py; default: no cap,
+#        ~25 model processes at the start, ~12-16 GB); N=6 fits a 10 GB memory cap (systemd-run -p MemoryMax=10G).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"

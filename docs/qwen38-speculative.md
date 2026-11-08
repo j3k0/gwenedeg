@@ -151,7 +151,7 @@ checkpoints))", the script's estimate below.
   the decode / batched `xb` / `xq` rows: `xs >= 2 dim` on a view; h = `RqSegment.h_in`'s row, NULL zeros), then the
   layer exactly as a trunk attention layer, then `shared_head_norm` and the classifier: rows `[0, vocab)` and the added
   tokens' (`RqMtpOpts.vocab`, whole 16-row blocks of the repacked classifier as two matrices of their own: no copy,
-  the other logits -inf). Everything else (the attention, KV types, seqfile) is the model's code. The target's hidden
+  the other logits `RQ_LOGIT_OFF`, -1e30: finite, as `-Ofast` assumes). Everything else (the attention, KV types, seqfile) is the model's code. The target's hidden
   rows come from the new `RqSegment.hidden` (every row's final hidden state after `output_norm`, the row its logits
   are computed from; rows without logits get their residual and the final norm only; logits, cache and state
   unchanged). The plain path is unchanged: `tests/compare_bins.sh` identical (792 jobs), the target's estimate does

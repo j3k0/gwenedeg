@@ -2451,7 +2451,7 @@ static inline QuantizedTensor qsub(QuantizedTensor *t, int i0) {
 //     then the eh_proj GEMV / GEMM / rows into x, then layer 0's attention rmsnorm + quantize as for a model's
 //     embedding; one phase more in decode (the GEMV), two in the batched passes
 //   classifier: a subset (RqModel.cls_n[1] != 0): the two row ranges' matrices (cls_part) over their 16-row blocks
-//     one after the other, the other rows -inf (cls_fill, after the pass)
+//     one after the other, the other rows RQ_LOGIT_OFF (cls_fill, after the pass)
 // The hidden rows (RqSegment.hidden, any model): the row the logits are computed from (the final rmsnorm's output),
 // copied; a row without logits gets its residual and the final rmsnorm only (hidden_row). Each through the same
 // functions in every path, so the bits do not depend on the path
@@ -2491,12 +2491,13 @@ static void cls_sub_rows(const RqCtx *c, float *out, int ldo, QuantizedTensor *x
 }
 
 static void cls_fill(const RqModel *m, float *lg, int n) {
-    // n logits rows of an MTP view's subset: the rows it does not compute -inf (an argmax or softmax over the whole
+    // n logits rows of an MTP view's subset: the rows it does not compute RQ_LOGIT_OFF (finite: not -INFINITY, which
+    // -Ofast / -ffast-math assume away; an argmax or softmax over the whole
     // vocabulary never takes them)
     int V = m->config.vocab_size;
     for (int j = 0; j < n; j++)
         for (int i = m->cls_n[0]; i < m->cls_lo[1]; i++)
-            lg[(size_t)j * V + i] = -INFINITY;
+            lg[(size_t)j * V + i] = RQ_LOGIT_OFF;
 }
 
 static inline float *row_hidden(const RqCtx *c, int b) {

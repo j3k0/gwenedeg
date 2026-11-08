@@ -42,7 +42,7 @@
  * (-b 1), from short segments (the batched decode rows), long chunks (prefill: rows with all / the last / no logits),
  * mixed passes; the logits with and without it equal. mtp_paths: the MTP view (rq_mtp_load) fed the target's hidden
  * rows shifted by one (h_in) gives the same logits and hidden rows batched, alone, through decode and mixed; h_in NULL
- * == zeros; a vocabulary subset == the full vocabulary on its rows, -inf elsewhere; truncate + refeed == straight.
+ * == zeros; a vocabulary subset == the full vocabulary on its rows, RQ_LOGIT_OFF elsewhere; truncate + refeed == straight.
  * mtp_load: no block / optional nextn tensors / the memory budget refused, a second view, views loaded and freed
  * twice, h_in on the target refused, a view's sequence on the target's context refused, its info / estimate / matrix
  * names. Prints "mtp digest: HEX" (the target's hidden rows and the view's logits and hidden rows of one prompt: the
@@ -2228,15 +2228,14 @@ static int mt_paths(RqModel *m, RqCtx *c1, RqCtx *c64, const int *t, int n, cons
     return ok;
 }
 
-static int neg_inf(float x) { // (by its bits: -Ofast assumes finite values, a comparison with -inf is folded away)
-    uint32_t u;
-    memcpy(&u, &x, 4);
-    return u == 0xff800000u;
+static int logit_off(float x) { // (RQ_LOGIT_OFF, by its bits)
+    const float off = RQ_LOGIT_OFF;
+    return !memcmp(&x, &off, 4);
 }
 
 static int mt_subset(RqModel *view, RqCtx *c64, const int *t, int n, const float *h_in, const float *full, int quick, char *d, size_t dn) {
     // a vocabulary subset (RqMtpOpts.vocab 1000): every path's logits == the full vocabulary's (full) on rows [0, 1008)
-    // and from the added tokens' block on, -inf between; the hidden states equal (they do not depend on the subset)
+    // and from the added tokens' block on, RQ_LOGIT_OFF between; the hidden states equal (they do not depend on the subset)
     (void)c64;
     char err[512];
     RqMtpOpts o = { 1000, -1 };
@@ -2273,12 +2272,12 @@ static int mt_subset(RqModel *view, RqCtx *c64, const int *t, int n, const float
             int i = 0;
             while (i < 1008 && a[i] == b[i]) i++;
             ok &= i == 1008;
-            while (i < V && neg_inf(a[i])) i++;
+            while (i < V && logit_off(a[i])) i++;
             if (lo1 < 0) lo1 = i;
             ok &= i == lo1 && lo1 % 16 == 0 && lo1 <= fa && lo1 > fa - 16 && !memcmp(a + i, b + i, (size_t)(V - i) * sizeof(float));
         }
     }
-    snprintf(d, dn, "vocab 1000: rows [0, 1008) and [%d, %d) == the full vocabulary's, -inf between (first added token %d), "
+    snprintf(d, dn, "vocab 1000: rows [0, 1008) and [%d, %d) == the full vocabulary's, RQ_LOGIT_OFF (-1e30) between (first added token %d), "
              "decode / chunks of 64%s%s", lo1, V, fa, quick ? "" : " / segments of 7", ok ? "" : " DIFFER");
     free(out);
     free(ho);

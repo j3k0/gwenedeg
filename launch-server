@@ -9,7 +9,8 @@ DRAFT_MODEL=models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf
 MODEL=models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q3_K_M.gguf
 # MODEL=models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
 KV_CACHE_TYPE=q8-dot
-PARALLEL=1
+PARALLEL=4   # requests running at once (batched); bound admission makes the ones that do not fit wait
+ADMIT=bound  # bound: admitted on prompt + max_tokens (docs/memory-admission.md); worst: every slot reserved at --ctx
 BIND_PORT=8417
 # CONTEXT=65536
 CONTEXT=98304
@@ -17,12 +18,11 @@ CONTEXT=98304
 KV_DISK="./kv-cache"
 KV_DISK_MAX="10"
 
-# Saluki on port 8417
+# Saluki on port 8418
 if [ "$CONFIG" = "saluki" ]; then
   MODEL=models/Underdog-Saluki-27B-1.0-GGUF/Underdog-Saluki-27B-1.0-IQ2-mix.gguf
   NAME=saluki-27b
   KV_CACHE_TYPE=q8-dot
-  PARALLEL=2
   BIND_PORT=8418
 elif [ "$CONFIG" = "qwen3.8-27b-q4" ]; then
   MODEL=models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
@@ -50,13 +50,17 @@ else
   echo "- qwen3.8-27b-q4"
   echo "- qwopus"
   echo "- ista-iq3s"
-  echo "Env: KV=<type> overrides the KV cache type (q8-dot, q4-dot, q4k4-dot, ...); PAR=<n> the parallel requests"
+  echo "Env: KV=<type> overrides the KV cache type (q8-dot, q4-dot, q4k4-dot, ...); PAR=<n> the parallel requests; ADMIT_MODE=worst|bound|chunk the admission"
 fi
 
 # KV cache override, e.g. KV=q4-dot ./launch-server saluki
 KV_CACHE_TYPE="${KV:-$KV_CACHE_TYPE}"
-# parallel requests (= slots) override, e.g. PAR=3 ./launch-server saluki
+# parallel requests override, e.g. PAR=3 ./launch-server saluki
 PARALLEL="${PAR:-$PARALLEL}"
+# admission override, e.g. ADMIT_MODE=worst PAR=2 ./launch-server saluki (the pool before memory-aware admission)
+ADMIT="${ADMIT_MODE:-$ADMIT}"
+# slots: bound / chunk keep 2 idle ones as prefix caches (reclaimed when memory is needed); worst sizes every slot
+if [ "$ADMIT" = worst ]; then SLOTS=$PARALLEL; else SLOTS=$((PARALLEL + 2)); fi
 
 # /runq serve $MODEL -c 98304 -k bf16-dot --draft $DRAFT_MODEL --slots 2 --parallel 2 --checkpoints 3 --spec-calibrate 32768 --timeout 0 --port $BIND_PORT --host $BIND_HOST --name qwen3.8-27b
 
@@ -67,7 +71,7 @@ mkdir -p "$KV_DISK"
   -G 5 --tau 0.4 \
   -k "$KV_CACHE_TYPE" \
   --draft "$DRAFT_MODEL" \
-  --slots $PARALLEL --parallel $PARALLEL \
+  --slots $SLOTS --parallel $PARALLEL --admit "$ADMIT" \
   --kv-disk "$KV_DISK" --kv-disk-max "$KV_DISK_MAX" \
   --port "$BIND_PORT" --host "$BIND_HOST" \
   --name "$NAME"

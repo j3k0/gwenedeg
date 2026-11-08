@@ -54,6 +54,27 @@ Steps:
   classifier; a vocabulary subset is fine, exactness does not care which guesses). Needs the final hidden state per
   row from the verify pass (a new `rq_forward_batch` output). Measure acceptance first; keep whichever draft gives
   more tok/s (the 0.8B Q4_K_M at S7: ~6.5 ms per guess, 13.2-14.1 tok/s thinking on, 16.6-17.2 off).
+  - **Acceptance measured (2026-11-08, llama.cpp cf34d31 `--spec-type draft-mtp` vs `draft-simple -md` the 0.8B
+    Q4_K_M; k 3, thinking on, T 0.6 / top_p 0.95 / top_k 20, 12 threads, CPU):** MTP 410 / 765 drafted tokens accepted
+    (54%) vs the 0.8B 233 / 714 (33%), MTP ahead on each of the 4 prompts (38-70% vs 25-42%; LCB medium + 2 coding
+    prompts, 96-192 tokens). Small sample; details `/home/jeko/JC/lcb_timebox/mtp/results.md`. llama.cpp's speed there
+    is no guide (plain 3.5 tok/s vs runq's 11 on the same IQ3_S; its verify batch costs ~k steps, so no draft helped).
+    Published, GPU: Qwopus3.8-27B-Flash-V2 card 80.7% (MTP) vs 66.1% base; Qwen3.5-27B n 1/2/3 -> 49/66/74%.
+  - **Expected here (estimate):** if MTP's lead carries over (runq's 0.8B ~0.55-0.65 -> MTP ~0.75), with ~9.5 vs
+    6.5 ms per guess, roughly +20-30% tok/s thinking on; plus memory: no 0.8B weights nor its 708.7 MiB draft
+    sequence per slot, against one attention layer's KV per slot. Larger k may pay more with MTP's higher acceptance:
+    sweep k (and tau) as at S8.
+  - **Test files:** `models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (ISTA-DASLab, 12.1 GB, sha256
+    58fd8267...; downloaded). Its `blk.64` (15 tensors: attn q/k/v/output, ffn gate/up/down, `nextn.eh_proj` all Q6_K;
+    norms incl. `nextn.enorm` / `hnorm` / `shared_head_norm` F32) is a full block with its own FFN. Its trunk's
+    `ssm_alpha` / `ssm_beta` are **BF16**, which `gguf_matrix` refuses: either rewrite the file with
+    `/home/jeko/JC/lcb_timebox/tools/gguf_bf16_to_f32.py IN OUT` (exact, streaming; done for the non-MTP IQ3_S as
+    `...IQ3_S-f32ssm.gguf`, launch-server config `ista-iq3s`) or accept BF16 there (widened to F32 at load). Also
+    with MTP blocks: Unsloth's `Qwen3.8-27B-Q4_K_M.gguf` (already here, the S7 target), Qwopus
+    (`models/Qwopus3.8-27B-Flash-V2-GGUF/...-MTP-Q4_K_M.gguf`, launch-server `qwopus`) and the Saluki MTP variant below.
+  - **Reference implementation:** llama.cpp built at `/home/jeko/JC/llama.cpp` (`common/speculative.cpp`, the MTP
+    draft context; merged in PR #22673). End-to-end check: a LiveCodeBench time-boxed night
+    (`/home/jeko/JC/lcb_timebox/nightly.sh`, tok/s and solved per hour against the 0.8B draft).
 - [ ] **S10. Seed-coupled drafting at temperature > 0.** The draft samples its guess with the target's next uniform
   draw u_j (known from a copy of the target's RNG: `rq_seq_rng` + `rq_rng_f32`) and the same settings, instead of its
   argmax: more accepted guesses (up to sum min(p, q)), output unchanged. Measure first with the API's `top_logprobs`

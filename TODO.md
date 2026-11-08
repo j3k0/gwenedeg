@@ -63,10 +63,10 @@ Steps:
   - **Expected here (costs measured at S9w, 2026-11-08, on full-width synthetic files, 8 threads; acceptance still
     to measure, S9d):** a guess (a one-row MTP pass) costs ~9 ms with the full vocabulary and ~5.7 ms with
     `--mtp-vocab 100000` on IQ3_S-mtp (Q4_K classifier) at short context, 11.9 / 9.3 ms at 98k (f16 MTP cache; q8 is
-    slower there); Unsloth's Q6_K classifier ~9-10 / ~6. On IQ3_S-mtp at k = 3, thinking on, against the 0.8B's 16.4
-    tok/s (S7's 2.30 tokens per pass): p 0.70 / 0.75 per guess gives 18.4 / 19.9 tok/s (+12 / +21%) with the 100k
-    subset, 17.2 / 18.6 (+5 / +13%) with the full vocabulary; even at p ~0.62 (subset) / ~0.67 (full), +10% at ~0.69
-    / ~0.73. The 100k subset covers 99.9% of pi sessions' reply tokens (99.82% of the 27B's own answers). Prompt: the
+    slower there); Unsloth's Q6_K classifier ~9-10 / ~6. On IQ3_S-mtp at k = 3, thinking on, against the 0.8B's ~18.0
+    tok/s (S7's `-G 3` mean of 2.53 tokens per pass, measured on the Q4_K_M target): p 0.70 / 0.75 / 0.80 per guess
+    gives 18.4 / 19.9 / 21.5 tok/s (+2 / +11 / +19%) with the 100k subset, 17.2 / 18.6 / 20.0 (-4 / +3 / +11%) with
+    the full vocabulary; even at p ~0.68 (subset) / ~0.73 (full), +10% at ~0.75 / ~0.79. The 100k subset covers 99.9% of pi sessions' reply tokens (99.82% of the 27B's own answers). Prompt: the
     MTP follows every chunk, +1.9% at short context, +5.0% at 98k, +4.3% for a cold 96k prefill. Memory: no 0.8B
     weights nor its 708.7 MiB draft sequence per slot, against one attention layer's KV (4 KiB per position) per slot.
     Larger k may pay more with MTP's higher acceptance: sweep k (and tau) as at S8. Tables:

@@ -153,17 +153,22 @@ def write(path, kvs, ts, alignment=32):
         off += nbytes + (-nbytes) % alignment
     h = b"".join(head)
     tmp = path + ".part"
-    with open(tmp, "wb") as f:
-        f.write(h)
-        f.write(b"\0" * ((-len(h)) % alignment))
-        for name, ne, typ, nbytes, chunks in ts:
-            n = 0
-            for c in chunks():
-                f.write(c)
-                n += len(c)
-            assert n == nbytes, (name, n, nbytes)
-            f.write(b"\0" * ((-nbytes) % alignment))
-    os.replace(tmp, path)
+    try:  # (a failed or interrupted write: no partial multi-GB file left behind)
+        with open(tmp, "wb") as f:
+            f.write(h)
+            f.write(b"\0" * ((-len(h)) % alignment))
+            for name, ne, typ, nbytes, chunks in ts:
+                n = 0
+                for c in chunks():
+                    f.write(c)
+                    n += len(c)
+                assert n == nbytes, (name, n, nbytes)
+                f.write(b"\0" * ((-nbytes) % alignment))
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
 
 
 def main():

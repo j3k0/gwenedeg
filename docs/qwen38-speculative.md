@@ -1342,18 +1342,23 @@ measurable (+2-10 ms of 0.7-2.7 s, inside the noise).
 
 **Expected tok/s on IQ3_S-mtp** (short context, k = 3, thinking on; section 7's model with these costs): a round is
 the target's 4-row verify (~120 ms: 1.32 x its ~91 ms step), the MTP's first pass (the catch-up rows + the first guess:
-a guess + ~0.4 ms) and 2 more guesses; tokens per round 1 + p + p^2 + p^3 (per-guess acceptance p, geometric). The 0.8B
-at S7's measured 2.30 tokens per pass in 120 + 4 x 5.1 ms: **16.4 tok/s** (2.30 is p ~0.64 at k = 3 in this model; the
-plan's "p ~0.575" is the k = 6 equivalent). Per guess g from `-cls4` at 1k-16k f16 across the runs:
+a guess + ~0.4 ms, the 1k catch-up rows; ~+2.5 ms at 16k) and 2 more guesses; tokens per round 1 + p + p^2 + p^3
+(per-guess acceptance p, geometric). The 0.8B at S7's `-G 3` thinking-on mean of **2.53 tokens per pass** (2.30 /
+1.98 / 3.12 / 2.70 for chat / code / math / summ; p ~0.70 at k = 3 in this model) in 120 + 4 x 5.1 ms: **18.0 tok/s**.
+Caveats: S7's acceptance was measured with the Q4_K_M 27B as target, not IQ3_S-mtp (the 0.8B's acceptance on it is
+unmeasured); the ~91 ms step is runq's 11 tok/s on IQ3_S-mtp (TODO S9); S7's loop measured a k = 3 verify at ~1.4x
+a step, not 1.32x (both drafts pay it alike). Per guess g from `-cls4` at 1k-16k f16 across the runs:
 
-| `--mtp-vocab` | g (ms) | round (ms) | p 0.60 | p 0.70 | p 0.75 | even with the 0.8B at p | +10% at p |
-|---|---|---|---|---|---|---|---|
-| full | 9.0 | 147.4 | 14.8 (-10%) | 17.2 (+5%) | 18.6 (+13%) | 0.67 | 0.73 |
-| 151,643 | 6.8 | 140.8 | 15.5 (-6%) | 18.0 (+10%) | 19.4 (+19%) | 0.64 | 0.70 |
-| 100,000 | 5.7 | 137.5 | 15.8 (-3%) | 18.4 (+12%) | 19.9 (+21%) | 0.62 | 0.69 |
+| `--mtp-vocab` | g (ms) | round (ms) | p 0.60 | p 0.70 | p 0.75 | p 0.80 | even with the 0.8B at p | +10% at p |
+|---|---|---|---|---|---|---|---|---|
+| full | 9.0 | 147.4 | 14.8 (-18%) | 17.2 (-4%) | 18.6 (+3%) | 20.0 (+11%) | 0.73 | 0.79 |
+| 151,643 | 6.8 | 140.8 | 15.5 (-14%) | 18.0 (0%) | 19.4 (+8%) | 21.0 (+17%) | 0.70 | 0.76 |
+| 100,000 | 5.7 | 137.5 | 15.8 (-12%) | 18.4 (+2%) | 19.9 (+11%) | 21.5 (+19%) | 0.68 | 0.75 |
 
-So the go line of S9d (+10% over the 0.8B) needs p >= ~0.69 with the 100k subset (>= 0.73 with the full vocabulary);
-llama.cpp's MTP vs 0.8B acceptance (54% vs 33% of drafted, TODO S9) suggests ~0.7. Long context favours the MTP: at
+(S9w first compared against the chat prompt's 2.30 alone, 16.4 tok/s: even at p 0.62 / 0.67, +10% at 0.69 / 0.73.)
+So the go line of S9d (+10% over the 0.8B) needs p >= ~0.75 with the 100k subset (>= ~0.79 with the full
+vocabulary). llama.cpp's MTP accepted 54% of its drafted tokens at k = 3 (TODO S9), p ~0.72 in this model, but its
+0.8B only 33% against runq's 51% (S7, the same model: 43 / 33 / 71 / 57%), so the MTP's p in runq is open (S9d). Long context favours the MTP: at
 98k a guess costs 9.3-12 ms against the 0.8B's 19, but the catch-up rows' attention (~4 ms per accepted guess) eats
 part of it.
 

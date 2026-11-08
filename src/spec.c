@@ -421,7 +421,7 @@ void rq_pass_cost_default(const RqModel *m, RqPassCost *pc) {
     // a one-row pass reads (RqModelMem.read: an MTP view's block + the target's classifier rows it computes). An MTP view
     // (TODO S9w, its 1-row passes on Qwen3.8-27B-wide synthetic files at 8 threads, 1k-96k positions, Q4_K and Q6_K
     // classifiers): mostly one large classifier, read at ~140 GB/s with no per-pass term, and its one attention layer at
-    // ~80 GB/s with the arithmetic overlapped, a further row's as the first's (within -24% .. +14% of the measured time
+    // ~80 GB/s with the arithmetic overlapped, a further row's as the first's (within -21% .. +13% of the measured time
     // there; the 60 GB/s / 0.3 TFLOPS above: 2-3x it)
     static const double f[] = { 1, 1.08, 1.15, 1.25, 1.35, 1.45, 1.65, 2.1, 2.6 };
     memset(pc, 0, sizeof(*pc));

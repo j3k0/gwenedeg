@@ -24,6 +24,10 @@ curl -s localhost:8080/v1/chat/completions -d '{"messages": [{"role": "user", "c
 | `--parallel N` | 16 | requests running at once (their rows batched in each forward pass); more wait in the queue |
 | `--slots N` | parallel + 4 | sequences in the pool: one per running request, the idle ones keep their tokens as prefix caches |
 | `--kv-mem GiB` | half the RAM, at most MemAvailable after the load | bound for the pool: slots x (the KV cache of ctx positions + for Qwen3.5 / 3.8 the recurrent state and its `--checkpoints` copies); `--slots` (and `--parallel`) are lowered to fit; the memory is touched only as used. The startup line shows the size of a slot (e.g. Qwen3-0.6B f16: 115 KB per position, 0.9 GiB at 8192; Qwen3.5-0.8B at 2048 positions: 12 KB per position + 19.3 MiB of state x (1 + 4) = 120.5 MiB; Qwen3.8-27B at 8192: 0.5 GiB + 150 MiB x 5 = 1.23 GiB) |
+| `--admit worst\|bound\|chunk` | worst | how requests are admitted within `--kv-mem` ([memory-admission.md](memory-admission.md)). `worst`: the pool is sized for every slot full (above). `bound`: `--slots` is not lowered (the startup refuses only if one `-c` request, speculating, does not fit); a request is admitted on its lease, the memory it can ever use: the KV cache of prompt + `max_tokens` positions (no `max_tokens`: the whole context) and its state copies (Qwen3.5 / 3.8: 1 + `--checkpoints` + the verify rows' guesses + 1 when it speculates), target + draft. If the leases of the running requests and the idle slots' caches leave no room, idle slots are reclaimed (least recently used first; with `--kv-disk` saved first), else it waits in the queue, and so does every request behind it (FIFO); it never waits when nothing runs. A slot's memory past the lease is given back when its request starts. The live budget: a request is also admitted only if its growth (its lease minus what its slot holds) fits in MemAvailable - `--admit-margin` - what the running requests may still grow into (MemAvailable read at most every 100 ms; not on non-Linux systems: the static budget only); if other processes take memory after that, nothing is taken back (a warning in the log, new requests wait). Qwen3.5 / 3.8: a request's guesses (`"speculative"`'s `k`, `lookup`) are capped at the most whose state copies one `-c` request holds within `--kv-mem` (at least the server's `-G` / `--lookup`), so one `-c` request always fits (speculation changes only the speed). Outputs do not change, only when a request runs. The startup line: the budget, KV per position, a state copy, the largest request, the live budget; `-v` logs waits and reclaims; `/health` has `mem`, the timings `mem_wait_ms` and `lease_gib` (below). `chunk`: as `bound`, but the lease covers the prompt + `--admit-chunk` generated tokens (at most prompt + `max_tokens`), and is renewed by a chunk before a pass could write past it, the oldest request first (a renewal within the lease's last KV block of 256 positions costs nothing); a renewal that does not fit (static or live) parks the request: it keeps its slot and memory, gets no rows, and asks again at every step; the oldest request never parks: idle slots are reclaimed for it, then the youngest other requests (parked ones first) are swapped out to `--kv-disk` (which `chunk` needs: `DIR/<model>-<KV type>/swap/`, emptied at the start; the startup refuses unless the free space there, with the disk tier's files, holds `--kv-mem` + the disk tier's 1 GiB reserve, and the disk tier keeps that room free) until it fits, and renewed with a warning if nothing is left (the live budget below one request). A swapped-out request keeps everything but its slot (its sequences are on disk, bit for bit: KV, tokens, recurrent state, checkpoints, RNG) and comes back, the oldest first, when its lease + a chunk + the oldest request's next chunk fits (so that the oldest's next KV block does not swap it out again at once; the oldest of all swaps younger ones out in turn), continuing exactly where it was, also in the middle of its prompt's prefill: outputs do not change. A swap file that cannot be written or read ends that request with a 500 (its files deleted); no other request is affected. A new request is admitted only when none is parked or swapped out and one chunk per running request (the new one included) stays free after it. `--timeout` counts the parked and swapped-out time, a client leaving ends a parked or swapped-out request (its files deleted), SSE keep-alives continue during swaps; `/health`'s `mem` gains `parked` and `swapped_out`, the timings `renewals`, `paused_ms`, `swaps`, `swap_ms` (the time out of memory) and `yields`; `-v` logs `job N parked at T tokens` / `resumed` / `swapped out: X GB, Y s` / `swapped in -> slot S`. The default stays `worst` until the measurements on the 27B ([memory-admission.md](memory-admission.md), Measurements) |
+| `--admit-chunk N` | 1024 | `--admit chunk`: the lease's chunk in generated tokens |
+| `--admit-yield N` | 0 (off) | `--admit chunk`: round-robin of the running places. At a lease's end, with `--parallel` requests running and others waiting for a place (in the queue, or yielded), a request that has generated N chunks since it started or resumed yields its place: it keeps its slot and memory (swapped out to disk if the request whose turn it is needs them), gets no rows, and resumes when its turn comes (FIFO by the time each began to wait); a request denied a renewal yields instead of parking when a yielded one waits. The oldest request yields its place too but keeps its precedence for memory (never parked; its renewals and its swap-in move the others out), so every request finishes. Long replies get slower, short ones start sooner; outputs do not change. `/health`'s `mem` gains `yielded` (`running` counts them), the timings' `yields` count the yields and `paused_ms` includes the time without a place; `-v` logs `job N yielded its seat` / `resumed ... without a seat` |
+| `--admit-margin GiB` | 1.5 | `--admit bound` / `chunk`: MemAvailable kept free for the rest of the system (other processes' bursts, small buffers, page rounding) |
 | `--checkpoints N` | 4 | Qwen3.5 / 3.8: copies of the recurrent state a slot keeps (1..32; ~19 MiB each for the 0.8B, ~150 MiB for the 27B), where an agent's next requests leave the cache (below, Prefix reuse); counted in the slot's size and in the load check |
 | `--mem GiB` | MemAvailable | the load check (README, Memory): refuse to load if the weights, the runtime and one sequence of `-c` positions do not fit; `0` or `force`: no check |
 | `--page-cache auto\|drop\|keep` | auto | the model file's page cache after the load (auto: dropped if the file is >= 1/4 of the RAM) |
@@ -47,7 +51,10 @@ curl -s localhost:8080/v1/chat/completions -d '{"messages": [{"role": "user", "c
 | `-v`, `--verbose` | off | log request bodies and responses |
 
 Endpoints: `POST /v1/chat/completions` (also `/chat/completions`), `GET /v1/models`, `GET /v1/models/{id}`,
-`GET /health` (also `/v1/health`: status, running and queued requests). Chat completions take `messages`
+`GET /health` (also `/v1/health`: status, running and queued requests; with `--admit bound` / `chunk` also `"mem": {"budget", "live",
+"committed", "resident", "waiting_for_memory"}` (`chunk`: + `"parked"`, `"swapped_out"`, the requests parked for a renewal / swapped out to disk; `--admit-yield`: + `"yielded"`, the requests waiting for a running place): GiB, the static budget, the live one (MemAvailable - margin - what the
+running requests may still grow into; `null` without MemAvailable), the leases of the running requests + the idle slots'
+memory, what the slots hold, and 1 when the request at the head of the queue waits for memory). Chat completions take `messages`
 (system / developer / user / assistant, and with Qwen3.5 / Qwen3.8 tool, with assistant `tool_calls`; content a string or an
 array of `{"type": "text"}` parts), `tools` / `tool_choice` / `parallel_tool_calls` (Qwen3.5 / Qwen3.8: below),
 `max_tokens` / `max_completion_tokens`, `temperature` (0 = greedy), `top_p`, `top_k` (an extension, as vLLM's
@@ -68,7 +75,9 @@ prompt, completion and cached prompt tokens (`prompt_tokens_details.cached_token
 usage chunk) also carry llama.cpp's `timings` (`prompt_n`: tokens prefilled, `prompt_ms`, `predicted_n` /
 `predicted_ms`, `cache_n`) and runq's: `slot`, `slot_tokens` (its length when the request took it), `common_tokens`
 (its common prefix with the prompt: below `slot_tokens`, the history was sent differently from what was generated;
-above `cache_n`, the recurrent state rolled back to a checkpoint), `copied`, `queue_ms`, and with speculation
+above `cache_n`, the recurrent state rolled back to a checkpoint), `copied`, `queue_ms`, with `--admit bound` / `chunk`
+`mem_wait_ms` (the part of `queue_ms` spent at the head of the queue waiting for memory) and `lease_gib` (the request's
+lease; `chunk`: at the end), with `--admit chunk` `renewals` (the lease's), `paused_ms` (the time parked, or without a running place), `swaps` and `swap_ms` (swapped out to disk: the time out of memory) and `yields` (`--admit-yield`), and with speculation
 llama.cpp's `draft_n` / `draft_n_accepted` (guesses verified / accepted) and `speculative` (below); `finish_reason` is
 `stop`, `length` or `tool_calls`. Errors are OpenAI error objects: 400 (invalid request; a prompt longer than the context
 has `code: context_length_exceeded`), 401, 404, 405, 411 (chunked uploads), 413, 503 (queue full / shutting
@@ -294,7 +303,8 @@ speculates as asked (the CLI's semantics), whatever the batch.
 
 **Per request**: `"speculative": false` (plain), `true` / `"auto"`, `"fixed"`, or an object: `{"mode": "auto"|"fixed"|"off",
 "k": 0..16, "tau": 0..1, "lookup": 0..16, "lookup_min": 0 or 2..16}` (k > 0 needs `--draft`: else a 400; without any
-source configured, `true` gets the lookup at 3). `timings.speculative`: `{"mode", "passes" (decode passes), "model":
+source configured, `true` gets the lookup at 3; with `--admit bound` on Qwen3.5 / 3.8, k and lookup are capped at the
+most whose state copies one `-c` request holds within `--kv-mem`, at least the server's `-G` / `--lookup`). `timings.speculative`: `{"mode", "passes" (decode passes), "model":
 {"passes", "drafted", "accepted"}, "lookup": {...}, "draft_rows" (the draft's rows for this request, catch-up included),
 "refed" (positions fed again after a rollback: 0, every rollback lands on its row's checkpoint)}`.
 
@@ -484,9 +494,14 @@ instruction (Qwen3.8's `xhigh`, its default, reasons longest).
   tool calls only with the Qwen3.5 / Qwen3.8 templates, `tool_choice` auto / none, tool parameters not constrained
   while decoding; no images, `n > 1`; penalties are ignored.
 - No TLS: bind it to localhost or a trusted network (`--api-key` is a shared secret over plain HTTP).
-- The KV memory is a fixed pool (`--slots` x `-c`, no paging or preemption): a request keeps its slot until it ends.
-  `--kv-disk` keeps idle slots' sequences on disk, but a running request's slot is never swapped out, and the disk's
-  I/O pauses the running requests (seconds for a long sequence).
+- The KV memory is a fixed pool (`--slots` x `-c`, no paging or preemption; with `--admit bound` the requests'
+  leases within `--kv-mem` instead, still no preemption): a request keeps its slot until it ends. With `--admit chunk` a
+  younger request can be swapped out to disk for the oldest one's lease (and swapped back in later), and with
+  `--admit-yield` a long request gives its running place to a waiting one in turn; otherwise `--kv-disk` keeps only
+  idle slots' sequences on disk. With `chunk`, the swap's room is checked at the start only: if other processes fill the
+  disk, a request that cannot be swapped out (or back in) ends with a 500. Pages the OS swapped out still count as the
+  slots' memory (the live budget can then admit beyond what is really free). The disk's I/O (saves, loads, swaps) pauses the running requests
+  (seconds for a long sequence).
   With `--draft`, each slot also holds a draft sequence of `-c` positions (counted in the pool).
 - One model per process (and its draft). POSIX only (on Windows the server reports that it is not available).
 

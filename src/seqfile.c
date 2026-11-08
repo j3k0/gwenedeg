@@ -310,6 +310,7 @@ int rq_seq_load(RqSeq *dst, const char *path, int n) {
     if (e != RQ_OK) goto done;
     rq_seq_reset(dst); // (Qwen3.5: no checkpoints, none pending)
     SfJob j = { fd, 0, (L + ATT_P - 1) / ATT_P, 0, 0, 0, dst, &h, { 0 }, { 0 } };
+    seq_hwm(dst, L); // (before the writes: an I/O error leaves them touched)
     if (m->hy.on && L > 0) {
         // the state at L: the saved one (L the saved length) or the checkpoint there; the saved checkpoints at or
         // below L into dst's slots (the highest ones if fewer slots)
@@ -334,7 +335,7 @@ int rq_seq_load(RqSeq *dst, const char *path, int n) {
         if (j.err) { e = RQ_ERR_IO; goto done; }
     }
     memcpy(dst->tokens, b + SF_ALIGN, (size_t)L * sizeof(int));
-    dst->len = L;
+    seq_grow(dst, L);
     dst->rng = h.rng;
 done:
     if (e == RQ_ERR_IO) rq_seq_reset(dst);

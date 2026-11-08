@@ -129,7 +129,19 @@ static void get_health(App *a, HttpConn *c, HttpReq *r) {
     int st = http_shutting_down() ? 503 : 200;
     jb_printf(&b, "{\"status\": \"%s\", \"model\": ", st == 200 ? "ok" : "shutting down");
     jb_strz(&b, a->model_id);
-    jb_printf(&b, ", \"running\": %d, \"queued\": %d}", running, queued);
+    jb_printf(&b, ", \"running\": %d, \"queued\": %d", running, queued);
+    EngineMem em;
+    if (engine_mem(a->eng, &em)) { // (--admit bound / chunk, GiB)
+        const double G = 1073741824.0;
+        jb_printf(&b, ", \"mem\": {\"budget\": %.4f, \"live\": ", em.budget / G);
+        if (em.has_live) jb_printf(&b, "%.4f", em.live / G);
+        else jb_cstr(&b, "null");
+        jb_printf(&b, ", \"committed\": %.4f, \"resident\": %.4f, \"waiting_for_memory\": %d", em.committed / G, em.resident / G, em.waiting);
+        if (em.chunk) jb_printf(&b, ", \"parked\": %d, \"swapped_out\": %d", em.parked, em.swapped);
+        if (em.yield) jb_printf(&b, ", \"yielded\": %d", em.yielded);
+        jb_cstr(&b, "}");
+    }
+    jb_cstr(&b, "}");
     http_respond(c, r, st, "application/json", b.p, b.n, NULL);
     if (a->verbose) logline(a, r, st, NULL, NULL);
     jb_free(&b);
@@ -661,6 +673,10 @@ static void timings_json(JBuf *b, const Job *j) {
               "\"slot_tokens\": %d, \"common_tokens\": %d, \"copied\": %s, \"queue_ms\": %.3f", j->n_prompt - j->n_cached, pre * 1e3, j->n_gen,
               gen * 1e3, j->n_cached, j->slot, j->n_slot, j->n_common, j->copied ? "true" : "false",
               j->t_start > 0 ? (j->t_start - j->t_submit) * 1e3 : 0.0);
+    if (j->lease > 0) jb_printf(b, ", \"mem_wait_ms\": %.3f, \"lease_gib\": %.4f", j->mem_wait * 1e3, j->lease / 1073741824.0); // (--admit bound)
+    if (j->chunked) // (--admit chunk)
+        jb_printf(b, ", \"renewals\": %d, \"paused_ms\": %.3f, \"swaps\": %d, \"swap_ms\": %.3f, \"yields\": %d", j->renewals, j->paused * 1e3,
+                  j->swaps, j->swapped * 1e3, j->yields);
     if (j->spec != SPEC_OFF)
         jb_printf(b, ", \"draft_n\": %d, \"draft_n_accepted\": %d, \"speculative\": {\"mode\": \"%s\", \"passes\": %d, \"model\": "
                   "{\"passes\": %d, \"drafted\": %d, \"accepted\": %d}, \"lookup\": {\"passes\": %d, \"drafted\": %d, \"accepted\": %d}, "
@@ -1036,6 +1052,17 @@ static void usage(void) {
             "  --slots <int>       sequences in the pool: running requests + prefix caches, default parallel + 4\n"
             "  --kv-mem <GiB>      memory of the pool at most (slots x (KV cache of ctx positions + recurrent state and its\n"
             "                      checkpoints)), default half the RAM, at most MemAvailable after the load\n"
+            "  --admit <mode>      worst|bound|chunk: worst (the default) sizes the pool for every slot at -c (--slots lowered\n"
+            "                      to fit); bound admits a request on what it can ever use (prompt + max tokens, its state\n"
+            "                      copies) within --kv-mem, idle slots reclaimed when needed, else it waits (FIFO); and only\n"
+            "                      if its growth fits in MemAvailable - --admit-margin - the running requests' growth; chunk:\n"
+            "                      as bound on the prompt + --admit-chunk tokens, renewed chunk by chunk as the reply grows\n"
+            "                      (a renewal that does not fit parks the request until it does; the oldest never waits:\n"
+            "                      younger ones are swapped out to --kv-disk, which chunk needs, with the budget free)\n"
+            "  --admit-chunk <int> chunk: a lease's chunk in generated tokens, default 1024\n"
+            "  --admit-yield <int> chunk: a request yields its running place after this many chunks when others wait for\n"
+            "                      one (round-robin), default 0 = never\n"
+            "  --admit-margin <GiB> bound, chunk: MemAvailable kept free for the rest of the system, default 1.5\n"
             "  --mem <GiB>         refuse to load if the estimate (weights, runtime, one sequence) does not fit, default\n"
             "                      MemAvailable; 0 or force = no check\n"
             "  --page-cache <mode> auto|drop|keep: the model file's page cache after the load, default auto (dropped if the\n"
@@ -1085,8 +1112,8 @@ int serve_main(int argc, char **argv) {
     int port = 8080, ctx = 8192, kv = RQ_KV_DEFAULT, batch = RQ_BATCH_MAX, slots = 0, queue = 64, conns = 128, threads = 0, verbose = 0, maxtok = 0;
     int parallel = 16, chunk = 64, copy_min = 32, ckpts = 4;
     const char *draft_path = NULL, *kv_disk = NULL;
-    int kv_disk_min = 1024;
-    double kv_disk_max = 0;
+    int kv_disk_min = 1024, admit = ADMIT_WORST, admit_chunk = 1024, admit_yield = 0;
+    double kv_disk_max = 0, admit_margin = 1.5;
     int spec_k = 3, lookup = -1, lookup_min = 0, spec_mode = -1, calib = 8192;
     float spec_tau = 0;
     long long maxbody = 4 << 20;
@@ -1108,6 +1135,21 @@ int serve_main(int argc, char **argv) {
         else if (!strcmp(f, "--slots")) slots = atoi(v);
         else if (!strcmp(f, "--parallel")) parallel = atoi(v);
         else if (!strcmp(f, "--kv-mem")) kv_mem = atof(v);
+        else if (!strcmp(f, "--admit")) {
+            if ((admit = !strcmp(v, "worst") ? ADMIT_WORST : !strcmp(v, "bound") ? ADMIT_BOUND : !strcmp(v, "chunk") ? ADMIT_CHUNK : -1) < 0) usage();
+        }
+        else if (!strcmp(f, "--admit-chunk")) {
+            char *end;
+            long x = strtol(v, &end, 10);
+            if (end == v || *end || x < 1 || x > 1 << 24) usage();
+            admit_chunk = (int)x;
+        }
+        else if (!strcmp(f, "--admit-yield")) admit_yield = num_arg(v, 0, 1 << 20);
+        else if (!strcmp(f, "--admit-margin")) {
+            char *end;
+            admit_margin = strtod(v, &end);
+            if (end == v || *end || !(admit_margin >= 0)) usage();
+        }
         else if (!strcmp(f, "--mem")) {
             char *end;
             mem = strtod(v, &end);
@@ -1209,7 +1251,8 @@ int serve_main(int argc, char **argv) {
         snprintf(a.model_id, sizeof(a.model_id), "%.*s", (int)n, b);
     }
     EngineOpts eo = { path, ctx, kv, batch, chunk, parallel, slots, kv_mem, copy_min, queue, verbose, ckpts, dm, calib,
-                      a.spec_mode != SPEC_OFF, a.spec_k > a.spec_lookup ? a.spec_k : a.spec_lookup, kv_disk, kv_disk_max, kv_disk_min };
+                      a.spec_mode != SPEC_OFF, a.spec_k > a.spec_lookup ? a.spec_k : a.spec_lookup, kv_disk, kv_disk_max, kv_disk_min, admit, admit_margin, admit_chunk,
+                      admit_yield };
     double t0 = rq_now();
     a.eng = engine_start(m, &eo, err, sizeof(err));
     if (!a.eng) { fprintf(stderr, "runq serve: %s\n", err); return 1; }
@@ -1217,10 +1260,11 @@ int serve_main(int argc, char **argv) {
     int bound = 0;
     int lfd = http_listen(&ho, &bound, err, sizeof(err));
     if (lfd < 0) { fprintf(stderr, "runq serve: %s\n", err); return 1; }
-    char desc[512];
+    char desc[1024];
     engine_describe(a.eng, desc, sizeof(desc));
     fprintf(stderr, "runq serve: %s as '%s' (context %d of %d, KV %s, %d threads, chat template %s, vocab index %.0f ms)\nrunq serve: %s\n",
             path, a.model_id, ctx, a.info.ctx_max, rq_kv_name(kv), rq_threads(), rq_chat_name(a.info.chat), (rq_now() - t0) * 1e3, desc);
+    if (engine_describe_admit(a.eng, desc, sizeof(desc))) fprintf(stderr, "runq serve: %s\n", desc);
     if (a.spec_mode != SPEC_OFF || dm) {
         char sd[1024], lk[64] = "off";
         engine_describe_spec(a.eng, sd, sizeof(sd));

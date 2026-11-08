@@ -592,15 +592,14 @@ static int seq_checkpoints(const RqModel *m, int n) {
     return m->hy.on ? (n > 0 ? n : RQ_SEQ_CK) : 0;
 }
 
-static size_t pages(size_t n) { return (n + 4095) / 4096 * 4096; }
-
 static void seq_mem(const RqModel *m, int cap, int kv_type, int ck, RqSeqMem *o) {
     // rq_seq_new's buffers (KV cache of whole attention blocks, tokens, state) and its checkpoints (ck_slot)
     size_t kv_len = ((size_t)cap + ATT_P - 1) / ATT_P * ATT_P;
     size_t tiles = (size_t)m->n_attn * (kv_len / ATT_T) * m->config.n_kv_heads;
-    o->kv = pages(tiles * kv_tile_bytes(kv_type, m->config.head_dim, 0)) + pages(tiles * kv_tile_bytes(kv_type, m->config.head_dim, 1)) +
+    // (= rq_seq_kv_bytes at cap)
+    o->kv = mem_pages(tiles * kv_tile_bytes(kv_type, m->config.head_dim, 0)) + mem_pages(tiles * kv_tile_bytes(kv_type, m->config.head_dim, 1)) +
             (size_t)cap * sizeof(int);
-    o->state = m->hy.on ? pages((size_t)m->hy.n_lin * m->ssm_layer * sizeof(float)) : 0;
+    o->state = m->hy.on ? mem_pages((size_t)m->hy.n_lin * m->ssm_layer * sizeof(float)) : 0;
     o->checkpoints = seq_checkpoints(m, ck);
     o->total = o->kv + (1 + (size_t)o->checkpoints) * o->state;
 }

@@ -220,6 +220,18 @@ plus the last reply (met: 46 of 52 tool turns exact, none beyond).
 
 ## Server (`runq serve`)
 
+- [ ] **Memory admission: the measurements and the default.** `--admit bound` / `chunk` (+ `--admit-yield`) are in
+  (2026-11-07, [docs/memory-admission.md](docs/memory-admission.md): the `admit` / `admit_chunk` groups on the 0.6B and
+  the 0.8B); not measured. On Saluki (q8-dot, the 0.8B Q4_K_M draft, `-c 98304`; a test port, never the live server's
+  `./kv-cache`): (1) `--admit bound --parallel 3 --slots 5`, the 1-3 request benchmark (prompts 600-800, 1,024 tokens):
+  total tok/s, `committed` vs the ~16.8 GiB of `worst`, peak RSS vs the estimate; (2) `--parallel 4`: does a fourth
+  request pay (compute, not memory, the expected limit); (3) an agent session (`scripts/replay_sessions.py`, 30-90k)
+  with short requests beside it: waits, reclaims, the session's re-prefills, `mem_wait_ms`; (4) the same with
+  `--kv-disk` (launch-server passes it now); (5) `--admit chunk` with requests without `max_tokens`: admitted at once,
+  `renewals` / `swaps` / `paused_ms` per request, swap time vs generation time, the free disk as the limit (and
+  `--admit-yield` with a long and a short client). Then decide the default (`worst` until then) and the chunk size;
+  record the numbers in the doc's Measurements.
+
 - [ ] **Tool calls, after G1.** (a) Stream a call's arguments as they are generated: each call goes out whole when its
   `</function>` arrives, so a long `write` / `edit` call shows no progress until it is complete (OpenAI streams the
   arguments' JSON in pieces; the typed conversion needs a parameter's end, a string parameter could stream its text).

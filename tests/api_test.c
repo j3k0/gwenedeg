@@ -81,6 +81,19 @@ static RqSeq *seq_new(int cap) {
 
 static int same(const float *a, const float *b, size_t n) { return !memcmp(a, b, n * sizeof(float)); }
 
+static long rss_anon(void) {
+    // RssAnon of /proc/self/status in bytes, -1 where unknown (not Linux)
+    long kb = -1;
+#ifdef __linux__
+    FILE *f = fopen("/proc/self/status", "r");
+    char line[256];
+    while (f && fgets(line, sizeof(line), f))
+        if (sscanf(line, "RssAnon: %ld kB", &kb) == 1) break;
+    if (f) fclose(f);
+#endif
+    return kb < 0 ? -1 : kb * 1024;
+}
+
 static int seq_from(RqCtx *c, RqSeq *dst, const RqSeq *base, int n) {
     // dst := base's first n positions: rq_seq_copy; a model with linear-attention layers (Qwen3.5) keeps only a
     // checkpointed length there, so its prefix is prefilled again (the same bits as a copy would give)
@@ -741,6 +754,106 @@ int main(int argc, char **argv) {
         rq_seq_free(s);
         rq_seq_free(t);
         rq_seq_free(small);
+    }
+#endif
+
+    // 3e. giving memory back (rq_seq_release, rq_seq_resident, rq_seq_kv_bytes): a sequence prefilled to 1,024 positions
+    // (4 whole blocks, Qwen3.5: checkpoints at 300 and 768 of 4 slots), cut to keep = 768 (block-aligned), 300
+    // (mid-block), 0, then released: its resident estimate is kv_bytes(keep) (+ the state copies it still holds: the
+    // free checkpoint buffers go, at length 0 the live state too), RssAnon drops by the estimate's difference (within a
+    // page per range; a huge page per range more where THP is always on: the mapping's tail past the last block), and
+    // the next rows (4 in a prefill chunk, then a decode step) == a fresh sequence's on the same prefix, bitwise;
+    // Qwen3.5: the kept checkpoint still restores (truncate to it again, the same rows). keep below the length: the
+    // length is kept. kv_bytes at the capacity == rq_seq_mem's kv; errors. (Windows: no release, hwm stays)
+#ifndef _WIN32
+    {
+        RqSeq *s = seq_new(0), *f = seq_new(0);
+        enum { N = 4 * 256, R = 5 };
+        int cap = rq_seq_capacity(s);
+        if (cap >= N + R) {
+            int ok = 1, *u = malloc((size_t)(N + R) * sizeof(int)), nattn = 0;
+            float *out = malloc((size_t)R * V * sizeof(float)), *ref = malloc((size_t)R * V * sizeof(float));
+            for (int i = 0; i < N + R; i++)
+                u[i] = C.v[i % C.n];
+            RqSeqMem sm, r0, r1;
+            ok &= rq_seq_mem(M, cap, KVT, &sm) == RQ_OK && rq_seq_kv_bytes(s, cap) == sm.kv && rq_seq_kv_bytes(s, cap + 9) == sm.kv;
+            ok &= rq_seq_kv_bytes(s, 0) == (size_t)cap * sizeof(int) && rq_seq_kv_bytes(s, -1) == rq_seq_kv_bytes(s, 0);
+            ok &= rq_seq_kv_bytes(s, 1) == rq_seq_kv_bytes(s, 256) && rq_seq_kv_bytes(s, 257) > rq_seq_kv_bytes(s, 256);
+            ok &= rq_seq_release(s, -1) == RQ_ERR_ARG && rq_seq_release(s, 0) == RQ_OK;
+            rq_seq_resident(s, &r0);
+            ok &= r0.kv == rq_seq_kv_bytes(s, 0) && r0.total == r0.kv && r0.checkpoints == 0;
+            nattn = I.n_layers - I.linear_layers; // (the KV cache's ranges: 2 per attention layer)
+            long thp = 0;
+#ifdef __linux__
+            FILE *tf = fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r");
+            char tb[128] = "";
+            if (tf) {
+                if (!fgets(tb, sizeof(tb), tf)) tb[0] = 0;
+                fclose(tf);
+            }
+            thp = strstr(tb, "[always]") ? 2L << 20 : 0;
+#endif
+            // below the estimate: a page per range at most (the partial pages kept); above: + a huge page per range
+            // (THP faulted past the high-water mark, given back with the whole mapping at keep 0)
+            long pg = 4096;
+#ifdef __linux__
+            pg = sysconf(_SC_PAGESIZE) > 0 ? sysconf(_SC_PAGESIZE) : 4096;
+#endif
+            long slo = 2L * nattn * pg + (64L << 10), shi = slo + 2L * nattn * thp;
+            static const int keep[3] = { 768, 300, 0 };
+            char dd[3][96];
+            ok &= rq_seq_set_checkpoints(s, 4) == RQ_OK;
+            for (int k = 0; k < 3; k++) {
+                int P = keep[k], okk = 1, cont = 0;
+                // the reference: a fresh sequence on u[0..P), then the R rows
+                rq_seq_reset(f);
+                okk &= (P == 0 || rq_prefill(c, f, u, P, RQ_LOGITS_NONE, NULL, NULL) == RQ_OK) &&
+                       rq_prefill(c, f, u + P, R - 1, RQ_LOGITS_ALL, ref, NULL) == RQ_OK;
+                float *lg;
+                okk &= rq_decode(c, f, u[P + R - 1], &lg) == RQ_OK;
+                if (okk) memcpy(ref + (size_t)(R - 1) * V, lg, V * sizeof(float));
+                rq_seq_reset(s);
+                okk &= rq_seq_checkpoint_at(s, 300) == RQ_OK && rq_seq_checkpoint_at(s, 768) == RQ_OK;
+                okk &= rq_prefill(c, s, u, N, RQ_LOGITS_NONE, NULL, NULL) == RQ_OK;
+                okk &= P ? rq_seq_truncate(s, P) == RQ_OK && rq_seq_len(s) == P : (rq_seq_reset(s), 1);
+                rq_seq_resident(s, &r0);
+                okk &= r0.kv == rq_seq_kv_bytes(s, N);
+                long a0 = rss_anon();
+                okk &= rq_seq_release(s, P) == RQ_OK;
+                long a1 = rss_anon();
+                rq_seq_resident(s, &r1);
+                int nck = I.linear_layers ? (P >= 768) + (P >= 300) : 0; // (the held ones; the freed: P = 300, 768's)
+                okk &= r1.kv == rq_seq_kv_bytes(s, P) && r1.checkpoints == nck &&
+                       r1.total == r1.kv + (size_t)(nck + (I.linear_layers && P > 0)) * r1.state;
+                long want = (long)(r0.total - r1.total), drop = a0 - a1;
+                okk &= a0 < 0 || (drop >= want - slo && drop <= want + shi);
+                // the next rows: as the fresh sequence's (Qwen3.5 and P > 0: again from the kept checkpoint)
+                for (int again = 0; again < 1 + (I.linear_layers && P > 0) && okk; again++) {
+                    okk &= rq_seq_truncate(s, P) == RQ_OK && rq_seq_len(s) == P;
+                    okk &= rq_prefill(c, s, u + P, R - 1, RQ_LOGITS_ALL, out, NULL) == RQ_OK &&
+                           same(out, ref, (size_t)(R - 1) * V);
+                    okk &= rq_decode(c, s, u[P + R - 1], &lg) == RQ_OK && same(lg, ref + (size_t)(R - 1) * V, V);
+                    cont += okk;
+                }
+                snprintf(dd[k], sizeof(dd[k]), "keep %d: RssAnon -%.1f MiB (estimate -%.1f), %d continuation(s) %s", P,
+                         (a0 - a1) / 1048576.0, want / 1048576.0, cont, okk ? "ok" : "FAIL");
+                ok &= okk;
+            }
+            // keep below the length: nothing past it goes (len P + R = 5 positions, one block)
+            rq_seq_resident(s, &r0);
+            ok &= rq_seq_release(s, 0) == RQ_OK && rq_seq_len(s) == R;
+            rq_seq_resident(s, &r1);
+            ok &= r1.kv == r0.kv && r1.kv == rq_seq_kv_bytes(s, R);
+            char dl[3 * 96 + 8];
+            snprintf(dl, sizeof(dl), "%s; %s; %s", dd[0], dd[1], dd[2]);
+            report(ok, "seq_release", dl);
+            free(u);
+            free(out);
+            free(ref);
+        } else
+            report(1, "seq_release", "skipped: capacity below 1,029 positions");
+        rq_seq_free(s);
+        rq_seq_free(f);
     }
 #endif
 

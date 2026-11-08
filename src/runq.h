@@ -185,6 +185,20 @@ int rq_seq_len(const RqSeq *s);                // positions in the cache = the n
 int rq_seq_capacity(const RqSeq *s);
 const int *rq_seq_tokens(const RqSeq *s);      // the tokens at positions 0..len-1
 int rq_seq_common_prefix(const RqSeq *s, const int *tokens, int n); // longest common prefix length
+// Giving memory back (a sequence keeps what it touched until then: truncate / reset only move its length). The KV
+// blocks of 256 positions wholly past max(keep, len) are given back to the system (Linux: madvise MADV_DONTNEED, 2 x
+// the attention layers' calls at most; they read as a fresh sequence's afterwards), and so are the checkpoint
+// buffers that hold no checkpoint; at length 0 the recurrent state's buffer too. The contents below max(keep, len)
+// are untouched: the sequence continues exactly as before. Other Unix systems: MADV_FREE (the system takes the pages
+// back under memory pressure). Where the system has no such call (Windows), only the checkpoint buffers go. RQ_OK, RQ_ERR_ARG (keep < 0)
+int rq_seq_release(RqSeq *s, int keep);
+// the memory the sequence holds (an upper bound): kv = rq_seq_kv_bytes up to its high-water mark (the longest length
+// since its last release), state = one copy of the recurrent state, checkpoints = the checkpoint buffers allocated,
+// total = kv + (checkpoints + the live state if touched since the last release at length 0) x state
+void rq_seq_resident(const RqSeq *s, RqSeqMem *out);
+// the KV bytes of positions 0..n-1 (n clamped to [0, capacity]): their whole blocks, in pages, + the token array; at
+// the capacity rq_seq_mem's kv
+size_t rq_seq_kv_bytes(const RqSeq *s, int n);
 // dst := the first n positions of src (KV entries and tokens; n <= rq_seq_len(src), n <= dst's capacity, the
 // same model and KV type; dst's RNG unchanged): e.g. a cached prompt prefix shared by several sequences.
 // The copied entries are the same bits, so dst continues exactly as src would. Qwen3.5: unless n is src's

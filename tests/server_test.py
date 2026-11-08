@@ -55,6 +55,39 @@ first), the disk tier group only (--kv-disk; its own servers, one slot each, so 
              sequence); after a restart the files serve the next turn again (== the reference); a second server on the same
              directory refused (its lock); a corrupted file and a leftover .tmp removed at the start (the request then
              prefilled, == the reference); a budget too small for any save: none, replies unchanged
+With --admit [--draft DRAFT] (tests/check.py's server group on the Qwen3 file and Qwen3.5-0.8B, with its Q4_K_M as the draft),
+the memory admission group only (--admit bound; its own servers, -c 4096 --parallel 8, the budget from the startup line:
+one -c job fits, four short ones too, a -c job beside three short ones not):
+  admit      the startup line; refusals (one -c job does not fit; --admit chunk); three short requests at once all run
+             (/health running 3) == each alone (text, logprobs); one without max_tokens sent while they run waits (queue_ms,
+             the log) and == alone; a short one behind it waits too (strict FIFO: admitted after it); nothing running: a -c
+             job takes the idle slots' room (reclaimed) and is admitted at once; with --kv-disk the reclaimed slots are saved
+             first and a conversation's next turn loads its file back (cached_tokens), == a fresh prefill; a -c job asking for
+             16 guesses fits (capped to what one -c job holds), == the default; the live budget (RUNQ_TEST_MEMAVAILABLE=FILE, --kv-mem
+             large): /health's mem consistent, MemAvailable lowered to 0 while a stream holds a slot: a new request waits
+             (/health waiting_for_memory 1), raised: admitted, mem_wait_ms > 0, == alone
+With --admit-chunk [--draft DRAFT] (tests/check.py's server group, the same files and drafts), the chunked leases group only
+(--admit chunk --admit-chunk 16 --kv-disk TMP; its own servers, RUNQ_TEST_MEMAVAILABLE set to 0 once the requests run, so
+that a renewal needing a new KV block is denied, and with --admit-margin 1 the live budget is then -1 GiB: the oldest's
+next block swaps out every younger job; prompts padded to just below a block):
+  admit_chunk refusals (no --kv-disk; a --kv-mem the free space does not hold); the startup line, /health's parked and
+             swapped_out; a long count (the oldest: renewed, never parked nor swapped) with 3 requests parked mid-reply at
+             once, then swapped out by its next block (their files there), then swapped back in: each == alone without
+             speculation, bitwise (logprobs), swaps / swap_ms > 0: greedy, seeded, thinking (</think> after the park; greedy,
+             seeded), a stop string across chunks, json_schema, tool calls (Qwen3.5, + thinking), speculation (draft k 3 /
+             the lookup / off); no admission while parked or swapped out (a short request queued: admitted after the
+             swap-ins, mem_wait_ms > 0); a stream cancelled while parked, then while swapped out (keep-alives meanwhile; its
+             files deleted; the oldest == alone); a swap-out that fails (the swap directory read-only: that request gets a
+             500, the oldest == alone, nothing left); a restart empties the swap directory; liveness (-c 400, three requests
+             without max_tokens, RUNQ_TEST_SWAP_DELAY 0.5: the oldest, streamed, swaps the others out running, gets
+             keep-alives during the swap and is renewed beyond the live budget with a warning; all end at the context in
+             order, == alone); a swap mid-prefill (-c 4096 --chunk 8: a ~2,400-token prompt swapped out by the oldest's
+             block, the log's "prefilling: N of M", continued after the swap-in) beside a parked reply, == alone; with a
+             draft, the draft's swap save, then its load, made to fail (RUNQ_TEST_SWAP_FAIL=FILE: "draft-save" /
+             "draft-load"): the draft reset (logged), outputs unchanged; --admit-yield 2 with --parallel 1: two long
+             requests (greedy; seeded with speculation) take turns (their yields alternate in the log; yields, paused_ms,
+             renewals; /health yielded), then the same with MemAvailable 0 once both run (the yielded one swapped out:
+             swaps), each == alone; --admit-yield without chunk refused
 With --spec DRAFT (tests/check_spec.py: the Qwen3-0.6B Q8_0 + Q4_K_M pair, Qwen3.5-0.8B Q8_0 + Q4_K_M; "none": the prompt
 lookup alone, the 0.8B), the speculative decoding group only (the server: -D DRAFT or --lookup 4):
   spec       every request with "speculative": false (plain decoding) and with fixed settings (the draft model at k 1 / 3 /
@@ -68,6 +101,7 @@ lookup alone, the 0.8B), the speculative decoding group only (the server: -D DRA
 """
 import argparse
 import concurrent.futures as cf
+import glob
 import http.client
 import json
 import os
@@ -379,6 +413,726 @@ def run_disk(a, t):
     rc, log4 = stop(p, lg)
     rep(rc == 0 and x5 and y5 and x6 and x6["lp"] == rx2["lp"] and "saved as entry" not in log4 and "no room" in log4 and
         not [f for f in files() if f.endswith(".rqseq")], "disk/budget", "--kv-disk-max 0.0001: nothing saved, the replies unchanged")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def run_admit(a, t):
+    """--admit bound: a request admitted on its lease (prompt + max tokens, its state copies) within --kv-mem; its own servers
+    (-c 4096, --parallel 8: only the memory makes a request wait), the budget chosen from the startup line so that one -c
+    job fits, four short ones do too, but not a -c job beside three short ones"""
+    rep = t.report
+    env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
+    d = tempfile.mkdtemp(prefix="runq-admit-", dir=os.environ.get("RUNQ_DISK_TMP") or ("/var/tmp" if os.access("/var/tmp", os.W_OK) else None))
+    base = ["--port", "0", "-c", "4096", "--parallel", "8", "--slots", "6", "--chunk", "16", "--checkpoints", "1", "-v"] + \
+        (["-D", a.draft, "--spec-calibrate", "1024"] if a.draft else [])
+
+    def start(args, xenv=None):
+        log = tempfile.NamedTemporaryFile(prefix="runq-serve-admit-", suffix=".log", delete=False)
+        p = subprocess.Popen([a.runq, "serve", a.model] + base + args, stderr=log, stdout=subprocess.DEVNULL, env=dict(env, **(xenv or {})))
+        for _ in range(1200):
+            m = re.search(r"listening on http://127\.0\.0\.1:(\d+)", open(log.name).read())
+            if m:
+                return p, int(m.group(1)), log.name
+            if p.poll() is not None:
+                break
+            time.sleep(0.05)
+        return p, None, log.name
+
+    def stop(p, logname):
+        p.send_signal(signal.SIGTERM)
+        try:
+            rc = p.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            rc = "timeout"
+        text = open(logname).read()
+        os.unlink(logname)
+        return rc, text
+
+    def ask(port, msgs, **kw):
+        body = dict({"messages": msgs, "temperature": 0, "logprobs": True, "top_logprobs": 2}, **kw)
+        st, r, _ = chat(port, body, timeout=600)
+        if st != 200:
+            return {"err": st, "text": None, "lp": None, "queue": -1, "cached": -1, "prompt": -1, "finish": None}
+        return {"text": text_of(r), "lp": json.dumps(r["choices"][0]["logprobs"]), "queue": r["timings"]["queue_ms"],
+                "cached": r["usage"]["prompt_tokens_details"]["cached_tokens"], "prompt": r["usage"]["prompt_tokens"],
+                "finish": r["choices"][0]["finish_reason"], "mw": r["timings"].get("mem_wait_ms", -1),
+                "lease": r["timings"].get("lease_gib", -1), "spec": r["timings"].get("speculative")}
+
+    def health(port):
+        st, h, _ = req(port, "GET", "/health")
+        return h if st == 200 else {}
+
+    # the terms: a probe server's startup line (KV per position, a state copy, the slot's size), the leases as engine.c
+    p, port, lg = start(["--admit", "bound", "--kv-mem", "64"])
+    if not port:
+        rep(False, "admit/start", open(lg).read()[-500:])
+        return
+    _, desc = stop(p, lg)
+    m = re.search(r"per slot ([\d.]+) MiB", desc)
+    al = (re.findall(r"admission bound:.*", desc) or [""])[0]  # (target + draft)
+    kvp = re.search(r"leases \(prompt \+ max tokens: KV ([\d.]+) KB per position", al)
+    stm = re.search(r"state ([\d.]+) MiB x \(1 \+ (\d+) checkpoints", al)
+    if not (m and kvp):
+        rep(False, "admit/startup_line", desc[-600:])
+        return
+    MiB, per_slot, kv = 1048576.0, float(m.group(1)) * 1048576.0, float(kvp.group(1)) * 1000.0
+    st, ck = (float(stm.group(1)) * MiB, int(stm.group(2))) if stm else (0.0, 0)
+    kk = 3 if a.draft else 0  # (-G 3, --lookup 3: the defaults with a draft)
+    extra = (kk + 1) * st if kk else 0.0
+    S = 256 * kv + (1 + ck) * st + extra  # a short request (prompt + max_tokens within one block of 256 positions)
+    J = per_slot + extra                 # a request without max_tokens: the whole context
+    B = max(J, 4 * S) + 0.1 * S
+    rep("admission bound:" in desc and B < J + 3 * S - 0.05 * S, "admit/startup_line",
+        f"short lease {S / MiB:.1f} MiB, -c job {J / MiB:.1f} MiB: --kv-mem {B / MiB:.1f} MiB (a -c job + 3 short ones: "
+        f"{(J + 3 * S) / MiB:.1f})")
+    kvmem = ["--admit", "bound", "--kv-mem", f"{B / 1073741824.0:.6f}"]
+    # refusals: one -c job must fit; a chunk of 0 tokens
+    q = subprocess.run([a.runq, "serve", a.model] + base + ["--admit", "bound", "--kv-mem", f"{0.5 * J / 1073741824.0:.6f}"],
+                       capture_output=True, env=env, timeout=120)
+    q2 = subprocess.run([a.runq, "serve", a.model, "--admit", "chunk", "--admit-chunk", "0"], capture_output=True, env=env, timeout=60)
+    rep(q.returncode != 0 and b"--admit bound: a job of -c 4096" in q.stderr and q2.returncode != 0 and b"--admit-chunk" in q2.stderr,
+        "admit/refused", q.stderr.decode(errors="replace").strip()[-160:])
+
+    p, port, lg = start(kvmem)
+    if not port:
+        rep(False, "admit/start", open(lg).read()[-500:])
+        return
+    try:
+        COUNT = "Count from 1 to 200, separated by commas."  # (a reply longer than max_tokens: the requests overlap)
+        shorts = [[{"role": "user", "content": f"{COUNT} Start with {k}."}] for k in range(3)]
+        shorts.append([{"role": "user", "content": f"{COUNT} Start with 3, then go on slowly."}])  # (another prompt length)
+        sky = [{"role": "user", "content": "What colour is the sky on a clear day? Answer in one word."}]
+        MT = 180
+        res, hs = {}, []
+        with cf.ThreadPoolExecutor(max_workers=6) as ex:
+            fs = [ex.submit(ask, port, shorts[k], max_tokens=MT) for k in range(3)]
+            time.sleep(0.4)
+            fl = ex.submit(ask, port, sky)  # (no max_tokens: the lease is the whole context)
+            time.sleep(0.3)
+            f4 = ex.submit(ask, port, shorts[3], max_tokens=MT)  # (it would fit, but it is behind the waiting one)
+            for _ in range(20):
+                time.sleep(0.05)
+                hs.append(health(port))
+            res = {"s": [f.result() for f in fs], "long": fl.result(), "s4": f4.result()}
+        ref = {"s": [ask(port, shorts[k], max_tokens=MT, cache_prompt=False) for k in range(3)], "long": ask(port, sky, cache_prompt=False),
+               "s4": ask(port, shorts[3], max_tokens=MT, cache_prompt=False)}
+        both = [(x, y) for x, y in zip(res["s"] + [res["long"], res["s4"]], ref["s"] + [ref["long"], ref["s4"]])]
+        saw = max((h.get("running", 0), h.get("queued", 0)) for h in hs) if hs else (0, 0)
+        three = any(h.get("running") == 3 and h.get("queued", 0) >= 1 for h in hs)
+        # (never refused for memory: mem_wait_ms 0; queue_ms also holds the step in flight when one arrives, long under load)
+        rep(all(x["text"] is not None for x, _ in both) and all(x["mw"] == 0 for x in res["s"]) and three and
+            all(x["text"] == y["text"] and x["lp"] == y["lp"] for x, y in zip(res["s"], ref["s"])), "admit/three_short_bitwise",
+            f"queue_ms {[round(x['queue']) for x in res['s']]}, mem_wait_ms {[x['mw'] for x in res['s']]}, /health running 3 with requests queued: {three} (max {saw}); "
+            f"== alone: {[x['lp'] == y['lp'] for x, y in zip(res['s'], ref['s'])]}")
+        lw = res["long"]
+        log1 = open(lg).read()
+        hw = any((h.get("mem") or {}).get("waiting_for_memory") == 1 for h in hs)
+        rep(lw["text"] is not None and lw["queue"] > 200 and lw["text"] == ref["long"]["text"] and lw["lp"] == ref["long"]["lp"] and
+            "job waits for memory" in log1 and 0 < lw["mw"] <= lw["queue"] and lw["lease"] > 0 and hw, "admit/no_max_tokens_waits",
+            f"queue_ms {lw['queue']:.0f} (mem_wait_ms {lw['mw']:.0f}, lease {lw['lease']:.3f} GiB), {lw['finish']}, == alone: "
+            f"{lw['lp'] == ref['long']['lp']}, logged: {'job waits for memory' in log1}, /health waiting_for_memory 1: {hw}")
+        # strict FIFO: the short one behind it was admitted after it (the log's admissions: their prompt tokens), and waited
+        adm = [int(x) for x in re.findall(r"\[engine\] job -> slot \d+: \d+ of (\d+) prompt tokens", log1)]
+        pl, p4 = lw["prompt"], res["s4"]["prompt"]
+        order = pl in adm and p4 in adm and pl != p4 and adm.index(pl) < adm.index(p4)
+        rep(order and res["s4"]["queue"] > 200 and res["s4"]["lp"] == ref["s4"]["lp"], "admit/strict_fifo",
+            f"admissions by prompt tokens {adm[:6]} (the waiting one: {pl}, behind it: {p4}); queue_ms {res['s4']['queue']:.0f}; "
+            f"== alone: {res['s4']['lp'] == ref['s4']['lp']}")
+    finally:
+        rc, log = stop(p, lg)
+    rep(rc == 0 and "over the memory budget" not in log, "admit/stop", f"exit {rc}")
+
+    # a budget where a -c job does not fit beside two idle slots of one block and a state copy each: nothing running, the
+    # idle slots are reclaimed for it and it is admitted at once; with --kv-disk they are saved first, and a conversation's
+    # next request loads it back
+    B2 = J + 0.25 * (256 * kv + st)
+    lines = " ".join(f"Entry {i}: the keeper logged wind {i % 7} knots, swell {i % 5} m, visibility {i % 9} km." for i in range(36))
+    X = [{"role": "system", "content": LONG_SYS}, {"role": "user", "content": lines + "\nWhich entry had the most wind?"}]
+    Y = [{"role": "system", "content": PIRATE_SYS}, {"role": "user", "content": lines + "\nDescribe your ship."}]
+    def tight(port, lg, disk):
+        x, y = ask(port, X, max_tokens=8), ask(port, Y, max_tokens=8)
+        for _ in range(200):  # (/health's running drops at the engine's reap, which may follow the reply)
+            hp = health(port)
+            if hp.get("running") == 0:
+                break
+            time.sleep(0.02)
+        z = ask(port, sky)  # (the whole context: X's and Y's slots are reclaimed; with the disk tier saved first)
+        log = open(lg).read()
+        if not disk:
+            n = log.count("reclaimed:")
+            rep(hp.get("running") == 0 and z["text"] is not None and z["mw"] == 0 and n >= 1 and "(saved to disk)" not in log,
+                "admit/nothing_running", f"queue_ms {z['queue']:.0f}, mem_wait_ms {z['mw']}, {n} slot(s) reclaimed for it")
+            # the guesses capped at what one -c job holds (this budget: -G 3 / --lookup 3's, else none): a -c job asking for
+            # 16 fits the budget made for one -c job (Qwen3.5: their state copies; no "over the memory budget" warning, checked at the stop) and
+            # its output is the default's
+            sp = {"k": 16, "lookup": 16} if a.draft else {"lookup": 16}
+            z16 = ask(port, sky, speculative=sp, cache_prompt=False)
+            z0 = ask(port, sky, cache_prompt=False)
+            rep(z16["text"] is not None and z16["text"] == z0["text"] and z16["lp"] == z0["lp"] and z16["lease"] <= z0["lease"] + 1e-6,
+                "admit/guesses_capped", f"speculative {sp}: lease {z16['lease']:.4f} GiB (default {z0['lease']:.4f}), == default: "
+                f"{z16['lp'] == z0['lp']}, {z16['spec']}")
+            return
+        X2 = X + [{"role": "assistant", "content": x["text"] or ""}, {"role": "user", "content": "And the least?"}]
+        x2 = ask(port, X2, max_tokens=8, temperature=0.8, seed=5)
+        rx2 = ask(port, X2, max_tokens=8, temperature=0.8, seed=5, cache_prompt=False)
+        log = open(lg).read()
+        saved = len(re.findall(r"reclaimed: \d+ tokens, [\d.]+ GiB \(saved to disk\)", log))
+        rep(z["text"] is not None and saved >= 1 and x2["cached"] >= x["prompt"] // 2 and "disk: entry" in log and x2["lp"] == rx2["lp"],
+            "admit/reclaim_disk", f"{saved} slot(s) reclaimed after a save; X's next turn {x2['cached']} of {x2['prompt']} cached (its "
+            f"prompt {x['prompt']}), == fresh: {x2['lp'] == rx2['lp']}")
+
+    for disk in (False, True):
+        tag = "_disk" if disk else ""
+        p, port, lg = start(["--admit", "bound", "--kv-mem", f"{B2 / 1073741824.0:.6f}"] + (["--kv-disk", d, "--kv-disk-min", "64"] if disk else []))
+        if not port:
+            rep(False, f"admit/start_tight{tag}", open(lg).read()[-500:])
+            break
+        try:
+            tight(port, lg, disk)
+        finally:
+            rc, log = stop(p, lg)
+        rep(rc == 0 and "over the memory budget" not in log, f"admit/stop_tight{tag}", f"exit {rc}")
+
+    # step 3, the live budget (RUNQ_TEST_MEMAVAILABLE: MemAvailable read from a file at each admission), --kv-mem large
+    # (only the live budget binds): a request holds a slot (a stream), MemAvailable lowered to 0: a new one waits (/health
+    # waiting_for_memory 1); raised: it is admitted, mem_wait_ms > 0, == alone
+    mf = os.path.join(d, "memavailable")
+    def setmem(v):
+        with open(mf + ".tmp", "w") as f:
+            f.write(f"{int(v)}\n")
+        os.replace(mf + ".tmp", mf)
+    def poll(port, ok, n=1200):
+        for _ in range(n):
+            h = health(port)
+            if ok(h):
+                return h
+            time.sleep(0.05)
+        return h
+    setmem(1e12)
+    p, port, lg = start(["--admit", "bound", "--kv-mem", "8", "--admit-margin", "0.5"], {"RUNQ_TEST_MEMAVAILABLE": mf})
+    if not port:
+        rep(False, "admit/start_live", open(lg).read()[-500:])
+        shutil.rmtree(d, ignore_errors=True)
+        return
+    hold = None
+    try:
+        h0 = health(port)
+        m0 = h0.get("mem") or {}
+        line = re.findall(r"admission bound:.*", open(lg).read())
+        rep(set(m0) == {"budget", "live", "committed", "resident", "waiting_for_memory"} and abs(m0["budget"] - 8) < 1e-3 and
+            m0["resident"] <= m0["committed"] + 1e-6 <= m0["budget"] and abs(m0["live"] - (1e12 / 2**30 - 0.5 - (m0["committed"] - m0["resident"]))) < 1e-2
+            and m0["waiting_for_memory"] == 0 and line and "margin 0.50 GiB" in line[0], "admit/health_mem", f"{m0}")
+        hold = socket.create_connection(("127.0.0.1", port), timeout=600)
+        b = json.dumps({"messages": [{"role": "user", "content": "Count from 1 to 5000, separated by commas."}], "temperature": 0,
+                        "max_tokens": 3000, "stream": True}).encode()
+        hold.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % len(b) + b)
+        hold.recv(4096)  # (its first bytes: it runs)
+        h1 = poll(port, lambda h: h.get("running") == 1)
+        m1 = h1.get("mem") or {}
+        setmem(0)
+        sky = [{"role": "user", "content": "What colour is the sky on a clear day? Answer in one word."}]
+        with cf.ThreadPoolExecutor(max_workers=2) as ex:
+            fw = ex.submit(ask, port, sky, max_tokens=16)
+            hw = poll(port, lambda h: (h.get("mem") or {}).get("waiting_for_memory") == 1 and h.get("queued") == 1)
+            mw = hw.get("mem") or {}
+            setmem(1e12)
+            w = fw.result()
+        hold.close()
+        hold = None
+        poll(port, lambda h: h.get("running") == 0)
+        ref = ask(port, sky, max_tokens=16, cache_prompt=False)
+        rep(m1.get("committed", 0) > m1.get("resident", 0) and mw.get("waiting_for_memory") == 1 and mw.get("live", 1) < 0 and
+            w["text"] is not None and 0 < w["mw"] <= w["queue"] and w["lp"] == ref["lp"] and ref["mw"] == 0, "admit/live_budget",
+            f"holding: committed {m1.get('committed', 0):.3f} > resident {m1.get('resident', 0):.3f} GiB; MemAvailable 0: {mw}; raised: "
+            f"mem_wait_ms {w['mw']:.0f} of queue_ms {w['queue']:.0f}, == alone: {w['lp'] == ref['lp']}")
+        # the guesses' cap is what one -c job holds within --kv-mem (8 GiB: all 16), not the server's -G / --lookup: a
+        # request asking for the lookup at 8 gets it (Qwen3.5: 8 + 1 more state copies in its lease), == plain
+        zl = ask(port, sky, max_tokens=16, cache_prompt=False, speculative={"lookup": 8})
+        rep(zl["text"] is not None and zl["lp"] == ref["lp"] and (zl["lease"] > ref["lease"] + 1e-6 if st > 0 else zl["lease"] == ref["lease"]),
+            "admit/guesses_fit", f"lookup 8: lease {zl['lease']:.4f} GiB (default {ref['lease']:.4f}), == plain: {zl['lp'] == ref['lp']}")
+    finally:
+        if hold:
+            hold.close()
+        rc, log = stop(p, lg)
+    rep(rc == 0 and "over the memory budget" not in log and "job waits for memory" in log and "live " in log, "admit/stop_live",
+        f"exit {rc}")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def run_admit_chunk(a, t):
+    """--admit chunk (step 4: chunked leases, parking, the swap): a request admitted on its prompt + 16 tokens, its lease
+    renewed by 16 as it grows. The live budget's test hook (RUNQ_TEST_MEMAVAILABLE, --kv-mem large, margin 0) makes the
+    renewals that need a new KV block (256 positions) fail: MemAvailable set to 0 once the requests run (the live budget is
+    then -margin, -1 GiB), the young ones park at their next block (prompts padded to just below it); the oldest (a long
+    count) never does: its new block swaps out the younger ones (--kv-disk DIR/.../swap/), the youngest first, then it is
+    renewed beyond the live budget; raised: they are swapped back in, the oldest first, and finish. Every reply == the same request alone with no speculation, bitwise (logprobs)"""
+    rep = t.report
+    env = dict(os.environ, OMP_NUM_THREADS=str(a.threads), RUNQ_SSE_KEEPALIVE="0.05")
+    d = tempfile.mkdtemp(prefix="runq-admitc-", dir=os.environ.get("RUNQ_DISK_TMP") or ("/var/tmp" if os.access("/var/tmp", os.W_OK) else None))
+    mf = os.path.join(d, "memavailable")
+    kvd = os.path.join(d, "kv")
+    env["RUNQ_TEST_MEMAVAILABLE"] = mf
+    base = ["--port", "0", "--parallel", "5", "--slots", "7", "--chunk", "16", "--checkpoints", "1", "-v", "--admit", "chunk",
+            "--admit-chunk", "16", "--kv-mem", "4", "--admit-margin", "1", "--kv-disk", kvd] + (["-D", a.draft, "--spec-calibrate", "1024"] if a.draft else [])
+
+    def setmem(v):
+        with open(mf + ".tmp", "w") as f:
+            f.write(f"{int(v)}\n")
+        os.replace(mf + ".tmp", mf)
+
+    def start(args, xenv=None, b=None):
+        log = tempfile.NamedTemporaryFile(prefix="runq-serve-admitc-", suffix=".log", delete=False)
+        p = subprocess.Popen([a.runq, "serve", a.model] + (base if b is None else b) + args, stderr=log, stdout=subprocess.DEVNULL,
+                             env=dict(env, **(xenv or {})))
+        for _ in range(1200):
+            m = re.search(r"listening on http://127\.0\.0\.1:(\d+)", open(log.name).read())
+            if m:
+                return p, int(m.group(1)), log.name
+            if p.poll() is not None:
+                break
+            time.sleep(0.05)
+        return p, None, log.name
+
+    def stop(p, logname):
+        p.send_signal(signal.SIGTERM)
+        try:
+            rc = p.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            rc = "timeout"
+        text = open(logname).read()
+        os.unlink(logname)
+        return rc, text
+
+    def health(port):
+        st, h, _ = req(port, "GET", "/health")
+        return h if st == 200 else {}
+
+    def mem(h, k):
+        return (h.get("mem") or {}).get(k, 0)
+
+    def swap_files():
+        return [f for sd in glob.glob(os.path.join(kvd, "*", "swap")) for f in os.listdir(sd)]
+
+    def sse(port, body):
+        # a stream: its content, finish_reason, timings, and the longest run of keep-alive comments between two chunks
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=600)
+        c.request("POST", "/v1/chat/completions", body=json.dumps(dict(body, stream=True, stream_options={"include_usage": True})).encode())
+        r = c.getresponse()
+        content, finish, tm, run, best = "", None, {}, 0, 0
+        while True:
+            line = r.readline()
+            if not line:
+                break
+            line = line.decode().rstrip("\n")
+            if line.startswith(": keep-alive"):
+                run += 1
+                best = max(best, run)
+            elif line.startswith("data: ") and line != "data: [DONE]":
+                run = 0
+                dd = json.loads(line[6:])
+                tm = dd.get("timings") or tm
+                for ch in dd.get("choices") or []:
+                    content += ch["delta"].get("content") or ""
+                    finish = ch["finish_reason"] or finish
+        c.close()
+        return {"content": content, "finish": finish, "tm": tm, "ka": best, "done": time.time()}
+
+    def poll(port, ok, n=600):
+        h = {}
+        for _ in range(n):
+            h = health(port)
+            if ok(h):
+                return h
+            time.sleep(0.02)
+        return h
+
+    def ask(port, body):
+        st, r, _ = chat(port, body, timeout=600)
+        if st != 200:
+            return {"err": st, "out": (st, str(r)[:200]), "tm": {}, "done": time.time()}
+        m, c = r["choices"][0]["message"], r["choices"][0]
+        calls = [x["function"] for x in m.get("tool_calls") or []]
+        return {"out": (m.get("content"), m.get("reasoning_content"), calls, c["finish_reason"], r["usage"]["completion_tokens"],
+                        json.dumps(c.get("logprobs"))), "tm": r["timings"], "prompt": r["usage"]["prompt_tokens"], "done": time.time()}
+
+    def alone(port, body):
+        return ask(port, dict(body, cache_prompt=False, speculative=False))
+
+    def padded(port, body, target):
+        # the body with filler words in its system message so that its prompt is target tokens (+- 1; + 256 x n if longer)
+        msgs = body["messages"]
+        sys0 = msgs[0]["content"] if msgs[0]["role"] == "system" else "You are a helpful assistant."
+        rest = msgs[1:] if msgs[0]["role"] == "system" else msgs
+        def make(k):
+            return dict(body, messages=[{"role": "system", "content": sys0 + " (Filler, ignore it:" + " ok" * k + ".)"}] + rest)
+        def n(k):
+            st, r, _ = chat(port, dict(make(k), max_tokens=1, speculative=False))
+            return r["usage"]["prompt_tokens"] if st == 200 else 0
+        n0, n1 = n(0), n(100)
+        while target <= n0:  # (a long prompt, e.g. with tools: below the next block of 256 positions)
+            target += 256
+        k = max(0, round((target - n0) * 100 / max(1, n1 - n0)))
+        for _ in range(3):
+            nk = n(k)
+            if abs(nk - target) <= 1:
+                break
+            k = max(0, k + target - nk)
+        return make(k)
+
+    # the oldest: a long count from a short prompt (its first new block at ~230 tokens: with MemAvailable 0 the live budget is
+    # -margin, -1 GiB, so that block swaps out every younger job at once, then it is renewed beyond the live budget anyway)
+    OLD = {"messages": [{"role": "user", "content": "Count from 1 to 400, separated by commas."}], "temperature": 0, "max_tokens": 360,
+           "logprobs": True, "top_logprobs": 2}
+    OLD2 = OLD
+    q35 = "qwen3.5" in a.model.lower()
+    ADD = "What is 2 + 3? Answer briefly."
+    LP = {"logprobs": True, "top_logprobs": 2}
+    sp_model = {"mode": "fixed", "k": 3, "lookup": 0} if a.draft else {"mode": "fixed", "lookup": 4}
+    sp_lookup = {"mode": "fixed", "lookup": 8, "lookup_min": 2}
+    # (name, body, where its reply parks: about that many tokens in, the prompt padded to ~240 - it; speculation)
+    cases = [
+        ("greedy", dict({"messages": [{"role": "user", "content": "Describe the water cycle in a short paragraph."}], "temperature": 0,
+                         "max_tokens": 90}, **LP), 30, sp_model),
+        ("seeded", dict({"messages": [{"role": "user", "content": CATS}], "temperature": 0.8, "top_p": 0.9, "seed": 42, "max_tokens": 80},
+                        **LP), 24, sp_lookup),
+        # (greedy: the reply's </think> after the park, then the content; Qwen3.5-0.8B reasons at length after a long system
+        # prompt: its prompt unpadded, its reasoning ends near the first block, where it parks; seeded: a reasoning)
+        ("thinking", dict({"messages": [{"role": "user", "content": "Is 7 prime? Answer yes or no." if q35 else "What is the capital of France? "
+                                         "One word."}], "temperature": 0, "max_tokens": 400, "reasoning_effort": "high"}, **LP), None if q35 else 20, False),
+        ("thinking_seeded", dict({"messages": [{"role": "user", "content": ADD}], "temperature": 0.7, "seed": 3, "max_tokens": 200,
+                                  "reasoning_effort": "high"}, **LP), 37, sp_model),
+        ("stop_string", dict({"messages": [{"role": "user", "content": "Count from 1 to 100, separated by commas."}], "temperature": 0,
+                              "max_tokens": 200, "stop": ["21, 22, 23, 24, 25, 26, 27"]}, **LP), 12, sp_lookup),  # (~25 tokens: across chunks)
+        ("json_schema", dict({"messages": [{"role": "user", "content": "Describe a small pet as JSON."}], "temperature": 0, "max_tokens": 80,
+                              "response_format": {"type": "json_schema", "json_schema": {"name": "n", "schema": NESTED}}}, **LP), 8, False),
+    ]
+    if q35:  # (tool calls: the Qwen3.5 / 3.8 templates)
+        cases.append(("tool_call", dict({"messages": WEATHER, "tools": TOOLS, "temperature": 0, "max_tokens": 200}, **LP), 12, sp_lookup))
+        cases.append(("tool_call_thinking", dict({"messages": WEATHER, "tools": TOOLS, "temperature": 0, "max_tokens": 300,
+                                                  "reasoning_effort": "high"}), 40, sp_model))
+
+    # refusals: chunk without --kv-disk; a budget the free space under it does not hold (the swap's worst case)
+    setmem(1e12)
+    nod = [x for x in base if x not in ("--kv-disk", kvd)]
+    q1 = subprocess.run([a.runq, "serve", a.model] + nod + ["-c", "1024"], capture_output=True, env=env, timeout=120)
+    q2 = subprocess.run([a.runq, "serve", a.model] + base + ["-c", "1024", "--kv-mem", "1000000"], capture_output=True, env=env, timeout=120)
+    q3 = subprocess.run([a.runq, "serve", a.model, "--port", "0", "-c", "1024", "--admit", "bound", "--admit-yield", "2"], capture_output=True,
+                        env=env, timeout=120)
+    rep(q1.returncode != 0 and b"--admit chunk needs --kv-disk" in q1.stderr and q2.returncode != 0 and b"the swap needs" in q2.stderr
+        and q3.returncode != 0 and b"--admit-yield needs --admit chunk" in q3.stderr,
+        "admit_chunk/refused", f"{q1.stderr.decode()[-160:]} | {q2.stderr.decode()[-200:]} | {q3.stderr.decode()[-120:]}")
+    p, port, lg = start(["-c", "1024"])
+    if not port:
+        rep(False, "admit_chunk/start", open(lg).read()[-500:])
+        shutil.rmtree(d, ignore_errors=True)
+        return
+    try:
+        line = re.findall(r"admission chunk:.*", open(lg).read())
+        h0 = health(port)
+        m0 = h0.get("mem") or {}
+        rep(bool(line) and "prompt + 16 tokens" in line[0] and "swapped out to" in line[0] and m0.get("parked") == 0 and
+            m0.get("swapped_out") == 0 and "waiting_for_memory" in m0, "admit_chunk/startup", f"{(line or [''])[0][-200:]}; /health mem {m0}")
+        bodies = [(name, padded(port, b, 240 - at) if at is not None else b, s) for name, b, at, s in cases]
+        padded_names = {name for name, _, at, _ in cases if at is not None}
+        ref_old = alone(port, OLD)
+        ref_old2 = ref_old
+        refs = {name: alone(port, b) for name, b, _ in bodies}
+        for name, _, _ in bodies:
+            if "err" in refs[name]:
+                rep(False, f"admit_chunk/{name}", f"alone: {refs[name]['out']}")
+        groups = [bodies[i:i + 3] for i in range(0, len(bodies), 3)]
+        later = {"messages": [{"role": "user", "content": AUS}], "temperature": 0, "max_tokens": 8}
+        ref_later = alone(port, later)
+        for gi, grp in enumerate(groups):
+            poll(port, lambda h: h.get("running") == 0)
+            setmem(1e12)
+            hs = []
+            with cf.ThreadPoolExecutor(max_workers=6) as ex:
+                fo = ex.submit(ask, port, OLD)
+                poll(port, lambda h: h.get("running", 0) >= 1)
+                fs = [ex.submit(ask, port, dict(b, speculative=s)) for _, b, s in grp]
+                hr = poll(port, lambda h: h.get("running", 0) >= 1 + len(grp))
+                setmem(0)  # (the young ones park at their next KV block; one that has not yet when the oldest needs a block is swapped
+                # out running)
+                hp = poll(port, lambda h: mem(h, "parked") + mem(h, "swapped_out") >= len(grp), n=1500)
+                fl = None
+                if gi == 0:  # (no admission while a job is parked or swapped out: a short one queued now starts after they are back)
+                    fl = ex.submit(ask, port, later)
+                    hs.append(poll(port, lambda h: h.get("queued") == 1, n=1500))  # (in the queue: the HTTP side's time)
+                    for _ in range(5):
+                        hs.append(health(port))
+                        time.sleep(0.02)
+                # (the oldest's next blocks swap them out, the youngest first; MemAvailable 0: none comes back)
+                hw = poll(port, lambda h: mem(h, "swapped_out") + sum(f.done() for f in fs) >= len(grp), n=4000)
+                for _ in range(200):  # (/health counts a swap-out once planned: its files a moment later)
+                    nsw = len(swap_files())
+                    if nsw >= mem(hw, "swapped_out"):
+                        break
+                    time.sleep(0.02)
+                setmem(1e12)
+                ro = fo.result()
+                rs = [f.result() for f in fs]
+                rl = fl.result() if fl else None
+            np_seen = mem(hp, "parked") + mem(hp, "swapped_out")
+            to = ro["tm"]
+            rep(ro["out"] == ref_old["out"] and to.get("renewals", 0) > 0 and to.get("paused_ms", -1) == 0 and to.get("swaps", -1) == 0 and
+                mem(hw, "swapped_out") == len(grp) and nsw >= len(grp), f"admit_chunk/oldest_{gi}",
+                f"renewals {to.get('renewals')}, paused_ms {to.get('paused_ms')}, swaps {to.get('swaps')}, == alone: {ro['out'] == ref_old['out']}; "
+                f"running {hr.get('running')}, parked or swapped out at once {np_seen} of {len(grp)}, swapped out at once {mem(hw, 'swapped_out')} ({nsw} files)")
+            for (name, b, s), r in zip(grp, rs):
+                tm, ref = r["tm"], refs[name]
+                # (parked, then swapped out; the unpadded one may still run when the oldest needs its block: swapped out running)
+                ok = r["out"] == ref["out"] and (tm.get("paused_ms", 0) > 0 or name not in padded_names) and tm.get("renewals", 0) > 0
+                ok &= np_seen >= len(grp)
+                ok &= tm.get("swaps", 0) >= 1 and tm.get("swap_ms", 0) > 0
+                if name == "stop_string":
+                    ok &= r["out"][3] == "stop"
+                if name.startswith("tool_call"):
+                    ok &= len(r["out"][2]) > 0
+                if name.startswith("thinking"):  # (greedy: </think> sampled, then content)
+                    ok &= bool(r["out"][1]) and (name != "thinking" or (bool(r["out"][0]) and r["out"][3] == "stop"))
+                if name == "json_schema":
+                    ok &= validate(json.loads(r["out"][0] or "null"), NESTED, NESTED)
+                rep(ok, f"admit_chunk/{name}", f"speculative {s}: prompt {r.get('prompt')}, {r['out'][4] if 'err' not in r else r['out']} "
+                    f"tokens, {r['out'][3] if 'err' not in r else ''}; renewals {tm.get('renewals')}, paused_ms {tm.get('paused_ms', 0):.0f}, "
+                    f"swaps {tm.get('swaps')}, swap_ms {tm.get('swap_ms', 0):.0f}; "
+                    f"== alone: {r['out'] == ref['out']}" + ("" if r["out"] == ref["out"] else f" ({str(r['out'])[:160]} vs {str(ref['out'])[:160]})"))
+            if rl:
+                log = open(lg).read()
+                seen = any(h.get("queued") == 1 and mem(h, "parked") + mem(h, "swapped_out") > 0 for h in hs)
+                # (the log: every resume of this group before the short one's admission, its prompt tokens)
+                adm = [m.start() for m in re.finditer(r"\[engine\] job -> slot \d+: \d+ of %d prompt tokens" % rl["prompt"], log)]
+                res_ = [m.start() for m in re.finditer(r"\[engine\] job \d+ (resumed|swapped in)", log)]
+                order = bool(adm) and len(res_) >= len(grp) and max(res_[:len(grp)]) < adm[-1]
+                rep(rl["out"] == ref_later["out"] and seen and order and rl["tm"].get("mem_wait_ms", 0) > 0, "admit_chunk/no_admission_while_parked",
+                    f"queued while parked: {seen}; admitted after the swap-ins: {order}; mem_wait_ms {rl['tm'].get('mem_wait_ms', 0):.0f}; "
+                    f"== alone: {rl['out'] == ref_later['out']}")
+
+        # cancel while parked, then while swapped out (a stream: its keep-alive comments arrive meanwhile; swapped out: its
+        # files deleted), the oldest goes on, == alone
+        for where in ("parked", "swapped"):
+            poll(port, lambda h: h.get("running") == 0)
+            setmem(1e12)
+            name, b, _ = bodies[0]
+            with cf.ThreadPoolExecutor(max_workers=2) as ex:
+                fo = ex.submit(ask, port, OLD2)
+                poll(port, lambda h: h.get("running", 0) >= 1)
+                s = socket.create_connection(("127.0.0.1", port), timeout=600)
+                body = json.dumps({k: v for k, v in dict(b, stream=True, speculative=False).items() if "logprobs" not in k}).encode()
+                s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+                poll(port, lambda h: h.get("running", 0) >= 2)
+                setmem(0)
+                hp = poll(port, lambda h: mem(h, "parked") == 1, n=1500)
+                if where == "swapped":  # (the oldest's next block swaps it out)
+                    hp = poll(port, lambda h: mem(h, "swapped_out") == 1, n=4000)
+                nf = len(swap_files())
+                got, t0 = b"", time.time()
+                s.settimeout(0.05)
+                while time.time() - t0 < 0.5:
+                    try:
+                        got += s.recv(65536)
+                    except socket.timeout:
+                        pass
+                ka = got.split(b"data: ")[-1].count(b": keep-alive")  # (after the last chunk: while parked / swapped out)
+                s.close()
+                hc = poll(port, lambda h: h.get("running") == 1 and mem(h, "parked") == 0 and mem(h, "swapped_out") == 0)
+                left = swap_files()
+                setmem(1e12)
+                ro = fo.result()
+            log = open(lg).read()
+            ok = mem(hp, "parked" if where == "parked" else "swapped_out") == 1 and ka >= 2 and hc.get("running") == 1
+            ok &= mem(hc, "parked") == 0 and mem(hc, "swapped_out") == 0 and ro["out"] == ref_old2["out"] and " 499 " in log
+            if where == "swapped":
+                ok &= nf >= 1 and not left
+            rep(ok, f"admit_chunk/cancel_{where}",
+                f"{where} {mem(hp, 'parked' if where == 'parked' else 'swapped_out')}, keep-alives meanwhile {ka}, swap files {nf} -> {len(left)}; "
+                f"after the close: running {hc.get('running')}, parked {mem(hc, 'parked')}, swapped out {mem(hc, 'swapped_out')}; the oldest "
+                f"== alone: {ro['out'] == ref_old2['out']}" + ("" if ka >= 2 else "; " + " | ".join(re.findall(r"\[engine\] job .*", log)[-6:])))
+
+        # a swap-out that fails (the swap directory read-only): that job ends with a 500 and its slot is emptied; the oldest
+        # goes on, == alone; nothing is left in the directory
+        sd = glob.glob(os.path.join(kvd, "*", "swap"))
+        if sd and os.getuid() != 0:
+            poll(port, lambda h: h.get("running") == 0)
+            setmem(1e12)
+            with cf.ThreadPoolExecutor(max_workers=2) as ex:
+                fo = ex.submit(ask, port, OLD2)
+                poll(port, lambda h: h.get("running", 0) >= 1)
+                fy = ex.submit(ask, port, dict(bodies[0][1], speculative=False))
+                poll(port, lambda h: h.get("running", 0) >= 2)
+                os.chmod(sd[0], 0o500)
+                try:
+                    setmem(0)
+                    ry = fy.result()
+                finally:
+                    os.chmod(sd[0], 0o755)
+                setmem(1e12)
+                ro = fo.result()
+            log = open(lg).read()
+            rep(ry.get("err") == 500 and "swapped out" in ry["out"][1] and "could not be swapped out" in log and ro["out"] == ref_old2["out"]
+                and not swap_files() and mem(health(port), "swapped_out") == 0, "admit_chunk/swap_fails",
+                f"the young one: {ry['out'][:2] if 'err' in ry else 'no error'}; the oldest == alone: {ro['out'] == ref_old2['out']}; "
+                f"files {swap_files()}")
+    finally:
+        rc, log = stop(p, lg)
+    # (no pass wrote past its lease: the engine checks each running job's KV against it at every step)
+    rep(rc == 0 and re.search(r"\[engine\] job \d+ parked at \d+ tokens", log) and "swapped in -> slot" in log
+        and "[engine] bug:" not in log and len(re.findall(r"\[engine\] job \d+ could not be swapped", log)) <= 1 and not swap_files(), "admit_chunk/stop",
+        f"exit {rc}, swap files left {swap_files()}" + "".join("; " + x for x in re.findall(r"\[engine\] (?:bug:|job \d+ could not).*", log)[:2]))
+
+    # liveness: three requests without max_tokens (-c 400: they end at the context) whose growth does not fit (MemAvailable 0
+    # once they run): the oldest's new block swaps the younger ones out (the swap slowed down: RUNQ_TEST_SWAP_DELAY, the
+    # oldest's stream gets keep-alives meanwhile), it ends, the next one is swapped back in (beyond the live budget: a
+    # warning) and so on; all finish, the oldest first, each == alone. A restart empties DIR/.../swap/ first
+    sd = glob.glob(os.path.join(kvd, "*", "swap"))
+    if sd:
+        with open(os.path.join(sd[0], "7.rqseq"), "w") as f:
+            f.write("left over")
+    setmem(1e12)
+    p, port, lg = start(["-c", "400"], {"RUNQ_TEST_SWAP_DELAY": "0.5"})
+    if not port:
+        rep(False, "admit_chunk/start_liveness", open(lg).read()[-500:])
+        shutil.rmtree(d, ignore_errors=True)
+        return
+    try:
+        rep(bool(sd) and not swap_files() and "leftover swap file(s) removed" in open(lg).read(), "admit_chunk/restart_empties_swap",
+            f"swap dir {sd}, files {swap_files()}")
+        ls = [{"messages": [{"role": "user", "content": f"Count from {k} to 5000, separated by commas."}], "temperature": 0, **LP}
+              for k in (1, 2, 3)]
+        with cf.ThreadPoolExecutor(max_workers=3) as ex:
+            fs = []
+            for k, b in enumerate(ls):
+                fs.append(ex.submit(sse, port, {kk: v for kk, v in b.items() if "logprobs" not in kk}) if k == 0 else ex.submit(ask, port, b))
+                poll(port, lambda h: h.get("running", 0) >= k + 1)
+            setmem(0)
+            hp = poll(port, lambda h: mem(h, "swapped_out") >= 1, n=4000)
+            rs = [f.result() for f in fs]
+        setmem(1e12)
+        refs = [alone(port, b) for b in ls]
+        log = open(lg).read()
+        done = [r["done"] for r in rs]
+        r0 = rs[0]
+        ok = r0["content"] == refs[0]["out"][0] and r0["finish"] == "length" and r0["tm"].get("paused_ms") == 0 and r0["tm"].get("swaps") == 0
+        ok &= all(r["out"] == f["out"] and r["out"][3] == "length" for r, f in zip(rs[1:], refs[1:])) and done == sorted(done)
+        ok &= all(r["tm"].get("paused_ms", 0) > 0 or r["tm"].get("swaps", 0) > 0 for r in rs[1:])
+        nsw = sum(r["tm"].get("swaps", 0) for r in rs[1:])
+        rep(ok and nsw > 0 and r0["ka"] >= 3 and "beyond the live budget" in log, "admit_chunk/liveness",
+            f"swapped out at once {mem(hp, 'swapped_out')}; finish {[r0['finish']] + [r['out'][3] for r in rs[1:]]}, the oldest first: "
+            f"{done == sorted(done)}; paused_ms {[round(r['tm'].get('paused_ms', -1)) for r in rs]}, swaps {[r['tm'].get('swaps') for r in rs]}; "
+            f"== alone: {[r0['content'] == refs[0]['out'][0]] + [r['out'] == f['out'] for r, f in zip(rs[1:], refs[1:])]}; keep-alives in a row "
+            f"during a swap {r0['ka']}; warned: {'beyond the live budget' in log}")
+    finally:
+        rc, log = stop(p, lg)
+    rep(rc == 0 and "[engine] bug:" not in log and not swap_files(), "admit_chunk/stop_liveness",
+        f"exit {rc}" + "".join("; " + x for x in re.findall(r"\[engine\] bug:.*", log)[:2]))
+
+    # a swap during a prefill (-c 4096, --chunk 8: a ~2,500-token prompt takes ~300 passes, the oldest's first new block
+    # comes at ~236 tokens): the young ones (a reply parked at its block, the long prompt mid-prefill) are swapped out by
+    # the oldest's block, back in once MemAvailable is raised; == alone. With a draft, the draft's swap I/O made to fail
+    # (RUNQ_TEST_SWAP_FAIL=FILE: "draft-save", then "draft-load"): the draft is reset, the output unchanged
+    ff = os.path.join(d, "swapfail")
+
+    def setfail(s):
+        with open(ff + ".tmp", "w") as f:
+            f.write(s)
+        os.replace(ff + ".tmp", ff)
+    setfail("")
+    setmem(1e12)
+    p, port, lg = start(["-c", "4096", "--chunk", "8"], {"RUNQ_TEST_SWAP_FAIL": ff})
+    if not port:
+        rep(False, "admit_chunk/start_prefill", open(lg).read()[-500:])
+        shutil.rmtree(d, ignore_errors=True)
+        return
+    try:
+        # (cache_prompt false: the references leave these prompts in the slots, and the long one must be prefilled)
+        OLDP = dict(OLD, speculative=False, cache_prompt=False)
+        young = dict(padded(port, cases[0][1], 210), speculative=sp_model, cache_prompt=False)
+        longp = {"messages": [{"role": "user", "content": "(Filler, ignore it:" + " ok" * 2400 + ".) What is 2 + 3? Answer briefly."}],
+                 "temperature": 0, "max_tokens": 12, "cache_prompt": False, **LP}
+        ref_o, ref_y, ref_l = alone(port, OLDP), alone(port, young), alone(port, longp)
+        for fail in (["draft-save", "draft-load"] if a.draft else [""]):
+            poll(port, lambda h: h.get("running") == 0)
+            setmem(1e12)
+            setfail(fail)
+            n0 = len(open(lg).read())
+            with cf.ThreadPoolExecutor(max_workers=3) as ex:
+                fo = ex.submit(ask, port, OLDP)
+                poll(port, lambda h: h.get("running", 0) >= 1)
+                fy = ex.submit(ask, port, young)
+                poll(port, lambda h: h.get("running", 0) >= 2)
+                fl = ex.submit(ask, port, longp)
+                poll(port, lambda h: h.get("running", 0) >= 3)
+                setmem(0)
+                hw = poll(port, lambda h: mem(h, "swapped_out") >= 2 or fl.done(), n=6000)
+                setmem(1e12)
+                ro, ry, rl = fo.result(), fy.result(), fl.result()
+            log = open(lg).read()[n0:]
+            pre = [(int(m.group(1)), int(m.group(2))) for m in re.finditer(r"swapped out: .*prefilling: (\d+) of (\d+) prompt tokens", log)]
+            ok = ro["out"] == ref_o["out"] and ry["out"] == ref_y["out"] and rl["out"] == ref_l["out"] and mem(hw, "swapped_out") >= 2
+            ok &= rl["tm"].get("swaps", 0) >= 1 and any(t < n for t, n in pre) and ry["tm"].get("swaps", 0) >= 1
+            if fail == "draft-save":
+                ok &= "draft's sequence could not be swapped out" in log
+            if fail == "draft-load":
+                ok &= "draft's sequence could not be swapped back in" in log
+            rep(ok, "admit_chunk/swap_prefill" + (f"_{fail.replace('-', '_')}" if fail else ""),
+                f"swapped out at once {mem(hw, 'swapped_out')}; mid-prefill swaps {pre}; swaps: long {rl['tm'].get('swaps')}, young "
+                f"{ry['tm'].get('swaps')}; == alone: oldest {ro['out'] == ref_o['out']}, young {ry['out'] == ref_y['out']}, long "
+                f"{rl['out'] == ref_l['out']}" + ("; " + " | ".join(re.findall(r"\[engine\] job \d+: the draft's.*", log)[:2]) if fail else ""))
+    finally:
+        setfail("")
+        rc, log = stop(p, lg)
+    rep(rc == 0 and "[engine] bug:" not in log and not swap_files(), "admit_chunk/stop_prefill",
+        f"exit {rc}" + "".join("; " + x for x in re.findall(r"\[engine\] bug:.*", log)[:2]))
+
+    # --admit-yield 2 with --parallel 1: two long requests take turns (each yields its seat after 2 chunks of 16 tokens to
+    # the other, which waits: round-robin); then the same with MemAvailable 0 once both run (the yielded one is swapped out
+    # for the other's memory; the oldest keeps its precedence for memory). Each == alone, bitwise (logprobs)
+    setmem(1e12)
+    p, port, lg = start(["-c", "1024", "--parallel", "1", "--admit-yield", "2"])
+    if not port:
+        rep(False, "admit_chunk/start_yield", open(lg).read()[-500:])
+        shutil.rmtree(d, ignore_errors=True)
+        return
+    try:
+        line = re.findall(r"admission chunk:.*", open(lg).read())
+        yb = [{"messages": [{"role": "user", "content": f"Count from {k} to {k + 80}, separated by commas."}], "temperature": 0,
+               "max_tokens": 150, **LP} for k in (1, 200)]
+        yb[1] = dict(yb[1], temperature=0.8, seed=11)
+        refs = [alone(port, b) for b in yb]
+        for tight in (False, True):
+            poll(port, lambda h: h.get("running") == 0)
+            setmem(1e12)
+            n0 = len(open(lg).read())
+            hy = {}
+            with cf.ThreadPoolExecutor(max_workers=2) as ex:
+                f0 = ex.submit(ask, port, yb[0])
+                poll(port, lambda h: h.get("running", 0) >= 1)
+                f1 = ex.submit(ask, port, dict(yb[1], speculative=sp_model))
+                poll(port, lambda h: h.get("queued", 0) + h.get("running", 0) >= 2)
+                if tight:
+                    setmem(0)
+                hy = poll(port, lambda h: mem(h, "yielded") >= 1, n=3000)
+                rs = [f0.result(), f1.result()]
+            setmem(1e12)
+            log = open(lg).read()[n0:]
+            ys = [int(x) for x in re.findall(r"\[engine\] job (\d+) yielded its seat", log)]
+            alt = sum(1 for x, y in zip(ys, ys[1:]) if x != y)  # (turns: consecutive yields by different jobs)
+            ok = all(r["out"] == f["out"] for r, f in zip(rs, refs)) and alt >= 2 and mem(hy, "yielded") >= 1
+            ok &= "yields its seat after 2 chunks" in (line or [""])[0]
+            ok &= all(r["tm"].get("yields", 0) >= 1 and r["tm"].get("paused_ms", 0) > 0 and r["tm"].get("renewals", 0) > 0 for r in rs)
+            if tight:
+                ok &= sum(r["tm"].get("swaps", 0) for r in rs) >= 1
+            rep(ok, "admit_chunk/yield" + ("_swapped" if tight else ""),
+                f"startup: {'yields its seat after 2 chunks' in (line or [''])[0]}; yields in turn {ys[:8]} ({alt} turns); yields "
+                f"{[r['tm'].get('yields') for r in rs]}, paused_ms {[round(r['tm'].get('paused_ms', 0)) for r in rs]}, renewals "
+                f"{[r['tm'].get('renewals') for r in rs]}, swaps {[r['tm'].get('swaps') for r in rs]}; /health yielded {mem(hy, 'yielded')}; "
+                f"== alone: {[r['out'] == f['out'] for r, f in zip(rs, refs)]}")
+    finally:
+        rc, log = stop(p, lg)
+    rep(rc == 0 and "[engine] bug:" not in log and not swap_files(), "admit_chunk/stop_yield",
+        f"exit {rc}" + "".join("; " + x for x in re.findall(r"\[engine\] bug:.*", log)[:2]))
     shutil.rmtree(d, ignore_errors=True)
 
 
@@ -771,10 +1525,28 @@ def main():
     ap.add_argument("--spec", metavar="DRAFT", help="the speculative decoding group only: the server with this draft model "
                     "(\"none\": the prompt lookup alone)")
     ap.add_argument("--disk", action="store_true", help="the disk tier group only (--kv-disk: its own servers)")
-    ap.add_argument("--draft", help="with --disk: the servers with this draft model (its sequences saved too)")
+    ap.add_argument("--draft", help="with --disk / --admit / --admit-chunk: the servers with this draft model (its sequences saved too)")
+    ap.add_argument("--admit", action="store_true", help="the memory admission group only (--admit bound: its own servers)")
+    ap.add_argument("--admit-chunk", action="store_true", help="the chunked leases group only (--admit chunk: its own servers)")
     a = ap.parse_args()
     a.q35_spec = False
     t = T(a)
+    if a.admit_chunk:
+        try:
+            run_admit_chunk(a, t)
+        except Exception as e:
+            import traceback
+            t.report(False, "admit_chunk/error", f"{type(e).__name__}: {e} {traceback.format_exc()[-600:]}")
+        print(f"server tests: {t.n - t.failed} passed, {t.failed} failed")
+        return 1 if t.failed else 0
+    if a.admit:
+        try:
+            run_admit(a, t)
+        except Exception as e:
+            import traceback
+            t.report(False, "admit/error", f"{type(e).__name__}: {e} {traceback.format_exc()[-600:]}")
+        print(f"server tests: {t.n - t.failed} passed, {t.failed} failed")
+        return 1 if t.failed else 0
     if a.disk:
         try:
             run_disk(a, t)

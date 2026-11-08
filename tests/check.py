@@ -501,20 +501,33 @@ SERVER_THREADS = 2  # runq serve and its CLI reference runs (in the background f
 
 def server_run(a, ex):
     """Start tests/server_test.py (runq serve over HTTP) on the GGUF Q8_0 file (else the .bin); its disk tier group
-    (--disk: the KV cache saved to files) on the same file with the Q4_K_M as the draft, and on Qwen3.5-0.8B"""
+    (--disk: the KV cache saved to files) on the same file with the Q4_K_M as the draft, and on Qwen3.5-0.8B; its memory
+    admission groups (--admit: --admit bound; --admit-chunk: --admit chunk) on both"""
     model = a.gguf or a.model
     st = [sys.executable, "-I", os.path.join(ROOT, "tests", "server_test.py"), "--runq", a.runq, "--threads", str(SERVER_THREADS)]
     futs = [("", ex.submit(run, st + ["--model", model]))]
     futs.append(("disk_qwen3", ex.submit(run, st + ["--model", model, "--disk"] + (["--draft", a.q4] if a.q4 else []))))
     if a.q35:
         futs.append(("disk_qwen35", ex.submit(run, st + ["--model", a.q35, "--disk"])))
+    # memory admission (--admit bound: its own servers), the same files (Qwen3.5: with its Q4_K_M as the draft if it is there)
+    futs.append(("admit_qwen3", ex.submit(run, st + ["--model", model, "--admit"] + (["--draft", a.q4] if a.q4 else []))))
+    if a.q35:
+        q35d = os.path.join(os.path.dirname(a.q35), "Qwen3.5-0.8B-Q4_K_M.gguf")
+        futs.append(("admit_qwen35", ex.submit(run, st + ["--model", a.q35, "--admit"] + (["--draft", q35d] if os.path.exists(q35d) else []))))
+    # chunked leases (--admit chunk: parking; its own servers), the same files and drafts
+    futs.append(("admit_chunk_qwen3", ex.submit(run, st + ["--model", model, "--admit-chunk"] + (["--draft", a.q4] if a.q4 else []))))
+    if a.q35:
+        futs.append(("admit_chunk_qwen35", ex.submit(run, st + ["--model", a.q35, "--admit-chunk"] + (["--draft", q35d] if os.path.exists(q35d) else []))))
     return futs
 
 
 def test_server(a, res, fut):
     """tests/server_test.py: runq serve's endpoints, greedy / seeded completions == runq -m chat, prefix
     reuse == fresh prefill (bitwise logprobs), streaming, constrained json_schema outputs, errors, queue,
-    cancellation, fuzzing, shutdown; the disk tier (--kv-disk): saved and loaded == fresh prefill, a restart, refusals"""
+    cancellation, fuzzing, shutdown; the disk tier (--kv-disk): saved and loaded == fresh prefill, a restart, refusals;
+    memory admission (--admit bound): waits, strict FIFO, reclaims, outputs == alone; chunked leases (--admit chunk): parked
+    and swapped out mid-reply == alone, no admission while parked / swapped out, cancel while parked / swapped out, a failed
+    swap-out, liveness, a swap mid-prefill, the draft's swap I/O failing, --admit-yield's round-robin"""
     for tag, fut in fut:
         p = fut.result()
         pre = f"server/{tag}/" if tag else "server/"

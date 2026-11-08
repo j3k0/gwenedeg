@@ -337,6 +337,9 @@ struct RqSeq {
     void *key_cache;    // (layer, kv_len, kv_dim) elements: float, or bf16 / f16 (uint16_t), or q8 / q4 tiles by kvt
     void *value_cache;  // (layer, kv_len, kv_dim)
     int len;            // positions in the cache
+    int hwm;            // the high-water mark: the longest len since the last rq_seq_release (the cache is touched in
+                        // the blocks below it at most; seq_grow); st_res: the live state touched since then
+    int st_res;
     int *tokens;        // [cap]: the token at each position
     // Qwen3.5: the recurrent state of the linear-attention layers after position len - 1 (it cannot be rewound),
     // per linear layer RqModel.ssm_layer floats: the last conv - 1 inputs of the conv (per channel group (conv - 1, n) rows, as ssm_conv), then
@@ -358,5 +361,19 @@ struct RqSeq {
 // bytes of a cache offset of e elements (a whole number of tiles: layers, blocks of ATT_P positions, kv_tile) in the
 // K (kv 0) or V (kv 1) cache
 static inline size_t seq_kvb(const RqSeq *s, size_t e, int kv) { return e / s->kv_te * s->kv_tb[kv]; }
+
+// a sequence's positions (and its state) are written up to n: the high-water mark (before the writes, so that a
+// failed load counts too); seq_grow: and its length n (every place len grows goes through it)
+static inline void seq_hwm(RqSeq *s, int n) {
+    if (n > s->hwm) s->hwm = n;
+    if (n > 0) s->st_res = 1;
+}
+static inline void seq_grow(RqSeq *s, int n) {
+    seq_hwm(s, n);
+    s->len = n;
+}
+
+// the memory accounting's pages (rq_seq_mem, rq_seq_kv_bytes: 4 KiB, whatever the system's)
+static inline size_t mem_pages(size_t n) { return (n + 4095) / 4096 * 4096; }
 
 #endif // RUNQ_INTERNAL_H

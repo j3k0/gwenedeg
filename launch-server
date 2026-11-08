@@ -61,6 +61,7 @@ mkdir -p "$KV_DISK"
   -k "$KV_CACHE_TYPE" \
   --draft "$DRAFT_MODEL" \
   --slots $PARALLEL --parallel $PARALLEL \
+  --kv-disk "$KV_DISK" --kv-disk-max "$KV_DISK_MAX" \
   --port "$BIND_PORT" --host "$BIND_HOST" \
   --name "$NAME"
 

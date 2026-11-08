@@ -118,6 +118,8 @@ struct Job {
     int top_logprobs;           // < 0: no logprobs; else the number of alternatives per token (<= 20)
     int no_cache;               // prefill from position 0 (cache_prompt: false)
     int dk_tried;               // (engine.c) a load from the disk tier was planned for it once already
+    int mem_waited;             // (engine.c) it waited for memory (--admit bound; logged once)
+    double t_mw;                // (engine.c) since when it is refused for memory at the head of the queue (0: not)
     const ToolSet *tools;       // parse tool calls in the reply (tool_choice auto), or NULL
     int single_call;            // parallel_tool_calls: false (stop after the first call)
     unsigned long long call_seed; // the calls' ids
@@ -126,7 +128,8 @@ struct Job {
                                 // sampled (in passes of several rows), then the end token; empty: generate
     // speculative decoding (engine.c, docs/server.md): SPEC_OFF / SPEC_AUTO / SPEC_FIXED, the draft model's guesses per
     // pass at most (0: none; needs EngineOpts.draft), tau, the prompt lookup's guesses at most (0: none), its shortest
-    // match (0: the default). serve.c: the server's defaults, or the request's "speculative" object
+    // match (0: the default). serve.c: the server's defaults, or the request's "speculative" object (engine_submit:
+    // with --admit bound on Qwen3.5 / 3.8, the guesses capped at what one -c job can hold, >= the server's spec_kmax)
     int spec, spec_k, spec_lookup, spec_lmin;
     float spec_tau;
 
@@ -142,6 +145,12 @@ struct Job {
     int n_prompt, n_cached, n_gen;
     int n_slot, n_common;       // the slot's (or the copy source's) length at admission, its common prefix with the prompt
     int copied;                 // the prefix was copied from another slot (rq_seq_copy)
+    double mem_wait, lease;     // --admit bound / chunk: s of queue time refused for memory, the lease in bytes (0: worst)
+    int chunked, renewals;      // --admit chunk: (engine.c) its lease renewed so many times
+    double paused;              // --admit chunk: s parked (a renewal denied)
+    int swaps;                  // --admit chunk: swapped out to disk so many times (the oldest job's renewal needed its memory)
+    int yields;                 // --admit-yield: its seat given up so many times (paused includes the time without one)
+    double swapped;             // ... and s out of memory (from the swap-out's start to the swap-in's end)
     double t_submit, t_start, t_first, t_end; // rq_now()
     int cancel;                 // set by the connection (client gone): the engine stops at the next step
     int refs;                   // the submitter and the engine
@@ -151,6 +160,10 @@ struct Job {
 };
 
 enum { SPEC_OFF = 0, SPEC_AUTO = 1, SPEC_FIXED = 2 };
+// --admit (docs/memory-admission.md): worst: the pool sized for every slot at -c; bound: a job admitted on its lease
+// (prompt + max tokens) within --kv-mem; chunk: on prompt + --admit-chunk tokens, renewed by chunks (parked if denied;
+// --admit-yield: a long one gives its seat to a waiting one, round-robin)
+enum { ADMIT_WORST = 0, ADMIT_BOUND = 1, ADMIT_CHUNK = 2 };
 
 typedef struct {
     const char *model_path;
@@ -177,7 +190,18 @@ typedef struct {
     const char *kv_disk;
     double kv_disk_max;
     int kv_disk_min;
+    int admit;                  // ADMIT_*
+    double admit_margin;        // GiB kept free of MemAvailable (bound, chunk: step 3's live budget)
+    int admit_chunk;            // chunk: a lease's chunk in generated tokens (> 0)
+    int admit_yield;            // chunk: a job yields its seat after this many chunks when others wait for one (0: never)
 } EngineOpts;
+
+typedef struct {                // --admit bound / chunk, /health (bytes; live: step 3's, has_live 0 without MemAvailable)
+    double budget, live, committed, resident;
+    int has_live, waiting;      // waiting: jobs refused for memory at the head of the queue (0 / 1)
+    int chunk, parked, swapped; // --admit chunk; the jobs parked for memory, swapped out (yielded ones included)
+    int yield, yielded;         // --admit-yield; the jobs without a seat (in their slot or swapped out)
+} EngineMem;
 
 typedef struct Engine Engine;
 Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen);
@@ -188,6 +212,8 @@ void engine_free(Engine *e);                // (after engine_stop, once no conne
 int engine_queued(Engine *e, int *running); // waiting jobs; *running: jobs running
 void engine_describe(Engine *e, char *buf, size_t n); // the effective pool / batching settings (one line)
 void engine_describe_spec(Engine *e, char *buf, size_t n); // speculation: the cost model, the choice by position
+int engine_describe_admit(Engine *e, char *buf, size_t n); // --admit bound / chunk: the budget, a lease's terms (0: worst, no line)
+int engine_mem(Engine *e, EngineMem *out); // --admit bound / chunk: the memory as last published (0: worst, nothing)
 const ConVocab *engine_vocab(Engine *e);
 #define SPEC_GUESS_MAX 16 // guesses per pass of a request at most (either source)
 

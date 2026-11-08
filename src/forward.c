@@ -422,6 +422,84 @@ const int *rq_seq_tokens(const RqSeq *s) { return s->tokens; }
 void rq_seq_seed(RqSeq *s, unsigned long long seed) { s->rng = seed; }
 unsigned long long *rq_seq_rng(RqSeq *s) { return &s->rng; }
 
+// Giving memory back (docs/memory-admission.md, step 2). The layout (kv_tile): per attention layer and K / V, the
+// blocks of ATT_P positions one after the other (the heads inside a block), so the blocks from b0 on are one range
+// per (layer, K / V). Released pages read as zeros (a fresh sequence's) and are faulted in again as the sequence
+// grows into them; the attention never reads a block wholly past len, and a kept block is never touched: a
+// released sequence computes exactly as one that was not
+size_t rq_seq_kv_bytes(const RqSeq *s, int n) {
+    // the pages of blocks 0..ceil(n / ATT_P) - 1 of every (layer, K / V) range (the union: a page shared by two
+    // ranges counts once; every block: the whole mapping = rq_seq_mem's kv) + the token array
+    n = n < 0 ? 0 : n > s->cap ? s->cap : n;
+    size_t nb = ((size_t)n + ATT_P - 1) / ATT_P, tot = (size_t)s->cap * sizeof(int);
+    for (int kv = 0; kv < 2 && nb; kv++) {
+        size_t B = seq_kvb(s, (size_t)ATT_P * s->m->kv_dim, kv), L = s->att_nb * B, end = 0;
+        for (int l = 0; l < s->m->n_attn; l++) {
+            size_t a = (l * L) / 4096 * 4096, e = mem_pages(l * L + nb * B);
+            if (a < end) a = end;
+            if (e > a) tot += e - a, end = e;
+        }
+    }
+    return tot;
+}
+
+void rq_seq_resident(const RqSeq *s, RqSeqMem *out) {
+    memset(out, 0, sizeof(*out));
+    out->kv = rq_seq_kv_bytes(s, s->hwm);
+    out->state = s->m->hy.on ? mem_pages(s->ssm_bytes) : 0;
+    for (int i = 0; i < RQ_SEQ_CK_MAX; i++)
+        out->checkpoints += s->ck[i].st != NULL;
+    out->total = out->kv + ((size_t)(s->m->hy.on && s->st_res) + (size_t)out->checkpoints) * out->state;
+}
+
+#if !defined _WIN32 && (defined __linux__ || defined MADV_FREE)
+    #define SEQ_RELEASE 1
+    #ifdef __linux__
+        #define SEQ_MADV MADV_DONTNEED // (anonymous memory: freed now, zeros when touched again)
+    #else
+        #define SEQ_MADV MADV_FREE     // (freed under memory pressure only: the RSS drops then, not at once, and
+                                       // the pages may keep their old contents until; never read before written)
+    #endif
+#endif
+
+int rq_seq_release(RqSeq *s, int keep) {
+    if (!s || keep < 0) return RQ_ERR_ARG;
+    int k = keep > s->len ? keep : s->len;
+    k = k > s->cap ? s->cap : k;
+    for (int i = 0; i < RQ_SEQ_CK_MAX; i++) // (the free checkpoint slots' buffers: ck_slot allocates again)
+        if (s->ck[i].st && s->ck[i].pos < 0 && !s->ck[i].wr) {
+            free_big(s->ck[i].st, s->ssm_bytes);
+            s->ck[i].st = NULL;
+        }
+#ifdef SEQ_RELEASE
+    int b0 = (k + ATT_P - 1) / ATT_P, b1 = (s->hwm + ATT_P - 1) / ATT_P;
+    if (b0 < b1) {
+        uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
+        for (int kv = 0; kv < 2; kv++) {
+            char *c = kv ? s->value_cache : s->key_cache;
+            size_t B = seq_kvb(s, (size_t)ATT_P * s->m->kv_dim, kv), L = s->att_nb * B, sz = seq_kvb(s, s->kv_size, kv);
+            if (!b0) { // (nothing kept: the whole mapping at once)
+                madvise(c, sz, SEQ_MADV);
+                continue;
+            }
+            for (int l = 0; l < s->m->n_attn; l++) { // start rounded up, end down (the mapping's end: its last page)
+                uintptr_t a = ((uintptr_t)c + l * L + b0 * B + pg - 1) & ~(pg - 1);
+                uintptr_t e = l * L + b1 * B == sz ? ((uintptr_t)c + sz + pg - 1) & ~(pg - 1) : ((uintptr_t)c + l * L + b1 * B) & ~(pg - 1);
+                if (a < e) madvise((void *)a, e - a, SEQ_MADV);
+            }
+        }
+    }
+    if (k < s->hwm) s->hwm = k;
+    if (s->m->hy.on && s->len == 0 && s->st_res) { // (a position-0 token clears the state: never read at len 0)
+        madvise(s->ssm, s->ssm_bytes, SEQ_MADV);
+        s->st_res = 0;
+    }
+#else
+    (void)k;
+#endif
+    return RQ_OK;
+}
+
 int rq_seq_common_prefix(const RqSeq *s, const int *tokens, int n) {
     int L = 0;
     while (L < s->len && L < n && s->tokens[L] == tokens[L]) L++;
@@ -479,7 +557,7 @@ int rq_seq_copy(RqSeq *dst, const RqSeq *src, int n) {
         rq_parallel(copy_worker, &j);
     }
     memcpy(dst->tokens, src->tokens, (size_t)n * sizeof(int));
-    dst->len = n;
+    seq_grow(dst, n);
     return RQ_OK;
 }
 
@@ -2334,7 +2412,7 @@ int rq_seq_fill_synthetic(RqSeq *s, int n, unsigned long long seed) {
     int V = s->m->config.vocab_size;
     for (int i = 0; i < n; i++) // (tokens: common words' ids would do; any valid id)
         s->tokens[i] = (int)((seed + (unsigned long long)i * 7919u) % (unsigned long long)V);
-    s->len = n;
+    seq_grow(s, n);
     return RQ_OK;
 }
 
@@ -2609,7 +2687,7 @@ static int decode_step(RqCtx *c, RqSeq *s, int token, float *logits) {
     ck_plan(s, pos, 1);
     rq_parallel(decode_worker, &job);
     s->tokens[pos] = token;
-    s->len = pos + 1;
+    seq_grow(s, pos + 1);
     ck_done(s);
     return RQ_OK;
 }
@@ -3539,7 +3617,7 @@ int rq_forward_batch(RqCtx *c, const RqSegment *sg, int nseg, float *out, float 
     for (int i = 0; i < nseg; i++) {
         RqSeq *s = c->seg[i].seq;
         memcpy(s->tokens + s->len, sg[i].tokens, sg[i].n * sizeof(int));
-        s->len += sg[i].n;
+        seq_grow(s, s->len + sg[i].n);
         ck_done(s);
     }
     if (logits) *logits = nsel ? out : NULL;

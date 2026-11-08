@@ -147,6 +147,33 @@ struct Engine {
     struct { int spill, slot, load, L; } plan; // (slots / entry id, -1: none)
     unsigned long long dk_saves, dk_loads;
     double dk_save_s, dk_load_s;
+    int *rv;              // --admit bound: the idle slots a reclaim may take (nslot)
+    double job_max;       // the lease of a -c job that speculates with the defaults (the startup's check)
+    // step 3's live budget: MemAvailable as last read (-1: none, then the static budget only), when; the test hook's file
+    // (RUNQ_TEST_MEMAVAILABLE: bytes, read at each use); the last warning; /health's snapshot (under mu)
+    double ma, ma_t, ma_warn, ma_res; // (ma_res: the slots' resident memory at that reading: mem_avail)
+    const char *ma_file;
+    int kcap;             // --admit bound, Qwen3.5 / 3.8: a request's guesses at most (engine_submit; the most one -c job holds)
+    Job *mwj;             // the job refused for memory in this step's admissions (NULL: none; only compared)
+    EngineMem pub;
+    // --admit chunk (step 4): the jobs parked (mem_renewals; no admission while > 0), the jobs started (Run.id), the
+    // last warning of a renewal over the budget
+    int npark, njob;
+    double ow_warn;
+    // the swap (--admit chunk, --kv-disk DIR: dk_dir/swap): the jobs to swap out in this step and the one to swap in (into
+    // slot swin_si), planned under mu (mem_renewals), done by sw_run without it; the jobs swapped out, their files' bytes
+    // (outside --kv-disk-max), the swaps, RUNQ_TEST_SWAP_DELAY (s: a sleep in each swap-out; tests only)
+    char *sw_dir;
+    Run **swo, *swin;
+    int nswo, swin_si, nswap;
+    double sw_bytes, sw_delay;
+    unsigned long long swaps;
+    const char *sw_fail;  // RUNQ_TEST_SWAP_FAIL=FILE (tests only): "draft-save" / "draft-load" in it make the draft's swap I/O fail
+    // --admit-yield (mem_renewals): e->run's capacity (parallel + queue: yielded jobs hold no seat), the jobs yielded (no
+    // seat; nrun - nyld seats taken), the earliest yield of those still waiting (0: none; the queue's younger jobs wait
+    // behind it), a yielded job first for a seat but not back yet (admissions wait)
+    int rcap, nyld, yblock;
+    double yt;
 };
 
 // -------------------------------------------------------------------------------------------- jobs
@@ -443,6 +470,25 @@ struct Run {
     RqTokens dbuf;
     double pm[2], pl[RQ_LOOKUP_LMAX + 1][2];
     int nck0, dnck0;      // Qwen3.5: the checkpoint slots before the job (the speculative rows' are transient)
+    // --admit bound ("memory admission"): the positions it can ever write (P), its lease's end (E; P while the chunk is
+    // unlimited, step 4 renews it), its guesses per pass at most, the lease's KV and state bytes (target + draft)
+    int P, E, kk;
+    double lkv, lst;
+    // --admit chunk: its number (admission order, the log), parked (a renewal denied: step gives it no rows), since when
+    int id, park;
+    double t_park;
+    // --admit chunk, the swap ("swap-out"): 1 to be swapped out (planned: sw_run), 2 swapped out (si -1: its sequences in
+    // DIR/swap/<id>.rqseq, + .draft); since when, their lengths (0: no file), the files' bytes, the RNG, what the slot held,
+    // the constraint's mask (the tokens set in the slot's allow: nallow of them)
+    int swap, sw_len, sw_dlen;
+    double t_swap, sw_res;
+    long long sw_bytes;
+    unsigned long long rng;
+    int *alist;
+    // --admit-yield: its seat yielded (it waits for one: no rows; in its slot, or swapped out), since when; n_gen when it
+    // started or last resumed (its chunks since)
+    int yld, g0;
+    double t_yld;
 };
 
 static int slot_scratch(Engine *e, Slot *sl, int logprobs) {
@@ -478,19 +524,54 @@ static void ck_reply_end(Engine *e, Run *r) {
 static int verify_done(Engine *e, Run *r, int ended);
 static void spec_release(Engine *e, Run *r);
 
+static void sw_path(const Engine *e, int id, int draft, char *buf, size_t n) {
+    snprintf(buf, n, "%s/%d%s.rqseq", e->sw_dir, id, draft ? ".draft" : "");
+}
+
+static void sw_drop(Engine *e, Run *r) {
+    // a swapped-out job's files deleted (swapped in, or the job ended out of memory)
+    char p[4096];
+    for (int d = 0; d < 2; d++) {
+        sw_path(e, r->id, d, p, sizeof(p));
+        unlink(p);
+    }
+    e->sw_bytes -= (double)r->sw_bytes;
+    r->sw_bytes = 0;
+    r->sw_len = r->sw_dlen = 0;
+}
+
 static void end_run(Engine *e, Run *r, int finish, int status, int err, const char *emsg) {
     // the job is over (finish reason, an HTTP status for interruptions, or an RQ_ERR_*): flush its text,
-    // publish the result, free its slot (a prefix cache from now on)
+    // publish the result, free its slot (a prefix cache from now on). Swapped out (--admit chunk: no slot, r->si -1): its
+    // files deleted
     Job *j = r->j;
-    Slot *sl = &e->slot[r->si];
-    if (r->vn > 0 && verify_done(e, r, 1) != RQ_OK) { // (the cache can no longer be trusted)
-        rq_seq_reset(sl->seq);
-        if (!status && err == RQ_OK) err = RQ_ERR_STATE, emsg = "speculative decoding: the rollback failed";
+    Slot *sl = r->si >= 0 ? &e->slot[r->si] : NULL;
+    double now = rq_now();
+    if (r->park) { // (--admit chunk: cancelled, timed out or stopped while parked)
+        j->paused += now - r->t_park;
+        r->park = 0;
     }
-    spec_release(e, r);
-    if (e->hybrid && !status && err == RQ_OK) ck_reply_end(e, r);
-    for (int i = 0; i < r->nallow; i++) sl->allow[sl->list[i]] = 0;
-    r->nallow = 0;
+    if (r->yld) { // (--admit-yield: while waiting for a seat)
+        j->paused += now - r->t_yld;
+        r->yld = 0;
+    }
+    if (!sl) { // (cancelled, timed out or stopped while swapped out: always at a clean point, no verify in flight)
+        sw_drop(e, r);
+        j->swapped += now - r->t_swap;
+        r->swap = 0;
+        free(r->alist);
+        r->alist = NULL;
+        r->nallow = 0;
+    } else {
+        if (r->vn > 0 && verify_done(e, r, 1) != RQ_OK) { // (the cache can no longer be trusted)
+            rq_seq_reset(sl->seq);
+            if (!status && err == RQ_OK) err = RQ_ERR_STATE, emsg = "speculative decoding: the rollback failed";
+        }
+        spec_release(e, r);
+        if (e->hybrid && !status && err == RQ_OK) ck_reply_end(e, r);
+        for (int i = 0; i < r->nallow; i++) sl->allow[sl->list[i]] = 0;
+        r->nallow = 0;
+    }
     job_lock(j);
     out_end(&r->o);
     job_unlock(j);
@@ -504,8 +585,10 @@ static void end_run(Engine *e, Run *r, int finish, int status, int err, const ch
         job_finish(j, finish, 0, NULL, NULL);
     }
     r->done = 1;
-    sl->run = NULL;
-    sl->used = rq_now();
+    if (sl) {
+        sl->run = NULL;
+        sl->used = now;
+    }
 }
 
 static int prep(Engine *e, Run *r) {
@@ -856,9 +939,11 @@ static int dk_find(const Engine *e, int id) {
 static int dk_fit(Engine *e, double need, int keep_id) {
     // room for need more bytes (the budget, the file system's reserve): the least recently used entries removed (not
     // keep_id) until it fits; 0 if it cannot
+    // (--admit chunk: the budget kept free beyond the reserve for the swap files, sw_open)
+    double sw = e->sw_dir && e->o.kv_mem * 1073741824.0 > e->sw_bytes ? e->o.kv_mem * 1073741824.0 - e->sw_bytes : 0;
     for (;;) {
         double fr = dk_free(e);
-        if (e->dk_bytes + need <= e->dk_max && (fr < 0 || fr - need >= DK_RESERVE)) return 1;
+        if (e->dk_bytes + need <= e->dk_max && (fr < 0 || fr - need >= DK_RESERVE + sw)) return 1;
         int v = -1;
         for (int k = 0; k < e->ndk; k++)
             if (e->dk[k].id != keep_id && (v < 0 || e->dk[k].used < e->dk[v].used)) v = k;
@@ -921,6 +1006,43 @@ static int dk_add(Engine *e, int id, double used) {
     return e->ndk++;
 }
 
+static int sw_open(Engine *e, char *err, size_t errlen) {
+    // --admit chunk: the swap's directory dk_dir/swap/ (under the disk tier's lock: one server per model and KV type),
+    // emptied (a swapped-out job does not outlive the server: its client is gone); the free space must hold the budget (at
+    // worst every job but one is swapped out; the disk tier's files count as free: dk_fit gives the swap that room) + the
+    // disk tier's reserve (DK_RESERVE: dk_fit keeps it free beyond the swap's room)
+    size_t n = strlen(e->dk_dir) + 8;
+    if (!(e->sw_dir = malloc(n))) { snprintf(err, errlen, "out of memory"); return -1; }
+    snprintf(e->sw_dir, n, "%s/swap", e->dk_dir);
+    if (mkdir(e->sw_dir, 0755) && errno != EEXIST) {
+        snprintf(err, errlen, "--admit chunk: cannot create %s: %s", e->sw_dir, strerror(errno));
+        return -1;
+    }
+    DIR *dir = opendir(e->sw_dir);
+    if (!dir) {
+        snprintf(err, errlen, "--admit chunk: cannot read %s: %s", e->sw_dir, strerror(errno));
+        return -1;
+    }
+    char p[4096];
+    struct dirent *de;
+    int nf = 0;
+    while ((de = readdir(dir)))
+        if (strcmp(de->d_name, ".") && strcmp(de->d_name, "..")) {
+            snprintf(p, sizeof(p), "%s/%s", e->sw_dir, de->d_name);
+            nf += !unlink(p);
+        }
+    closedir(dir);
+    if (nf) fprintf(stderr, "runq serve: --admit chunk: %d leftover swap file(s) removed from %s\n", nf, e->sw_dir);
+    double fr = dk_free(e), B = e->o.kv_mem * 1073741824.0;
+    if (fr >= 0 && fr + (double)e->dk_bytes < B + DK_RESERVE) {
+        snprintf(err, errlen, "--admit chunk: the swap needs the memory budget's %.2f GiB + %.0f GiB kept free under %s, it has %.2f GiB "
+                 "(with the disk tier's files); free space or lower --kv-mem", B / 1073741824.0, DK_RESERVE / 1073741824.0, e->sw_dir,
+                 (fr + (double)e->dk_bytes) / 1073741824.0);
+        return -1;
+    }
+    return 0;
+}
+
 static int dk_open(Engine *e, char *err, size_t errlen) {
     // the directory (created), its lock, the index of the files there (leftover .tmp files and others' removed)
     RqModelInfo mi;
@@ -963,6 +1085,7 @@ static int dk_open(Engine *e, char *err, size_t errlen) {
         }
     }
     closedir(dir);
+    if (e->o.admit == ADMIT_CHUNK && sw_open(e, err, errlen)) return -1;
     double fr = dk_free(e);
     e->dk_max = e->o.kv_disk_max > 0 ? e->o.kv_disk_max * 1073741824.0 : fr >= 0 ? 0.5 * (fr + (double)e->dk_bytes) : 16.0 * 1073741824.0;
     dk_fit(e, 0, -1);
@@ -978,6 +1101,8 @@ static void dk_close(Engine *e) {
     if (e->dk_dir && e->dk_lock >= 0) close(e->dk_lock); // (the lock with it)
     free(e->dk_dir);
     e->dk_dir = NULL;
+    free(e->sw_dir);
+    e->sw_dir = NULL;
 }
 
 static int dk_wants(const Engine *e, const Slot *sl, int keep) {
@@ -1114,6 +1239,741 @@ static int dk_go(Engine *e, Job *j, int si, int src, int L) {
     return 1;
 }
 
+// --------------------------------------------------------------------------------------- memory admission
+// --admit bound (docs/memory-admission.md, steps 1-2): a job is admitted on its lease, the memory it can ever use: the
+// KV of positions 0..E-1 (E = P = prompt + max tokens: serve.c clamps max_new to the context, spec_cands the guesses
+// to max_new, so nothing is written past P) and its state copies (Qwen3.5: the live one, --checkpoints, and kk + 1
+// transient ones for the verify rows if it speculates), target + draft. A slot's res: what its sequences hold
+// (rq_seq_resident: the KV blocks up to the high-water mark, the state buffers; an upper bound but for THP). committed =
+// the sum over the slots of max(res, lease) (KV and state each) if running, else res; admissions keep it <= --kv-mem,
+// and between them an idle slot never grows, a running one never past its lease (start_run releases it past E).
+// committed is recomputed from the slots at each admission (a few slots, ~1 us each) rather than kept up to date: every
+// path that changes a sequence (start_run's truncate / copy / release, dk_load, the verify rows' transient checkpoints,
+// a reclaim, end_run / reap) counts as it is, without bookkeeping of its own to drift. A job that does not fit takes the
+// room of idle slots, least recently used first (their caches lost; --kv-disk: saved first), else waits (strict FIFO);
+// with nothing running it never waits. Step 3, the live budget: the static check does not see the other processes, so a
+// job is admitted only if its growth also fits in what the box has left: growth = lease - res(si) (what start_run's
+// release gives back returns to MemAvailable: netted), live = MemAvailable - margin - promised, promised = committed -
+// sum of res (what the running jobs may still touch: not out of MemAvailable yet); reclaimed idle slots count for both.
+// MemAvailable is read at most every 100 ms (mem_avail). The requests' guesses are capped at what one -c job can hold
+// (engine_submit, Qwen3.5 / 3.8: their state copies), so that one -c job always fits. Outputs never depend on any of it: only when a
+// job runs, and on which slot
+typedef struct { double kv, st; } Mem;
+
+static double mem_read(const char *file) {
+    // MemAvailable in bytes (-1: unknown, e.g. not Linux), or the test hook's (RUNQ_TEST_MEMAVAILABLE=FILE: bytes)
+    if (!file) return rq_mem_available();
+    FILE *f = fopen(file, "r");
+    double v;
+    if (!f || fscanf(f, "%lf", &v) != 1) v = -1;
+    if (f) fclose(f);
+    return v;
+}
+
+static double mem_avail(Engine *e, double res) {
+    // (the engine thread) mem_read at most every 100 ms; the test hook's file at each call. res: the slots' resident memory
+    // now; between readings what they touched (or gave back) since is taken out of (put back into) the last reading
+    if (e->ma_file) return e->ma = mem_read(e->ma_file);
+    double now = rq_now();
+    if (e->ma_t == 0 || now - e->ma_t >= 0.1) {
+        e->ma = mem_read(NULL);
+        e->ma_t = now;
+        e->ma_res = res;
+    }
+    return e->ma < 0 ? -1 : e->ma + e->ma_res - res;
+}
+
+static int job_kk(const Engine *e, const Job *j, int *dk) {
+    // spec_start's rule: the job's guesses per pass at most (0: it does not speculate); *dk: the draft model's among them
+    int sk = e->dm ? j->spec_k : 0, sl = j->spec_lookup;
+    *dk = 0;
+    if (j->con || j->force.n > 0 || j->spec == SPEC_OFF || (sk <= 0 && sl <= 0)) return 0;
+    *dk = sk > 0;
+    return sk > sl ? sk : sl;
+}
+
+static double kv_at(const Slot *sl, int n) {
+    // the KV bytes of positions 0..n-1, target + draft (n 0: the token arrays)
+    return (double)rq_seq_kv_bytes(sl->seq, n) + (sl->dseq ? (double)rq_seq_kv_bytes(sl->dseq, n) : 0);
+}
+
+static Mem job_lease(const Engine *e, const Job *j, int *P, int *E, int *kk) {
+    // the job's first lease (to E: P while the chunk is unlimited, --admit chunk: min(P, prompt + C)) and P, kk
+    const Slot *sl = &e->slot[0];
+    long long p = (long long)j->prompt.n + (j->max_new > 0 ? j->max_new : 0), cap = rq_seq_capacity(sl->seq);
+    int dk, k = job_kk(e, j, &dk), ck = e->ckn + (k > 0 ? k + 1 : 0), dck = e->ckn + (dk ? k + 1 : 0);
+    if (p > cap) p = cap;
+    long long x = e->o.admit == ADMIT_CHUNK && (long long)j->prompt.n + e->o.admit_chunk < p ? (long long)j->prompt.n + e->o.admit_chunk : p;
+    if (ck > RQ_CHECKPOINTS_MAX) ck = RQ_CHECKPOINTS_MAX; // (spec_start's rq_seq_set_checkpoints)
+    if (dck > RQ_CHECKPOINTS_MAX) dck = RQ_CHECKPOINTS_MAX;
+    RqSeqMem t, d = { 0 };
+    rq_seq_resident(sl->seq, &t);
+    if (sl->dseq) rq_seq_resident(sl->dseq, &d);
+    *P = (int)p;
+    *E = (int)x;
+    *kk = k;
+    return (Mem){ kv_at(sl, (int)x), (1.0 + ck) * (double)t.state + (1.0 + dck) * (double)d.state };
+}
+
+static Mem slot_res(const Slot *sl) {
+    RqSeqMem a, b = { 0 };
+    rq_seq_resident(sl->seq, &a);
+    if (sl->dseq) rq_seq_resident(sl->dseq, &b);
+    return (Mem){ (double)a.kv + (double)b.kv, (double)(a.total - a.kv) + (double)(b.total - b.kv) };
+}
+
+static double slot_mem(const Slot *sl) {
+    // the slot's part of committed
+    Mem m = slot_res(sl);
+    if (sl->run) {
+        if (sl->run->lkv > m.kv) m.kv = sl->run->lkv;
+        if (sl->run->lst > m.st) m.st = sl->run->lst;
+    }
+    return m.kv + m.st;
+}
+
+static double slot_floor(const Slot *sl) {
+    // what an emptied and released slot still holds (its token arrays)
+    return kv_at(sl, 0);
+}
+
+static void slot_reclaim(Engine *e, int si) {
+    // an idle slot's memory given back: its cache lost (on disk if dk_spill saved it)
+    Slot *sl = &e->slot[si];
+    int len = rq_seq_len(sl->seq), disk = 0;
+    double g = slot_mem(sl) - slot_floor(sl);
+    for (int k = 0; k < e->ndk && len > 0 && !disk; k++)
+        disk = rq_seq_file_keep(&e->dk[k].f, len) == len && lcp(e->dk[k].tok, e->dk[k].f.len, rq_seq_tokens(sl->seq), len) == len;
+    rq_seq_reset(sl->seq);
+    rq_seq_release(sl->seq, 0);
+    if (sl->dseq) {
+        rq_seq_reset(sl->dseq);
+        rq_seq_release(sl->dseq, 0);
+    }
+    if (e->o.verbose)
+        fprintf(stderr, "[engine] slot %d reclaimed: %d tokens, %.2f GiB%s\n", si, len, g / 1073741824.0,
+                disk ? " (saved to disk)" : e->dk_dir ? " (not on disk)" : "");
+}
+
+static int mem_reclaim(Engine *e, int nv, double need, double grow, double B, double lv, double *acc) {
+    // idle slots e->rv[0..nv) reclaimed, least recently used first, until need - *acc <= B and grow - *acc <= lv (*acc: what
+    // they gave back); 2 if one is to be saved first (e->plan.spill: dk_run, then the caller again), else 1
+    for (int a = 1; a < nv; a++)
+        for (int b = a; b > 0 && e->slot[e->rv[b]].used < e->slot[e->rv[b - 1]].used; b--) {
+            int x = e->rv[b];
+            e->rv[b] = e->rv[b - 1];
+            e->rv[b - 1] = x;
+        }
+    for (int k = 0; k < nv && !(need - *acc <= B && grow - *acc <= lv); k++) {
+        Slot *sl = &e->slot[e->rv[k]];
+        if (dk_wants(e, sl, 0)) {
+            e->plan.spill = e->rv[k];
+            return 2;
+        }
+        *acc += slot_mem(sl) - slot_floor(sl);
+        slot_reclaim(e, e->rv[k]);
+    }
+    return 1;
+}
+
+static int mem_admit(Engine *e, Job *j, int si, int src, int dry) {
+    // (admit) room for job j on idle slot si (copying from slot src, or -1): 1 it fits (idle slots reclaimed if need be),
+    // 2 a reclaim's save planned first (e->plan.spill: dk_run, then the job again), -1 it waits. Computed first, done only
+    // if it makes the job fit: a job that waits anyway destroys no cache. dry: only whether it fits with every idle slot
+    // reclaimed (1 / -1), nothing done. --admit chunk: none while a job is parked or swapped out, and one chunk per running
+    // job (this one included) stays free after it (rc), so that their renewals do not park at once
+    if (e->o.admit == ADMIT_WORST) return 1;
+    int P, E, kk, live = 0, nv = 0, np = e->o.admit == ADMIT_CHUNK && (e->npark > 0 || e->nswap > 0);
+    Mem l = job_lease(e, j, &P, &E, &kk);
+    double G = 1073741824.0, B = e->o.kv_mem * G, com = 0, res = 0, gain = 0, own = 0, M = e->o.admit_margin * G, rc = 0;
+    for (int i = 0; i < e->nslot; i++) {
+        Slot *sl = &e->slot[i];
+        Mem r = slot_res(sl);
+        double m = slot_mem(sl), f = slot_floor(sl);
+        com += m;
+        res += r.kv + r.st;
+        if (i == si) own = m; // (start_run releases it past E: its old contents do not count)
+        if (sl->run) live++;
+        else if (i != si && i != src && m > f) {
+            gain += m - f;
+            e->rv[nv++] = i;
+        }
+    }
+    if (e->o.admit == ADMIT_CHUNK) rc = (live + 1) * (kv_at(&e->slot[0], e->o.admit_chunk) - slot_floor(&e->slot[0]));
+    // the static check (need <= B) and the live one (grow <= lv), each with g bytes of idle slots reclaimed
+    double A = mem_avail(e, res), need = com - own + l.kv + l.st, grow = l.kv + l.st - own, lv = A >= 0 ? A - M - (com - res) : 1e300, acc = 0;
+#define MEM_FITS(g) (!np && need + rc - (g) <= B && grow + rc - (g) <= lv)
+    if (MEM_FITS(0)) return 1;
+    if (!MEM_FITS(gain) && (live > 0 || dry || np)) { // (np: also with every job swapped out, none in a slot)
+        if (!dry && !j->mem_waited && e->o.verbose) {
+            char lt[160] = "", ct[96] = "";
+            if (A >= 0)
+                snprintf(lt, sizeof(lt), "; live %.2f: MemAvailable %.2f - margin %.2f - promised %.2f, it grows %.2f", (lv + gain) / G, A / G,
+                         M / G, (com - res) / G, grow / G);
+            if (e->o.admit == ADMIT_CHUNK) snprintf(ct, sizeof(ct), "; a chunk each kept free %.2f, %d parked, %d swapped out", rc / G, e->npark, e->nswap);
+            fprintf(stderr, "[engine] job waits for memory: needs %.2f GiB (%d + %d positions%s), %.2f free with the idle slots reclaimed "
+                    "(budget %.2f, committed %.2f, %d running%s%s)\n", (l.kv + l.st) / G, j->prompt.n, E - j->prompt.n, kk ? ", speculating" : "",
+                    (B - com + own + gain) / G, B / G, com / G, live, ct, lt);
+        }
+        if (!dry) {
+            j->mem_waited = 1;
+            if (j->t_mw == 0) j->t_mw = rq_now();
+            e->mwj = j;
+        }
+        return -1;
+    }
+    if (dry) return 1;
+    if (mem_reclaim(e, nv, need + rc, grow + rc, B, lv, &acc) == 2) return 2;
+    if (need - acc > B) // (nothing running: the startup made sure one -c job fits, guesses capped to fit: engine_submit)
+        fprintf(stderr, "[engine] warning: a job admitted over the memory budget (nothing running): %.2f of %.2f GiB\n", (need - acc) / G, B / G);
+    else if (grow - acc > lv) // (step 3: the box is short of memory, but one job must run)
+        fprintf(stderr, "[engine] warning: a job admitted beyond the live budget (nothing running): it grows %.2f GiB, MemAvailable %.2f - "
+                "margin %.2f\n", (grow - acc) / G, A / G, M / G);
+#undef MEM_FITS
+    return 1;
+}
+
+static int run_reach(const Engine *e, const Run *r) {
+    // --admit chunk: the length the job's next passes could reach without a renewal check between them: the rest of its
+    // feed (a prompt's prefill whole, its forced tokens, a forced reply: never parked half-way) + its guesses per pass at
+    // most if this pass may speculate (step's rule: one token to feed, no forced reply; spec_cands caps them by the context
+    // and max tokens, so never past P)
+    int h = rq_seq_len(e->slot[r->si].seq) + r->feed.n - r->fed;
+    if (r->phase == R_DECODE && r->spec != SPEC_OFF && !r->forcing && r->feed.n - r->fed == 1) h += r->sk > r->sl ? r->sk : r->sl;
+    return h < r->P ? h : r->P;
+}
+
+static int run_held(const Engine *e, const Run *r) {
+    // (step) no rows for the job in this pass: swapped out, parked, its seat yielded, or its next pass could write past its
+    // lease (a renewal first)
+    return e->o.admit == ADMIT_CHUNK && (r->swap || r->park || r->yld || run_reach(e, r) > r->E);
+}
+
+static int mem_swap_out(Engine *e, const Run *old, double *acc, int yonly) {
+    // (under mu: mem_renew, mem_swap_in, mem_resume, engine_main) plan the swap-out of the youngest job in a slot but old,
+    // parked or yielded ones first, then running ones (yonly: yielded ones only); between steps every job is at a clean
+    // point (no verify segment in flight, r->vn 0); *acc += its slot's part of committed (its lease leaves it: sw_out gives
+    // the slot's memory back, also if the save fails). 1, 0 if there is none left
+    Run *v = NULL;
+    for (int pass = 0; pass < 2 - yonly && !v; pass++)
+        for (int i = e->nrun - 1; i >= 0 && !v; i--) {
+            Run *r = e->run[i];
+            if (r != old && !r->done && !r->swap && r->si >= 0 && (pass || r->yld || (r->park && !yonly))) v = r;
+        }
+    if (!v) return 0;
+    Slot *sl = &e->slot[v->si];
+    *acc += slot_mem(sl) - slot_floor(sl);
+    v->swap = 1;
+    e->swo[e->nswo++] = v;
+    return 1;
+}
+
+static int mem_renew(Engine *e, Run *r, int h, int oldest, int behind) {
+    // (mem_renewals) --admit chunk: job r's lease extended to cover h positions, by whole chunks: E' = min(P, E + C x n). 1
+    // granted, 0 denied (the job parks), 2 a reclaim's save planned first (dk_run; no rows for it in this step, renewed
+    // at the next one). No growth (E' in its last KV block): granted. Else denied if behind a parked job (FIFO), else the
+    // static check (committed + its growth <= budget) and the live one (growth <= MemAvailable - margin - promised); the
+    // oldest job is never denied: the idle slots reclaimed (LRU), then the younger jobs swapped out (mem_swap_out, the
+    // youngest first) until it fits; with nothing left to move, granted with a warning (the live budget below one job: one
+    // -c job fits the static one, the startup's check). A younger one takes no idle slot's cache: it parks until the memory
+    // is there. A slot whose job is planned to be swapped out in this step (the oldest's renewal: r->swap 1) counts as
+    // emptied: sw_run gives its memory back before the pass (also if the save fails), so a job between the oldest and the
+    // swapped-out ones may grow into it
+    Slot *sl = &e->slot[r->si];
+    int C = e->o.admit_chunk, nv = 0;
+    long long x = r->E + (long long)(h - r->E + C - 1) / C * C;
+    int E2 = x < r->P ? (int)x : r->P;
+    double G = 1073741824.0, B = e->o.kv_mem * G, M = e->o.admit_margin * G, com = 0, res = 0, gain = 0, kv2 = kv_at(sl, E2);
+    for (int i = 0; i < e->nslot; i++) {
+        Slot *t = &e->slot[i];
+        Mem m = slot_res(t);
+        double c = slot_mem(t), f = slot_floor(t);
+        if (t->run && t->run->swap == 1) c = f, m = (Mem){ f, 0 };
+        com += c;
+        res += m.kv + m.st;
+        if (!t->run && c > f) {
+            gain += c - f;
+            e->rv[nv++] = i;
+        }
+    }
+    Mem rs = slot_res(sl);
+    double d = (rs.kv > kv2 ? rs.kv : kv2) - (rs.kv > r->lkv ? rs.kv : r->lkv); // (the growth of its part of committed)
+    double A = mem_avail(e, res), lv = A >= 0 ? A - M - (com - res) : 1e300, acc = 0;
+#define MEM_FITS(g) (d <= 0 || (com + d - (g) <= B && d - (g) <= lv)) // (no growth: within its last KV block, always granted)
+    if (!oldest && d > 0 && behind) {
+        if (!r->park && e->o.verbose)
+            fprintf(stderr, "[engine] job %d parked at %d tokens (%d generated): behind a parked job\n", r->id, rq_seq_len(sl->seq), r->j->n_gen);
+        return 0;
+    }
+    if (!MEM_FITS(0) && !oldest) {
+        if (!r->park && e->o.verbose)
+            fprintf(stderr, "[engine] job %d parked at %d tokens (%d generated): its lease to %d positions does not fit (+%.3f GiB; budget %.2f, "
+                    "committed %.2f, idle %.2f, live %s%.2f)\n", r->id, rq_seq_len(sl->seq), r->j->n_gen, E2, d / G, B / G, com / G, gain / G,
+                    A >= 0 ? "" : "none ", A >= 0 ? lv / G : 0.0);
+        return 0;
+    }
+    if (!MEM_FITS(0)) {
+        if (mem_reclaim(e, nv, com + d, d, B, lv, &acc) == 2) return 2;
+        while (!MEM_FITS(acc) && mem_swap_out(e, r, &acc, 0)) {}
+        if (!MEM_FITS(acc) && (e->ow_warn == 0 || rq_now() - e->ow_warn >= 60)) { // (one job must run: the oldest)
+            e->ow_warn = rq_now();
+            fprintf(stderr, "[engine] warning: the oldest job's lease renewed %s (nothing left to swap out): job %d grows %.3f GiB; "
+                    "committed %.2f of %.2f, live %.2f\n", com + d - acc > B ? "over the memory budget" : "beyond the live budget", r->id,
+                    d / G, (com + d - acc) / G, B / G, A >= 0 ? (lv + acc) / G : 0.0);
+        }
+    }
+#undef MEM_FITS
+    r->E = E2;
+    r->lkv = kv2;
+    r->j->lease = r->lkv + r->lst;
+    r->j->renewals++;
+    return 1;
+}
+
+static int mem_swap_in(Engine *e, Run *r, int oldest);
+
+static void mem_yield(Engine *e, Run *r, double now, const char *why) {
+    // --admit-yield: job r gives its seat up at its lease's end; it keeps its slot and memory until another job needs them
+    // (mem_resume, engine_main: swapped out), gets no rows, and is resumed when a seat is its turn (mem_resume)
+    if (r->park) {
+        r->j->paused += now - r->t_park;
+        r->park = 0;
+    }
+    r->yld = 1;
+    r->t_yld = now;
+    r->j->yields++;
+    if (e->o.verbose)
+        fprintf(stderr, "[engine] job %d yielded its seat at %d tokens (%d generated, %d since it resumed): %s\n", r->id,
+                rq_seq_len(e->slot[r->si].seq), r->j->n_gen, r->j->n_gen - r->g0, why);
+}
+
+static int mem_resume(Engine *e, int nseat, int blocked, int io, double now) {
+    // (mem_renewals) --admit-yield: the free seats (nseat taken) to the yielded jobs, FIFO by the time they began to wait,
+    // against the queue's head (its submission; not while admissions are held: blocked, a job parked or swapped out for
+    // memory). One in its slot resumes at once (its renewal at the next step); a swapped-out one is swapped in (mem_swap_in,
+    // one per step, no other I/O planned): the oldest job of all, or any when no other job holding a seat is in a slot,
+    // goes in whatever it takes (younger jobs swapped out for it); else, if it does not fit (or no slot is idle), the
+    // youngest yielded job in a slot is swapped out for it and it tries again at the next step. Sets e->nyld, e->yt and
+    // e->yblock (the first for a seat could not take it: admissions wait). 1 if I/O was planned
+    int pl = 0;
+    for (;;) {
+        Run *w = NULL;
+        int first = 1, wold = 0, seated = 0;
+        for (int i = 0; i < e->nrun; i++) {
+            Run *r = e->run[i];
+            if (r->done) continue;
+            if (!r->yld) seated += r->si >= 0;
+            else if (r->swap != 1 && (!w || r->t_yld < w->t_yld)) w = r, wold = first;
+            first = 0;
+        }
+        if (!w || nseat >= e->parallel || (e->qn > 0 && !blocked && e->q[0]->t_submit < w->t_yld)) break;
+        if (w->si >= 0) {
+            w->yld = 0;
+            w->j->paused += now - w->t_yld;
+            w->g0 = w->j->n_gen;
+            nseat++;
+            if (e->o.verbose)
+                fprintf(stderr, "[engine] job %d resumed at %d tokens after %.2f s without a seat\n", w->id, rq_seq_len(e->slot[w->si].seq),
+                        now - w->t_yld);
+            continue;
+        }
+        if (io || pl || e->nswo > 0 || e->swin) {
+            e->yblock = 1;
+            break;
+        }
+        int g = mem_swap_in(e, w, wold || !seated);
+        if (g == 1) { // (sw_in at this step's sw_run; held until then: r->swap)
+            w->yld = 0;
+            w->j->paused += now - w->t_yld;
+            if (e->o.verbose) fprintf(stderr, "[engine] job %d resumed after %.2f s without a seat (swapped in)\n", w->id, now - w->t_yld);
+        } else {
+            double acc = 0;
+            e->yblock = 1;
+            if (g == 2 || mem_swap_out(e, w, &acc, 1)) pl = 1;
+        }
+        break;
+    }
+    e->nyld = 0;
+    e->yt = 0;
+    for (int i = 0; i < e->nrun; i++) {
+        Run *r = e->run[i];
+        if (r->done || !r->yld) continue;
+        e->nyld++;
+        if (e->yt == 0 || r->t_yld < e->yt) e->yt = r->t_yld;
+    }
+    return pl;
+}
+
+static int mem_renewals(Engine *e) {
+    // (engine_main, under mu, before the admissions: a renewal or a resume comes before a new job) --admit chunk (step 4):
+    // each running job whose next pass could write past its lease's end renews it, the oldest first (e->run: the admission
+    // order). A denied one parks: step gives it no rows, it keeps its slot and memory, and it asks again at every step;
+    // once one is denied, the younger ones whose renewal needs memory park too (FIFO). Every job is at a clean point here: a
+    // verify segment is sampled whole in its step (r->vn is 0 again at its end), and a prefill or a forced reply is
+    // covered whole by run_reach, so a job is held only before a pass, never inside one; and a job that runs has E >=
+    // run_reach, which bounds what its pass writes: the decode rows, its guesses (the draft's sequence and the lookup
+    // follow the target's tokens: their rows are below that too). A swapped-out job counts as a parked one for the younger
+    // ones (FIFO); then the oldest swapped-out job is swapped in if it fits (mem_swap_in: one per step, none while I/O is
+    // planned). --admit-yield N: at its lease's end, with every seat taken and someone waiting for one (a yielded job, or
+    // the queue while admissions are not held), a job that has generated N chunks since it started or resumed yields its
+    // seat (mem_yield), and so does one denied its renewal while a yielded job waits (parked, it would keep the seat that
+    // job needs); then the free seats go to the yielded jobs whose turn it is (mem_resume). A yielded job asks for no
+    // renewal and holds back no younger one (it waits for a seat, not for memory); the oldest job keeps its precedence for
+    // memory (never parked; its renewals and its swap-in move the others out), yielded or not. 1 if I/O was planned (a
+    // reclaim's save, swaps: sw_run first; no admission in this step)
+    int io = 0, denied = 0, first = 1, out_old = 0, out_behind = 0, yw = e->o.admit_yield > 0, nseat = 0, nyw = 0, blocked = 0;
+    Run *out = NULL;
+    e->npark = e->nswap = e->nswo = 0;
+    e->swin = NULL;
+    e->yblock = 0;
+    if (e->o.admit != ADMIT_CHUNK) return 0;
+    double now = rq_now();
+    long long yg = (long long)e->o.admit_yield * e->o.admit_chunk;
+    for (int i = 0; i < e->nrun; i++) { // (--admit-yield: the seats taken, the jobs waiting for one, admissions held)
+        Run *r = e->run[i];
+        if (r->done) continue;
+        if (r->yld) nyw++;
+        else nseat++, blocked |= r->park || r->swap;
+    }
+    for (int i = 0; i < e->nrun; i++) {
+        Run *r = e->run[i];
+        if (r->done) continue;
+        int oldest = first, g = 1;
+        first = 0;
+        if (r->yld) continue; // (waiting for a seat: mem_resume)
+        if (r->swap) { // (swapped out, or planned to be in this step by the oldest's renewal)
+            e->nswap++;
+            if (r->swap == 2 && !out) out = r, out_old = oldest, out_behind = denied; // (behind an older parked job: FIFO, it waits)
+            denied = 1;
+            continue;
+        }
+        int h = run_reach(e, r);
+        Mem rs = slot_res(&e->slot[r->si]);
+        if (rs.kv > r->lkv + 1) // (a pass wrote past E: a bug; the tests look for it)
+            fprintf(stderr, "[engine] bug: job %d's slot holds %.0f bytes of KV, its lease %.0f (to %d positions, at %d)\n", r->id, rs.kv,
+                    r->lkv, r->E, rq_seq_len(e->slot[r->si].seq));
+        if (h > r->E) {
+            int full = yw && nseat >= e->parallel, wait = nyw > 0 || (e->qn > 0 && !blocked);
+            if (full && wait && r->j->n_gen - r->g0 >= yg) g = 3; // (--admit-yield: its turn is over)
+            else if (io) g = 2; // (one save at a time: renewed at the next step)
+            else g = mem_renew(e, r, h, oldest, denied);
+            if (g == 0 && nyw > 0) g = 3; // (not only when full: parked with a seat free, it could hold the memory the first yielded
+                                          // job needs while that one waits for it: nothing runs)
+        }
+        if (g == 3) {
+            mem_yield(e, r, now, nyw > 0 ? "a job without a seat waits" : "a request waits in the queue");
+            nseat--;
+            nyw++;
+        } else if (g == 2) io = 1, e->npark += r->park; // (a parked one stays so until it is renewed)
+        else if (g == 0) {
+            denied = 1;
+            if (!r->park) r->park = 1, r->t_park = now;
+            e->npark++;
+        } else if (g == 1 && r->park) {
+            r->park = 0;
+            r->j->paused += now - r->t_park;
+            r->g0 = r->j->n_gen;
+            if (e->o.verbose)
+                fprintf(stderr, "[engine] job %d resumed at %d tokens after %.2f s (its lease to %d positions)\n", r->id,
+                        rq_seq_len(e->slot[r->si].seq), now - r->t_park, r->E);
+        }
+    }
+    if (out && !io && e->nswo == 0 && (out_old || !out_behind) && mem_swap_in(e, out, out_old) == 2) io = 1;
+    if (yw && mem_resume(e, nseat, e->npark > 0 || e->nswap > 0, io, now)) io = 1;
+    return io || e->nswo > 0 || e->swin != NULL;
+}
+
+static int spec_ckn(const Engine *e, const Run *r) {
+    // spec_start's checkpoint slots of a speculating job (--checkpoints + its guesses + 1)
+    int kk = r->sk > r->sl ? r->sk : r->sl, n = e->ckn + kk + 1;
+    return n < RQ_CHECKPOINTS_MAX ? n : RQ_CHECKPOINTS_MAX;
+}
+
+static void slot_empty(Slot *sl) {
+    // an idle slot emptied and its memory given back (no cache: nothing for the disk tier)
+    rq_seq_reset(sl->seq);
+    rq_seq_release(sl->seq, 0);
+    if (sl->dseq) {
+        rq_seq_reset(sl->dseq);
+        rq_seq_release(sl->dseq, 0);
+    }
+    sl->gen++;
+    sl->dk_gen = sl->gen;
+}
+
+// ------------------------------------------------------------------------------------------ the swap
+// --admit chunk (docs/memory-admission.md, step 4): when the oldest job's renewal does not fit with the idle slots
+// reclaimed, the youngest other jobs are swapped out (parked ones first) until it does: their sequences saved to
+// DIR/<model>-<KV type>/swap/<job>.rqseq (+ .draft.rqseq), their slots emptied, the Runs kept detached (r->si -1: no rows,
+// the deadline, the cancel and the shutdown still checked). The oldest swapped-out job comes back first, when its lease +
+// one chunk fits (or, the oldest of all, by swapping out the younger ones in turn), into an idle slot, and continues from
+// its pending token: the same bits (KV, tokens, recurrent state, checkpoints, the RNG), so only when it computes changes.
+// Planned under mu (mem_renewals), done by the engine thread between passes without it (sw_run, as dk_run): the HTTP
+// threads (SSE keep-alives, /health) never wait on the disk. A swap file that cannot be written or read ends that job
+// (500; its files deleted, its slot emptied all the same); no other job is touched. The files are outside --kv-disk-max;
+// the disk tier keeps the budget free for them (dk_fit), and DIR/.../swap/ is emptied at the start (sw_open)
+
+static int mem_swap_in(Engine *e, Run *r, int oldest) {
+    // (mem_renewals, mem_resume, under mu) room for swapped-out job r: its lease (>= what its slot held; committed counts it
+    // whole once it is back) + one chunk (its next renewal) + the oldest job's next renewal (its next chunk's growth, if it
+    // is in a slot: so that the oldest's next KV block does not swap r out again at once; a ping-pong guard), the last two
+    // not for the oldest job (oldest: it goes in whatever it takes), as an admission's checks, on the idle slot holding the
+    // least (emptied for it; saved first if the disk tier wants it). 1 planned (e->swin: sw_run), 0 it stays out, 2 a save
+    // planned first (dk_run; again at the next step). The other idle slots are reclaimed (LRU) if that makes it fit; the
+    // oldest job also swaps out the younger ones until it fits, and is swapped in with a warning if nothing is left (the live
+    // budget below one job: one -c job fits the static budget, the startup's check)
+    int si = -1, nv = 0;
+    for (int i = 0; i < e->nslot; i++) {
+        Slot *t = &e->slot[i];
+        if (t->run) continue;
+        double m = slot_mem(t) - slot_floor(t), b = si < 0 ? 0 : slot_mem(&e->slot[si]) - slot_floor(&e->slot[si]);
+        if (si < 0 || m < b || (m == b && t->used < e->slot[si].used)) si = i;
+    }
+    if (si < 0) { // (--admit-yield: the slots held by yielded jobs, one swapped out to free one; else cannot be: a swapped-out
+        double acc = 0; // job's seat is a slot nobody runs on)
+        return mem_swap_out(e, r, &acc, !oldest) ? 2 : 0;
+    }
+    Slot *sl = &e->slot[si];
+    double G = 1073741824.0, B = e->o.kv_mem * G, M = e->o.admit_margin * G, com = 0, res = 0, gain = 0, own = 0, acc = 0;
+    for (int i = 0; i < e->nslot; i++) {
+        Slot *t = &e->slot[i];
+        Mem m = slot_res(t);
+        double c = slot_mem(t), f = slot_floor(t);
+        com += c;
+        res += m.kv + m.st;
+        if (i == si) own = c;
+        else if (!t->run && c > f) {
+            gain += c - f;
+            e->rv[nv++] = i;
+        }
+    }
+    double rc = oldest ? 0 : kv_at(sl, e->o.admit_chunk) - slot_floor(sl), l = r->lkv + r->lst;
+    for (int i = 0; i < e->nrun && !oldest; i++) { // (the oldest job, if it is in a slot: its next chunk's growth)
+        Run *o = e->run[i];
+        if (o->done) continue;
+        if (o != r && o->si >= 0 && !o->swap) {
+            Slot *os = &e->slot[o->si];
+            Mem m = slot_res(os);
+            long long x = (long long)o->E + e->o.admit_chunk;
+            double k2 = kv_at(os, x < o->P ? (int)x : o->P), a = m.kv > k2 ? m.kv : k2, b = m.kv > o->lkv ? m.kv : o->lkv;
+            if (a > b) rc += a - b;
+        }
+        break;
+    }
+    double need = com - own + l + rc, grow = l + rc - own, A = mem_avail(e, res), lv = A >= 0 ? A - M - (com - res) : 1e300;
+#define MEM_FITS(g) (need - (g) <= B && grow - (g) <= lv)
+    if (!oldest && !MEM_FITS(gain)) return 0;
+    if (dk_wants(e, sl, 0)) {
+        e->plan.spill = si;
+        return 2;
+    }
+    if (!MEM_FITS(0)) {
+        if (mem_reclaim(e, nv, need, grow, B, lv, &acc) == 2) return 2;
+        while (oldest && !MEM_FITS(acc) && mem_swap_out(e, r, &acc, 0)) {}
+        if (!MEM_FITS(acc) && (e->ow_warn == 0 || rq_now() - e->ow_warn >= 60)) {
+            e->ow_warn = rq_now();
+            fprintf(stderr, "[engine] warning: the oldest job (or the only one with a seat in a slot) swapped in %s (nothing left to swap out): job %d, its lease %.3f GiB; "
+                    "committed %.2f of %.2f, live %.2f\n", need - acc > B ? "over the memory budget" : "beyond the live budget", r->id,
+                    l / G, (need - acc) / G, B / G, A >= 0 ? (lv + acc) / G : 0.0);
+        }
+    }
+#undef MEM_FITS
+    if (own > slot_floor(sl)) slot_reclaim(e, si);
+    e->swin = r;
+    e->swin_si = si;
+    return 1;
+}
+
+static int sw_failing(const Engine *e, const char *what) {
+    // RUNQ_TEST_SWAP_FAIL=FILE (tests only): whether the file names this I/O ("draft-save", "draft-load": it then fails), read
+    // at each use
+    if (!e->sw_fail) return 0;
+    FILE *f = fopen(e->sw_fail, "r");
+    char b[256] = "";
+    if (f) {
+        b[fread(b, 1, sizeof(b) - 1, f)] = 0;
+        fclose(f);
+    }
+    return strstr(b, what) != NULL;
+}
+
+static void sw_out(Engine *e, Run *r) {
+    // (sw_run) job r out of memory: the verify rows' transient checkpoints dropped (as spec_release; the regular ones go
+    // into the file), its sequences saved (the draft's only if it uses it), its slot emptied and given back, the Run kept
+    // (si -1) with its RNG (also in the file; kept for a job not prefilled yet: no file) and its constraint's mask. A
+    // draft that cannot be saved is reset at the swap-in (its guesses only change the speed); a target that cannot be
+    // saved (the disk full, an I/O error) ends the job with a 500, its slot emptied all the same (the renewal that asked
+    // for the swap counted on that memory)
+    Slot *sl = &e->slot[r->si];
+    Job *j = r->j;
+    double t0 = rq_now();
+    char p[4096];
+    int rc = RQ_OK;
+    if (r->park) {
+        j->paused += t0 - r->t_park;
+        r->park = 0;
+    }
+    if (r->nck0 > 0) rq_seq_checkpoint_rows_drop(sl->seq);
+    if (r->dnck0 > 0) rq_seq_checkpoint_rows_drop(sl->dseq);
+    Mem m = slot_res(sl);
+    r->sw_res = m.kv + m.st;
+    r->rng = *rq_seq_rng(sl->seq);
+    r->sw_len = rq_seq_len(sl->seq);
+    r->sw_dlen = sl->dseq && r->sk > 0 ? rq_seq_len(sl->dseq) : 0;
+    r->sw_bytes = 0;
+    if (r->nallow > 0) {
+        if (!(r->alist = malloc((size_t)r->nallow * sizeof(int)))) rc = RQ_ERR_NOMEM;
+        else memcpy(r->alist, sl->list, (size_t)r->nallow * sizeof(int));
+    }
+    if (e->sw_delay > 0) usleep((useconds_t)(e->sw_delay * 1e6));
+    if (rc == RQ_OK && r->sw_len > 0) {
+        sw_path(e, r->id, 0, p, sizeof(p));
+        if ((rc = rq_seq_save(sl->seq, p)) == RQ_OK) r->sw_bytes += rq_seq_save_bytes(sl->seq);
+    }
+    if (rc == RQ_OK && r->sw_dlen > 0) {
+        sw_path(e, r->id, 1, p, sizeof(p));
+        int dr = sw_failing(e, "draft-save") ? RQ_ERR_IO : rq_seq_save(sl->dseq, p);
+        if (dr == RQ_OK) r->sw_bytes += rq_seq_save_bytes(sl->dseq);
+        else {
+            fprintf(stderr, "[engine] job %d: the draft's sequence could not be swapped out (%s): reset at the swap-in (only the speed "
+                    "changes)\n", r->id, rq_strerror(dr));
+            r->sw_dlen = 0;
+        }
+    }
+    e->sw_bytes += (double)r->sw_bytes;
+    if (rc != RQ_OK) {
+        fprintf(stderr, "[engine] job %d could not be swapped out to %s: %s (the job fails)\n", r->id, e->sw_dir, rq_strerror(rc));
+        free(r->alist);
+        r->alist = NULL;
+        sw_drop(e, r);
+        end_run(e, r, 0, 0, rc, "the request could not be swapped out to disk (--kv-disk)");
+        slot_empty(sl);
+        return;
+    }
+    for (int i = 0; i < r->nallow; i++) sl->allow[sl->list[i]] = 0;
+    slot_empty(sl);
+    if (r->nck0 > 0) rq_seq_set_checkpoints(sl->seq, r->nck0);
+    if (r->dnck0 > 0) rq_seq_set_checkpoints(sl->dseq, r->dnck0);
+    sl->run = NULL;
+    if (e->o.verbose) {
+        char pf[64] = "";
+        if (r->phase == R_PREFILL) snprintf(pf, sizeof(pf), "; prefilling: %d of %d prompt tokens", r->sw_len, j->prompt.n);
+        fprintf(stderr, "[engine] job %d swapped out: %.2f GB, %.2f s (slot %d: %d tokens%s, %.3f GiB given back%s)\n", r->id, r->sw_bytes / 1e9,
+                rq_now() - t0, r->si, r->sw_len, r->sw_dlen ? " + the draft's" : "", (r->sw_res - slot_floor(sl)) / 1073741824.0, pf);
+    }
+    r->si = -1;
+    r->swap = 2;
+    r->t_swap = t0;
+    j->swaps++;
+    e->swaps++;
+}
+
+static void sw_in(Engine *e, Run *r, int si) {
+    // (sw_run) swapped-out job r back into idle slot si (emptied by mem_swap_in): its files loaded (the checkpoint slots it
+    // had: the saved checkpoints all come back) and deleted, its pending checkpoints asked for again (rq_seq_load forgets
+    // them), its RNG and mask back; it continues from its pending token. A target that cannot be read ends the job with a
+    // 500 (its slot emptied); a draft that cannot: the draft is reset
+    Slot *sl = &e->slot[si];
+    Job *j = r->j;
+    double t0 = rq_now();
+    char p[4096];
+    int rc = RQ_OK;
+    rq_seq_reset(sl->seq);
+    if (r->nck0 > 0) rq_seq_set_checkpoints(sl->seq, spec_ckn(e, r));
+    if (r->sw_len > 0) {
+        sw_path(e, r->id, 0, p, sizeof(p));
+        rc = rq_seq_load(sl->seq, p, r->sw_len);
+        if (rc == RQ_OK && rq_seq_len(sl->seq) != r->sw_len) rc = RQ_ERR_STATE;
+    }
+    if (sl->dseq) {
+        rq_seq_reset(sl->dseq);
+        if (r->dnck0 > 0) rq_seq_set_checkpoints(sl->dseq, spec_ckn(e, r));
+        sw_path(e, r->id, 1, p, sizeof(p));
+        int dr = rc == RQ_OK && r->sw_dlen > 0 ? sw_failing(e, "draft-load") ? RQ_ERR_IO : rq_seq_load(sl->dseq, p, r->sw_dlen) : RQ_OK;
+        if (dr != RQ_OK) {
+            fprintf(stderr, "[engine] job %d: the draft's sequence could not be swapped back in (%s): reset (only the speed changes)\n", r->id,
+                    rq_strerror(dr));
+            rq_seq_reset(sl->dseq);
+        }
+    }
+    *rq_seq_rng(sl->seq) = r->rng;
+    int len = r->sw_len, dl = sl->dseq ? rq_seq_len(sl->dseq) : 0;
+    double now = rq_now();
+    sw_drop(e, r);
+    r->si = si;
+    r->swap = 0;
+    r->g0 = j->n_gen;
+    sl->run = r;
+    sl->used = now;
+    sl->gen++;
+    job_lock(j);
+    j->slot = si;
+    j->swapped += now - r->t_swap;
+    job_unlock(j);
+    if (rc == RQ_OK && e->hybrid)
+        for (int i = 0; i < r->nckw; i++)
+            if (r->ckw[i] > len && r->ckw[i] <= rq_seq_capacity(sl->seq)) rq_seq_checkpoint_at(sl->seq, r->ckw[i]);
+    if (rc == RQ_OK && e->dhybrid && sl->dseq && r->sk > 0) draft_ck_pending(e, r);
+    if (rc == RQ_OK && r->nallow > 0) {
+        if ((rc = slot_scratch(e, sl, j->top_logprobs >= 0)) == RQ_OK)
+            for (int i = 0; i < r->nallow; i++) sl->allow[sl->list[i] = r->alist[i]] = 1;
+    }
+    free(r->alist);
+    r->alist = NULL;
+    if (rc != RQ_OK) {
+        fprintf(stderr, "[engine] job %d could not be swapped back in: %s (the job fails)\n", r->id, rq_strerror(rc));
+        r->nallow = 0; // (nothing set in the slot's mask: the load or slot_scratch failed first)
+        end_run(e, r, 0, 0, rc, "the request could not be swapped back in from disk (--kv-disk)");
+        slot_empty(sl);
+        return;
+    }
+    if (e->o.verbose)
+        fprintf(stderr, "[engine] job %d swapped in -> slot %d: %.2f s (%d tokens%s; out %.2f s)\n", r->id, si, now - t0, len,
+                dl > 0 ? " + the draft's" : "", now - r->t_swap);
+}
+
+static void sw_run(Engine *e) {
+    // (the engine thread, without mu, between passes) the I/O mem_renewals / admit planned: the swap-outs (their memory is
+    // the room of the renewal or the swap-in), the disk tier's save / load, then the swap-in
+    for (int k = 0; k < e->nswo; k++) sw_out(e, e->swo[k]);
+    e->nswo = 0;
+    dk_run(e);
+    if (e->swin) sw_in(e, e->swin, e->swin_si);
+    e->swin = NULL;
+}
+
+static void mem_publish(Engine *e) {
+    // (under mu, the engine thread) /health's memory; the warning when the running jobs' promise no longer fits (step 3:
+    // another process took memory; bound never takes it back, chunk denies renewals), at most once a minute
+    if (e->o.admit == ADMIT_WORST) return;
+    double com = 0, res = 0, M = e->o.admit_margin * 1073741824.0, now = rq_now();
+    int np = 0, ns = 0, ny = 0;
+    for (int i = 0; i < e->nslot; i++) {
+        Mem r = slot_res(&e->slot[i]);
+        com += slot_mem(&e->slot[i]);
+        res += r.kv + r.st;
+    }
+    for (int i = 0; i < e->nrun; i++) {
+        np += !e->run[i]->done && e->run[i]->park && !e->run[i]->swap; // (a parked one planned to be swapped out: swapped)
+        ns += !e->run[i]->done && e->run[i]->swap;
+        ny += !e->run[i]->done && e->run[i]->yld;
+    }
+    double A = mem_avail(e, res);
+    e->pub = (EngineMem){ e->o.kv_mem * 1073741824.0, A - M - (com - res), com, res, A >= 0, e->mwj != NULL, e->o.admit == ADMIT_CHUNK, np, ns,
+                          e->o.admit_yield > 0, ny };
+    if (A >= 0 && e->nrun > 0 && A - M < com - res && (e->ma_warn == 0 || now - e->ma_warn >= 60)) {
+        e->ma_warn = now;
+        fprintf(stderr, "[engine] warning: MemAvailable %.2f GiB - margin %.2f is below the %.2f GiB the running jobs may still grow "
+                "into (another process took memory): new jobs wait\n", A / 1073741824.0, M / 1073741824.0, (com - res) / 1073741824.0);
+    }
+}
+
+static int go(Engine *e, Job *j, int si, int src, int L) {
+    // admit's start: the memory first (--admit bound), then dk_go
+    int a = mem_admit(e, j, si, src, 0);
+    return a == 1 ? dk_go(e, j, si, src, L) : a;
+}
+
 static int prompt_sys_end(const Engine *e, const int *P, int n) {
     // the end of the prompt's leading system block ("<|im_start|>system...<|im_end|>\n": the system prompt and the tools),
     // the position of the next <|im_start|>; -1 if none
@@ -1177,6 +2037,8 @@ static void start_run(Engine *e, Job *j, int si, int src, int L) {
     j->state = JOB_RUNNING;
     j->t_start = now;
     j->slot = si;
+    if (j->t_mw > 0) j->mem_wait += now - j->t_mw;
+    j->t_mw = 0;
     job_unlock(j);
     sl->used = now;
     sl->gen++; // (the disk tier: new tokens from here on)
@@ -1222,10 +2084,25 @@ static void start_run(Engine *e, Job *j, int si, int src, int L) {
         end_run(e, r, 0, 0, err, NULL);
         return;
     }
+    if (e->o.admit != ADMIT_WORST) { // the lease; the slot holds no more than it from here on (the draft: not past E either)
+        Mem l = job_lease(e, j, &r->P, &r->E, &r->kk);
+        r->id = ++e->njob;
+        j->chunked = e->o.admit == ADMIT_CHUNK;
+        r->lkv = l.kv;
+        r->lst = l.st;
+        j->lease = l.kv + l.st;
+        rq_seq_release(s, r->E);
+        if (sl->dseq) {
+            if (rq_seq_len(sl->dseq) > r->E) // (a job without the draft: spec_start left its sequence as it was)
+                rq_seq_truncate(sl->dseq, rq_seq_keep(sl->dseq, rq_seq_common_prefix(sl->dseq, j->prompt.v, n)));
+            rq_seq_release(sl->dseq, r->E);
+        }
+    }
     if (e->o.verbose) {
         char cp[48] = "";
         if (src >= 0) snprintf(cp, sizeof(cp), " (copied from slot %d)", src);
         fprintf(stderr, "[engine] job -> slot %d: %d of %d prompt tokens cached%s, %d running", si, L, n, cp, e->nrun);
+        if (e->o.admit == ADMIT_CHUNK) fprintf(stderr, "; job %d, its lease to %d of %d positions", r->id, r->E, r->P);
         if (e->hybrid) {
             int held[RQ_CHECKPOINTS_MAX], nh = rq_seq_checkpoints(s, held, RQ_CHECKPOINTS_MAX);
             fprintf(stderr, "; checkpoints");
@@ -1296,9 +2173,9 @@ out:
 }
 
 static int admit(Engine *e, Job *j) {
-    // (under e->mu) start the job on a slot: 1, or -1 if no slot is idle, 0 if it should wait for a
-    // prefix that a job being prefilled will share with it, 2 if the disk tier has I/O to do first (e->plan: dk_run,
-    // then the job is admitted again)
+    // (under e->mu) start the job on a slot: 1, or -1 if no slot is idle (--admit bound: or no room for it: go), 0 if it
+    // should wait for a prefix that a job being prefilled will share with it, 2 if the disk tier has I/O to do first
+    // (e->plan: dk_run, then the job is admitted again)
     const int *P = j->prompt.v;
     int n = j->prompt.n, ib = -1, li = -1, lru = -1, bb = -1, lb = 0;
     for (int i = 0; i < e->nslot; i++) {
@@ -1314,10 +2191,12 @@ static int admit(Engine *e, Job *j) {
     }
     if (lru < 0) return -1;
     if (j->no_cache) // (the least recently used slot: keeps the useful caches)
-        return dk_go(e, j, lru, -1, 0);
+        return go(e, j, lru, -1, 0);
     if (e->ndk && !j->dk_tried) { // a saved sequence shares a longer prefix (by a real margin: it is read whole up to there)
         int k, Ld = dk_best(e, P, n, &k), have = li > lb ? li : lb, gain = Ld - have;
         if (k >= 0 && real_reuse(Ld, n) && gain >= (e->o.copy_min > 0 ? e->o.copy_min : 32) && 8 * gain >= Ld) {
+            int ma = mem_admit(e, j, lru, -1, 0); // (the load fills lru: its room first)
+            if (ma != 1) return ma;
             j->dk_tried = 1;
             e->plan.spill = dk_wants(e, &e->slot[lru], 0) ? lru : -1;
             e->plan.slot = lru;
@@ -1330,13 +2209,13 @@ static int admit(Engine *e, Job *j) {
         int have = li > lb ? li : lb, pend = 0;
         for (int k = 0; k < e->nrun; k++) {
             Run *r = e->run[k];
-            if (r->done || r->phase != R_PREFILL) continue;
+            if (r->done || r->phase != R_PREFILL || r->si < 0) continue;
             int sh = lcp(r->j->prompt.v, r->j->prompt.n, P, n);
             if (sh > rq_seq_len(e->slot[r->si].seq) && sh > pend) pend = sh;
         }
         // (Qwen3.5: no waiting for a prefix being prefilled: its state is gone once the prefill moves past it)
         if (!e->hybrid && pend >= have + e->o.copy_min && real_reuse(pend, n)) return 0;
-        if (bb >= 0 && lb >= li + e->o.copy_min && real_reuse(lb, n)) return dk_go(e, j, lru, bb, lb);
+        if (bb >= 0 && lb >= li + e->o.copy_min && real_reuse(lb, n)) return go(e, j, lru, bb, lb);
     }
     if (real_reuse(li, n)) {
         // slot affinity: a slot holding a longer conversation than it would keep (it shares only a prefix, e.g. the system
@@ -1345,10 +2224,12 @@ static int admit(Engine *e, Job *j) {
         int lost = rq_seq_len(e->slot[ib].seq) - li, other = -1;
         for (int i = 0; i < e->nslot; i++)
             if (i != ib && !e->slot[i].run && (other < 0 || e->slot[i].used < e->slot[other].used)) other = i;
-        if (e->o.copy_min > 0 && other >= 0 && lost >= e->o.copy_min && lost > li) return dk_go(e, j, other, ib, li);
-        return dk_go(e, j, ib, -1, li);
+        // (--admit bound: unless the copy cannot fit beside its source; then the slot itself)
+        if (e->o.copy_min > 0 && other >= 0 && lost >= e->o.copy_min && lost > li && mem_admit(e, j, other, ib, 1) > 0)
+            return go(e, j, other, ib, li);
+        return go(e, j, ib, -1, li);
     }
-    return dk_go(e, j, lru, -1, rq_seq_keep(e->slot[lru].seq, rq_seq_common_prefix(e->slot[lru].seq, P, n)));
+    return go(e, j, lru, -1, rq_seq_keep(e->slot[lru].seq, rq_seq_common_prefix(e->slot[lru].seq, P, n)));
 }
 
 // ------------------------------------------------------------------------------------------- a step
@@ -1486,6 +2367,7 @@ static void spec_cands(Engine *e, Cand *c, int nc, int dbud) {
         int P = rq_seq_len(s), t = r->feed.v[r->fed], lim = SPEC_GUESS_MAX;
         if (j->max_new - j->n_gen - 1 < lim) lim = j->max_new - j->n_gen - 1;
         if (rq_seq_capacity(s) - 1 - P < lim) lim = rq_seq_capacity(s) - 1 - P;
+        if (e->o.admit == ADMIT_CHUNK && r->E - 1 - P < lim) lim = r->E - 1 - P; // (within the lease: run_reach kept kk free)
         c[i].L = P;
         c[i].lim = lim;
         c[i].nl = c[i].mk = c[i].lag = c[i].n = 0;
@@ -1610,7 +2492,7 @@ static void spec_draft(Engine *e, int dbud, int ndec) {
     int room = dbud - drows, standalone = nds == 0, idle = e->since_model > 32 && ndec > 1;
     for (int i = 0; i < e->nrun && room > 0; i++) {
         Run *r = e->run[i];
-        if (r->done || r->src == RQ_SPEC_MODEL || r->spec == SPEC_OFF || r->sk <= 0 || !e->dm) continue;
+        if (r->done || r->src == RQ_SPEC_MODEL || r->spec == SPEC_OFF || r->sk <= 0 || !e->dm || run_held(e, r)) continue;
         Slot *sl = &e->slot[r->si];
         RqSeq *d = sl->dseq, *s = sl->seq;
         const int *ref;
@@ -1697,7 +2579,7 @@ static void step(Engine *e, int stopping) {
     Cand *cand = e->cand;
     for (int i = 0; i < e->nrun; i++) { // decode rows first: every decoding job's next token(s)
         Run *r = e->run[i];
-        if (r->done) continue;
+        if (r->done || run_held(e, r)) continue; // (--admit chunk: parked, or a renewal first)
         if (r->phase == R_PREFILL) {
             npre++;
             pre_left += r->feed.n - r->fed;
@@ -1737,7 +2619,7 @@ static void step(Engine *e, int stopping) {
     for (int round = 0; round < 2 && budget > 0; round++)
         for (int i = 0; i < e->nrun && budget > 0; i++) {
             Run *r = e->run[i];
-            if (r->done || r->phase != R_PREFILL) continue;
+            if (r->done || r->phase != R_PREFILL || run_held(e, r)) continue;
             int left = r->feed.n - r->fed - r->seg, k = left < budget ? left : budget;
             if (round == 0 && k > share) k = share;
             r->seg += k;
@@ -1908,6 +2790,7 @@ static void reap(Engine *e) {
         rq_tokens_free(&r->feed);
         rq_tokens_free(&r->dbuf);
         rq_lookup_free(r->lk);
+        free(r->alist);
         jb_free(&r->o.text);
         tscan_free(&r->o.ts);
         job_release(r->j);
@@ -1938,10 +2821,22 @@ static void *engine_main(void *arg) {
             job_release(j);
         }
         e->qn = k;
-        int io = 0;
-        for (int i = 0; i < e->qn && e->nrun < e->parallel;) { // FIFO (a job waiting for a shared prefix keeps its place)
+        int io = mem_renewals(e); // (--admit chunk: the running jobs' leases first; a save planned: no admission in this step)
+        e->mwj = NULL;
+        if (io && e->qn > 0 && (e->npark > 0 || e->nswap > 0)) { // (the head waits for memory: a job parked or swapped out)
+            if (e->q[0]->t_mw == 0) e->q[0]->t_mw = rq_now();
+            e->mwj = e->q[0];
+        }
+        // FIFO (a job waiting for a shared prefix keeps its place); --admit-yield: the seats are nrun - nyld (a yielded job holds
+        // none), and the queue's jobs that came after a yielded job's yield wait behind it (mem_resume gives it the seat)
+        int refused = 0;
+        for (int i = 0; i < e->qn && e->nrun - e->nyld < e->parallel && e->nrun < e->rcap && !io && !e->yblock;) {
+            if (e->yt > 0 && e->q[i]->t_submit > e->yt) break;
             int a = admit(e, e->q[i]);
-            if (a < 0) break;
+            if (a < 0) {
+                refused = 1;
+                break;
+            }
             if (a == 2) { // (the disk tier's I/O first, then this job again: it keeps its place)
                 io = 1;
                 break;
@@ -1953,14 +2848,25 @@ static void *engine_main(void *arg) {
             memmove(&e->q[i], &e->q[i + 1], (size_t)(e->qn - i - 1) * sizeof(Job *));
             e->qn--;
         }
+        if (refused && !io && e->nyld > 0 && e->npark == 0 && e->nswap == 0) { // (--admit-yield: no room or no idle slot for the
+            double acc = 0;                                                        // job whose turn it is: a yielded job's swapped out)
+            io = mem_swap_out(e, NULL, &acc, 1);
+        }
+        for (int i = 0; i < e->qn; i++) // (mem_wait_ms: a wait for memory ends when the job is refused for something else)
+            if (e->q[i]->t_mw > 0 && e->q[i] != e->mwj) {
+                e->q[i]->mem_wait += now - e->q[i]->t_mw;
+                e->q[i]->t_mw = 0;
+            }
         int stopping = e->stop && now > e->grace_until;
         e->running = e->nrun;
+        mem_publish(e);
         pthread_mutex_unlock(&e->mu);
-        if (io) dk_run(e);
+        if (io) sw_run(e);
         if (e->nrun > 0) step(e, stopping);
         reap(e);
         pthread_mutex_lock(&e->mu);
         e->running = e->nrun;
+        mem_publish(e);
     }
     pthread_mutex_unlock(&e->mu);
     for (int i = 0; e->dk_dir && i < e->nslot; i++) // the disk tier: what the disk has not seen yet
@@ -1989,6 +2895,8 @@ void engine_free(Engine *e) {
         free(e->slot[i].lcopy);
     }
     free(e->slot);
+    free(e->rv);
+    free(e->swo);
     if (e->c) rq_ctx_free(e->c);
     con_vocab_free(e->vocab);
     free(e->run);
@@ -2034,6 +2942,16 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
     if (e->o.batch > RQ_BATCH_MAX) e->o.batch = RQ_BATCH_MAX;
     if (e->o.chunk < 1) e->o.chunk = 64;
     if (e->o.chunk > e->o.batch) e->o.chunk = e->o.batch;
+    if (o->admit == ADMIT_CHUNK && !(o->kv_disk && *o->kv_disk)) { // (the swap: the oldest job's guarantee)
+        snprintf(err, errlen, "--admit chunk needs --kv-disk DIR: a request is swapped out to DIR when the oldest one's lease needs its memory");
+        engine_free(e);
+        return NULL;
+    }
+    if (o->admit_yield > 0 && o->admit != ADMIT_CHUNK) {
+        snprintf(err, errlen, "--admit-yield needs --admit chunk (a request yields its seat at a lease's end)");
+        engine_free(e);
+        return NULL;
+    }
     RqModelInfo info;
     rq_model_info(m, &info);
     e->V = info.vocab_size;
@@ -2093,8 +3011,28 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
     }
     e->parallel = o->parallel > 0 ? o->parallel : 16;
     e->nslot = o->slots > 0 ? o->slots : e->parallel + 4;
-    if (o->spec_used) e->spec_res = (double)e->parallel * (o->spec_kmax + 1) * ((double)e->sm.state + (double)e->dsm.state);
-    if (e->nslot * per_slot > mem - e->spec_res) e->nslot = (int)((mem - e->spec_res) / per_slot);
+    if (o->admit != ADMIT_WORST) { // (the slots are not lowered: the leases are within the budget, and one -c job fits)
+        int ck = e->ckn + (o->spec_used ? o->spec_kmax + 1 : 0);
+        if (ck > RQ_CHECKPOINTS_MAX) ck = RQ_CHECKPOINTS_MAX;
+        e->job_max = per_slot + (double)(ck - e->ckn) * ((double)e->sm.state + (double)e->dsm.state);
+        // a request's guesses at most (Qwen3.5 / 3.8: their state copies): the most one -c job can hold within the budget
+        // (>= spec_kmax: the check below), so a request with "speculative" and no -G / --lookup still speculates
+        double st = (double)e->sm.state + (double)e->dsm.state;
+        for (e->kcap = SPEC_GUESS_MAX; st > 0 && e->kcap > 0; e->kcap--) {
+            int c = e->ckn + e->kcap + 1;
+            if (c > RQ_CHECKPOINTS_MAX) c = RQ_CHECKPOINTS_MAX;
+            if (per_slot + (double)(c - e->ckn) * st <= mem) break;
+        }
+        if (e->job_max > mem) {
+            snprintf(err, errlen, "--admit %s: a job of -c %d positions%s needs %.2f GiB (KV cache and recurrent state), more than the "
+                     "pool's %.2f GiB (%s)", o->admit == ADMIT_CHUNK ? "chunk" : "bound", o->ctx, o->spec_used ? ", speculating" : "", e->job_max / 1073741824.0, mem / 1073741824.0, e->mem_src);
+            engine_free(e);
+            return NULL;
+        }
+    } else {
+        if (o->spec_used) e->spec_res = (double)e->parallel * (o->spec_kmax + 1) * ((double)e->sm.state + (double)e->dsm.state);
+        if (e->nslot * per_slot > mem - e->spec_res) e->nslot = (int)((mem - e->spec_res) / per_slot);
+    }
     if (e->nslot < 1) {
         snprintf(err, errlen, "-c %d needs %.2f GiB per sequence (KV cache and recurrent state), more than the pool's %.2f GiB (%s)", o->ctx,
                  per_slot / 1073741824.0, mem / 1073741824.0, e->mem_src);
@@ -2124,8 +3062,13 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
         }
     }
     e->slot = calloc(e->nslot, sizeof(Slot));
+    e->rv = calloc(e->nslot, sizeof(int));
+    // (--admit-yield: the runs are the seats + the yielded jobs, and queued + started jobs are at most queue + parallel:
+    // engine_submit)
+    e->rcap = o->admit_yield > 0 && o->admit == ADMIT_CHUNK ? e->parallel + e->o.queue : e->parallel;
+    e->swo = calloc(e->rcap, sizeof(Run *));
     e->q = calloc(e->o.queue + e->parallel, sizeof(Job *));
-    e->run = calloc(e->parallel, sizeof(Run *));
+    e->run = calloc(e->rcap, sizeof(Run *));
     e->seg = calloc(e->parallel, sizeof(RqSegment));
     e->segrun = calloc(e->parallel, sizeof(Run *));
     e->logits = malloc((size_t)(e->parallel + e->gmax) * e->V * sizeof(float));
@@ -2135,7 +3078,7 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
     e->srun = calloc(e->parallel, sizeof(Run *));
     e->vocab = con_vocab_new(m);
     if (!e->c || !e->slot || !e->q || !e->run || !e->seg || !e->segrun || !e->logits || !e->sseq || !e->scfg || !e->stok || !e->srun || !e->vocab ||
-        !e->slg || !e->cand) {
+        !e->slg || !e->cand || !e->rv || !e->swo) {
         snprintf(err, errlen, "out of memory (compute context)");
         engine_free(e);
         return NULL;
@@ -2169,6 +3112,13 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
             fprintf(stderr, "runq serve: the speculation cost calibration failed (%s): estimates instead\n", rq_strerror(rc));
         if (e->hybrid) rq_seq_set_checkpoints(e->slot[0].seq, e->ckn);
         if (e->dhybrid) rq_seq_set_checkpoints(e->slot[0].dseq, e->ckn);
+        // (the calibration's positions given back, in both modes: up to --spec-calibrate of them stayed resident)
+        rq_seq_reset(e->slot[0].seq);
+        rq_seq_release(e->slot[0].seq, 0);
+        if (e->slot[0].dseq) {
+            rq_seq_reset(e->slot[0].dseq);
+            rq_seq_release(e->slot[0].dseq, 0);
+        }
         e->t_cal = rq_now() - t0;
     }
     e->tcal = e->tcost;
@@ -2177,6 +3127,14 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
         engine_free(e);
         return NULL;
     }
+    const char *mf = getenv("RUNQ_TEST_MEMAVAILABLE"); // (step 3's test hook: MemAvailable from this file)
+    e->ma_file = mf && *mf ? mf : NULL;
+    const char *sd = getenv("RUNQ_TEST_SWAP_DELAY"); // (tests: s of sleep in each swap-out, so that one lasts)
+    e->sw_delay = sd && *sd ? atof(sd) : 0;
+    const char *sf = getenv("RUNQ_TEST_SWAP_FAIL"); // (tests: a file naming the swap I/O to fail, draft-save / draft-load)
+    e->sw_fail = sf && *sf ? sf : NULL;
+    if (e->o.admit_margin < 0) e->o.admit_margin = 0;
+    mem_publish(e);
     if (pthread_create(&e->th, NULL, engine_main, e)) {
         snprintf(err, errlen, "cannot start the engine thread");
         engine_free(e);
@@ -2231,12 +3189,49 @@ void engine_describe_spec(Engine *e, char *buf, size_t n) {
     }
 }
 
+int engine_describe_admit(Engine *e, char *buf, size_t n) {
+    // --admit bound / chunk: the budget, a lease's terms (per position, a state copy: target + draft), the -c job that must fit
+    if (e->o.admit == ADMIT_WORST) return 0;
+    const double G = 1073741824.0;
+    double kv = ((double)e->sm.kv + (double)e->dsm.kv) / e->o.ctx, st = (double)e->sm.state + (double)e->dsm.state;
+    int l = e->o.admit == ADMIT_CHUNK
+                ? snprintf(buf, n, "admission chunk: leases (prompt + %d tokens, renewed by %d as the reply grows, at most prompt + max tokens: KV "
+                           "%.1f KB per position", e->o.admit_chunk, e->o.admit_chunk, kv / 1000.0)
+                : snprintf(buf, n, "admission bound: leases (prompt + max tokens: KV %.1f KB per position", kv / 1000.0);
+    if (st > 0) l += snprintf(buf + l, n - l, ", state %.1f MiB x (1 + %d checkpoints + the verify rows' guesses + 1)", st / 1048576.0, e->ckn);
+    l += snprintf(buf + l, n - l, ") within the budget %.2f GiB (%s); idle slots reclaimed (LRU) when needed, else the request waits; the "
+                  "largest job (-c %d%s) %.2f GiB", e->o.kv_mem, e->mem_src, e->o.ctx, e->o.spec_used ? ", speculating" : "", e->job_max / G);
+    double A = mem_read(e->ma_file); // (not mem_avail: the engine thread's)
+    if (A >= 0)
+        l += snprintf(buf + l, n - l, "; live budget: MemAvailable (%.2f GiB%s) - margin %.2f GiB - the running jobs' growth", A / G,
+                      e->ma_file ? ", RUNQ_TEST_MEMAVAILABLE" : "", e->o.admit_margin);
+    else l += snprintf(buf + l, n - l, "; no live budget (no MemAvailable)");
+    if (st > 0) l += snprintf(buf + l, n - l, "; a request's guesses at most %d", e->kcap);
+    if (e->o.admit == ADMIT_CHUNK) {
+        double fr = e->sw_dir ? dk_free(e) : -1;
+        l += snprintf(buf + l, n - l, "; a chunk per running request kept free at admission; a renewal denied: the request is parked, and "
+                      "swapped out to %s (%.2f GiB free) if the oldest one's renewal needs its memory", e->sw_dir ? e->sw_dir : "?",
+                      fr >= 0 ? fr / G : 0.0);
+        if (e->o.admit_yield > 0 && l < (int)n)
+            snprintf(buf + l, n - l, "; a request yields its seat after %d chunks (%d tokens) when others wait for one", e->o.admit_yield,
+                     e->o.admit_yield * e->o.admit_chunk);
+    }
+    return 1;
+}
+
 int engine_submit(Engine *e, Job *j) {
     pthread_mutex_lock(&e->mu);
     int r = 0;
     if (e->stop) r = -2;
     else if (e->qn >= e->o.queue + (e->parallel - e->running)) r = -1; // (jobs that start at the next step do not wait)
     else {
+        if (e->o.admit != ADMIT_WORST && e->sm.state + e->dsm.state > 0) {
+            // the request's guesses ("speculative": k, lookup) at most the most whose state copies one -c job can hold
+            // (engine_start): one -c job always fits. Speculation changes only the speed, never the output
+            int c = e->kcap;
+            if (j->spec_k > c) j->spec_k = c;
+            if (j->spec_lookup > c) j->spec_lookup = c;
+        }
         j->refs++; // (no other thread knows the job yet)
         j->t_submit = rq_now();
         j->state = JOB_QUEUED;
@@ -2245,6 +3240,14 @@ int engine_submit(Engine *e, Job *j) {
     }
     pthread_mutex_unlock(&e->mu);
     return r;
+}
+
+int engine_mem(Engine *e, EngineMem *out) {
+    if (e->o.admit == ADMIT_WORST) return 0;
+    pthread_mutex_lock(&e->mu);
+    *out = e->pub;
+    pthread_mutex_unlock(&e->mu);
+    return 1;
 }
 
 int engine_queued(Engine *e, int *running) {

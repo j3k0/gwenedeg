@@ -1703,8 +1703,9 @@ that in the server only if S9c.G asks for it). Every request is followed, so the
 across prefix reuse, copies, the swap (its kept state in the version 2 seqfile) and cancels; the tests compare every
 finished request's view with a fresh lockstep run (`RUNQ_TEST_MTP_DUMP`, `api_test --mtp-seqcheck`). S9c.4: a view
 loaded from `--kv-disk` goes to the prompt's common prefix with the saved tokens (ahead of a target cut back to a
-checkpoint; the whole file with its kept state), so a loaded conversation has no approximate row either (915894a's cap
-at the target's loaded length cost one per load); the 0.8B draft's files of a directory switched to `--draft mtp` are
+checkpoint; the whole file with its kept state), so a loaded conversation has no approximate row either, but for a
+restart exactly at a divergence (the target's restart point the common prefix itself, below the file's end: no kept state
+there, at most 1, as in a slot; 915894a's cap at the target's loaded length cost one per load); the 0.8B draft's files of a directory switched to `--draft mtp` are
 removed at the start (logged, the targets kept), their conversations' views then follow the loaded prefix as a gap
 (zeros, counted). Admission needs no change: the view's terms (one attention layer, no state) enter `kv(n)` and `st`
 (docs/memory-admission.md: 37.0 KB per position and 149.6 MiB on the 27B at q8, against 41.3 / 168.9 with the 0.8B). Not measured yet: the

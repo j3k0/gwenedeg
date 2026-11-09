@@ -1515,8 +1515,8 @@ results (box load 12-24 from the test suite and other jobs).
 
 A measurement window the user opened (saluki and `runq-day.timer` stopped, no runq server up, MemAvailable 22-25 GiB):
 every job through `scripts/s9_gate.sh --until 21:30` (the nightly benchmark at 22:00Z), `build/spec_sweep FILE -c 4096
--n 256`, 8 threads, S7's four prompts, under the bench lock; box load 5-10 from other jobs (plain 7.2-8.6 tok/s on
-IQ3_S-mtp, not an idle box's). Cells: tok/s (guesses accepted, tokens per pass); mean of the prompts; x plain = the mean
+-n 256`, 8 threads, S7's four prompts, under the bench lock; box load 5-10 from other jobs (plain 7.2-8.1 tok/s on
+IQ3_S-mtp, 8.4-8.6 on the Q4_K_M, not an idle box's). Cells: tok/s (guesses accepted, tokens per pass); mean of the prompts; x plain = the mean
 of the prompts' ratios to plain in the same process. **Every output == plain's: 172 of 172 runs** (164 speculative,
 128 of them with the MTP; tokens, stop, RNG state), `mtp_approx` 0 everywhere.
 
@@ -1545,10 +1545,10 @@ The MTP's 3.01 tokens per pass are a per-guess p of **0.81** in [S9w's model](#c
 (1 + p + p^2 + p^3), above its go line for the full vocabulary (0.79); the 0.8B's 2.39 on this target are p 0.66 (its
 per-prompt tokens per pass as on S7's Q4_K_M: 2.30 / 1.98 / 3.12 / 2.71). **Predicted** with S9w's costs (step 91 ms,
 verify 1.32 steps, a guess 9.0 ms full / the 0.8B's 5.1): MTP 20.4 tok/s, the 0.8B 17.0, **+20%**; **measured: +25%**
-(12.48 vs 10.02; per prompt +27 / +25 / +27 / +19%). The absolute numbers are lower because the box's target step was
+(12.48 vs 10.02; per prompt +28 / +25 / +27 / +19%). The absolute numbers are lower because the box's target step was
 128 ms (not 91) and the 4-row verify 221 ms (1.73 steps; Unsloth's Q4_K_M below: 1.44, S7's ~1.4): with the measured
 step, verify and guess (7.65 ms full, 6.5 the 0.8B) the model gives 12.3 / 9.9 tok/s against 12.5 / 10.0 measured.
-A guess in the loop: 7.6-8.5 ms with the full vocabulary, 5.3-6.2 with 100,000 (S9w: ~9.0 / ~5.7).
+A guess in the loop: 7.6-8.7 ms with the full vocabulary, 5.3-6.2 with 100,000 (S9w: ~9.0 / ~5.7).
 
 **The sweep** (IQ3_S-mtp, greedy, the full vocabulary; plain the best of 2):
 
@@ -1593,7 +1593,8 @@ runs at k 6 on code and math (5.7 tokens per pass) beat the MTP there; the MTP w
 (Per prompt: math 5.21 -> 5.06 tokens per pass thinking on, the others within 0.03.) 151,643 accepts exactly what
 100,000 accepts; the gap to the full vocabulary is the ids >= 151,643 and tau's top-1 taken over the subset (it is
 renormalised: a subset's top-1 is higher). **100,000 is the default** (`--mtp-vocab`, when the vocabulary is larger):
-its tokens per pass are within 1% of all thinking on (1.6% off) and its tok/s the best in both modes.
+its tokens per pass are within 1% of all thinking on (1.6% off) and its tok/s the best in both modes (by 0.1-3%,
+within the noise between processes; the reason is the guess's cost, 6.2 / 6.0 ms vs 8.7 / 8.4 with all in this job).
 
 **Seeded** (the GGUF's T 1 / top-p 0.95 / top-k 20, `-s 42`):
 
@@ -1625,13 +1626,21 @@ on its Q6_K classifier: 10.3 ms full, 5.9 with 100,000 (S9w: ~9-10 / ~6); its 4-
 **The go / no-go** (PLAN-S9-mtp.md 8: >= +10% over the 0.8B on the mean of the thinking-on prompts, not worse on any):
 **go.** IQ3_S-mtp, greedy, the best fixed settings of the sweep: MTP `-G 6 --tau 0.5` 12.85 tok/s vs the 0.8B's `-G 6
 --tau 0.4` 11.12, **+16%** (per prompt +12 / +9 / +27 / +12%); at `-G 3` each, +25%. Seeded +17% (12.05 vs 10.34, every
-prompt ahead). Unsloth's Q4_K_M: +21% (17.08 vs 14.07; code -2% at those settings, +27% at `-G 3` each). Thinking off
+prompt ahead). Unsloth's Q4_K_M: +21% (17.08 vs 14.07; every prompt
+ahead, +24 / +23 / +21 / +19%; at `-G 3` each +16%, +23% with the 100k subset). Thinking off
 the two are even (greedy -4%, seeded -2%: the 0.8B's long runs on code), so the 0.8B stays an option there. Not
 measured: long contexts (S9w's costs favour the MTP: a guess at 98k ~9-12 ms vs the 0.8B's 19), `--spec auto` with
-the MTP on the 27B. Defaults set from these: `--mtp-vocab` 100,000 (CLI; `RqMtpOpts.vocab` 0 stays all), the auto
+the MTP on the 27B (so the prior below is unverified there), Qwopus' block, llama.cpp (section 8 item 6).
+**Caveats:** 4 prompts x <= 256 tokens, one run per cell (plain varies 7.2-8.1 tok/s between this window's processes:
+only the comparisons within one process count, and a few % between jobs is noise); a loaded box (step 128 ms, not
+~91; the verify 1.73 steps), which costs both drafts alike. A nightly dry run (`lcb-dry-sched`, a transient unit
+with the Unsloth Q4_K_M 27B server, 21 GiB peak) ran 07:19:56-07:20:38Z, between the subset job (ended 07:19:51) and
+the seeded one (started 07:21:32, loadavg 6 / 10 / 10), and again from 07:48:00Z, 6 s after the last job: no timed
+run overlapped it per the logs, but the gate (`/health` and the known timers, checked at the start) could not have
+foreseen it; the watchdog was the only guard. Defaults set from these: `--mtp-vocab` 100,000 (CLI; `RqMtpOpts.vocab` 0 stays all), the auto
 prior for an MTP view's guesses 0.8 (`RqSpecOpts.prior`; the measured p at k 3: 0.81 greedy / 0.76 seeded thinking
 on, 0.88 / 0.85 off; it was 0.7); `-G` keeps 3 (the best MTP fixed setting is `-G 6 --tau 0.5`, +4% over `-G 3`
-thinking on, as the 0.8B's `-G 6 --tau 0.4` is over its `-G 3`).
+thinking on; the 0.8B's `-G 6 --tau 0.4` is +12% over its `-G 3`, and `-G` stays 3 for it too).
 
 ## Not now
 

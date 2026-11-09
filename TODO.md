@@ -65,10 +65,13 @@ Steps:
     margin and the timers that start one, a capped scope without swap, the watchdog, the bench lock) and
     `build/spec_sweep` (`make spec-sweep`: settings x S7's prompts in one process, every output checked against plain);
     the 0.8B-mtp through the gate: 80 / 80 runs == plain (docs/qwen38-speculative.md, "The 27B gate"). **S9d.2 done
-    (2026-11-09): go** (below). **Open: S9c** (the server), with the user's OK and an MTP file for production.
+    (2026-11-09): go** (below). **Open:** S9c (the server; needs the user's OK, and for production an MTP file: the
+    Saluki MTP variant below, the live Saluki IQ2-mix has no block); on the 27B `--spec auto` with the MTP (the prior
+    0.8 unverified there), long contexts (S9w's costs only), Qwopus' block, llama.cpp's comparison (PLAN 8 item 6).
   - **S9d.2, the 27B's acceptance (2026-11-09, a window the user opened: saluki stopped, no runq server up):** every job
     through `scripts/s9_gate.sh --until 21:30`, `build/spec_sweep FILE -c 4096 -n 256`, 8 threads, S7's 4 prompts, box
-    load 5-10 from other jobs (plain 7.2-8.6 tok/s). **172 / 172 runs == plain** (164 speculative, 128 with the MTP),
+    load 5-10 from other jobs (plain 7.2-8.1 tok/s on IQ3_S-mtp, 8.4-8.6 on the Q4_K_M; a nightly dry run's 27B server
+    up 07:19:56-07:20:38Z and from 07:48:00Z, between / after the jobs, overlapping none). **172 / 172 runs == plain** (164 speculative, 128 with the MTP),
     `mtp_approx` 0. Tok/s, mean of the 4 prompts (docs/qwen38-speculative.md, "The 27B's acceptance and the go"):
     | target, mode | plain | 0.8B `-G 3` | 0.8B `-G 6 --tau 0.4` | MTP `-G 3` | MTP `-G 6 --tau 0.5` |
     |---|---|---|---|---|---|
@@ -78,11 +81,12 @@ Steps:
     | Unsloth Q4_K_M, greedy, thinking on | 8.46 | 13.13 | 14.07 | 15.23 (16.10 with 100k) | **17.08** (100k; +21%) |
     - Acceptance first: MTP k 3 3.01 tokens per pass (67% of the guesses, p 0.81 in S9w's model; go line 0.79 full) vs
       the 0.8B's 2.39 (p 0.66, its per-prompt numbers as at S7); predicted with S9w's costs +20%, measured +25% (12.48
-      vs 10.02). The box's step was 128 ms, the 4-row verify 1.73 steps (Unsloth's 1.44), a guess 7.6-8.5 ms full /
+      vs 10.02). The box's step was 128 ms, the 4-row verify 1.73 steps (Unsloth's 1.44), a guess 7.6-8.7 ms full /
       5.3-6.2 with 100,000.
     - **Go** (PLAN-S9-mtp.md 8): thinking on, the best fixed settings, +16% greedy (per prompt +12 / +9 / +27 / +12%), +17%
-      seeded, +21% on Unsloth's Q4_K_M (code -2% there; +27% at `-G 3` each). Thinking off the 0.8B is even or ahead
-      (its long runs on code); long contexts and `--spec auto` with the MTP not measured on the 27B.
+      seeded, +21% on Unsloth's Q4_K_M (every prompt ahead, +19-24%; at `-G 3` each +16%, +23% with 100k). Thinking off the
+      0.8B is even or ahead (its long runs on code); long contexts and `--spec auto` with the MTP not measured on the 27B.
+      Small sample: 4 prompts x <= 256 tokens, one run per cell, a loaded box (step 128 ms, not ~91).
     - `--mtp-vocab`: 100,000 accepts as 151,643 (tokens per pass -0.8% thinking on / -1.6% off vs all; 65,536 -1.9 /
       -4.1%) and gives the most tok/s: **the CLI's default** when the vocabulary is larger (`RqMtpOpts.vocab` 0 stays all).
       `RqSpecOpts.prior` for an MTP view: **0.8** (p at k 3: 0.81 / 0.76 greedy / seeded on, 0.88 / 0.85 off; was 0.7).
@@ -124,7 +128,7 @@ Steps:
     the full vocabulary; even at p ~0.68 (subset) / ~0.73 (full), +10% at ~0.75 / ~0.79. The 100k subset covers 99.9% of pi sessions' reply tokens (99.82% of the 27B's own answers). Prompt: the
     MTP follows every chunk, +1.9% at short context, +5.0% at 98k, +4.3% for a cold 96k prefill. Memory: no 0.8B
     weights nor its 708.7 MiB draft sequence per slot, against one attention layer's KV (4 KiB per position) per slot.
-    Larger k may pay more with MTP's higher acceptance: sweep k (and tau) as at S8. Tables:
+    k and tau swept at S9d.2 (above: `-G 6 --tau 0.5` the best fixed setting, +4% over `-G 3`). Tables:
     docs/qwen38-speculative.md, "The MTP drafter (S9)".
   - **Test files:** `models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (ISTA-DASLab, 12.1 GB, sha256
     58fd8267...; downloaded). Its `blk.64` (15 tensors: attn q/k/v/output, ffn gate/up/down, `nextn.eh_proj` all Q6_K;
@@ -386,7 +390,8 @@ Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M (Qwen3.8-27B Q4_K_M, the same
   activation rows, as `kqn_unpack_tile`), with the AVX-512 one of the item above; (c) gcc on AArch64 Linux (Graviton) is
   untested (built and checked with Apple clang only).
 - [ ] **The Saluki MTP variant** (`Kujira/Underdog-Saluki-27B-1.0-MTP-GGUF`: Saluki + an MTP block) once S9 runs MTP
-  blocks: a self-drafting 7.9 GB 27B.
+  blocks: a self-drafting 7.9 GB 27B. S9d.2 (2026-11-09) is a go for MTP on the 27B; this file is S9c's prerequisite
+  for production (with the user's OK).
 - [ ] **More GGUF types**: Q4_0 / Q4_1, IQ4_NL, F16 / BF16 weights (Unsloth's Qwen3.5-0.8B UD-IQ3_XXS has F16 matrices).
   Each needs its block format, a repacked layout and generic, AVX-512 and NEON kernels that follow one
   arithmetic definition, as in `src/kquants.h` / `src/iquants.h` (Q5_K and Q3_K, done, are the templates: a new bit

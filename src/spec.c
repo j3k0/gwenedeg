@@ -355,6 +355,10 @@ static int mtp_prefill(RqCtx *c, RqSeq *s, RqCtx *dc, RqSeq *ms, const int *toke
     Mtp x;
     if (logits) *logits = NULL;
     if (ms->m->mtp_of != s->m || !dc || n < 1 || (mode == RQ_LOGITS_ALL && !out)) return RQ_ERR_ARG;
+    // (what rq_prefill refuses before any pass, refused here before any chunk: its error, the target untouched)
+    int bad = mode < RQ_LOGITS_NONE || mode > RQ_LOGITS_ALL || rq_seq_len(s) + n > rq_seq_capacity(s);
+    for (int i = 0; i < n && !bad; i++) bad = tokens[i] < 0 || tokens[i] >= V;
+    if (bad) return rq_prefill(c, s, tokens, n, mode, out, logits);
     if ((e = mtp_init(&x, dc, ms, nb, nb, st)) != RQ_OK) return e;
     e = rq_seq_truncate(ms, mtp_prefix(ms, s, tokens, n));
     for (int i = 0; i < n && e == RQ_OK; i += nb) {

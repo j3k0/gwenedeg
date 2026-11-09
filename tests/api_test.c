@@ -2318,9 +2318,26 @@ static int spec_main(int argc, char **argv) {
         rq_seq_reset(ms);
         mtp_seq_state(ms, &hv, &hp, &hpv);
         ok &= hv == 0 && hp == -1;
+        { // a prompt rq_prefill refuses (past the capacity; a token out of range after the first chunk): the same error,
+          // nothing fed (not the first chunk)
+            int nb = rq_ctx_max_batch(c) > 1 ? rq_ctx_max_batch(c) : 64, np = nb + 16, *pt = malloc((size_t)np * sizeof(int));
+            RqSeq *sc = rq_seq_new(M, nb + 8, RQ_KV_DEFAULT, &e);
+            if (!pt || !sc) die("spec_mtp_hvalid", RQ_ERR_NOMEM);
+            for (int i = 0; i < np; i++) pt[i] = u.v[i % n];
+            rq_seq_reset(ms);
+            int e1 = rq_prefill(c, sc, pt, np, RQ_LOGITS_LAST, NULL, &l1), e2 = rq_prefill_spec(c, sc, dc, ms, pt, np, RQ_LOGITS_LAST, NULL, &l2);
+            ok &= e1 != RQ_OK && e2 == e1 && rq_seq_len(sc) == 0;
+            pt[nb + 2] = V;
+            rq_seq_reset(s);
+            e1 = rq_prefill(c, s, pt, nb + 4, RQ_LOGITS_LAST, NULL, &l1);
+            e2 = rq_prefill_spec(c, s, dc, ms, pt, nb + 4, RQ_LOGITS_LAST, NULL, &l2);
+            ok &= e1 == RQ_ERR_ARG && e2 == e1 && rq_seq_len(s) == 0;
+            rq_seq_free(sc);
+            free(pt);
+        }
         report(ok, "spec_mtp_hvalid", "rq_prefill_spec: the target's logits == rq_prefill's, the view's rows final (hvalid) with "
                "the last hidden state kept; a row fed outside the loop not kept by rq_seq_common_prefix; copy / truncate / "
-               "save + load / reset");
+               "save + load / reset; a prompt rq_prefill refuses: its error, nothing fed");
         // the MTP block of another model (a second load of the target file): refused before any pass
         if (!quick) {
             ok = 1;

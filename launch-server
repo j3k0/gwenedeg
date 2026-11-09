@@ -37,9 +37,10 @@ elif [ "$CONFIG" = "qwopus" ]; then
   NAME=qwopus3.8-27b
   KV_CACHE_TYPE=q8-dot
 elif [ "$CONFIG" = "ista-iq3s" ]; then
-  # ISTA-DASLab Qwen3.8-27B GSQ-RCO IQ3_S (3.5 bpw, 11.8 GB), its BF16 ssm_alpha / ssm_beta rewritten as F32
-  # (runq takes them as F32 only; lcb_timebox/tools/gguf_bf16_to_f32.py, exact)
-  MODEL=models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-f32ssm.gguf
+  # ISTA-DASLab Qwen3.8-27B GSQ-RCO IQ3_S (3.5 bpw, 12.1 GB), the file with its MTP block (blk.64, Q6_K): BF16
+  # ssm_alpha / ssm_beta widened to F32 at load (TODO S9.1; logits identical to the F32-rewritten file's); the block
+  # is not loaded unless --draft mtp (TODO S9c)
+  MODEL=models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
   NAME=qwen3.8-27b-iq3s
   KV_CACHE_TYPE=q8-dot
 else
@@ -51,6 +52,7 @@ else
   echo "- qwopus"
   echo "- ista-iq3s"
   echo "Env: KV=<type> overrides the KV cache type (q8-dot, q4-dot, q4k4-dot, ...); PAR=<n> the parallel requests; ADMIT_MODE=worst|bound|chunk the admission"
+  exit 2
 fi
 
 # KV cache override, e.g. KV=q4-dot ./launch-server saluki

@@ -44,7 +44,9 @@ curl -s localhost:8080/v1/chat/completions -d '{"messages": [{"role": "user", "c
 | `--top-k N` | 0 (off) | default for requests without top_k. `-t` / `-p` / `--top-k` not given: the model's recommended values if its GGUF has them (`general.sampling.temp` / `top_p` / `top_k`, e.g. Qwen3.8-27B 1.0 / 0.95 / 20) |
 | `--threads N` | `OMP_NUM_THREADS`, else nproc - nproc/8 | threads per forward pass |
 | `-D`, `--draft FILE` | none | speculative decoding with a draft model of the same vocabulary (e.g. Qwen3-0.6B Q4_K_M for Qwen3-1.7B, Qwen3.5-0.8B Q4_K_M for Qwen3.5 / 3.8; refused otherwise, or if its context is shorter than `-c`): its guesses are verified in the batched passes, the output is exactly plain decoding's (below, Speculative decoding) |
-| `-G N`, `--tau T` | 3, 0 | with `--draft`: the draft model's guesses per pass at most (0..16); stop guessing at a draft top-1 probability < T (0: off) |
+| `-D mtp`, `--draft mtp` | none | the model file's own MTP block as the draft (Qwen3.8-27B's `blk.64`: the MTP drafter, below, Speculative decoding); a file without a block is refused; a draft file named `mtp`: `--draft ./mtp` |
+| `--mtp-vocab N` | 100000 (if the vocabulary is larger) | with `--draft mtp`: the view guesses among the tokens 0..N-1 and the added ones only (a part of the classifier: faster guesses); 0: all; negative: usage error |
+| `-G N`, `--tau T` | 3, 0 | with `--draft`: the draft model's guesses per pass at most (0..16); stop guessing at a draft top-1 probability < T (0: off). `--draft mtp -G 0`: the block is not loaded, the server has no draft (as the CLI's `-G 0 -D mtp`) |
 | `--lookup N`, `--lookup-min M` | 3 with `--draft` in auto mode, else 0; auto: by length, fixed: 2 | prompt lookup: up to N guesses copied after the latest longest match of the last tokens earlier in the context (no model, no memory; 0: off); the shortest match used (2..16) |
 | `--spec auto\|fixed\|off` | auto with `--draft` / `--lookup`, else off | the default of requests: **auto** chooses the source and the guess count per pass from the cost model, the position and the batch (plain steps when no guess pays off); **fixed** speculates as the CLI's `-G` / `--lookup` (the lookup when it matches, else the model); off: plain decoding. Requests may override (`speculative`) |
 | `--spec-calibrate N` | 8192 | the cost model's calibration at the start (both models, on slot 0's empty sequences: decode steps and 2-16-row verify segments at 16 and min(N, -c) positions, ~1-5 s; 0: estimates from the models' sizes); the startup line shows it |
@@ -312,7 +314,26 @@ speculates as asked (the CLI's semantics), whatever the batch.
 source configured, `true` gets the lookup at 3; with `--admit bound` on Qwen3.5 / 3.8, k and lookup are capped at the
 most whose state copies one `-c` request holds within `--kv-mem`, at least the server's `-G` / `--lookup`). `timings.speculative`: `{"mode", "passes" (decode passes), "model":
 {"passes", "drafted", "accepted"}, "lookup": {...}, "draft_rows" (the draft's rows for this request, catch-up included),
-"refed" (positions fed again after a rollback: 0, every rollback lands on its row's checkpoint)}`.
+"refed" (positions fed again after a rollback: 0, every rollback lands on its row's checkpoint), with `--draft mtp` also
+"mtp_approx" (below)}`.
+
+**The MTP drafter** (`--draft mtp`, TODO S9c; `src/engine.c`, "the MTP drafter"): the draft is the model's own MTP block
+(`rq_mtp_load`, a view of the target: one attention layer whose row q takes the target's final hidden state at q - 1),
+one view sequence per slot. That hidden state exists only during the target's pass that computed it, so the view
+**follows every request** (prompts, forced tokens, replies; constrained and `"speculative": false` ones too): after
+each step's sampling, B, one batched pass of the view over the target's new positions with the pass's hidden rows
+(the target's passes ask for them only on a `--draft mtp` server). A view at rest is as long as its target, every row
+final, the target's last hidden state kept with it (`rq_mtp_keep`: the next row's input; a version 2 seqfile carries it
+through the swap and to disk). Before the target's pass, A guesses for the requests whose plan takes the model: row P
+(the token to feed, the kept state) gives the first guess and the view's own hidden state h', then one row per further
+guess with h' (provisional rows: B's cut to the common prefix drops them, and whatever the verify cut). Costs: B is one
+block pass per step for every request (+2-5% of a prefill's time; ~3 ms a step on the 27B at short context), A's guesses
+~6 ms each on the 27B with the 100k subset (docs/qwen38-speculative.md). The auto policy prices the view's guesses as a
+draft model's (its calibrated costs, prior 0.8: `rq_spec_prior`). A view row whose h is unknown takes zeros, counted in
+`timings.speculative.mtp_approx`: after a failed view pass or a view lost in the swap (its rows then catch up as a gap),
+and at most one row per conversation turn that restarts exactly where it diverged (the cut drops the kept state; a
+hybrid model's restart below the divergence leaves the view ahead, exact). Only the guesses get worse; the output stays
+plain decoding's. `-v`'s summary at the end: `mtp: A n passes r rows t s; B ...; steps n t s; approx n; gaps n`.
 
 **Tests** (`tests/server_test.py --spec DRAFT|none`, in `make test`'s spec group: the Qwen3-0.6B Q8_0 + Q4_K_M pair,
 Qwen3.5-0.8B Q8_0 + Q4_K_M, the 0.8B with the lookup alone; 19 / 22 / 22 checks): every request with speculation off
@@ -320,7 +341,15 @@ and with fixed settings (k 1 / 3 / 8 with tau, the lookup at 1 / 4 / 16, both) a
 tool calls, finish_reason, usage and logprobs, streamed and not; greedy, seeded (top-p, top-k), thinking cut inside a
 verify pass, `max_tokens` 1 / 2 / 5, stop strings, the end of the context inside a pass, a reply that copies its prompt;
 four requests at once; a conversation's next turn reuses the first prompt + its reply (and == a fresh prefill); tool
-calls streamed and with thinking (Qwen3.5); no position fed again.
+calls streamed and with thinking (Qwen3.5); no position fed again. `--spec mtp` (the spec group: the ISTA-shaped
+synthetic file whole, synth-q35-27b-mtp, the trained Qwen3.5-0.8B-mtp block and the generic build quick): the same
+against a server on the same file without `--draft` (run first, stopped first: one server at a time) and the MTP
+drafter's checks: every reply's `mtp_approx` 0 (a restart exactly at a divergence: at most 1), the next turn after a
+`"speculative": false` and after a constrained one, the copy paths (from a running request, from an idle slot under slot
+affinity), a cancelled stream retried, the trained block's guesses accepted, the views at rest after every step
+(`RUNQ_TEST_MTP_CHECK=1`: no `[engine] bug:` line) and every finished request's view == a fresh lockstep run
+(`RUNQ_TEST_MTP_DUMP=DIR` + `api_test --mtp-seqcheck`); `--admit-chunk --draft mtp`: the swap with the view
+(`mtp_approx` 0 after a swap, a lookup-only request's view swapped too); `--draft mtp -G 0` == no draft.
 
 **Measured** (`scripts/bench_serve.py --only gen`, streamed 128-token greedy replies, 2 per client, `--parallel 4`, 8
 threads, the bench lock; the shared box at load 5-15 from other jobs: the runs' spread is ~±15%; tok/s in aggregate):

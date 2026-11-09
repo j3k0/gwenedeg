@@ -180,7 +180,33 @@ def req(port, method, path, body=None, headers=None, timeout=120, raw=None):
 
 
 def chat(port, body, timeout=120):
-    return req(port, "POST", "/v1/chat/completions", body, {"Content-Type": "application/json"}, timeout)
+    r = req(port, "POST", "/v1/chat/completions", body, {"Content-Type": "application/json"}, timeout)
+    mtp_note(r[1])
+    return r
+
+
+# --draft mtp: the timings of every response with timings.speculative.mtp_approx (chat, stream; the spec group's
+# mtp_approx and mtp_lockstep checks); the runq serve processes this script runs at once (now, at most: --one-server)
+MTP_REC = []
+LIVE = {"n": 0, "max": 0}
+
+
+def mtp_note(d):
+    sp = (d.get("timings") or {}).get("speculative") if isinstance(d, dict) else None
+    if isinstance(sp, dict) and "mtp_approx" in sp:
+        MTP_REC.append(d["timings"])
+
+
+def live(k):
+    """a runq serve process started (k 1) or ended (-1)"""
+    LIVE["n"] += k
+    LIVE["max"] = max(LIVE["max"], LIVE["n"])
+
+
+def gate_mem(a):
+    """--one-server: the gate's budget (scripts/s9_gate.sh exports S9_GATE_MEM) passed to every server as --mem"""
+    m = os.environ.get("S9_GATE_MEM")
+    return ["--mem", m] if getattr(a, "one_server", False) and m else []
 
 
 def text_of(d):
@@ -192,7 +218,7 @@ def stream(port, body):
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
     c.request("POST", "/v1/chat/completions", body=json.dumps(dict(body, stream=True)).encode())
     r = c.getresponse()
-    content, reasoning, finish, usage, done, err = "", "", None, None, False, None
+    content, reasoning, finish, usage, done, err, tm = "", "", None, None, False, None, None
     for line in r.read().decode().split("\n"):
         if not line.startswith("data: "):
             continue
@@ -203,6 +229,7 @@ def stream(port, body):
         if "error" in d:
             err = d["error"]
             continue
+        tm = d.get("timings") or tm
         if d.get("usage"):
             usage = d["usage"]
         for ch in d["choices"]:
@@ -210,6 +237,7 @@ def stream(port, body):
             reasoning += ch["delta"].get("reasoning_content") or ""
             finish = ch["finish_reason"] or finish
     c.close()
+    mtp_note({"timings": tm})
     return content, reasoning, finish, usage, done, err
 
 
@@ -775,8 +803,11 @@ def run_admit_chunk(a, t):
     mf = os.path.join(d, "memavailable")
     kvd = os.path.join(d, "kv")
     env["RUNQ_TEST_MEMAVAILABLE"] = mf
+    mtp = a.draft == "mtp"  # (--draft mtp: every job's view swapped with it, its kept state in the file; checked at rest)
+    if mtp:
+        env["RUNQ_TEST_MTP_CHECK"] = "1"
     base = ["--port", "0", "--parallel", "5", "--slots", "7", "--chunk", "16", "--checkpoints", "1", "-v", "--admit", "chunk",
-            "--admit-chunk", "16", "--kv-mem", "4", "--admit-margin", "1", "--kv-disk", kvd] + (["-D", a.draft, "--spec-calibrate", "1024"] if a.draft else [])
+            "--admit-chunk", "16", "--kv-mem", "4", "--admit-margin", "1", "--kv-disk", kvd] + (["-D", a.draft, "--spec-calibrate", "1024"] if a.draft else []) + gate_mem(a)
 
     def setmem(v):
         with open(mf + ".tmp", "w") as f:
@@ -787,6 +818,7 @@ def run_admit_chunk(a, t):
         log = tempfile.NamedTemporaryFile(prefix="runq-serve-admitc-", suffix=".log", delete=False)
         p = subprocess.Popen([a.runq, "serve", a.model] + (base if b is None else b) + args, stderr=log, stdout=subprocess.DEVNULL,
                              env=dict(env, **(xenv or {})))
+        live(1)
         for _ in range(1200):
             m = re.search(r"listening on http://127\.0\.0\.1:(\d+)", open(log.name).read())
             if m:
@@ -803,6 +835,7 @@ def run_admit_chunk(a, t):
         except subprocess.TimeoutExpired:
             p.kill()
             rc = "timeout"
+        live(-1)
         text = open(logname).read()
         os.unlink(logname)
         return rc, text
@@ -810,6 +843,9 @@ def run_admit_chunk(a, t):
     def health(port):
         st, h, _ = req(port, "GET", "/health")
         return h if st == 200 else {}
+
+    def approx(r):  # (--draft mtp: timings.speculative.mtp_approx; None: not reported)
+        return ((r.get("tm") or {}).get("speculative") or {}).get("mtp_approx")
 
     def mem(h, k):
         return (h.get("mem") or {}).get(k, 0)
@@ -887,12 +923,16 @@ def run_admit_chunk(a, t):
     # -margin, -1 GiB, so that block swaps out every younger job at once, then it is renewed beyond the live budget anyway)
     OLD = {"messages": [{"role": "user", "content": "Count from 1 to 400, separated by commas."}], "temperature": 0, "max_tokens": 360,
            "logprobs": True, "top_logprobs": 2}
-    OLD2 = OLD
+    synth = os.path.basename(a.model).startswith("synth-")  # (a synthetic model: fast, no </think>, no counting)
+    OLD2 = dict(OLD, max_tokens=900) if synth else OLD  # (it runs on while the cancels happen)
     q35 = "qwen3.5" in a.model.lower()
     ADD = "What is 2 + 3? Answer briefly."
     LP = {"logprobs": True, "top_logprobs": 2}
     sp_model = {"mode": "fixed", "k": 3, "lookup": 0} if a.draft else {"mode": "fixed", "lookup": 4}
     sp_lookup = {"mode": "fixed", "lookup": 8, "lookup_min": 2}
+    if mtp:  # (no guesses of the view, k 0: its sequence is swapped all the same, admit_chunk/mtp_swap_approx)
+        sp_lookup["k"] = 0
+    swapped = []  # (--draft mtp: (name, its speculation, mtp_approx) of every job swapped out and back without a failure)
     # (name, body, where its reply parks: about that many tokens in, the prompt padded to ~240 - it; speculation)
     cases = [
         ("greedy", dict({"messages": [{"role": "user", "content": "Describe the water cycle in a short paragraph."}], "temperature": 0,
@@ -918,10 +958,12 @@ def run_admit_chunk(a, t):
     # refusals: chunk without --kv-disk; a budget the free space under it does not hold (the swap's worst case)
     setmem(1e12)
     nod = [x for x in base if x not in ("--kv-disk", kvd)]
+    live(1)  # (one at a time: each refused at its start)
     q1 = subprocess.run([a.runq, "serve", a.model] + nod + ["-c", "1024"], capture_output=True, env=env, timeout=120)
     q2 = subprocess.run([a.runq, "serve", a.model] + base + ["-c", "1024", "--kv-mem", "1000000"], capture_output=True, env=env, timeout=120)
-    q3 = subprocess.run([a.runq, "serve", a.model, "--port", "0", "-c", "1024", "--admit", "bound", "--admit-yield", "2"], capture_output=True,
-                        env=env, timeout=120)
+    q3 = subprocess.run([a.runq, "serve", a.model, "--port", "0", "-c", "1024", "--admit", "bound", "--admit-yield", "2"] + gate_mem(a),
+                        capture_output=True, env=env, timeout=120)
+    live(-1)
     rep(q1.returncode != 0 and b"--admit chunk needs --kv-disk" in q1.stderr and q2.returncode != 0 and b"the swap needs" in q2.stderr
         and q3.returncode != 0 and b"--admit-yield needs --admit chunk" in q3.stderr,
         "admit_chunk/refused", f"{q1.stderr.decode()[-160:]} | {q2.stderr.decode()[-200:]} | {q3.stderr.decode()[-120:]}")
@@ -939,7 +981,7 @@ def run_admit_chunk(a, t):
         bodies = [(name, padded(port, b, 240 - at) if at is not None else b, s) for name, b, at, s in cases]
         padded_names = {name for name, _, at, _ in cases if at is not None}
         ref_old = alone(port, OLD)
-        ref_old2 = ref_old
+        ref_old2 = ref_old if OLD2 is OLD else alone(port, OLD2)
         refs = {name: alone(port, b) for name, b, _ in bodies}
         for name, _, _ in bodies:
             if "err" in refs[name]:
@@ -989,11 +1031,13 @@ def run_admit_chunk(a, t):
                 ok = r["out"] == ref["out"] and (tm.get("paused_ms", 0) > 0 or name not in padded_names) and tm.get("renewals", 0) > 0
                 ok &= np_seen >= len(grp)
                 ok &= tm.get("swaps", 0) >= 1 and tm.get("swap_ms", 0) > 0
-                if name == "stop_string":
+                if mtp and tm.get("swaps", 0) >= 1:
+                    swapped.append((name, s, approx(r)))
+                if name == "stop_string" and not synth:
                     ok &= r["out"][3] == "stop"
-                if name.startswith("tool_call"):
+                if name.startswith("tool_call") and not synth:
                     ok &= len(r["out"][2]) > 0
-                if name.startswith("thinking"):  # (greedy: </think> sampled, then content)
+                if name.startswith("thinking") and not synth:  # (greedy: </think> sampled, then content)
                     ok &= bool(r["out"][1]) and (name != "thinking" or (bool(r["out"][0]) and r["out"][3] == "stop"))
                 if name == "json_schema":
                     ok &= validate(json.loads(r["out"][0] or "null"), NESTED, NESTED)
@@ -1154,7 +1198,7 @@ def run_admit_chunk(a, t):
         longp = {"messages": [{"role": "user", "content": "(Filler, ignore it:" + " ok" * 2400 + ".) What is 2 + 3? Answer briefly."}],
                  "temperature": 0, "max_tokens": 12, "cache_prompt": False, **LP}
         ref_o, ref_y, ref_l = alone(port, OLDP), alone(port, young), alone(port, longp)
-        for fail in (["draft-save", "draft-load"] if a.draft else [""]):
+        for fail in (["", "draft-save", "draft-load"] if mtp else ["draft-save", "draft-load"] if a.draft else [""]):
             poll(port, lambda h: h.get("running") == 0)
             setmem(1e12)
             setfail(fail)
@@ -1178,10 +1222,15 @@ def run_admit_chunk(a, t):
                 ok &= "draft's sequence could not be swapped out" in log
             if fail == "draft-load":
                 ok &= "draft's sequence could not be swapped back in" in log
+            if mtp and fail:  # (the view reset at the swap-in: its rows behind take zeros for h, reported)
+                ok &= (approx(ry) or 0) + (approx(rl) or 0) > 0
+            elif mtp:
+                swapped += [(n, None, approx(r)) for n, r in (("young", ry), ("long, mid-prefill", rl)) if r["tm"].get("swaps", 0) >= 1]
             rep(ok, "admit_chunk/swap_prefill" + (f"_{fail.replace('-', '_')}" if fail else ""),
                 f"swapped out at once {mem(hw, 'swapped_out')}; mid-prefill swaps {pre}; swaps: long {rl['tm'].get('swaps')}, young "
                 f"{ry['tm'].get('swaps')}; == alone: oldest {ro['out'] == ref_o['out']}, young {ry['out'] == ref_y['out']}, long "
-                f"{rl['out'] == ref_l['out']}" + ("; " + " | ".join(re.findall(r"\[engine\] job \d+: the draft's.*", log)[:2]) if fail else ""))
+                f"{rl['out'] == ref_l['out']}" + ("; " + " | ".join(re.findall(r"\[engine\] job \d+: the draft's.*", log)[:2]) if fail else "")
+                + (f"; mtp_approx: young {approx(ry)}, long {approx(rl)}" if mtp else ""))
     finally:
         setfail("")
         rc, log = stop(p, lg)
@@ -1226,6 +1275,8 @@ def run_admit_chunk(a, t):
             ok &= all(r["tm"].get("yields", 0) >= 1 and r["tm"].get("paused_ms", 0) > 0 and r["tm"].get("renewals", 0) > 0 for r in rs)
             if tight:
                 ok &= sum(r["tm"].get("swaps", 0) for r in rs) >= 1
+            if mtp:
+                swapped += [(f"yield_{k}", None, approx(r)) for k, r in enumerate(rs) if r["tm"].get("swaps", 0) >= 1]
             rep(ok, "admit_chunk/yield" + ("_swapped" if tight else ""),
                 f"startup: {'yields its seat after 2 chunks' in (line or [''])[0]}; yields in turn {ys[:8]} ({alt} turns); yields "
                 f"{[r['tm'].get('yields') for r in rs]}, paused_ms {[round(r['tm'].get('paused_ms', 0)) for r in rs]}, renewals "
@@ -1235,6 +1286,12 @@ def run_admit_chunk(a, t):
         rc, log = stop(p, lg)
     rep(rc == 0 and "[engine] bug:" not in log and not swap_files(), "admit_chunk/stop_yield",
         f"exit {rc}" + "".join("; " + x for x in re.findall(r"\[engine\] bug:.*", log)[:2]))
+    if mtp:  # (every job swapped out and back in with its view, the kept state in its v2 file: no approximate row; a lookup-only
+        # job, k 0, among them: its view is swapped too)
+        k0 = [n for n, sp, _ in swapped if isinstance(sp, dict) and sp.get("k") == 0]
+        swapped = [x for x in swapped if x[2] is not None]  # (those that report it: "speculative" not off)
+        rep(bool(swapped) and all(ap == 0 for _, _, ap in swapped) and bool(k0), "admit_chunk/mtp_swap_approx",
+            f"{len(swapped)} swapped jobs, mtp_approx {[(n, ap) for n, _, ap in swapped]}; lookup-only (k 0): {k0}")
     shutil.rmtree(d, ignore_errors=True)
 
 
@@ -1456,24 +1513,71 @@ COPY_CODE = ("def moving_average(xs, n):\n    out = []\n    for i in range(len(x
              "            out.append(None)\n        else:\n            out.append(sum(xs[i-n+1:i+1]) / n)\n    return out\n")
 
 
+def spec_out(st, d):
+    """a response as run_spec compares it: content, reasoning, tool calls (without their ids), finish, usage, logprobs"""
+    if st != 200:
+        return (st, d)
+    m, c = d["choices"][0]["message"], d["choices"][0]
+    calls = [x["function"] for x in m.get("tool_calls") or []]
+    u = dict(d["usage"])
+    return (m.get("content"), m.get("reasoning_content"), calls, c["finish_reason"], u["completion_tokens"], u["prompt_tokens"],
+            json.dumps(c.get("logprobs")))
+
+
+def spec_bodies():
+    """run_spec's requests that --spec mtp also asks a plain server (the same file without -D): greedy, seeded, thinking,
+    a reply that copies its prompt, the four concurrent ones"""
+    g = {"messages": [{"role": "user", "content": AUS}], "temperature": 0, "max_tokens": 60}
+    seeded = {"messages": [{"role": "user", "content": CATS}], "temperature": 0.8, "top_p": 0.9, "seed": 42, "max_tokens": 48}
+    think = {"messages": [{"role": "user", "content": MULT}], "temperature": 0, "max_tokens": 41, "reasoning_effort": "high"}
+    copy = {"messages": [{"role": "user", "content": "Repeat this code exactly, with no comment:\n\n" + COPY_CODE}], "temperature": 0,
+            "max_tokens": 80}
+    conc = [dict(g, max_tokens=40), {"messages": [{"role": "user", "content": CATS}], "temperature": 0.8, "top_p": 0.9, "seed": 5,
+                                     "max_tokens": 40},
+            dict(copy, max_tokens=50), {"messages": [{"role": "user", "content": MULT}], "temperature": 0, "max_tokens": 30,
+                                        "reasoning_effort": "high", "logprobs": True, "top_logprobs": 2}]
+    return g, seeded, think, copy, conc
+
+
+SPEC_CONV = {"temperature": 0, "max_tokens": 24, "reasoning_effort": "none"}  # (thinking off: Qwen3.8's default is on, and a reply
+# that is all reasoning (a synthetic model's) does not come back in the history; off already for the others)
+
+
+def spec_conv(i):
+    return [{"role": "system", "content": f"You are terse. (variant {i})"}, {"role": "user", "content": ADA[0]}]
+
+
+def spec_plain_refs(port):
+    """--spec mtp: the references of greedy, seeded, thinking, the concurrent requests and the next turns, from a server
+    on the same file without a draft (run before the MTP server starts, stopped before it: one server at a time)"""
+    g, seeded, think, copy, conc = spec_bodies()
+    o = lambda b: spec_out(*chat(port, dict(b, speculative=False, cache_prompt=False))[:2])  # noqa: E731
+    r = {"greedy": o(g), "seeded": o(seeded), "thinking": o(think), "concurrent": [o(b) for b in conc]}
+    for i in range(4):
+        msgs = spec_conv(i)
+        st, d1, _ = chat(port, dict(SPEC_CONV, messages=msgs, speculative=False, cache_prompt=False))
+        msgs2 = msgs + [{"role": "assistant", "content": (text_of(d1) if st == 200 else "") or ""}, {"role": "user", "content": ADA[1]}]
+        st, d2, _ = chat(port, dict(SPEC_CONV, messages=msgs2, speculative=False))  # (its cached tokens: plain decoding's)
+        r[f"next_turn_{i}"] = spec_out(st, d2)
+        r[f"next_turn_{i}_cached"] = d2["usage"]["prompt_tokens_details"]["cached_tokens"] if st == 200 else -1
+    return r
+
+
 def run_spec(a, t, port, has_draft, logname):
     """speculation on == off (the server runs with a draft model, or the lookup alone): every request with
     "speculative": false (plain decoding) and with fixed settings (the draft model at k 1 / 3 / 8 + tau, the lookup alone,
     both) and auto, compared: content, reasoning, tool calls (without their random ids), finish_reason, usage, logprobs
-    (bitwise logits), streamed and not; concurrent requests; a conversation's next turn reuses what plain decoding's
-    would (the cache and, Qwen3.5, the checkpoints as plain decoding leaves them)"""
+    (bitwise logits), streamed and not; concurrent requests; a conversation's next turn reuses what plain decoding's would
+    (the cache and, Qwen3.5, the checkpoints as plain decoding leaves them). --spec mtp: also == a plain server's replies
+    (a.plain: the same file without -D; the same server's "speculative": false requests still run the view), and the MTP
+    drafter's checks (mtp_approx, mtp_copy, mtp_cancel; mtp_accepts with --mtp-accepts). --quick: greedy, seeded, thinking,
+    the next turns, four at once with auto (+ the MTP checks)"""
     rep = t.report
     settings = (SPEC_MODEL if has_draft else []) + SPEC_LOOKUP + ["auto"]
     q35 = a.q35_spec
-
-    def out(st, d):
-        if st != 200:
-            return (st, d)
-        m, c = d["choices"][0]["message"], d["choices"][0]
-        calls = [x["function"] for x in m.get("tool_calls") or []]
-        u = dict(d["usage"])
-        return (m.get("content"), m.get("reasoning_content"), calls, c["finish_reason"], u["completion_tokens"], u["prompt_tokens"],
-                json.dumps(c.get("logprobs")))
+    quick, mtp, plain = a.quick, a.spec == "mtp", getattr(a, "plain", None) or {}
+    synth = os.path.basename(a.model).startswith("synth-")  # (a synthetic model: no stop word in its content, no tool call)
+    out = spec_out
 
     def stats(d):
         return d.get("timings", {}).get("speculative") if isinstance(d, dict) else None
@@ -1487,6 +1591,10 @@ def run_spec(a, t, port, has_draft, logname):
         st, ref, _ = chat(port, dict(body, speculative=False))
         want = out(st, ref)
         ok, seen, det = st == 200 and stats(ref) is None, [], []
+        if name in plain:  # (--spec mtp: a plain server's reply too)
+            ok &= plain[name] == want
+            if plain[name] != want:
+                det.append(f"\"speculative\": false != the plain server's: {str(want)[:120]} vs {str(plain[name])[:120]}")
         for s in sets:
             st2, d, _ = chat(port, dict(body, speculative=s))
             got = out(st2, d)
@@ -1510,7 +1618,8 @@ def run_spec(a, t, port, has_draft, logname):
         refed = sum(x.get("refed", 0) for x in seen if x)
         ok &= refed == 0  # (every rollback on its row's checkpoint)
         k, g = acc(seen)
-        rep(ok, f"spec/{name}", f"{len(sets)} settings{' + streamed' if stream_too else ''} == plain; {k}/{g} guesses accepted"
+        rep(ok, f"spec/{name}", f"{len(sets)} settings{' + streamed' if stream_too else ''} == plain"
+            + (" (and the plain server)" if name in plain else "") + f"; {k}/{g} guesses accepted"
             + (f"; {refed} positions fed again" if refed else "") + ("; " + "; ".join(det) if det else ""))
         return ref
 
@@ -1518,102 +1627,339 @@ def run_spec(a, t, port, has_draft, logname):
         return [settings[(i + k) % len(settings)] for k in range(3)] + ["auto"]
 
     # greedy, streamed and not; seeded (top-p, top-k); thinking cut inside a pass; max_tokens 1 / 2 / 5; logprobs
-    g = {"messages": [{"role": "user", "content": AUS}], "temperature": 0, "max_tokens": 60}
+    g, seeded, think, copy, conc = spec_bodies()
     ref = equal_case("greedy", g, settings, stream_too=True)
-    equal_case("seeded", {"messages": [{"role": "user", "content": CATS}], "temperature": 0.8, "top_p": 0.9, "seed": 42,
-                          "max_tokens": 48}, at(1), stream_too=True)
-    equal_case("seeded_top_k", {"messages": [{"role": "user", "content": CATS}], "temperature": 1.2, "top_p": 0.95, "top_k": 3,
-                                "seed": 9, "max_tokens": 40}, at(2))
-    equal_case("thinking", {"messages": [{"role": "user", "content": MULT}], "temperature": 0, "max_tokens": 41,
-                            "reasoning_effort": "high"}, at(3), stream_too=True)
-    equal_case("thinking_seeded", {"messages": [{"role": "user", "content": MULT}], "temperature": 0.7, "seed": 3, "max_tokens": 90,
-                                   "reasoning_effort": "high"}, at(4))
-    for n in (1, 2, 5):
-        equal_case(f"max_tokens_{n}", dict(g, max_tokens=n), at(n))
-    equal_case("logprobs", dict(g, max_tokens=24, logprobs=True, top_logprobs=3), at(5))
-    words = (text_of(ref) or "").split()
-    word = words[len(words) // 2].strip(".,") if len(words) > 4 else "zzzz"
-    equal_case("stop_string", dict(g, stop=["zzz", word]), at(6), stream_too=True,
-               check=lambda r, s: (r["choices"][0]["finish_reason"] == "stop" and word not in (text_of(r) or ""), f"stop {word!r}"))
-    # a reply that copies its prompt: the lookup's guesses accepted
-    copy = {"messages": [{"role": "user", "content": "Repeat this code exactly, with no comment:\n\n" + COPY_CODE}], "temperature": 0,
-            "max_tokens": 80}
-    lk = [{"mode": "fixed", "lookup": 8, "k": 0}, {"mode": "fixed", "lookup": 4, "k": 0}, "auto"]
-    equal_case("copy_lookup", copy, lk, check=lambda r, s: (s[0]["lookup"]["accepted"] >= 20, f"lookup 8: {s[0]['lookup']}"))
-    # the end of the context inside a verify pass (-c 2048)
-    def count_prompt(n_words):
-        return {"messages": [{"role": "user", "content": "Here are some words: " + " ".join(["apple"] * n_words) +
-                              "\nNow count from 1 to 500, separated by spaces."}], "temperature": 0}
-    st, d, _ = chat(port, dict(count_prompt(1000), max_tokens=1, speculative=False))
-    per = 1  # (" apple": one token)
-    longp = count_prompt(1000 + (2048 - 37 - d["usage"]["prompt_tokens"]) // per if st == 200 else 1000)
-    equal_case("context_end", longp, at(7), check=lambda r, s: (r["choices"][0]["finish_reason"] == "length" and
-                                                                r["usage"]["prompt_tokens"] + r["usage"]["completion_tokens"] == 2048,
-                                                                f"usage {r['usage']}"))
+    equal_case("seeded", seeded, at(1), stream_too=True)
+    equal_case("thinking", think, at(3), stream_too=True)
+    if not quick:
+        equal_case("seeded_top_k", {"messages": [{"role": "user", "content": CATS}], "temperature": 1.2, "top_p": 0.95, "top_k": 3,
+                                    "seed": 9, "max_tokens": 40}, at(2))
+        equal_case("thinking_seeded", {"messages": [{"role": "user", "content": MULT}], "temperature": 0.7, "seed": 3, "max_tokens": 90,
+                                       "reasoning_effort": "high"}, at(4))
+        for n in (1, 2, 5):
+            equal_case(f"max_tokens_{n}", dict(g, max_tokens=n), at(n))
+        equal_case("logprobs", dict(g, max_tokens=24, logprobs=True, top_logprobs=3), at(5))
+        words = (text_of(ref) or "").split()
+        word = words[len(words) // 2].strip(".,") if len(words) > 4 else "zzzz"
+        equal_case("stop_string", dict(g, stop=["zzz", word]), at(6), stream_too=True,
+                   check=lambda r, s: (synth or (r["choices"][0]["finish_reason"] == "stop" and word not in (text_of(r) or "")), f"stop {word!r}"))
+        # a reply that copies its prompt: the lookup's guesses accepted
+        lk = [{"mode": "fixed", "lookup": 8, "k": 0}, {"mode": "fixed", "lookup": 4, "k": 0}, "auto"]
+        equal_case("copy_lookup", copy, lk, check=lambda r, s: (s[0]["lookup"]["accepted"] >= 20, f"lookup 8: {s[0]['lookup']}"))
+
+        # the end of the context inside a verify pass (-c 2048)
+        def count_prompt(n_words):
+            return {"messages": [{"role": "user", "content": "Here are some words: " + " ".join(["apple"] * n_words) +
+                                  "\nNow count from 1 to 500, separated by spaces."}], "temperature": 0}
+        st, d, _ = chat(port, dict(count_prompt(1000), max_tokens=1, speculative=False))
+        per = 1  # (" apple": one token)
+        longp = count_prompt(1000 + (2048 - 37 - d["usage"]["prompt_tokens"]) // per if st == 200 else 1000)
+        equal_case("context_end", longp, at(7), check=lambda r, s: (r["choices"][0]["finish_reason"] == "length" and
+                                                                    r["usage"]["prompt_tokens"] + r["usage"]["completion_tokens"] == 2048,
+                                                                    f"usage {r['usage']}"))
     # concurrent: different requests at once, each with speculation == each alone without
-    bodies = [dict(g, max_tokens=40), {"messages": [{"role": "user", "content": CATS}], "temperature": 0.8, "top_p": 0.9, "seed": 5,
-                                       "max_tokens": 40},
-              dict(copy, max_tokens=50), {"messages": [{"role": "user", "content": MULT}], "temperature": 0, "max_tokens": 30,
-                                          "reasoning_effort": "high", "logprobs": True, "top_logprobs": 2}]
-    alone = [out(*chat(port, dict(b, speculative=False))[:2]) for b in bodies]
+    alone = [out(*chat(port, dict(b, speculative=False))[:2]) for b in conc]
     for rnd, sets in enumerate([settings[:4], ["auto"] * 4]):
+        if quick and rnd == 0:
+            continue
         with cf.ThreadPoolExecutor(max_workers=4) as ex:
-            futs = [ex.submit(chat, port, dict(b, speculative=s)) for b, s in zip(bodies, sets)]
+            futs = [ex.submit(chat, port, dict(b, speculative=s)) for b, s in zip(conc, sets)]
             res = [f.result() for f in futs]
         got = [out(*r[:2]) for r in res]
         k, gs = acc([stats(r[1]) for r in res])
-        rep(got == alone, f"spec/concurrent_{'fixed' if rnd == 0 else 'auto'}", f"4 at once {sets} == each alone, plain; {k}/{gs} accepted"
-            + ("" if got == alone else f"; {[i for i in range(4) if got[i] != alone[i]]} differ"))
+        ok = got == alone and plain.get("concurrent", alone) == alone
+        rep(ok, f"spec/concurrent_{'fixed' if rnd == 0 else 'auto'}", f"4 at once {sets} == each alone, plain"
+            + (" (and the plain server's)" if "concurrent" in plain else "") + f"; {k}/{gs} accepted"
+            + ("" if got == alone else f"; {[i for i in range(4) if got[i] != alone[i]]} differ")
+            + ("" if plain.get("concurrent", alone) == alone else "; the plain server's differ"))
+
     # a conversation's next turn: what it reuses (cached_tokens) is plain decoding's (the reply's tokens; Qwen3.5: the
     # checkpoints left as plain decoding leaves them); the second turn == plain
-    def conv(sys_text, s):
-        b = {"temperature": 0, "max_tokens": 24}
-        msgs = [{"role": "system", "content": sys_text}, {"role": "user", "content": ADA[0]}]
-        st, d1, _ = chat(port, dict(b, messages=msgs, speculative=s, cache_prompt=False))
+    def conv(i, s):
+        msgs = spec_conv(i)
+        st, d1, _ = chat(port, dict(SPEC_CONV, messages=msgs, speculative=s, cache_prompt=False))
         msgs2 = msgs + [{"role": "assistant", "content": text_of(d1) or ""}, {"role": "user", "content": ADA[1]}]
-        st2, d2, _ = chat(port, dict(b, messages=msgs2, speculative=s))
-        st3, d3, _ = chat(port, dict(b, messages=msgs2, speculative=False, cache_prompt=False))
+        st2, d2, _ = chat(port, dict(SPEC_CONV, messages=msgs2, speculative=s))
+        st3, d3, _ = chat(port, dict(SPEC_CONV, messages=msgs2, speculative=False, cache_prompt=False))
         u = d1["usage"]
         want = u["prompt_tokens"] + u["completion_tokens"] - (d1["choices"][0]["finish_reason"] == "length")
-        return out(st2, d2) == out(st3, d3), d2["usage"]["prompt_tokens_details"]["cached_tokens"], want
+        same = out(st2, d2) == out(st3, d3) and plain.get(f"next_turn_{i}", out(st3, d3)) == out(st3, d3)
+        # (--spec mtp: the plain server's reuse; a synthetic model's reply need not come back as the same tokens)
+        return same, d2["usage"]["prompt_tokens_details"]["cached_tokens"], plain.get(f"next_turn_{i}_cached", want)
     ok, det = True, []
     for i, s in enumerate([False] + settings[:3]):
-        same, cached, want = conv(f"You are terse. (variant {i})", s)
+        same, cached, want = conv(i, s)
         ok &= same and cached == want
-        det.append(f"{s}: cached {cached} (the first prompt + its reply: {want})" + ("" if same else ", second turn DIFFERS"))
-    rep(ok, "spec/next_turn_cache", "; ".join(det))
+        det.append(f"{s}: cached {cached} ({'the plain server' if plain else 'the first prompt + its reply'}: {want})"
+                   + ("" if same else ", second turn DIFFERS"))
+    rep(ok, "spec/next_turn_cache", "; ".join(det) + ("; == the plain server's" if plain else ""))
     # tools (Qwen3.5): a call, streamed and not, with thinking
-    if q35:
+    if q35 and not quick:
         tb = {"messages": WEATHER, "tools": TOOLS, "temperature": 0, "max_tokens": 200}
-        equal_case("tools_call", tb, at(8), stream_too=True, check=lambda r, s: (r["choices"][0]["finish_reason"] == "tool_calls",
+        equal_case("tools_call", tb, at(8), stream_too=True, check=lambda r, s: (synth or r["choices"][0]["finish_reason"] == "tool_calls",
                                                                                  f"finish {r['choices'][0]['finish_reason']}"))
         equal_case("tools_thinking", dict(tb, reasoning_effort="high", max_tokens=300), at(9))
         st, d, _ = chat(port, dict(tb, speculative=False, stream=False))
         sref = [(c["function"]["name"], c["function"]["arguments"]) for c in d["choices"][0]["message"].get("tool_calls") or []]
         c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
-        c.request("POST", "/v1/chat/completions", body=json.dumps(dict(tb, stream=True, speculative=settings[0])).encode())
+        c.request("POST", "/v1/chat/completions", body=json.dumps(dict(tb, stream=True, speculative=settings[0],
+                                                                        stream_options={"include_usage": True})).encode())
         ev = [json.loads(l[6:]) for l in c.getresponse().read().decode().split("\n") if l.startswith("data: ") and l != "data: [DONE]"]
         c.close()
+        for e in ev:
+            mtp_note(e)
         sc = [(x["function"]["name"], x["function"]["arguments"]) for e in ev if e.get("choices") for x in e["choices"][0]["delta"].get("tool_calls", [])]
-        rep(sc == sref and len(sc) >= 1, "spec/tools_stream_deltas", f"{sc} == {sref}")
-    # the counters: timings.speculative and llama.cpp's draft_n / draft_n_accepted
-    st, d, _ = chat(port, dict(copy, speculative={"mode": "fixed", "lookup": 8, "k": 0}))
-    ti = d["timings"]
-    sp = ti.get("speculative", {})
-    ok = st == 200 and sp.get("mode") == "fixed" and ti["draft_n"] == sp["model"]["drafted"] + sp["lookup"]["drafted"] and \
-        ti["draft_n_accepted"] == sp["model"]["accepted"] + sp["lookup"]["accepted"] and sp["model"]["drafted"] == 0 and \
-        sp["lookup"]["passes"] > 0 and ti["predicted_n"] - 1 <= sp["passes"] + ti["draft_n_accepted"] <= ti["predicted_n"]
-    rep(ok, "spec/timings", f"{ti}")
-    # errors
-    bad = [{"mode": "sometimes"}, {"k": 99}, {"lookup_min": 1}, 3]
-    if not has_draft:
-        bad.append({"k": 2})
-    codes = [chat(port, dict(g, speculative=b)) for b in bad]
-    rep(all(c[0] == 400 and c[1]["error"]["param"] == "speculative" for c in codes), "spec/errors",
-        "; ".join(f"{b}: {c[0]} {c[1].get('error', {}).get('message', '')[:60]!r}" for b, c in zip(bad, codes)))
+        rep(sc == sref and (synth or len(sc) >= 1), "spec/tools_stream_deltas", f"{sc} == {sref}")
+    if not quick:
+        # the counters: timings.speculative and llama.cpp's draft_n / draft_n_accepted
+        st, d, _ = chat(port, dict(copy, speculative={"mode": "fixed", "lookup": 8, "k": 0}))
+        ti = d["timings"]
+        sp = ti.get("speculative", {})
+        ok = st == 200 and sp.get("mode") == "fixed" and ti["draft_n"] == sp["model"]["drafted"] + sp["lookup"]["drafted"] and \
+            ti["draft_n_accepted"] == sp["model"]["accepted"] + sp["lookup"]["accepted"] and sp["model"]["drafted"] == 0 and \
+            sp["lookup"]["passes"] > 0 and ti["predicted_n"] - 1 <= sp["passes"] + ti["draft_n_accepted"] <= ti["predicted_n"]
+        ok &= ("mtp_approx" in sp) == mtp  # (--draft mtp only)
+        rep(ok, "spec/timings", f"{ti}")
+        # errors
+        bad = [{"mode": "sometimes"}, {"k": 99}, {"lookup_min": 1}, 3]
+        if not has_draft:
+            bad.append({"k": 2})
+        codes = [chat(port, dict(g, speculative=b)) for b in bad]
+        ok = all(c[0] == 400 and c[1]["error"]["param"] == "speculative" for c in codes)
+        kd = ""
+        if has_draft:  # ("k" with a draft, --draft mtp included: accepted)
+            st, d, _ = chat(port, dict(g, max_tokens=4, speculative={"k": 2}))
+            ok &= st == 200
+            kd = f"; {{'k': 2}}: {st}"
+        rep(ok, "spec/errors", "; ".join(f"{b}: {c[0]} {c[1].get('error', {}).get('message', '')[:60]!r}" for b, c in zip(bad, codes)) + kd)
+    if mtp:
+        run_spec_mtp(a, t, port, out, quick)
     log = open(logname).read()
-    rep("speculative decoding auto" in log and "costs: target" in log, "spec/startup_line",
-        next((l for l in log.splitlines() if "speculative decoding" in l), "no startup line")[:300])
+    line = next((l for l in log.splitlines() if "speculative decoding" in l), "no startup line")
+    if mtp:  # (scripts' consumers, e.g. the nightly's 'speculative decoding [^:]*: draft ([^ ]+)': mtp)
+        m = re.search(r"speculative decoding [^:]*: draft ([^ ]+)", line)
+        rep(bool(m) and m.group(1) == "mtp" and re.search(r"draft mtp \(blk\.\d+, vocab (all|\d+); weights [0-9.]+ GiB\)", line) is not None
+            and "costs: target" in line and "; draft " in line and " model k " not in line, "spec/mtp_startup_line", line[:300])
+    else:
+        rep("speculative decoding auto" in log and "costs: target" in log, "spec/startup_line", line[:300])
+
+
+def run_spec_mtp(a, t, port, out, quick):
+    """--spec mtp: the MTP drafter's own checks (the server: --draft mtp, RUNQ_TEST_MTP_CHECK, RUNQ_TEST_MTP_DUMP; main checks
+    the log's invariant and the dumps after the shutdown): the next turn of a "speculative": false and of a constrained turn
+    (the view followed them: its rows exact, the constrained turn's mtp_approx reported), every reply's mtp_approx 0 (a
+    restart exactly at a divergence: at most 1); the copy paths (a running job's prefix, an idle slot under slot affinity:
+    copied, == plain, mtp_approx 0); a stream closed by its client, then the same request again; the trained block's
+    accepted guesses (--mtp-accepts)"""
+    rep = t.report
+    k3 = {"mode": "fixed", "k": 3, "lookup": 0}
+    # the next turn after a "speculative": false turn, after a constrained one
+    det, ok = [], True
+    for i, first in enumerate([{"speculative": False}, {"response_format": {"type": "json_schema", "json_schema": {"name": "n", "schema": NESTED}}}]):
+        msgs = [{"role": "system", "content": f"(Followed {i}.) " + LONG_SYS}, {"role": "user", "content": ADA[0]}]  # (a real reuse)
+        st, d1, _ = chat(port, dict(SPEC_CONV, messages=msgs, max_tokens=40, **first))
+        msgs2 = msgs + [{"role": "assistant", "content": (text_of(d1) if st == 200 else "") or ""}, {"role": "user", "content": ADA[1]}]
+        st2, d2, _ = chat(port, dict(SPEC_CONV, messages=msgs2, speculative=k3))
+        st3, d3, _ = chat(port, dict(SPEC_CONV, messages=msgs2, speculative=False, cache_prompt=False))
+        a1 = ((d1.get("timings") or {}).get("speculative") or {}).get("mtp_approx", "none") if st == 200 else "error"
+        tm = d2.get("timings", {}) if st2 == 200 else {}
+        a2 = (tm.get("speculative") or {}).get("mtp_approx", -1)
+        div = tm.get("cache_n", 0) > 0 and tm.get("cache_n") == tm.get("common_tokens") and tm.get("common_tokens", 0) < tm.get("slot_tokens", 0)
+        o = st2 == 200 and out(st2, d2) == out(st3, d3) and 0 <= a2 <= (1 if div else 0) and tm.get("cache_n", 0) > 0
+        if i == 1:
+            o &= a1 == 0  # (constrained: "speculative" not off, the view followed it)
+        ok &= o
+        what = "a \"speculative\": false" if i == 0 else "a constrained"
+        det.append(f"after {what} turn (its mtp_approx {a1}): == plain {out(st2, d2) == out(st3, d3)}, cached {tm.get('cache_n')}, "
+                   f"mtp_approx {a2}" + (" (a restart at a divergence)" if div else ""))
+    rep(ok, "spec/mtp_followed", "; ".join(det))
+
+    # the copy paths: a running job's prefix (the second request while the first streams), then an idle slot's (slot
+    # affinity: the slot holding a longer conversation is copied from, not cut); the references last (they fill slots too)
+    sysm = "Copy test. " + LONG_SYS
+    A = {"messages": [{"role": "system", "content": sysm}, {"role": "user", "content": "Count from 1 to 300, separated by commas."}],
+         "temperature": 0, "max_tokens": 400}
+    B = {"messages": [{"role": "system", "content": sysm}, {"role": "user", "content": CATS}], "temperature": 0.8, "seed": 7, "max_tokens": 120}
+    C = {"messages": [{"role": "system", "content": sysm}, {"role": "user", "content": MULT}], "temperature": 0, "max_tokens": 30}
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=600)
+    c.request("POST", "/v1/chat/completions", body=json.dumps(dict(A, stream=True, speculative=k3, stream_options={"include_usage": True})).encode())
+    r = c.getresponse()
+    nchunk, tmA = 0, None
+    rb = None
+    while True:
+        line = r.readline()
+        if not line:
+            break
+        line = line.decode().rstrip("\n")
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        d = json.loads(line[6:])
+        tmA = d.get("timings") or tmA
+        nchunk += 1
+        if nchunk == 3:  # (A decodes: B is admitted beside it)
+            with cf.ThreadPoolExecutor(max_workers=1) as ex:
+                fb = ex.submit(chat, port, dict(B, speculative=k3), 600)
+                while not fb.done():  # (A's stream read meanwhile)
+                    line = r.readline()
+                    if not line:
+                        break
+                    line = line.decode().rstrip("\n")
+                    if line.startswith("data: ") and line != "data: [DONE]":
+                        d = json.loads(line[6:])
+                        tmA = d.get("timings") or tmA
+                rb = fb.result()
+    c.close()
+    mtp_note({"timings": tmA})
+    sc, dc_, _ = chat(port, dict(C, speculative=k3), 600)
+    refs = [out(*chat(port, dict(x, speculative=False, cache_prompt=False), 600)[:2]) for x in (B, C)]
+    det, ok = [], rb is not None
+    for name, (st, d), want in zip("BC", [(rb[0], rb[1]) if rb else (0, {}), (sc, dc_)], refs):
+        tm = d.get("timings", {}) if st == 200 else {}
+        a2 = (tm.get("speculative") or {}).get("mtp_approx", -1)
+        o = st == 200 and out(st, d) == want and tm.get("copied") is True and tm.get("cache_n", 0) >= 32 and a2 == 0
+        ok &= o
+        det.append(f"{name}: copied {tm.get('copied')}, cached {tm.get('cache_n')}, mtp_approx {a2}, == plain {st == 200 and out(st, d) == want}")
+    rep(ok, "spec/mtp_copy", "from a running job, then from an idle slot (slot affinity): " + "; ".join(det))
+
+    # a stream closed by its client after 5 chunks, then the same request again: == plain, mtp_approx 0
+    body = {"messages": [{"role": "user", "content": "Write a long story about a lighthouse."}], "temperature": 0, "max_tokens": 200,
+            "speculative": k3}
+    s = socket.create_connection(("127.0.0.1", port), timeout=120)
+    raw = json.dumps(dict(body, stream=True)).encode()
+    s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % len(raw) + raw)
+    got = b""
+    while got.count(b"data: ") < 5:
+        x = s.recv(65536)
+        if not x:
+            break
+        got += x
+    s.close()
+    for _ in range(600):
+        st, h, _ = req(port, "GET", "/health")
+        if st == 200 and h.get("running") == 0:
+            break
+        time.sleep(0.02)
+    st, d, _ = chat(port, body, 600)
+    want = out(*chat(port, dict(body, speculative=False, cache_prompt=False), 600)[:2])
+    tm = d.get("timings", {}) if st == 200 else {}
+    a2 = (tm.get("speculative") or {}).get("mtp_approx", -1)
+    rep(got.count(b"data: ") >= 5 and st == 200 and out(st, d) == want and a2 == 0, "spec/mtp_cancel",
+        f"closed after {got.count(b'data: ')} chunks; the retry: cached {tm.get('cache_n')}, mtp_approx {a2}, == plain {out(st, d) == want}")
+    if a.mtp_accepts:  # (the trained block: the guesses accepted, B after them: mtp_lockstep on these dumps)
+        st, d, _ = chat(port, dict(spec_bodies()[0], speculative=k3))
+        sp = (d.get("timings") or {}).get("speculative") or {} if st == 200 else {}
+        m = sp.get("model", {})
+        rep(m.get("accepted", 0) > 0, "spec/mtp_accepts", f"greedy, k 3: model {m.get('accepted')} / {m.get('drafted')} guesses accepted")
+    # every reply's mtp_approx: 0, at most 1 for a restart exactly at a divergence (the cut drops the kept state)
+    bad = []
+    for tm in MTP_REC:
+        ap = tm["speculative"]["mtp_approx"]
+        div = tm.get("cache_n", 0) > 0 and tm.get("cache_n") == tm.get("common_tokens") and tm.get("common_tokens", 0) < tm.get("slot_tokens", 0)
+        if not 0 <= ap <= (1 if div else 0):
+            bad.append(f"mtp_approx {ap} (cached {tm.get('cache_n')}, common {tm.get('common_tokens')}, slot {tm.get('slot_tokens')})")
+    nd = sum(1 for tm in MTP_REC if tm["speculative"]["mtp_approx"] > 0)
+    rep(not bad and len(MTP_REC) > 0, "spec/mtp_approx", f"{len(MTP_REC)} replies, {nd} with approximate rows (restarts at a divergence)"
+        + ("; " + "; ".join(bad[:4]) if bad else ""))
+
+
+def spec_mtp_after(a, t, logtext, dump):
+    """--spec mtp, after the shutdown: no '[engine] bug:' line (RUNQ_TEST_MTP_CHECK: every view at rest after every step);
+    the dumps (RUNQ_TEST_MTP_DUMP: the finished jobs with mtp_approx 0) one per such reply, each == a fresh lockstep run
+    (api_test --mtp-seqcheck: the view's KV cache, its kept state, a probe row)"""
+    rep = t.report
+    bugs = re.findall(r"\[engine\] bug:.*", logtext)
+    rep(not bugs and "runq serve: stopped" in logtext, "spec/mtp_invariant", "; ".join(bugs[:3]) or "no '[engine] bug:' line")
+    pairs = sorted(f[:-len(".draft.rqseq")] for f in os.listdir(dump) if f.endswith(".draft.rqseq"))
+    want = sum(1 for tm in MTP_REC if tm["speculative"]["mtp_approx"] == 0)
+    api = a.api_test or os.path.join(os.path.dirname(os.path.abspath(a.runq)), "build", "api_test")
+    env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
+
+    def one(p):
+        q = subprocess.run([api, "--mtp-seqcheck", a.model, os.path.join(dump, p + ".rqseq"), os.path.join(dump, p + ".draft.rqseq")],
+                           capture_output=True, env=env)
+        return p, q.returncode == 0 and q.stdout.startswith(b"PASS "), q.stdout.decode(errors="replace").strip()[-200:]
+    with cf.ThreadPoolExecutor(max_workers=2) as ex:
+        res = list(ex.map(one, pairs))
+    fails = [f"job {p}: {o}" for p, ok, o in res if not ok]
+    v2 = sum(1 for _, ok, o in res if ok and "the kept state" in o)
+    rep(len(pairs) == want and want > 0 and not fails, "spec/mtp_lockstep", f"{len(pairs)} dumped jobs (replies with mtp_approx 0: "
+        f"{want}), each == a fresh lockstep run (KV cache bitwise; {v2} with the kept state and a probe row)" + ("; " + "; ".join(fails[:3]) if fails else ""))
+    shutil.rmtree(dump, ignore_errors=True)
+
+
+def run_mtp_g0(a, t):
+    """--mtp-g0: runq serve --draft mtp -G 0 (as the CLI's -G 0 -D mtp: the block not loaded, no draft): the startup line
+    says so, a request's "speculative": {"k": 2} gets the "needs a draft" error, the replies == a server without --draft
+    (run first and stopped: one server at a time)"""
+    rep = t.report
+    env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
+    base = ["--port", "0", "-c", "2048", "--parallel", "2", "--slots", "3"] + gate_mem(a)
+    bodies = [{"messages": [{"role": "user", "content": AUS}], "temperature": 0, "max_tokens": 32, "logprobs": True, "top_logprobs": 2},
+              {"messages": [{"role": "user", "content": CATS}], "temperature": 0.8, "top_p": 0.9, "seed": 42, "max_tokens": 32}]
+    outs, logs = [], []
+    for extra in ([], ["--draft", "mtp", "-G", "0"]):
+        log = tempfile.NamedTemporaryFile(prefix="runq-serve-g0-", suffix=".log", delete=False)
+        p = subprocess.Popen([a.runq, "serve", a.model] + base + extra, stderr=log, stdout=subprocess.DEVNULL, env=env)
+        live(1)
+        port = None
+        for _ in range(1200):
+            m = re.search(r"listening on http://127\.0\.0\.1:(\d+)", open(log.name).read())
+            if m:
+                port = int(m.group(1))
+                break
+            if p.poll() is not None:
+                break
+            time.sleep(0.05)
+        o = [spec_out(*chat(port, b)[:2]) for b in bodies] if port else None
+        e = chat(port, dict(bodies[0], speculative={"k": 2})) if port and extra else None
+        p.send_signal(signal.SIGTERM)
+        try:
+            p.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            p.kill()
+        live(-1)
+        logs.append(open(log.name).read())
+        os.unlink(log.name)
+        outs.append((o, e))
+    (ref, _), (got, err) = outs
+    line = next((l for l in logs[1].splitlines() if "speculative decoding" in l), "")
+    ok = ref is not None and got == ref and line == "runq serve: speculative decoding off (--draft mtp with -G 0: the MTP block not loaded)"
+    ok &= err is not None and err[0] == 400 and "needs a draft" in err[1].get("error", {}).get("message", "")
+    rep(ok, "spec/mtp_g0", f"{line!r}; {{\"k\": 2}}: {err[0] if err else None} "
+        f"{(err[1].get('error', {}).get('message', '') if err and isinstance(err[1], dict) else '')[:80]!r}; == no --draft: {got == ref}")
+
+
+def mtp_plain(a, t, base, env):
+    """--spec mtp: the plain references (spec_plain_refs) from a server on the same file without -D, stopped before the
+    MTP server starts (one server at a time: two 27B servers would not fit, S9c.G); None if it does not start"""
+    log = tempfile.NamedTemporaryFile(prefix="runq-serve-plain-", suffix=".log", delete=False)
+    p = subprocess.Popen([a.runq, "serve", a.model] + base, stderr=log, stdout=subprocess.DEVNULL, env=env)
+    live(1)
+    port, refs = None, None
+    for _ in range(1200):
+        m = re.search(r"listening on http://127\.0\.0\.1:(\d+)", open(log.name).read())
+        if m:
+            port = int(m.group(1))
+            break
+        if p.poll() is not None:
+            break
+        time.sleep(0.05)
+    try:
+        if port:
+            refs = spec_plain_refs(port)
+    except Exception as e:
+        import traceback
+        t.report(False, "spec/plain_server", f"{type(e).__name__}: {e} {traceback.format_exc()[-600:]}")
+    p.send_signal(signal.SIGTERM)
+    try:
+        p.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        p.kill()
+    live(-1)
+    if not port:
+        t.report(False, "spec/plain_server", open(log.name).read()[-500:])
+    os.unlink(log.name)
+    return refs
 
 
 def main():
@@ -1632,9 +1978,31 @@ def main():
     ap.add_argument("--admit-chunk", action="store_true", help="the chunked leases group only (--admit chunk: its own servers)")
     ap.add_argument("--disk-compat", metavar="REF_RUNQ", help="the disk tier across builds only: one --kv-disk directory served by "
                     "REF_RUNQ, this build, REF_RUNQ again (with --spec DRAFT or --draft: the draft's files too)")
+    ap.add_argument("--quick", action="store_true", help="with --spec: greedy, seeded, thinking, the next turns, four at once with "
+                    "auto (and with --spec mtp its own checks)")
+    ap.add_argument("--mtp-accepts", action="store_true", help="with --spec mtp: a trained block (its guesses accepted: spec/mtp_accepts)")
+    ap.add_argument("--mtp-g0", action="store_true", help="runq serve --draft mtp -G 0 only (the block not loaded; == no --draft)")
+    ap.add_argument("--api-test", help="with --spec mtp: tests/api_test for --mtp-seqcheck (default: build/api_test next to --runq)")
+    ap.add_argument("--one-server", action="store_true", help="never two runq serve processes at once (the 27B: S9c.G); with "
+                    "S9_GATE_MEM set, --mem S9_GATE_MEM for every server")
     a = ap.parse_args()
     a.q35_spec = False
     t = T(a)
+    try:
+        return main_groups(a, t)
+    finally:
+        print(f"[server_test] servers at once: max {LIVE['max']}")
+
+
+def main_groups(a, t):
+    if a.mtp_g0:
+        try:
+            run_mtp_g0(a, t)
+        except Exception as e:
+            import traceback
+            t.report(False, "spec/mtp_g0/error", f"{type(e).__name__}: {e} {traceback.format_exc()[-600:]}")
+        print(f"server tests: {t.n - t.failed} passed, {t.failed} failed")
+        return 1 if t.failed else 0
     if a.disk_compat:
         if a.spec and a.spec != "none" and not a.draft:
             a.draft = a.spec
@@ -1674,10 +2042,20 @@ def main():
     env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
     if a.tools:  # (SSE keep-alive comments after 0.05 s without a chunk instead of 15 s: tools/stream_keepalive)
         env["RUNQ_SSE_KEEPALIVE"] = "0.05"
-    srv = subprocess.Popen([a.runq, "serve", a.model, "--port", "0", "-c", "2048", "--parallel", "4", "--slots", "6", "--chunk", "16", "--queue", "4",
-                            "--max-body", "65536", "--name", "test-model"] + (["--checkpoints", "5"] if a.tools else []) +
+    base = ["--port", "0", "-c", "2048", "--parallel", "4", "--slots", "6", "--chunk", "16", "--queue", "4", "--max-body", "65536",
+            "--name", "test-model"] + (["--checkpoints", "5"] if a.tools else []) + gate_mem(a)
+    dump = None
+    if a.spec == "mtp":  # (the plain server's references first, that server stopped before the MTP one starts; the MTP
+        # server checks its views at rest after every step and dumps its finished jobs' sequences)
+        a.plain = mtp_plain(a, t, base, env)
+        if a.plain is None:
+            return 1
+        dump = tempfile.mkdtemp(prefix="runq-mtpdump-", dir=os.environ.get("RUNQ_DISK_TMP") or ("/var/tmp" if os.access("/var/tmp", os.W_OK) else None))
+        env.update(RUNQ_TEST_MTP_CHECK="1", RUNQ_TEST_MTP_DUMP=dump)
+    srv = subprocess.Popen([a.runq, "serve", a.model] + base +
                            ((["-D", a.spec] if a.spec != "none" else ["--lookup", "4"]) + ["--spec-calibrate", "1024"] if a.spec else []),
                            stderr=log, stdout=subprocess.DEVNULL, env=env)
+    live(1)
     # the CLI references, in parallel with the server tests
     ex = cf.ThreadPoolExecutor(max_workers=3)
     ref = {} if a.tools or a.spec else {
@@ -1699,10 +2077,12 @@ def main():
         time.sleep(0.05)
     if not port:
         t.report(False, "server/start", open(log.name).read()[-500:])
+        srv.kill()
+        live(-1)
         return 1
     try:
         if a.spec:
-            st, d, _ = req(port, "POST", "/v1/chat/completions", {"messages": WEATHER, "tools": TOOLS, "max_tokens": 1})
+            st, d, _ = chat(port, {"messages": WEATHER, "tools": TOOLS, "max_tokens": 1})  # (recorded: --spec mtp's dumps include it)
             a.q35_spec = st == 200  # (tool calls: the Qwen3.5 / 3.8 templates)
             run_spec(a, t, port, a.spec != "none", log.name)
         elif a.tools:
@@ -1719,8 +2099,11 @@ def main():
     except subprocess.TimeoutExpired:
         srv.kill()
         rc = "timeout"
+    live(-1)
     logtext = open(log.name).read()
     t.report(rc == 0 and "runq serve: stopped" in logtext, "shutdown/sigterm", f"exit status {rc}")
+    if dump:
+        spec_mtp_after(a, t, logtext, dump)
     if a.verbose:
         print(logtext[-3000:])
     os.unlink(log.name)

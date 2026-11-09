@@ -1693,6 +1693,18 @@ slower beyond the noise (+-3%) but in one small-file cell (synth-q35-ista-mtp, 1
 the decode path" stays with hidden states: `rq_decode_hidden` for a one-row pass of either model. Both are bitwise
 equal (`decode_hidden/*`).
 
+**S9c.3 (2026-11-09): the engine.** `runq serve MODEL --draft mtp [--mtp-vocab N] [-G k --tau t]` runs the view as the
+engine's draft (one view sequence per slot, its own context). Per step: A (the guesses: row P with the kept state, its
+logits and h', then one row per further guess with h', batched over the requests that guess), the target's pass (every
+row's hidden state into one buffer, `rq_decode_hidden` for one row; only on a `--draft mtp` server), the sampling, then B
+(each request of the pass: the view cut to its common prefix with the target, its rows up to the target's length with
+the pass's hidden rows, the last one kept). The CLI's loop instead runs the accepted rows in the next pass 1 (S9c.6 does
+that in the server only if S9c.G asks for it). Every request is followed, so the view needs no catch-up and is exact
+across prefix reuse, copies, the swap (its kept state in the version 2 seqfile) and cancels; the tests compare every
+finished request's view with a fresh lockstep run (`RUNQ_TEST_MTP_DUMP`, `api_test --mtp-seqcheck`). Before S9c.4 a
+view loaded from `--kv-disk` is cut at the target's loaded length: up to one approximate row per load. Not measured yet: the
+27B in the server (S9c.G: 14 threads, 4 parallel requests, 32k, auto with prior 0.8).
+
 ## Not now
 
 DFlash 2 (a 2B block-diffusion drafter: a new architecture, a 4 GB BF16 download); multi-VM splits (~10-30% over

@@ -19,7 +19,13 @@
              q35_synth_build, cached; needs the Qwen3.5-0.8B files): api_test --spec FILE mtp (every case, setting and hook
              pattern, mtp_lockstep after each case), the generic build's --quick, synth-q35-27b-f32.gguf --quick; the CLI
              cases with -D mtp (MTP_CASES) == plain as above; -G 0 -D mtp == plain byte for byte; -D mtp on a file without
-             a block refused, --mem prints the MTP's estimate; runq serve --draft mtp refused (TODO S9c)
+             a block refused, --mem prints the MTP's estimate; runq serve --draft mtp (TODO S9c.3; tests/server_test.py --spec
+             mtp): == a server without -D and == "speculative": false, the view's checks (mtp_approx 0, the copy paths, a
+             cancel, the at-rest invariant RUNQ_TEST_MTP_CHECK, every finished job's view == a fresh lockstep run:
+             RUNQ_TEST_MTP_DUMP + api_test --mtp-seqcheck) on synth-q35-ista-mtp (whole; the generic build quick),
+             synth-q35-27b-mtp and the trained Qwen3.5-0.8B-mtp block (quick; its guesses accepted) if present; the
+             chunked leases' swap with the view (--admit-chunk --draft mtp); -G 0 (the block not loaded); a file without a
+             block and --mtp-vocab -3 refused
 """
 import check_models  # (q35_synth_build: the synthetic MTP files)
 import concurrent.futures as cf
@@ -209,11 +215,38 @@ def mtp_start(a, d, ex):
         return out
     futs.append(("cli", "spec_mtp", ex.submit(refused)))
 
-    def server_refused():  # runq serve --draft mtp: refused before any load (TODO S9c)
-        p = run([a.runq, "serve", mtp, "--draft", "mtp", "--port", "0"], 2)
-        e = p.stderr.decode(errors="replace")
-        return [(p.returncode == 1 and "runq serve: --draft mtp: not supported yet (TODO S9c); the CLI's -D mtp works" in e,
-                 "mtp_refused", f"runq serve --draft mtp: exit status {p.returncode}, {e.strip()[-120:]!r}")]
+    # runq serve --draft mtp (TODO S9c.3; tests/server_test.py --spec mtp: == a plain server, the MTP checks): the ISTA-shaped
+    # file (Q6_K block and eh_proj, Q4_K classifier) whole, the 27B-shaped one and the trained 0.8B block quick (its guesses
+    # accepted: B after them), the generic build quick; the chunked leases' swap with the view (--admit-yield included);
+    # -G 0; the refusals
+    ista = os.path.join(sd, "synth-q35-ista-mtp.gguf")
+    mtp08 = os.path.join(os.path.dirname(os.path.dirname(a.q35)), "Qwen3.5-0.8B-MTP-GGUF", "Qwen3.5-0.8B-mtp-Q8_0.gguf")
+    srv = [sys.executable, "-I", os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_test.py"), "--threads", str(SPEC_THREADS)]
+    srv += ["--api-test", a.api_test] if a.api_test else []
+    if os.path.exists(ista):
+        futs.append(("api", "spec_server/mtp_ista", ex.submit(run, srv + ["--runq", a.runq, "--model", ista, "--spec", "mtp"], SPEC_THREADS)))
+        if a.generic:
+            futs.append(("api", "spec_server/mtp_generic", ex.submit(run, srv + ["--runq", a.generic, "--model", ista, "--spec", "mtp", "--quick"],
+                                                                      SPEC_THREADS)))
+        futs.append(("api", "spec_server/mtp_g0", ex.submit(run, srv + ["--runq", a.runq, "--model", ista, "--mtp-g0"], SPEC_THREADS)))
+    futs.append(("api", "spec_server/mtp_synth", ex.submit(run, srv + ["--runq", a.runq, "--model", mtp, "--spec", "mtp", "--quick"], SPEC_THREADS)))
+    if os.path.exists(mtp08):
+        futs.append(("api", "spec_server/mtp_trained", ex.submit(run, srv + ["--runq", a.runq, "--model", mtp08, "--spec", "mtp", "--quick",
+                                                                         "--mtp-accepts"], SPEC_THREADS)))
+    if os.path.exists(ista):
+        futs.append(("api", "spec_server/mtp_admit_chunk", ex.submit(run, srv + ["--runq", a.runq, "--model", ista, "--admit-chunk", "--draft",
+                                                                                 "mtp"], SPEC_THREADS)))
+
+    def server_refused():  # a file without a block; --mtp-vocab negative
+        out = []
+        if os.path.exists(base):
+            p = run([a.runq, "serve", base, "--draft", "mtp", "--port", "0"], 2)
+            e = p.stderr.decode(errors="replace")
+            out.append((p.returncode == 1 and f"runq serve: --draft mtp: {base} has no MTP block" in e, "mtp_no_block",
+                        f"runq serve FILE --draft mtp (no block): exit status {p.returncode}, {e.strip()[-120:]!r}"))
+        p = run([a.runq, "serve", mtp, "--draft", "mtp", "--mtp-vocab", "-3", "--port", "0"], 2)
+        out.append((p.returncode == 1 and b"Usage:" in p.stderr, "mtp_bad_vocab", f"--mtp-vocab -3: exit status {p.returncode}"))
+        return out
     futs.append(("cli", "spec_server", ex.submit(server_refused)))
     return futs
 

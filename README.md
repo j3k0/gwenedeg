@@ -116,7 +116,8 @@ no second 64-layer state per sequence; the output is still plain decoding's. On 
 the 0.8B draft: IQ3_S-mtp 12.8 vs 11.1 tok/s at each one's best fixed settings (`-D mtp -G 6 --tau 0.5` vs `-G 6 --tau
 0.4`; 1.6x plain), Unsloth's Q4_K_M 17.1 vs 14.1 (2.0x plain); with thinking off the two are even (TODO S9d,
 [docs/qwen38-speculative.md](docs/qwen38-speculative.md#the-27bs-acceptance-and-the-go-todo-s9d2-2026-11-09)).
-`runq serve` does not take it yet (`--draft mtp` is refused).
+`runq serve --draft mtp` runs it too (TODO S9c.3: every request followed by the view, its guesses batched across
+requests; [docs/server.md](docs/server.md#speculative-decoding-todo-s8-g7)); not measured on the 27B in the server yet.
 
 **Prompt lookup** (`--lookup N`, no model needed): replies that copy from their context (code being edited, paths,
 tool output) are guessed from the context itself, verified in the same loop (so the output is still plain decoding's).
@@ -283,7 +284,8 @@ trusted network.
 - **Continuous batching**: every running request (up to `--parallel` 16) contributes its next token or a
   prompt chunk to one batched forward pass per step. Streams keep flowing while long prompts prefill,
   and each request's output is bit-identical to running it alone.
-- **Speculative decoding** (`--draft FILE`, `--lookup N`): the guesses of a draft model of the same vocabulary, or
+- **Speculative decoding** (`--draft FILE|mtp`, `--lookup N`): the guesses of a draft model of the same vocabulary (or the
+  model's own MTP block), or
   copied from the context, verified in the same batched passes; the draft's steps in its own batched passes. Every
   output is plain decoding's (seeded, streamed, with logprobs, tool calls and stop strings; tested request by request).
   By default (`--spec auto`) the source and the guess count are chosen per pass from a cost model calibrated at the

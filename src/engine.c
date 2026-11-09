@@ -126,6 +126,18 @@ struct Engine {
     unsigned long long sp_passes, sp_rows, sp_guess[3], sp_acc[3], d_passes, d_rows;
     double t_draft, t_cal;
     int since_model;      // passes since the policy last chose the model for a job (its drafts are kept in sync while recent)
+    // the MTP drafter (--draft mtp: dm is the model's MTP view; below "the MTP drafter"): the hidden state's width, the
+    // target's pass's hidden rows (H: maxb x dim, positions as the pass's segments) and the view's passes' h inputs (Hin),
+    // auto's prior per guess (rq_spec_prior), the counters of the -v summary (A: the guesses' passes, B: the follow passes;
+    // the steps' time), RUNQ_TEST_MTP_CHECK (the at-rest check after each step) and RUNQ_TEST_MTP_DUMP (a directory: the
+    // finished jobs' sequences; tests only)
+    int mtp, dim;
+    float *H, *Hin;
+    double dprior;
+    unsigned long long mA_passes, mA_rows, mB_passes, mB_rows, m_approx, m_gaps, steps;
+    double t_mtpA, t_mtpB, t_step;
+    int mtp_chk;
+    const char *mtp_dump;
     // the queue (shared with the connection threads, under mu)
     pthread_t th;
     int started;
@@ -202,6 +214,7 @@ Job *job_new(void) {
     j->cv = s;
     j->refs = 1;
     j->top_logprobs = -1;
+    j->sp_mtp_approx = -1; // (no MTP view: no "mtp_approx"; start_run sets 0 on a --draft mtp server)
     return j;
 }
 
@@ -470,6 +483,12 @@ struct Run {
     RqTokens dbuf;
     double pm[2], pl[RQ_LOOKUP_LMAX + 1][2];
     int nck0, dnck0;      // Qwen3.5: the checkpoint slots before the job (the speculative rows' are transient)
+    // --draft mtp ("the MTP drafter"): a guess's own hidden state h' (2 x dim: the passes' input and output, mcur the
+    // input's); this pass's rows in the target's hidden rows (hrow: its first in Engine.H, hp0 its position, hn of them, hk
+    // those still in the target after the sampling); the follow passes run so far (mfol) and the rows a failed one left
+    // behind (mgap); the follow pass's end (mend), its current segment's rows that took zeros (map), a failure logged (mlog)
+    float *mh;
+    int mcur, hrow, hp0, hn, hk, mfol, mgap, mend, map, mlog;
     // --admit bound ("memory admission"): the positions it can ever write (P), its lease's end (E; P while the chunk is
     // unlimited, step 4 renews it), its guesses per pass at most, the lease's KV and state bytes (target + draft)
     int P, E, kk;
@@ -732,7 +751,8 @@ static void draft_ck_plan(Engine *e, Run *r) {
 static int spec_start(Engine *e, Run *r, int src, int L) {
     // the job's speculation: its settings (none for a constrained or forced reply), the lookup index, Qwen3.5's transient
     // checkpoint slots for the verify rows (the slot's --checkpoints stay as they are), the draft's sequence on the
-    // prompt's prefix (the copy source's draft, or its own common prefix with the prompt)
+    // prompt's prefix (the copy source's draft, or its own common prefix with the prompt; an MTP view: mtp_start, for every
+    // job)
     Job *j = r->j;
     Slot *sl = &e->slot[r->si];
     r->spec = j->con || j->force.n > 0 ? SPEC_OFF : j->spec;
@@ -748,7 +768,7 @@ static int spec_start(Engine *e, Run *r, int src, int L) {
         r->nck0 = e->ckn;
         rq_seq_set_checkpoints(sl->seq, e->ckn + kk + 1 < RQ_CHECKPOINTS_MAX ? e->ckn + kk + 1 : RQ_CHECKPOINTS_MAX);
     }
-    if (r->sk > 0) {
+    if (r->sk > 0 && !e->mtp) {
         RqSeq *d = sl->dseq;
         if (src >= 0 && e->slot[src].dseq) {
             int c = rq_seq_common_prefix(e->slot[src].dseq, j->prompt.v, L < n ? L : n);
@@ -791,6 +811,24 @@ static void spec_release(Engine *e, Run *r) {
         rq_seq_set_checkpoints(d, r->dnck0);
         r->dnck0 = 0;
     }
+}
+
+static void mtp_start(Engine *e, Run *r, int src) {
+    // --draft mtp ("the MTP drafter"; start_run, every job, before spec_start): the view on the prompt's prefix. Copied from
+    // the source slot's view to its common prefix with the prompt (not capped at the target's copy, which a checkpoint may
+    // shorten: the kept state comes along if it is below), else its own common prefix with the prompt, in place (also a
+    // view a failed load left: dk_load returns before it). Ahead of the target (a hybrid target's restart lower down), its
+    // rows wait for the prefill (their h was true); level with it, its first row takes the kept state (an agent's next
+    // turn). At most the prompt: within the lease (job_lease's E >= the prompt)
+    RqSeq *v = e->slot[r->si].dseq;
+    const int *P = r->j->prompt.v;
+    int n = r->j->prompt.n;
+    if (src >= 0 && e->slot[src].dseq) {
+        RqSeq *sv = e->slot[src].dseq;
+        if (rq_seq_copy(v, sv, rq_seq_common_prefix(sv, P, n)) != RQ_OK) rq_seq_reset(v);
+    } else
+        rq_seq_truncate(v, rq_seq_common_prefix(v, P, n));
+    r->j->sp_mtp_approx = 0;
 }
 
 static void force_feed(Engine *e, Run *r) {
@@ -1799,9 +1837,10 @@ static int sw_failing(const Engine *e, const char *what) {
 
 static void sw_out(Engine *e, Run *r) {
     // (sw_run) job r out of memory: the verify rows' transient checkpoints dropped (as spec_release; the regular ones go
-    // into the file), its sequences saved (the draft's only if it uses it), its slot emptied and given back, the Run kept
-    // (si -1) with its RNG (also in the file; kept for a job not prefilled yet: no file) and its constraint's mask. A
-    // draft that cannot be saved is reset at the swap-in (its guesses only change the speed); a target that cannot be
+    // into the file), its sequences saved (the draft's only if it uses it; an MTP view always), its slot emptied and given
+    // back, the Run kept (si -1) with its RNG (also in the file; kept for a job not prefilled yet: no file) and its
+    // constraint's mask. A draft that cannot be saved is reset at the swap-in (its guesses only change the speed; an MTP
+    // view's rows then catch up as a gap, zeros counted); a target that cannot be
     // saved (the disk full, an I/O error) ends the job with a 500, its slot emptied all the same (the renewal that asked
     // for the swap counted on that memory)
     Slot *sl = &e->slot[r->si];
@@ -1819,7 +1858,7 @@ static void sw_out(Engine *e, Run *r) {
     r->sw_res = m.kv + m.st;
     r->rng = *rq_seq_rng(sl->seq);
     r->sw_len = rq_seq_len(sl->seq);
-    r->sw_dlen = sl->dseq && r->sk > 0 ? rq_seq_len(sl->dseq) : 0;
+    r->sw_dlen = sl->dseq && (r->sk > 0 || e->mtp) ? rq_seq_len(sl->dseq) : 0; // (an MTP view: every job's, its kept state too)
     r->sw_bytes = 0;
     if (r->nallow > 0) {
         if (!(r->alist = malloc((size_t)r->nallow * sizeof(int)))) rc = RQ_ERR_NOMEM;
@@ -1914,6 +1953,10 @@ static void sw_in(Engine *e, Run *r, int si) {
         for (int i = 0; i < r->nckw; i++)
             if (r->ckw[i] > len && r->ckw[i] <= rq_seq_capacity(sl->seq)) rq_seq_checkpoint_at(sl->seq, r->ckw[i]);
     if (rc == RQ_OK && e->dhybrid && sl->dseq && r->sk > 0) draft_ck_pending(e, r);
+    if (rc == RQ_OK && e->mtp) { // (a view reset: the gap's rows take zeros, counted; ahead or level: as it was)
+        int Lv = rq_seq_len(sl->dseq), end = len < rq_seq_capacity(sl->dseq) ? len : rq_seq_capacity(sl->dseq);
+        r->mgap = Lv < end ? end - Lv : 0;
+    }
     if (rc == RQ_OK && r->nallow > 0) {
         if ((rc = slot_scratch(e, sl, j->top_logprobs >= 0)) == RQ_OK)
             for (int i = 0; i < r->nallow; i++) sl->allow[sl->list[i] = r->alist[i]] = 1;
@@ -2080,13 +2123,20 @@ static void start_run(Engine *e, Job *j, int si, int src, int L) {
     // need: ck_plan_job)
     L = rq_seq_len(s);
     if (e->hybrid) ck_plan_job(e, r, L);
+    r->id = ++e->njob;
+    if (e->mtp) { // (every job: the view follows it whatever it asks for)
+        if (!(r->mh = malloc(2 * (size_t)e->dim * sizeof(float)))) {
+            end_run(e, r, 0, 0, RQ_ERR_NOMEM, NULL);
+            return;
+        }
+        mtp_start(e, r, src);
+    }
     if ((err = spec_start(e, r, src, L)) != RQ_OK) {
         end_run(e, r, 0, 0, err, NULL);
         return;
     }
     if (e->o.admit != ADMIT_WORST) { // the lease; the slot holds no more than it from here on (the draft: not past E either)
         Mem l = job_lease(e, j, &r->P, &r->E, &r->kk);
-        r->id = ++e->njob;
         j->chunked = e->o.admit == ADMIT_CHUNK;
         r->lkv = l.kv;
         r->lst = l.st;
@@ -2345,10 +2395,11 @@ static int draft_wanted(const Engine *e, const Run *r, int L, int lag) {
     // the draft model may guess for this job at position L, so its sequence follows the target's (lag positions behind):
     // fixed, if the job has a model k; auto, if a model pass beats plain decoding for the job alone there (the cost model,
     // its acceptance) and the time it saves over the reply's remaining tokens is worth catching up (twice the cost of
-    // the lag's rows: e.g. a long prompt for a short reply is not)
+    // the lag's rows: e.g. a long prompt for a short reply is not). An MTP view: whenever the job may guess (it follows every
+    // job anyway, B: no lag to pay for; spec_plan chooses)
     if (!e->dm || r->spec == SPEC_OFF || r->sk <= 0) return 0;
-    if (r->spec == SPEC_FIXED) return 1;
-    RqSpecChoice x = rq_spec_choose(&e->tcost, &e->dcost, L, r->sk, acc_p(r->pm, e->pm, 0.6), 0, 0);
+    if (r->spec == SPEC_FIXED || e->mtp) return 1;
+    RqSpecChoice x = rq_spec_choose(&e->tcost, &e->dcost, L, r->sk, acc_p(r->pm, e->pm, e->dprior), 0, 0);
     if (x.src != RQ_SPEC_MODEL) return 0;
     if (lag <= 2 * SPEC_GUESS_MAX) return 1;
     double left = r->j->max_new - r->j->n_gen, save = left * x.t_plain * (1 - 1 / x.gain);
@@ -2394,7 +2445,7 @@ static void spec_cands(Engine *e, Cand *c, int nc, int dbud) {
             if (dl >= 0 && P - dl + 1 <= dbud && mk > 0) {
                 c[i].mk = mk;
                 c[i].lag = P - dl;
-                c[i].pmd = acc_p(r->pm, e->pm, 0.6);
+                c[i].pmd = acc_p(r->pm, e->pm, e->dprior);
             }
         }
         if (c[i].fixed) {
@@ -2560,6 +2611,245 @@ static void spec_draft(Engine *e, int dbud, int ndec) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------- the MTP drafter
+// --draft mtp (TODO S9c; docs/server.md, "Speculative decoding"): the draft is the model's own MTP block (rq_mtp_load: a
+// view of the target), one view sequence per slot (Slot.dseq) on its own context (dc). The view's row q takes the
+// target's final hidden state at q - 1, which exists only in the pass that computed it, so every job is followed
+// (prompts, forced tokens, replies; constrained and "speculative": false ones too) by B, the follow pass after each step's
+// sampling: the view's rows of the target's new positions with the hidden rows of the target's pass that just ran
+// (Engine.H: the target's passes ask for them only here), batched over the pass's jobs; the target's hidden state at its
+// last position is kept with the view (rq_mtp_keep: the next row's h; a v2 seqfile carries it to disk and through the
+// swap). At rest (between steps) a job's view is as long as its target (to its capacity), every row final, that state
+// kept; it may be ahead only while the prompt is prefilled, as a prefix of the prompt (a copy, a load, a hybrid target's
+// restart lower down: those rows' h was true). A, the guesses, runs before the target's pass for the jobs whose plan takes
+// the model: row P (the token t to feed, h the kept state) with its logits (the first guess) and its own hidden state h',
+// then one row per further guess (d_{j-1}, h'), provisional: B's cut to the common prefix (rq_seq_common_prefix counts
+// final rows only) drops them, and whatever the verify cut. A row whose h is unknown (a gap after a failed view pass or a
+// view reset; a restart exactly at a divergence: the cut drops the kept state) takes zeros, counted (Job.sp_mtp_approx,
+// timings.speculative.mtp_approx): only the guesses get worse. The outputs stay plain decoding's: the view only proposes
+
+static int mtp_pass(Engine *e, int nds, int rows, float **lg, double *t) {
+    // one pass of the view over e->dseg (the decode path for a single row); lg: the segments' last rows' logits (A), NULL:
+    // none (B). A failed pass appended nothing (every check comes first): the views stay as they were. The cost model learns
+    // from passes of one row per segment (the guesses' shape, as draft_pass)
+    RqSegment *g = e->dseg;
+    double pred = lg && rows == nds ? seg_cost(&e->dcal, g, nds, rows) : 0, t0 = rq_now();
+    int err = nds == 1 && rows == 1 ? rq_decode_hidden(e->dc, g->seq, g->tokens[0], lg, g->hidden, g->h_in)
+                                    : rq_forward_batch(e->dc, g, nds, lg && nds > 1 ? e->dlogits : NULL, lg);
+    double took = rq_now() - t0;
+    *t += took;
+    if (err == RQ_OK && pred > 0) cost_learn(&e->dcost, &e->dcal, &e->dlr, pred, took);
+    if (err == RQ_OK)
+        for (int i = 0; i < nds; i++) e->dsegrun[i]->j->sp_draft_rows += g[i].n;
+    else if (e->o.verbose)
+        fprintf(stderr, "[engine] the MTP view's pass failed (%d rows): %s (only the speed changes)\n", rows,
+                rq_ctx_error(e->dc)[0] ? rq_ctx_error(e->dc) : rq_strerror(err));
+    return err;
+}
+
+static void mtp_draft(Engine *e, int dbud) {
+    // A (step, before the target's pass; spec_draft's part): the guesses of the jobs whose plan takes the model. Pass 1, one
+    // segment per job: the view's rows from its length to P - 1 (a gap's, within dbud rows; h the kept state or zeros, as
+    // H belongs to the coming pass) then t at P (h_{P-1}: the kept state at rest), all final; its logits the first guess,
+    // its hidden state h' (into Run.mh). Then one pass per further guess, one row per job still guessing: (its last guess,
+    // h'), its own h' next, provisional. A failed pass: its jobs stop guessing in this step (the view is not reset: nothing
+    // was appended, B cuts the rest)
+    int V = e->V, D = e->dim, nds = 0, rows = 0;
+    float *lg = NULL;
+    for (int i = 0; i < e->nrun; i++) {
+        Run *r = e->run[i];
+        if (r->done || r->src != RQ_SPEC_MODEL) continue;
+        Slot *sl = &e->slot[r->si];
+        RqSeq *v = sl->dseq, *s = sl->seq;
+        int P = rq_seq_len(s), ML = rq_seq_common_prefix(v, rq_seq_tokens(s), P), m = P - ML + 1;
+        if (ML < rq_seq_len(v)) rq_seq_truncate(v, ML); // (at rest a prefix of the target's tokens already)
+        r->dbuf.n = 0;
+        if (rows + m > dbud || rows + m > e->dmaxb || rq_tokens_push(&r->dbuf, rq_seq_tokens(s) + ML, P - ML) != RQ_OK ||
+            rq_tokens_push(&r->dbuf, &r->feed.v[r->fed], 1) != RQ_OK) {
+            r->src = RQ_SPEC_PLAIN;
+            r->want = 0;
+            continue;
+        }
+        r->map = rq_mtp_hin(v, NULL, 0, 0, m, e->Hin + (size_t)rows * D);
+        r->dn = r->ddone = 0;
+        e->dseg[nds] = (RqSegment) { v, r->dbuf.v, m, RQ_LOGITS_LAST, e->H + (size_t)rows * D, e->Hin + (size_t)rows * D };
+        e->dsegrun[nds++] = r;
+        rows += m;
+    }
+    if (nds == 0) return;
+    int err = mtp_pass(e, nds, rows, &lg, &e->t_mtpA);
+    e->mA_passes++;
+    e->mA_rows += rows;
+    for (int i = 0, off = 0; i < nds; off += e->dseg[i++].n) {
+        Run *r = e->dsegrun[i];
+        RqSeq *v = e->dseg[i].seq;
+        if (err != RQ_OK) {
+            r->src = RQ_SPEC_PLAIN;
+            r->want = r->nd = 0;
+            continue;
+        }
+        rq_mtp_final(v, rq_seq_len(v) - e->dseg[i].n);
+        r->j->sp_mtp_approx += r->map;
+        e->m_approx += r->map;
+        memcpy(r->mh, e->H + (size_t)(off + e->dseg[i].n - 1) * D, (size_t)D * sizeof(float));
+        r->mcur = 0;
+    }
+    if (err != RQ_OK) return;
+    for (;;) { // the guesses: each job's row, then a pass per further guess
+        int ng = 0;
+        for (int i = 0; i < nds; i++) {
+            Run *r = e->dsegrun[i];
+            const float *row = lg + (size_t)i * V;
+            float p1;
+            int g = rq_spec_pick(row, V, NULL, r->stau, &p1);
+            if (g < 0 || (r->stau > 0 && p1 < r->stau)) {
+                r->ddone = 1;
+                continue;
+            }
+            r->guess[++r->dn] = g;
+            if (r->dn >= r->want) r->ddone = 1;
+            else ng++;
+        }
+        if (ng == 0) break;
+        nds = 0;
+        for (int i = 0; i < e->nrun; i++) {
+            Run *r = e->run[i];
+            if (r->done || r->src != RQ_SPEC_MODEL || r->ddone) continue;
+            e->dseg[nds] = (RqSegment) { e->slot[r->si].dseq, &r->guess[r->dn], 1, RQ_LOGITS_LAST, r->mh + (size_t)(1 - r->mcur) * D,
+                                         r->mh + (size_t)r->mcur * D };
+            e->dsegrun[nds++] = r;
+        }
+        err = mtp_pass(e, nds, nds, &lg, &e->t_mtpA);
+        e->mA_passes++;
+        e->mA_rows += nds;
+        for (int i = 0; i < nds; i++) {
+            Run *r = e->dsegrun[i];
+            if (err == RQ_OK) r->mcur ^= 1;
+            else r->src = RQ_SPEC_PLAIN, r->want = r->nd = 0, r->ddone = 1;
+        }
+        if (err != RQ_OK) break;
+    }
+    for (int i = 0; i < e->nrun; i++) {
+        Run *r = e->run[i];
+        if (!r->done && r->src == RQ_SPEC_MODEL) r->nd = r->dn;
+    }
+}
+
+static void mtp_follow(Engine *e, int nseg) {
+    // B (step, after the sampling): every job of this pass followed, those that ended in it too (their Run lives until reap,
+    // their slot is not reused before). Per job: the view cut to its common prefix with the target (with the prompt while
+    // the view's final rows are ahead of a target being prefilled: A's provisional rows do not count, they are past the
+    // target's length after every verify that does not take them all), then its rows up to the target's length (its capacity), the tokens
+    // the target's; h from this pass's hidden rows (hk: those still in the target, 0 if its pass failed or the rollback
+    // reset it), else the kept state, else zeros (counted). A gap (the rows before this pass's: a failed view pass, a view
+    // reset) runs whole if it fits in one pass (dmaxb rows), else dmaxb of its rows per step, this pass's rows then waiting
+    // as gap rows too. In passes of at most dmaxb rows (a job's rows in order, several passes if need be), no logits. Then
+    // the target's state at its last position kept: from this pass, else as kept if it is that one, else none. A failed
+    // pass appended nothing: its jobs keep the gap (mgap), the next B carries it; logged once per job
+    int D = e->dim, any = 0;
+    for (int i = 0; i < nseg; i++) {
+        Run *r = e->segrun[i];
+        Slot *sl = &e->slot[r->si];
+        RqSeq *v = sl->dseq, *s = sl->seq;
+        int Lt = rq_seq_len(s), Lv = rq_seq_len(v), cap = rq_seq_capacity(v), end = Lt < cap ? Lt : cap;
+        int Lf = rq_seq_common_prefix(v, rq_seq_tokens(v), Lv), n = r->j->prompt.n; // (Lf: its final rows)
+        int ML = Lt >= Lf || Lt >= n ? rq_seq_common_prefix(v, rq_seq_tokens(s), Lt) : rq_seq_common_prefix(v, r->j->prompt.v, n);
+        if (ML < Lv) rq_seq_truncate(v, ML);
+        int hk = Lt - r->hp0 < r->hn ? Lt - r->hp0 : r->hn, gap = (r->hp0 < end ? r->hp0 : end) - ML;
+        r->hk = hk > 0 ? hk : 0;
+        r->mend = ML >= end ? ML : gap > e->dmaxb ? ML + e->dmaxb : end;
+        any |= r->mend > ML;
+    }
+    while (any) {
+        int nds = 0, rows = 0;
+        any = 0;
+        for (int i = 0; i < nseg && rows < e->dmaxb; i++) {
+            Run *r = e->segrun[i];
+            Slot *sl = &e->slot[r->si];
+            RqSeq *v = sl->dseq;
+            int q = rq_seq_len(v), k = r->mend - q;
+            if (k <= 0) continue;
+            if (k > e->dmaxb - rows) k = e->dmaxb - rows;
+            float *hin = e->Hin + (size_t)rows * D;
+            r->map = rq_mtp_hin(v, e->H + (size_t)r->hrow * D, r->hp0, r->hk, k, hin);
+            e->dseg[nds] = (RqSegment) { v, rq_seq_tokens(sl->seq) + q, k, RQ_LOGITS_NONE, NULL, hin };
+            e->dsegrun[nds++] = r;
+            rows += k;
+        }
+        if (nds == 0) break;
+        int err = mtp_pass(e, nds, rows, NULL, &e->t_mtpB);
+        e->mB_passes++;
+        e->mB_rows += rows;
+        for (int i = 0; i < nds; i++) {
+            Run *r = e->dsegrun[i];
+            RqSeq *v = e->dseg[i].seq;
+            if (err == RQ_OK) {
+                rq_mtp_final(v, rq_seq_len(v) - e->dseg[i].n);
+                r->j->sp_mtp_approx += r->map;
+                e->m_approx += r->map;
+                any |= rq_seq_len(v) < r->mend;
+                continue;
+            }
+            if (!r->mlog)
+                fprintf(stderr, "[engine] job %d: the MTP view's follow pass failed (%s): its rows from %d wait (zeros for their h; only "
+                        "the speed changes)\n", r->id, rq_strerror(err), rq_seq_len(v));
+            r->mlog = 1;
+            r->mend = rq_seq_len(v);
+        }
+    }
+    for (int i = 0; i < nseg; i++) {
+        Run *r = e->segrun[i];
+        Slot *sl = &e->slot[r->si];
+        RqSeq *v = sl->dseq;
+        int Lt = rq_seq_len(sl->seq), Lv = rq_seq_len(v), cap = rq_seq_capacity(v), end = Lt < cap ? Lt : cap;
+        if (Lt > 0 && r->hp0 <= Lt - 1 && Lt - 1 < r->hp0 + r->hk) rq_mtp_keep(v, Lt - 1, e->H + (size_t)(r->hrow + Lt - 1 - r->hp0) * D);
+        else if (rq_mtp_kept(v, NULL) != Lt - 1) rq_mtp_keep(v, 0, NULL);
+        r->mfol++;
+        r->mgap = Lv < end ? end - Lv : 0;
+        e->m_gaps += r->mgap > 0;
+    }
+}
+
+static void mtp_check(Engine *e) {
+    // RUNQ_TEST_MTP_CHECK=1 (tests only; engine_main, after each step): every slot's view at rest, by the public calls.
+    // I1 every row final; a running job's view ahead only while its prompt is prefilled, as a prefix of the prompt; else I2
+    // the target's tokens, I3 as long as the target (to its capacity) and I4 the target's state at its last position kept
+    // (not at the capacity), unless no B has run yet or a failed one left a gap; an idle slot's: the target's tokens as far
+    // as both go
+    for (int i = 0; i < e->nslot; i++) {
+        Slot *sl = &e->slot[i];
+        RqSeq *v = sl->dseq, *s = sl->seq;
+        Run *r = sl->run;
+        if (!v) continue;
+        int Lv = rq_seq_len(v), Lt = rq_seq_len(s), cap = rq_seq_capacity(v), hp = rq_mtp_kept(v, NULL), m = Lt < Lv ? Lt : Lv;
+        const char *bad = NULL;
+        if (rq_seq_common_prefix(v, rq_seq_tokens(v), Lv) != Lv) bad = "I1 (a row not final)";
+        else if (!r) {
+            if (rq_seq_common_prefix(v, rq_seq_tokens(s), m) != m) bad = "idle: not the target's tokens";
+        } else if (Lv > Lt) {
+            int n = r->j->prompt.n;
+            if (Lt >= n || Lv > n || rq_seq_common_prefix(v, r->j->prompt.v, n) != Lv) bad = "ahead, not a prompt prefix being prefilled";
+        } else if (rq_seq_common_prefix(v, rq_seq_tokens(s), Lt) != Lv) bad = "I2 (not the target's tokens)";
+        else if (r->mfol > 0 && r->mgap == 0 && Lv != (Lt < cap ? Lt : cap)) bad = "I3 (the length)";
+        else if (r->mfol > 0 && r->mgap == 0 && Lv < cap && hp != Lt - 1) bad = "I4 (the kept state)";
+        if (bad) fprintf(stderr, "[engine] bug: slot %d's MTP view: %s (Lv %d, Lt %d, hpos %d)\n", i, bad, Lv, Lt, hp);
+    }
+}
+
+static void mtp_dump(Engine *e, Run *r) {
+    // RUNQ_TEST_MTP_DUMP=DIR (tests only; reap): a job that finished (no error status) with "mtp_approx" 0 in its timings
+    // ("speculative" not off) after a follow pass: its target's and view's sequences as DIR/<job>.rqseq and .draft.rqseq
+    // (the view's in version 2 with its kept state), for api_test --mtp-seqcheck
+    if (r->si < 0 || r->mfol == 0 || r->j->status || r->j->spec == SPEC_OFF || r->j->sp_mtp_approx != 0) return;
+    Slot *sl = &e->slot[r->si];
+    char p[4096];
+    snprintf(p, sizeof(p), "%s/%d.rqseq", e->mtp_dump, r->id);
+    int rc = rq_seq_save(sl->seq, p);
+    snprintf(p, sizeof(p), "%s/%d.draft.rqseq", e->mtp_dump, r->id);
+    if (rc == RQ_OK) rc = rq_seq_save(sl->dseq, p);
+    if (rc != RQ_OK) fprintf(stderr, "[engine] RUNQ_TEST_MTP_DUMP: job %d not saved: %s\n", r->id, rq_strerror(rc));
+}
+
 static void step(Engine *e, int stopping) {
     // one batched pass over every running job, then the sampling of the rows with logits
     int V = e->V, nseg = 0, rows = 0, ndec = 0, nc = 0;
@@ -2631,7 +2921,8 @@ static void step(Engine *e, int stopping) {
         int used = 0;
         for (int i = 0; i < e->nrun; i++) used |= !e->run[i]->done && e->run[i]->src == RQ_SPEC_MODEL;
         e->since_model = used ? 0 : e->since_model + 1;
-        spec_draft(e, ndec ? e->o.chunk : e->o.batch, ndec);
+        if (e->mtp) mtp_draft(e, ndec ? e->o.chunk : e->o.batch); // (A; the view follows in B, after the sampling)
+        else spec_draft(e, ndec ? e->o.chunk : e->o.batch, ndec);
     }
     int nspec = 0;
     for (int i = 0; i < e->nrun; i++) {
@@ -2666,6 +2957,14 @@ static void step(Engine *e, int stopping) {
         e->segrun[nseg++] = r;
     }
     if (nseg == 0) return;
+    if (e->mtp) // (the MTP drafter: every row's hidden state, for B; a server without it does not pay for them)
+        for (int i = 0, off = 0; i < nseg; off += e->seg[i++].n) {
+            Run *r = e->segrun[i];
+            e->seg[i].hidden = e->H + (size_t)off * e->dim;
+            r->hrow = off;
+            r->hp0 = rq_seq_len(e->seg[i].seq);
+            r->hn = e->seg[i].n;
+        }
 
     int nsel = 0, err;
     for (int i = 0; i < nseg; i++) nsel += e->seg[i].logits == RQ_LOGITS_ALL ? e->seg[i].n : e->seg[i].logits == RQ_LOGITS_LAST;
@@ -2675,7 +2974,8 @@ static void step(Engine *e, int stopping) {
         dec_like = e->seg[i].logits == RQ_LOGITS_ALL || (e->seg[i].logits == RQ_LOGITS_LAST && e->seg[i].n == 1);
     double pred = dec_like ? seg_cost(&e->tcal, e->seg, nseg, rows) : 0, t0 = rq_now();
     if (nseg == 1 && rows == 1 && nsel == 1) // (one decode row: the decode path)
-        err = rq_decode(e->c, e->seg[0].seq, e->seg[0].tokens[0], &lg);
+        err = e->mtp ? rq_decode_hidden(e->c, e->seg[0].seq, e->seg[0].tokens[0], &lg, e->H, NULL)
+                     : rq_decode(e->c, e->seg[0].seq, e->seg[0].tokens[0], &lg);
     else
         err = rq_forward_batch(e->c, e->seg, nseg, nsel > 1 ? e->logits : NULL, &lg);
     if (err == RQ_OK && pred > 0) cost_learn(&e->tcost, &e->tcal, &e->tlr, pred, rq_now() - t0); // (decode-like passes)
@@ -2694,6 +2994,7 @@ static void step(Engine *e, int stopping) {
             if (ei != RQ_OK) {
                 snprintf(msg, sizeof(msg), "%s", rq_ctx_error(e->c)[0] ? rq_ctx_error(e->c) : rq_strerror(ei));
                 if (r->vn > 0) r->vn = 0, r->feed.n = r->fed + 1; // (nothing fed: no rollback)
+                r->hn = 0;
                 end_run(e, r, 0, 0, ei, msg);
                 continue;
             }
@@ -2776,6 +3077,7 @@ static void step(Engine *e, int stopping) {
         }
         ns = nn;
     }
+    if (e->mtp) mtp_follow(e, nseg); // (B: the views of this pass's jobs to their targets' lengths)
 }
 
 static void reap(Engine *e) {
@@ -2787,6 +3089,8 @@ static void reap(Engine *e) {
             e->run[k++] = r;
             continue;
         }
+        if (e->mtp_dump) mtp_dump(e, r);
+        free(r->mh);
         rq_tokens_free(&r->feed);
         rq_tokens_free(&r->dbuf);
         rq_lookup_free(r->lk);
@@ -2862,8 +3166,14 @@ static void *engine_main(void *arg) {
         mem_publish(e);
         pthread_mutex_unlock(&e->mu);
         if (io) sw_run(e);
-        if (e->nrun > 0) step(e, stopping);
+        if (e->nrun > 0) {
+            double ts = rq_now();
+            step(e, stopping);
+            e->t_step += rq_now() - ts;
+            e->steps++;
+        }
         reap(e);
+        if (e->mtp_chk) mtp_check(e);
         pthread_mutex_lock(&e->mu);
         e->running = e->nrun;
         mem_publish(e);
@@ -2881,6 +3191,10 @@ static void *engine_main(void *arg) {
                     "%llu / %llu; draft %llu passes, %llu rows, %.3f s; measured / calibrated costs x%.2f (target), x%.2f (draft)\n",
                     e->sp_passes, e->sp_rows, e->sp_acc[RQ_SPEC_MODEL], e->sp_guess[RQ_SPEC_MODEL], e->sp_acc[RQ_SPEC_LOOKUP],
                     e->sp_guess[RQ_SPEC_LOOKUP], e->d_passes, e->d_rows, e->t_draft, exp(e->tlr), exp(e->dlr));
+        if (e->mtp) // (A: the guesses' passes, B: the follow passes; approx: rows with zeros for h; gaps: follow passes that left one)
+            fprintf(stderr, "[engine] mtp: A %llu passes %llu rows %.3f s; B %llu passes %llu rows %.3f s; steps %llu %.3f s; approx %llu; "
+                    "gaps %llu\n", e->mA_passes, e->mA_rows, e->t_mtpA, e->mB_passes, e->mB_rows, e->t_mtpB, e->steps, e->t_step,
+                    e->m_approx, e->m_gaps);
     }
     return NULL;
 }
@@ -2911,6 +3225,8 @@ void engine_free(Engine *e) {
     free(e->dlogits);
     free(e->dseg);
     free(e->dsegrun);
+    free(e->H);
+    free(e->Hin);
     free(e->cand);
     if (e->dc) rq_ctx_free(e->dc);
     dk_close(e);
@@ -2983,6 +3299,9 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
     // speculation: a draft sequence per slot (its KV cache, state and checkpoints), and per running job the transient
     // checkpoints of the verify rows (Qwen3.5: spec_kmax + 1 states of each model)
     e->dm = o->draft;
+    e->mtp = e->dm && o->draft_mtp > 0; // (the MTP view: KV only, one attention layer; no state)
+    e->dim = info.dim;
+    e->dprior = rq_spec_prior(e->dm);
     if (e->dm) {
         RqModelInfo di;
         rq_model_info(e->dm, &di);
@@ -3055,7 +3374,11 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
         e->dseg = calloc(e->parallel, sizeof(RqSegment));
         e->dsegrun = calloc(e->parallel, sizeof(Run *));
         e->dlogits = malloc((size_t)e->parallel * e->V * sizeof(float));
-        if (!e->dc || !e->dseg || !e->dsegrun || !e->dlogits) {
+        if (e->mtp) { // (the target's pass's hidden rows, the view's passes' h inputs: maxb rows each)
+            e->H = malloc((size_t)e->maxb * e->dim * sizeof(float));
+            e->Hin = malloc((size_t)e->maxb * e->dim * sizeof(float));
+        }
+        if (!e->dc || !e->dseg || !e->dsegrun || !e->dlogits || (e->mtp && (!e->H || !e->Hin))) {
             snprintf(err, errlen, "out of memory (the draft model's compute context)");
             engine_free(e);
             return NULL;
@@ -3133,6 +3456,9 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
     e->sw_delay = sd && *sd ? atof(sd) : 0;
     const char *sf = getenv("RUNQ_TEST_SWAP_FAIL"); // (tests: a file naming the swap I/O to fail, draft-save / draft-load)
     e->sw_fail = sf && *sf ? sf : NULL;
+    const char *mc = getenv("RUNQ_TEST_MTP_CHECK"), *md = getenv("RUNQ_TEST_MTP_DUMP"); // (tests: the MTP view's at-rest check, dumps)
+    e->mtp_chk = e->mtp && mc && !strcmp(mc, "1");
+    e->mtp_dump = e->mtp && md && *md ? md : NULL;
     if (e->o.admit_margin < 0) e->o.admit_margin = 0;
     mem_publish(e);
     if (pthread_create(&e->th, NULL, engine_main, e)) {
@@ -3174,17 +3500,18 @@ static void cost_text(char *b, size_t n, const RqPassCost *c) {
 }
 
 void engine_describe_spec(Engine *e, char *buf, size_t n) {
-    // the cost model, and the choice for one sequence alone by position (the priors: the model's guesses accepted at 0.6,
-    // a lookup match of 4 tokens)
+    // the cost model, and the choice for one sequence alone by position (the priors: the model's guesses accepted at 0.6, an
+    // MTP view's at 0.8: rq_spec_prior; a lookup match of 4 tokens)
     char t[200], d[200] = "";
     cost_text(t, sizeof(t), &e->tcost);
     if (e->dm) cost_text(d, sizeof(d), &e->dcost);
     int l = snprintf(buf, n, "costs: target %s%s%s (calibration %.1f s); one sequence alone", t, e->dm ? "; draft " : "", d, e->t_cal);
     const int Ls[] = { 512, 4096, 16384, 32768, 65536, 98304 };
     for (int i = 0; i < 6 && Ls[i] <= e->o.ctx && l < (int)n; i++) {
-        RqSpecChoice c = rq_spec_choose(&e->tcost, e->dm ? &e->dcost : NULL, Ls[i], 3, 0.6, 3, rq_lookup_prior(4));
+        RqSpecChoice c = rq_spec_choose(&e->tcost, e->dm ? &e->dcost : NULL, Ls[i], 3, e->dprior, 3, rq_lookup_prior(4));
         if (c.src == RQ_SPEC_PLAIN) l += snprintf(buf + l, n - l, "%s at %d: plain", i ? "," : "", Ls[i]);
-        else l += snprintf(buf + l, n - l, "%s at %d: %s %d (x%.2f)", i ? "," : "", Ls[i], c.src == RQ_SPEC_MODEL ? "model k" : "lookup",
+        else l += snprintf(buf + l, n - l, "%s at %d: %s %d (x%.2f)", i ? "," : "", Ls[i],
+                           c.src == RQ_SPEC_MODEL ? e->mtp ? "mtp k" : "model k" : "lookup",
                            c.n, c.gain);
     }
 }

@@ -157,6 +157,7 @@ struct Job {
     int slot;                   // the sequence (slot) used
     // speculation's counters (timings): decode passes; per source the passes with guesses, guesses, accepted ones
     int sp_passes, sp_model[3], sp_lookup[3], sp_draft_rows, sp_refed; // (refed: positions fed again after a rollback: 0)
+    int sp_mtp_approx;          // --draft mtp: the MTP view's rows that took zeros for an unknown hidden state (-1: no MTP view)
 };
 
 enum { SPEC_OFF = 0, SPEC_AUTO = 1, SPEC_FIXED = 2 };
@@ -184,6 +185,8 @@ typedef struct {
     int calib;
     int spec_used;              // requests speculate by default (the cost calibration runs at the start)
     int spec_kmax;              // the default guesses per pass at most (either source): the transient checkpoints counted
+    int draft_mtp;              // the draft is the model's MTP view (--draft mtp, rq_mtp_load): its block's index (blk.N), else 0
+    int mtp_vocab;              // ... its vocabulary subset (RqMtpOpts.vocab; 0: all)
     // the disk tier (engine.c, "the disk tier"): saved sequences in kv_disk/<model fingerprint>-<KV type>/ (NULL: off),
     // at most kv_disk_max GiB (0: half the free space at the start, our files included), a slot saved when a job would
     // discard >= kv_disk_min of its tokens (and at shutdown)

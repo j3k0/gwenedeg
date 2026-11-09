@@ -60,9 +60,40 @@ Steps:
     `mtp_approx`); output == plain decoding on every case (spec group: `spec_api/mtp_synth*`, `spec_mtp/*`, the
     `mtp_lockstep` check after every run). On Qwen3.5-0.8B with its own block (the opt-in test file) as target and
     draft: 64 / 64 outputs == plain, 42-79% of the guesses accepted, 2.2-3.5 tokens per pass at k 2-4, 0.87-1.24x plain's
-    tok/s on that small model (docs/qwen38-speculative.md, "The loop"). `runq serve --draft mtp` is refused until S9c. **Next: S9d** (S9d.1:
-    `scripts/s9_gate.sh`, `tests/spec_sweep.c`; S9d.2: the 27B's acceptance, gated: closed while MemAvailable is ~12 GiB
-    next to the live server), then S9c only after a go.
+    tok/s on that small model (docs/qwen38-speculative.md, "The loop"). `runq serve --draft mtp` is refused until S9c.
+    **S9d.1 done (2026-11-09):** `scripts/s9_gate.sh` (the 27B gate: the estimate from metadata, the servers' `/health`
+    margin and the timers that start one, a capped scope without swap, the watchdog, the bench lock) and
+    `build/spec_sweep` (`make spec-sweep`: settings x S7's prompts in one process, every output checked against plain);
+    the 0.8B-mtp through the gate: 80 / 80 runs == plain (docs/qwen38-speculative.md, "The 27B gate"). **Open: S9d.2**
+    (below), then S9c only after a go.
+  - **Open, S9d.2 (the 27B's acceptance; gated):** IQ3_S-mtp needs ~13.1 GiB (MTP, k <= 3) / ~14.4 GiB (with the 0.8B
+    draft, k <= 6) + 1 GiB cap, i.e. MemAvailable >= ~17-18.5 GiB + the servers' margin. On 2026-11-09 the gate was
+    closed only by the timers (saluki's restore at 06:00Z, the nightly benchmark at 22:00Z); next to a running saluki it
+    is closed by its margin (06:02Z: budget 14.63 - committed 0.004 + 1 = 15.62 GiB against MemAvailable 14.6). A window: saluki down (the user's call) and `--until` 5+ min before the next server start.
+    Each step is one command (8 threads; `scripts/s9_gate.sh --dry ...` first; build: `make -s -j8 runq spec-sweep`):
+    ```
+    export OMP_NUM_THREADS=8 TMPDIR=/var/tmp; mkdir -p /var/tmp/s9d2; G=models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO
+    D8=models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf; U=05:40   # --until: before the next server start
+    # 1. BF16 alpha / beta == their F32 rewrite on the real file (two gated loads, then cmp)
+    scripts/s9_gate.sh --until $U -- ./runq $G-IQ3_S.gguf -m logits -c 512 -i "The capital of Australia is" -o /var/tmp/s9d2/bf16.bin
+    scripts/s9_gate.sh --until $U -- ./runq $G-IQ3_S-f32ssm.gguf -m logits -c 512 -i "The capital of Australia is" -o /var/tmp/s9d2/f32.bin
+    cmp /var/tmp/s9d2/bf16.bin /var/tmp/s9d2/f32.bin && rm /var/tmp/s9d2/*.bin
+    # 2. acceptance first: MTP k 3, greedy, thinking on, the full vocabulary (~5 min)
+    scripts/s9_gate.sh --until $U -- build/spec_sweep $G-IQ3_S-mtp.gguf -c 4096 -n 256 -r 1 -S plain -S "mtp -G 3" > /var/tmp/s9d2/accept.jsonl
+    # 3. only if section 7's model with S9w's costs predicts >= +10% over the 0.8B (p >= ~0.79 full, ~0.75 with 100k):
+    #    plain (best of 2), the 0.8B, MTP k 1-6 and tau, thinking on and off (~35 min)
+    scripts/s9_gate.sh --until $U -- build/spec_sweep $G-IQ3_S-mtp.gguf -c 4096 -n 256 -r 1,0 -D $D8 -S plain -S plain \
+      -S "draft -G 3" -S "draft -G 6 --tau 0.4" -S "mtp -G 1" -S "mtp -G 2" -S "mtp -G 3" -S "mtp -G 4" -S "mtp -G 6" \
+      -S "mtp -G 6 --tau 0.3" -S "mtp -G 6 --tau 0.5" > /var/tmp/s9d2/sweep.jsonl
+    #    then the subsets at the best K / TAU of step 3:
+    scripts/s9_gate.sh --until $U -- build/spec_sweep $G-IQ3_S-mtp.gguf -c 4096 -n 256 -r 1,0 -S "mtp -G K --tau TAU" \
+      -S "mtp -G K --tau TAU --mtp-vocab 65536" -S "mtp -G K --tau TAU --mtp-vocab 100000" -S "mtp -G K --tau TAU --mtp-vocab 151643" > /var/tmp/s9d2/vocab.jsonl
+    # 4. seeded (the GGUF's T 1 / top-p 0.95 / top-k 20, -s 42) at the best settings
+    scripts/s9_gate.sh --until $U -- build/spec_sweep $G-IQ3_S-mtp.gguf -c 4096 -n 256 -r 1,0 -t 1 -p 0.95 -K 20 -s 42 -D $D8 \
+      -S "draft -G 6 --tau 0.4" -S "mtp -G K --tau TAU --mtp-vocab N" > /var/tmp/s9d2/seeded.jsonl
+    ```
+    Then: the tables in docs/qwen38-speculative.md, the go / no-go (PLAN-S9-mtp.md 8), `--mtp-vocab`'s default and
+    `RqSpecOpts.prior`'s MTP default (a commit with TEST and CMP).
   - **Acceptance measured (2026-11-08, llama.cpp cf34d31 `--spec-type draft-mtp` vs `draft-simple -md` the 0.8B
     Q4_K_M; k 3, thinking on, T 0.6 / top_p 0.95 / top_k 20, 12 threads, CPU):** MTP 410 / 765 drafted tokens accepted
     (54%) vs the 0.8B 233 / 714 (33%), MTP ahead on each of the 4 prompts (38-70% vs 25-42%; LCB medium + 2 coding

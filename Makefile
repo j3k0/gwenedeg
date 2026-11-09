@@ -29,7 +29,7 @@ HDR = $(wildcard src/*.h)
 Q8  = models/Qwen3-0.6B-q8.bin
 B   = build
 
-.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test iq-neon-test api-test tools-test bench-batch bench-verify long-ctx bench-long bench-mtp teacher-force mem-probe bf16dp-test FORCE
+.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test iq-neon-test api-test tools-test bench-batch bench-verify long-ctx bench-long bench-mtp spec-sweep teacher-force mem-probe bf16dp-test FORCE
 
 all: runq
 
@@ -113,6 +113,13 @@ $(B)/bench_mtp: tests/bench_mtp.c src/runq.h $(LIB:%=$(B)/native/%.o)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
 
 bench-mtp: $(B)/bench_mtp
+
+# the speculative settings x prompts in one process (tests/spec_sweep.c: the model, its MTP view and a draft model loaded
+# once; one JSON line per run, the outputs checked against plain decoding's; scripts/s9_gate.sh for the 27B, TODO S9d)
+$(B)/spec_sweep: tests/spec_sweep.c src/runq.h $(LIB:%=$(B)/native/%.o)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
+
+spec-sweep: $(B)/spec_sweep
 
 # draft predictions teacher-forced on long token streams (tests/teacher_force.c: the argmax and its probability at given
 # positions; scripts/lookup_accept.py draft, TODO G0 (c))

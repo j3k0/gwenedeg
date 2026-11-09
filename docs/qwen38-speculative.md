@@ -1462,6 +1462,54 @@ acceptance pays; on the 27B a guess is ~6-9% of a step (S9w). The acceptance (42
 pass at k 2-4) is in the range llama.cpp's measurement suggests for the 27B's block (54% at k 3). Not done: llama.cpp's
 `--spec-type draft-mtp` on the same file and prompts (the plan's optional comparison).
 
+### The 27B gate and the sweep driver (TODO S9d.1, 2026-11-09)
+
+The 27B's acceptance (S9d.2) runs next to the production server, so every 27B process goes through
+`scripts/s9_gate.sh [--dry] [--until TIME] -- COMMAND` (COMMAND: `runq` or `build/spec_sweep`, without `--mem`):
+- **Open only if it fits:** the bench lock (`/tmp/cwayn-bench.lock`, held for the run); MemAvailable and SwapFree (>= 4
+  GiB); every `runq serve` process and the launch-server endpoints (8418, 8417): `/health` must answer with a `mem` object
+  and `running` 0, and each server's margin is `max(0, mem.budget - mem.committed)` + a floor (1 GiB) + its swapped-out
+  memory (VmSwap: it comes back when the server runs); the servers to come: `runq-day.timer` (saluki's morning restore)
+  and `lcb-bench.timer` (the nightly benchmark) close the gate unless `--until` ends the run 5 minutes before their next
+  start (the job is killed at `--until`), and close it while their service runs. budget = MemAvailable - the servers'
+  margin - 3 GiB; cap = the estimate + 1 GiB; closed (exit 3, the numbers printed) if budget < cap.
+- **The estimate**, from metadata only (no tensor data read; each probe in a 1 GiB scope): the job's own command with
+  `--mem 0.01` refuses with the model's estimate (`needs ~X GiB`); + the MTP view: its block's bytes in the file x 1.10
+  (repacked; the 0.8B-mtp's Q8_0 block: 20.7 MiB in the file, 22.0 resident) + norms + the model's runtime (a bound for
+  the view's context: 0.8B-mtp 44.5 vs 98.2 MiB) + one attention layer's KV; + the loop's checkpoints, state x (kmax + 2);
+  + a draft model's estimate (`runq DRAFT --mem 0.01`) and its checkpoints. `spec_sweep --list` tells the gate its kmax,
+  MTP and draft use. The view's own `[memory] mtp estimate` line needs the model loaded, so the gate cannot read it.
+- **The run:** `systemd-run --user --scope -p MemoryMax=<cap> -p MemorySwapMax=0 choom -n 1000 nice -n 10 COMMAND --mem
+  <budget>`: the job checks its scope's `memory.max` / `memory.swap.max` before it starts; a watchdog kills the scope
+  (only the job) when MemAvailable < 3 GiB (exit 4) or at `--until` (exit 5); the end reports the scope's `memory.peak`.
+
+On 2026-11-09 04:56Z (saluki down for the benchmark window, MemAvailable 21.6 GiB, SwapFree 8.4): `--dry` on
+IQ3_S-mtp `-c 4096`, MTP k <= 3: estimate 13.08 GiB (model 11.76 + view 0.59 + checkpoints 0.73), cap 14.08, budget
+19.38, **closed** by the timers (saluki's restore at 06:00Z, the benchmark at 22:00Z); with the 0.8B draft and k <= 6:
+14.37 / 15.37 (open with `--until 05:50`; not run). The plan's ~13.6 / ~14.3 GiB. At 06:02Z, saluki restored (its
+`/health`: budget 14.63, committed 0.004 GiB; MemAvailable 14.6): margin 15.62 GiB, budget -4.00, **closed** (any job
+next to it is: the server's budget is all of MemAvailable at its start). Checked by hand: the scope probe and
+every job's scope read `memory.swap.max` 0 and the cap as `memory.max`, `oom_score_adj` 1000; the watchdog with a fake
+threshold (MemAvailable - 0.5 GiB) killed a `runq -D mtp` job 1 s after its load (exit 4, nothing left of the scope),
+`--until` 75 s ahead killed a sweep at the deadline (exit 5, its first 25 JSON lines kept); `/health` replies as
+`file://` fixtures (curl): an idle server's margin taken (budget 12.5 - committed 3.25 + 1 = 10.25 GiB), `running 1`
+and no `mem` object closed; a held bench lock, `--until` 2 minutes before a timer, an unknown command (not run) closed;
+`--mem` in the command refused.
+
+**`build/spec_sweep MODEL [-S SETTING]... [-r 1,0] [-n 256] [-c 4096] [-D DRAFT] ...`** (`make spec-sweep`,
+`tests/spec_sweep.c`, rev-perf 6): the model, its MTP view (one at a time, reloaded when `--mtp-vocab` changes) and a
+draft model loaded once; per reasoning mode, prompt (S7's chat / code / math / summ) and setting (`plain`, `mtp` or
+`draft` + runq's `-G`, `--tau`, `--mtp-vocab`, `--lookup`, `--spec auto`), fresh sequences, the chat rendering of one
+`-i` turn, `rq_generate_spec` and one JSON line (tokens, passes, drafted, accepted, draft_steps, mtp_rows, mtp_approx,
+t_prefill, t_gen, t_draft, t_verify, tok/s without the prompt, tokens per pass); plain first, every other run's tokens,
+stop and RNG state must equal its (exit 1 otherwise); a summary table per mode. Smoke tests (2026-11-09, by hand):
+synth-q35-27b-mtp and -f32 (`-b 1`, seeded, a 1000-token subset): 12 / 12 runs == plain each; 40 runs with auto and
+lookup settings == plain; synth-q35-27b (no block) refused. The real 0.8B-mtp **through the gate**: greedy, thinking on
+and off, plain + MTP k 2 / 3 / 4, k 3 with the 100k subset and the 0.8B Q4_K_M as a draft model: 40 / 40 == plain;
+seeded (T 1, top-p 0.95, top-k 20, `-s 42`) with tau, auto, lookup and a 65,536 subset: 40 / 40 == plain;
+`mtp_approx` 0 everywhere; the scope's peak 0.96-1.07 GiB against estimates of 1.20-1.26 GiB. Their tok/s are not
+results (box load 12-24 from the test suite and other jobs).
+
 ## Not now
 
 DFlash 2 (a 2B block-diffusion drafter: a new architecture, a 4 GB BF16 download); multi-VM splits (~10-30% over

@@ -79,7 +79,11 @@ while [ $# -gt 0 ]; do
         *) die "unknown option $1 (usage: s9_gate.sh [--dry] [--until TIME] [options] -- COMMAND ARGS...)" ;;
     esac
 done
-[ -n "$SRV" ] || [ $# -ge 2 ] || die "no command (s9_gate.sh [options] -- runq|spec_sweep MODEL ...)"
+if [ -n "$SRV" ]; then  # (the server mode: any command; none only with --dry)
+    [ $# -ge 1 ] || [ "$DRY" = 1 ] || die "no command (s9_gate.sh --server MODEL ... -- COMMAND ARGS...)"
+else
+    [ $# -ge 2 ] || die "no command (s9_gate.sh [options] -- runq|spec_sweep MODEL ...)"
+fi
 CMD=("$@")
 for a in "${CMD[@]}"; do [ "$a" = --mem ] && die "the command must not have --mem: the gate computes it"; done
 if [ -n "$SRV" ]; then

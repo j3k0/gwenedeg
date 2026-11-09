@@ -2,7 +2,8 @@
 """The server benchmark of TODO S9c (PLAN-S9c-server.md S9c.G): one `runq serve` and the requests of one configuration.
 
   scripts/s9c_bench.py --model MODEL --serve-args "ARGS" [--short [--think 1,0]] [--long L --turns T] [--label X] [--json PATH]
-  scripts/s9c_bench.py --compare A.json B.json ...      (the output hashes of the runs: equal per request, exit 0; else 1)
+  scripts/s9c_bench.py --compare A.json B.json ...      (the output hashes of the runs: equal per request and
+                                                        every request in every run, exit 0; else 1)
 
 The server: `runq serve MODEL ARGS [--mem $S9_GATE_MEM] --host 127.0.0.1 --port 0 --timeout 0` (S9_GATE_MEM: exported by
 scripts/s9_gate.sh's server mode; the server's threads, draft, pool and -v come with ARGS). Its startup lines, its
@@ -186,6 +187,8 @@ def record(key, st, d, wall, **kw):
     ch = (d.get("choices") or [{}])[0] if st == 200 else {}
     msg = ch.get("message") or {}
     out = (msg.get("content") or "") + "\0" + (msg.get("reasoning_content") or "") + "\0" + str(ch.get("finish_reason"))
+    if msg.get("tool_calls"):  # (parsed calls: only with a request's tools; their text is not in content)
+        out += "\0" + json.dumps(msg["tool_calls"], sort_keys=True)
     tm = d.get("timings", {}) if st == 200 else {}
     sp = tm.get("speculative") or {}
     r = dict(key=key, status=st, wall_s=round(wall, 3), prompt_n=tm.get("prompt_n"), prompt_ms=tm.get("prompt_ms"),
@@ -269,11 +272,12 @@ def run_long(srv, a, recs):
 
 def compare(paths):
     """the runs' output hashes per request key (every client count): equal, or the differences"""
-    seen, bad, n = {}, [], 0
+    seen, bad, n, where = {}, [], 0, {}
     for p in paths:
         with open(p) as f:
             d = json.load(f)
         for r in d["requests"]:
+            where.setdefault(r["key"], set()).add(p)
             if r["status"] != 200:
                 bad.append(f"{p}: {r['key']}: status {r['status']}")
                 continue
@@ -281,6 +285,10 @@ def compare(paths):
             w = seen.setdefault(r["key"], (r["hash"], p))
             if w[0] != r["hash"]:
                 bad.append(f"{r['key']}: {p} {r['hash']} vs {w[1]} {w[0]}")
+    for k, ps in where.items():  # (a request one of the runs lacks: not compared there)
+        if len(ps) != len(set(paths)):
+            bad.append(f"{k}: only in {len(ps)} of {len(set(paths))} runs (missing from "
+                       + ", ".join(sorted(set(paths) - ps)) + ")")
     print(f"s9c_bench --compare: {n} replies of {len(paths)} runs, {len(seen)} requests: "
           + ("every hash equal" if not bad else f"{len(bad)} differ"))
     for b in bad:

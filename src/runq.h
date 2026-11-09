@@ -73,7 +73,13 @@ typedef struct {
                         // if the file is >= 1/4 of the RAM, 1 = dropped, -1 = kept
     int checkpoints;    // Qwen3.5: the checkpoint slots of the sequence the check counts (rq_seq_set_checkpoints; 0: the
                         // default 2)
+    int repack;         // the IQ3_XXS / IQ3_S matmul weights repacked losslessly as 4-bit codes (runq --repack): the same
+                        // values and bit-identical results, less decode work per weight (faster where the matmuls are
+                        // compute-bound), 4.19 bits per weight instead of 3.44 / 3.19 (more RAM; the memory check counts
+                        // it). RQ_REPACK_ALL, or RQ_REPACK_IQ3_S / _IQ3_XXS bits: those types only; 0 / < 0: none
+                        // (default). AVX-512 builds only (elsewhere ignored). rq_repack_info: what it costs
 } RqModelOpts;
+enum { RQ_REPACK_ALL = 1, RQ_REPACK_IQ3_S = 2, RQ_REPACK_IQ3_XXS = 4 };
 
 // A qwen3.c .bin (with its .tokenizer / .template* side files) or a GGUF file (Q8_0, Q3_K_M .. Q5_K_M), by
 // magic. NULL on failure, with the reason in err (e.g. "GGUF <path>: tensor ... not found"; a model whose
@@ -165,6 +171,32 @@ int rq_model_mem(const RqModel *m, RqModelMem *mem);
 int rq_seq_mem(const RqModel *m, int capacity, int kv_type, RqSeqMem *mem);
 // MemAvailable of /proc/meminfo in bytes (Linux), or -1 where unknown
 double rq_mem_available(void);
+
+// RqModelOpts.repack for a loaded model: per type of its matmul weights (the MTP block not counted) what the repack costs
+// (exact, from the shapes), and IQ1_S / IQ1_M, which are always stored as codes (not optional: their cost is in every
+// load). What it gains depends on the machine and the threads: runq --repack-info loads the model with each choice in
+// turn and times it (rq_pass_times). RQ_ERR_STATE: no weights
+#define RQ_REPACK_TYPES 4
+typedef struct {
+    const char *type;     // the file's type ("IQ3_S")
+    int bit;              // its RqModelOpts.repack bit (RQ_REPACK_IQ3_S, ...); 0: always stored as codes (IQ1_S / IQ1_M)
+    int repacked;         // the model was loaded with it repacked (bytes: repacked)
+    int mats;             // its matmul weights
+    double share;         // their share of the matmul weights' values
+    size_t bytes, extra;  // their bytes in memory now; the repack's additional bytes (bit 0: over the file's)
+} RqRepackType;
+typedef struct {
+    int available;        // 1: this build has the repacked kernels (AVX-512 VNNI); 0: RqModelOpts.repack does nothing
+    int n;                // types below (the repackable ones first)
+    RqRepackType t[RQ_REPACK_TYPES];
+    size_t weights;       // the weights in memory now (rq_model_mem's)
+    size_t extra;         // the repack's additional bytes for the types not repacked yet
+} RqRepackInfo;
+int rq_repack_info(const RqModel *m, RqRepackInfo *info);
+// A decode step (rq_decode) and a 4-row pass with every row's logits (an MTP verify pass at -G 3, rq_prefill) of a loaded
+// model at position 32 (rq_seq_fill_synthetic), the fastest of reps each (after a warm-up), seconds. On the caller's
+// threads; its own context and sequence (~ a few MB)
+int rq_pass_times(const RqModel *m, int reps, double *t1, double *t4);
 
 // --------------------------------------------------------------------------------------- sequence
 typedef struct RqSeq RqSeq;

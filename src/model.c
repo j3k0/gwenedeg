@@ -357,6 +357,29 @@ static int prep_mats(const RqModel *m, PrepMat *mt) {
     return sizeof(t) / sizeof(t[0]);
 }
 
+static int repack_type(int mask, int type) {
+    // the layout of a matmul weight of this (file) type under RqModelOpts.repack mask (RQ_REPACK_*)
+    int bit = type == GGML_IQ3_S ? RQ_REPACK_IQ3_S : type == GGML_IQ3_XXS ? RQ_REPACK_IQ3_XXS : 0;
+    return mask > 0 && (mask & (RQ_REPACK_ALL | bit)) && bit ? iq_repack_type(type) : type;
+}
+
+static int repack_types(RqModel *m) {
+    // RqModelOpts.repack: the matmul weights' types -> their --repack layouts (iq_repack_type: IQ3_XXS / IQ3_S on the
+    // AVX-512 builds), before the memory estimate and prepare_weights; how many. (A tied classifier's embedding rows still
+    // come from the file's blocks: iq_dequant_row reads them as the base type)
+    if (m->repack <= 0 || !m->is_gguf) return 0;
+    PrepMat mt[16];
+    int nm = prep_mats(m, mt), n = 0;
+    for (int i = 0; i < nm; i++)
+        for (int l = 0; l < mt[i].n; l++) {
+            QuantizedTensor *t = mt[i].t + l;
+            int r = repack_type(m->repack, t->type);
+            n += r != t->type;
+            t->type = r;
+        }
+    return n;
+}
+
 static int prep_pack(const PrepMat *mt, int nm, char *warning, size_t wlen) {
     // 1 if the Q8_0 matrices are repacked for the SIMD kernels (else a warning, if not NULL)
     int pack = 0;
@@ -972,6 +995,8 @@ static void load_model(RqModel *m, const char *path, const RqModelOpts *o, Loade
         gguf_map_weights(m);
     else
         bin_map_weights(m, path, e);
+    m->repack = o->repack > 0 ? o->repack : 0;
+    repack_types(m); // (before the check: it counts the repacked sizes)
     mem_check(m, o, path, e); // (nothing of the tensor data read yet)
     if (m->is_gguf)
         gguf_copy_norms(m);
@@ -1137,6 +1162,7 @@ static void mtp_build(RqModel *v, const RqMtpOpts *o, MtpLoader *ld) {
         (*dst[i])->b = src[i]->b;
         (*dst[i])->type = src[i]->type;
         if (src[i]->type != GGML_Q8_0) v->kq = 1; // (the target's kq covers its embedding and classifier)
+        (*dst[i])->type = repack_type(t->repack, src[i]->type); // (RqModelOpts.repack: as the target's)
     }
     if (!forward_model_init(v)) load_fail(e, "%s: MTP block of an unsupported shape", path);
     if (v->xs < 2 * dim) v->xs = 2 * dim; // (the input row [e | h] in the batched xb / xq rows and decode's xb / xq)
@@ -1371,4 +1397,65 @@ int rq_dequant_rows(const RqModel *m, const char *name, size_t nlen, long r0, lo
     *ncols = k;
     *npacked = b != NULL;
     return RQ_OK;
+}
+
+// ---------------------------------------------------------------------------- --repack: its cost (rq_repack_info), times
+
+int rq_repack_info(const RqModel *m, RqRepackInfo *ri) {
+    memset(ri, 0, sizeof(*ri));
+    if (!m || !m->has_weights) return RQ_ERR_STATE;
+    ri->available = iq_repack_type(GGML_IQ3_S) != GGML_IQ3_S;
+    ri->weights = m->mem.weights;
+    static const int types[RQ_REPACK_TYPES] = { GGML_IQ3_S, GGML_IQ3_XXS, GGML_IQ1_S, GGML_IQ1_M };
+    static const int bits[RQ_REPACK_TYPES] = { RQ_REPACK_IQ3_S, RQ_REPACK_IQ3_XXS, 0, 0 };
+    PrepMat mt[16];
+    int nm = m->is_gguf ? prep_mats(m, mt) : 0;
+    double all = 0;
+    for (int i = 0; i < nm; i++)
+        for (int l = 0; l < mt[i].n; l++)
+            all += (double)mt[i].d * mt[i].k;
+    for (int j = 0; j < RQ_REPACK_TYPES; j++) {
+        RqRepackType *x = &ri->t[ri->n];
+        for (int i = 0; i < nm; i++)
+            for (int l = 0; l < mt[i].n; l++) {
+                const QuantizedTensor *t = mt[i].t + l;
+                if (!iq_type(t->type) || iq_base(t->type) != types[j]) continue;
+                int d = mt[i].d, k = mt[i].k;
+                x->mats++;
+                x->share += (double)d * k / all;
+                x->bytes += lq_size(t->type, d, k);
+                x->repacked = t->type != types[j];
+                x->extra += bits[j] ? iq_size(types[j] | IQ_R, d, k) - iq_size(types[j], d, k)
+                                    : iq_size(t->type, d, k) - (size_t)d * (k / QK_K) * iq_block_bytes(t->type);
+            }
+        if (!x->mats) continue;
+        x->type = iq_name(types[j]);
+        x->bit = bits[j];
+        if (x->bit && !x->repacked) ri->extra += x->extra;
+        ri->n++;
+    }
+    return RQ_OK;
+}
+
+int rq_pass_times(const RqModel *m, int reps, double *t1, double *t4) {
+    int e, V = m->config.vocab_size, L = 32, toks[4];
+    RqCtx *c = rq_ctx_new(m, 4, 0, &e);
+    RqSeq *s = c ? rq_seq_new(m, 128, RQ_KV_DEFAULT, &e) : NULL;
+    float *out = malloc((size_t)4 * V * sizeof(float)), *lg;
+    *t1 = *t4 = 1e30;
+    e = !c || !s || !out ? RQ_ERR_NOMEM : rq_seq_fill_synthetic(s, L, 0x5eed);
+    if (e == RQ_OK) e = rq_seq_checkpoint_at(s, L); // (Qwen3.5: the truncations land here)
+    for (int i = 0; i < 4; i++) toks[i] = (1000 + 37 * i) % V;
+    for (int rep = -1; rep < reps && e == RQ_OK; rep++) // (rep -1: a warm-up)
+        for (int r = 0; r < 2 && e == RQ_OK; r++) {
+            double t0 = rq_now();
+            e = r ? rq_prefill(c, s, toks, 4, RQ_LOGITS_ALL, out, &lg) : rq_decode(c, s, toks[0], &lg);
+            double dt = rq_now() - t0;
+            if (e == RQ_OK) e = rq_seq_truncate(s, L);
+            if (rep >= 0 && dt < (r ? *t4 : *t1)) *(r ? t4 : t1) = dt;
+        }
+    free(out);
+    if (s) rq_seq_free(s);
+    if (c) rq_ctx_free(c);
+    return e;
 }

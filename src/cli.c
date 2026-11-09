@@ -626,6 +626,12 @@ static void error_usage(void) {
     fprintf(stderr, "              messages ({\"role\": \"user\", \"content\": \"...\"}), with -r; or of [{\"request\": BODY}, ...]:\n");
     fprintf(stderr, "              chat completion request bodies as runq serve renders them (tools)\n");
     fprintf(stderr, "              logits: write the logits at every position of -i to -o (binary)\n");
+    fprintf(stderr, "  --repack    store the IQ3_XXS / IQ3_S weights as 4-bit codes at load: lossless (bit-identical output), faster\n");
+    fprintf(stderr, "              matmuls where compute-bound, +0.75 / +1.0 bit per such weight of RAM (AVX-512 builds)\n");
+    fprintf(stderr, "  --repack=LIST  only these types: IQ3_S, IQ3_XXS (comma-separated)\n");
+    fprintf(stderr, "  --no-repack weights as in the file (default)\n");
+    fprintf(stderr, "  --repack-info  what --repack costs (RAM) and gains here (a decode step, a 4-row pass; the current threads)\n");
+    fprintf(stderr, "              per type: loads and times the model with each choice in turn (~4 loads), then exits\n");
     fprintf(stderr, "  -i <string> input prompt (chat: one turn, then exit; without -i, one turn per stdin line,\n");
     fprintf(stderr, "              the conversation is kept until an empty line or EOF)\n");
     fprintf(stderr, "              dequant (GGUF, test hook): rows of the matrix -i NAME[:ROW0[:NROWS]] to -o (binary)\n");
@@ -715,6 +721,151 @@ static void load_draft(const char *path, const RqModel *target, const char *targ
     if (!(draft.c = rq_ctx_new(draft.m, prefill_chunk, 0, &e))) die("malloc failed!");
 }
 
+static int word_is(const char *v, size_t n, const char *w) {
+    // v[0..n) == w, ASCII case-insensitive
+    if (strlen(w) != n) return 0;
+    for (size_t i = 0; i < n; i++)
+        if ((v[i] | 32) != (w[i] | 32)) return 0;
+    return 1;
+}
+
+int rq_repack_parse(const char *v) {
+    // --repack=LIST: comma-separated IQ3_S / IQ3_XXS / all (any case) -> RqModelOpts.repack bits; -1 if unknown
+    int bits = 0;
+    while (*v) {
+        size_t n = strcspn(v, ",");
+        if (word_is(v, n, "iq3_s")) bits |= RQ_REPACK_IQ3_S;
+        else if (word_is(v, n, "iq3_xxs")) bits |= RQ_REPACK_IQ3_XXS;
+        else if (word_is(v, n, "all")) bits |= RQ_REPACK_ALL;
+        else return -1;
+        v += n + (v[n] == ',');
+    }
+    return bits ? bits : -1;
+}
+
+void rq_repack_note(const RqModel *m) {
+    // --repack: a line on stderr (what was repacked and its cost; runq serve too)
+    const double G = 1073741824.0;
+    RqRepackInfo ri;
+    if (rq_repack_info(m, &ri) != RQ_OK) return;
+    char list[160] = "";
+    size_t x = 0;
+    for (int i = 0; i < ri.n; i++)
+        if (ri.t[i].bit && ri.t[i].repacked) {
+            size_t l = strlen(list);
+            snprintf(list + l, sizeof(list) - l, "%s%s (%d)", l ? ", " : "", ri.t[i].type, ri.t[i].mats);
+            x += ri.t[i].extra;
+        }
+    if (!ri.available) fprintf(stderr, "--repack: not available on this build (AVX-512 VNNI only): weights as in the file\n");
+    else if (!*list) fprintf(stderr, "--repack: nothing to repack (no IQ3_XXS / IQ3_S matmul weights selected)\n");
+    else fprintf(stderr, "[repack] %s as 4-bit codes: +%.2f GiB, weights %.2f GiB\n", list, x / G, ri.weights / G);
+}
+
+static int repack_measure(const char *path, RqModelOpts o, int bits, double *t1, double *t4, double *gib, char *err, size_t el) {
+    // --repack-info: a load with RqModelOpts.repack = bits, its pass times (rq_pass_times) and weights (GiB), freed again
+    o.repack = bits;
+    RqModel *m = rq_model_load(path, &o, err, el);
+    if (!m) return 0;
+    RqModelMem mm;
+    rq_model_mem(m, &mm);
+    *gib = mm.weights / 1073741824.0;
+    int e = rq_pass_times(m, 7, t1, t4);
+    rq_model_free(m);
+    if (e != RQ_OK) snprintf(err, el, "timing failed (%d)", e);
+    return e == RQ_OK;
+}
+
+static void repack_report(const char *path, RqModelOpts o) {
+    // --repack-info: the model loaded as in the file, with each repackable type alone (if it has two) and with all, one at
+    // a time (the peak RAM: the largest of them), in two rounds, the second in reverse order (drift on a busy machine
+    // affects every choice alike); per choice the fastest of 7 in either. The costs per type: rq_repack_info. The page
+    // cache as any load's (--page-cache; a big file's dropped: keeping it pushed an idle server's memory into swap)
+    const double G = 1073741824.0;
+    char err[512];
+    o.repack = 0;
+    RqModel *m = rq_model_load(path, &o, err, sizeof(err));
+    if (!m) die(err);
+    RqRepackInfo ri;
+    double c1, c4, w0 = 0, t1, t4, w;
+    rq_repack_info(m, &ri);
+    w0 = ri.weights / G;
+    int e = rq_pass_times(m, 7, &c1, &c4), nr = 0;
+    rq_model_free(m);
+    if (e != RQ_OK) die("--repack-info: timing failed");
+    for (int i = 0; i < ri.n; i++) nr += ri.t[i].bit != 0;
+    printf("--repack: the IQ3_XXS / IQ3_S matmul weights stored as 4-bit codes at load. The same values (bit-identical\n"
+           "output); less decode work per weight, more RAM.\n");
+    if (!ri.available || !nr) {
+        printf(!ri.available ? "Not available on this build (the repacked kernels are AVX-512 VNNI only).\n"
+                             : "Nothing to repack in this model (no IQ3_XXS / IQ3_S matmul weights).\n");
+        for (int i = 0; i < ri.n; i++)
+            printf("  %-8s %4d matri%s %5.1f%% of the weights: always stored as codes (+%.2f GiB over the file)\n", ri.t[i].type,
+                   ri.t[i].mats, ri.t[i].mats == 1 ? "x, " : "ces,", 100 * ri.t[i].share, ri.t[i].extra / G);
+        return;
+    }
+    struct { int bits, ok; double t1, t4, w; char err[160]; } r[RQ_REPACK_TYPES + 1];
+    int nrow = 0;
+    for (int i = 0; i < ri.n && nr > 1; i++)
+        if (ri.t[i].bit) r[nrow++].bits = ri.t[i].bit;
+    r[nrow++].bits = RQ_REPACK_ALL;
+    fprintf(stderr, "measuring: %d more loads of %s, %d threads...\n", 2 * nrow + 1, path, rq_threads());
+    for (int i = 0; i < nrow; i++) {
+        r[i].ok = 0;
+        r[i].t1 = r[i].t4 = 1e30;
+    }
+    for (int round = 0; round < 2; round++) // (as in the file: first and between the rounds)
+        for (int q = 0; q <= nrow; q++) {
+            int i = round ? q - 1 : nrow - 1 - q; // (round 0: the rows in reverse, then the file's; round 1: forward)
+            if (round == 0 && q == nrow) i = -1;
+            if (round == 1 && q == 0) continue; // (the file's: once between the rounds)
+            int bits = i < 0 ? 0 : r[i].bits;
+            if (!repack_measure(path, o, bits, &t1, &t4, &w, err, sizeof(err))) {
+                if (i >= 0 && !r[i].ok) snprintf(r[i].err, sizeof(r[i].err), "%s", err);
+                continue;
+            }
+            double *a1 = i < 0 ? &c1 : &r[i].t1, *a4 = i < 0 ? &c4 : &r[i].t4;
+            *a1 = t1 < *a1 ? t1 : *a1;
+            *a4 = t4 < *a4 ? t4 : *a4;
+            if (i >= 0) {
+                r[i].ok = 1;
+                r[i].w = w;
+            }
+        }
+    printf("Measured on this machine, %d threads (OMP_NUM_THREADS), each choice loaded in turn (two rounds, the fastest):\n"
+           "                                                     weights   decode step       4-row pass (MTP verify, -G 3)\n"
+           "  as in the file                                  %6.2f GiB %6.1f ms          %6.1f ms\n", rq_threads(), w0,
+           1e3 * c1, 1e3 * c4);
+    for (int i = 0; i < nrow; i++) {
+        char what[64];
+        size_t x = 0;
+        int mats = 0;
+        double share = 0;
+        for (int j = 0; j < ri.n; j++)
+            if (ri.t[j].bit && (r[i].bits == RQ_REPACK_ALL || r[i].bits == ri.t[j].bit)) {
+                x += ri.t[j].extra;
+                mats += ri.t[j].mats;
+                share += ri.t[j].share;
+            }
+        if (r[i].bits == RQ_REPACK_ALL) snprintf(what, sizeof(what), "--repack%s", nr > 1 ? " (all)" : "");
+        else
+            for (int j = 0; j < ri.n; j++)
+                if (ri.t[j].bit == r[i].bits) snprintf(what, sizeof(what), "--repack=%s", ri.t[j].type);
+        printf("  %-17s %3d matrices %5.1f%% +%.2f GiB ", what, mats, 100 * share, x / G);
+        if (r[i].ok)
+            printf("%6.2f GiB %6.1f ms %5.2fx   %6.1f ms %5.2fx\n", r[i].w, 1e3 * r[i].t1, c1 / r[i].t1, 1e3 * r[i].t4, c4 / r[i].t4);
+        else
+            printf("not loaded: %s\n", r[i].err);
+    }
+    for (int i = 0; i < ri.n; i++)
+        if (!ri.t[i].bit)
+            printf("  %-8s %4d matri%s %5.1f%% of the weights: always stored as codes (+%.2f GiB over the file, included)\n",
+                   ri.t[i].type, ri.t[i].mats, ri.t[i].mats == 1 ? "x, " : "ces,", 100 * ri.t[i].share, ri.t[i].extra / G);
+    double avail = rq_mem_available();
+    if (avail >= 0) printf("  MemAvailable now (no model loaded): %.2f GiB\n", avail / G);
+    printf("The gain depends on the machine and the threads: largest where the matmuls are compute-bound (fewer threads,\n"
+           "verify passes, prefill), small where they are memory-bound. Timings on a busy machine vary by ~10%%.\n");
+}
+
 int main(int argc, char *argv[]) {
     if (argc >= 2 && !strcmp(argv[1], "serve")) return serve_main(argc - 1, argv + 1);
     // default parameters
@@ -743,10 +894,21 @@ int main(int argc, char *argv[]) {
     int lookup = 0, lookup_min = 0; // --lookup, --lookup-min (0: RQ_LOOKUP_MIN_DEFAULT)
     int spec_auto = 0;          // --spec auto (G7: the cost model's choice per pass)
     int mtp_vocab = -1;         // --mtp-vocab (-D mtp: RqMtpOpts.vocab; 0 all; -1: RQ_MTP_VOCAB_DEFAULT)
+    int repack = 0, repack_info = 0; // --repack[=LIST] / --no-repack (-1): RqModelOpts.repack; --repack-info
 
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
     for (int i = 2; i < argc; i+=2) {
+        // the flags without a value (i - 1: the loop's step is 2)
+        if (!strcmp(argv[i], "--repack") || !strcmp(argv[i], "--no-repack") || !strcmp(argv[i], "--repack-info") ||
+            !strncmp(argv[i], "--repack=", 9)) {
+            if (argv[i][2] == 'n') repack = -1;
+            else if (argv[i][8] == '-') repack_info = 1;
+            else if (argv[i][8] == '=' && (repack = rq_repack_parse(argv[i] + 9)) < 0) error_usage();
+            else if (!argv[i][8]) repack = RQ_REPACK_ALL;
+            i--;
+            continue;
+        }
         // do some basic validation
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
@@ -869,12 +1031,17 @@ int main(int argc, char *argv[]) {
 
     // the model (weights, tokenizer, templates); -m dequant: the weights only
     int dequant = strcmp(mode, "dequant") == 0;
-    RqModelOpts o = { ctx_length, 0, dequant, mem, rq_kv_bits(kv_type), page_cache };
+    RqModelOpts o = { ctx_length, 0, dequant, mem, rq_kv_bits(kv_type), page_cache, 0, repack };
+    if (repack_info) { // (the model loaded and timed with each choice in turn)
+        repack_report(checkpoint_path, o);
+        return 0;
+    }
     RqModel *m = rq_model_load(checkpoint_path, &o, err, sizeof(err));
     if (!m) die(err);
     RqModelInfo info;
     rq_model_info(m, &info);
     if (info.warning) fprintf(stderr, "warning: %s\n", info.warning);
+    if (repack > 0) rq_repack_note(m);
     if (mem_given) print_memory(m, info.seq_len);
     if (dequant) {
         dump_dequant(m, prompt, out_path);

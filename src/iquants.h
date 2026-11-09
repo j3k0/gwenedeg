@@ -98,10 +98,26 @@
 enum { GGML_Q2_K = 10, GGML_IQ2_XXS = 16, GGML_IQ2_XS = 17, GGML_IQ3_XXS = 18, GGML_IQ1_S = 19, GGML_IQ3_S = 21,
        GGML_IQ2_S = 22, GGML_IQ4_XS = 23, GGML_IQ1_M = 29 }; // ggml type numbers
 
+// runq-internal types (never in a file): IQ3_XXS / IQ3_S matmul weights repacked at load as 4-bit codes (RqModelOpts.repack,
+// --repack; docs/iquants.md). Each value v is stored as n = e | (v < 0) << 3, e its magnitude's index (IQ3_S: |v| = 2 e + 1;
+// IQ3_XXS: |v| = 4, 12, .. 52, 62 = e << 3 | 4, but 62 for e 7), in IQ4_XS's nibble layout; the D and the scales as the
+// base type's. The same v, S and D: bit-identical results; the kernels decode a nibble with one vpshufb instead of the
+// codebook lookup (~3.7x faster single-thread GEMV on Zen 4), at 2144 bytes per 16 x 256 values (4.19 bits per weight
+// instead of 3.44 / 3.19). iq_base: the file's type. Only the AVX-512 builds make them (iq_repack_type)
+enum { IQ_R = 0x100, GGML_IQ3_XXS_R = IQ_R | GGML_IQ3_XXS, GGML_IQ3_S_R = IQ_R | GGML_IQ3_S };
+static inline int iq_base(int type) { return type & ~IQ_R; }
+static inline int iq_r_value(int type, int n) {
+    // the value of 4-bit code n of a *_R type
+    static const int8_t xxs[8] = { 4, 12, 20, 28, 36, 44, 52, 62 };
+    int m = type == GGML_IQ3_S_R ? 2 * (n & 7) + 1 : xxs[n & 7];
+    return n & 8 ? -m : m;
+}
+
 static inline int iq_type(int type) {
     // 1 for the types of this header
     return type == GGML_Q2_K || type == GGML_IQ2_XXS || type == GGML_IQ2_XS || type == GGML_IQ3_XXS || type == GGML_IQ1_S ||
-           type == GGML_IQ3_S || type == GGML_IQ2_S || type == GGML_IQ4_XS || type == GGML_IQ1_M;
+           type == GGML_IQ3_S || type == GGML_IQ2_S || type == GGML_IQ4_XS || type == GGML_IQ1_M || type == GGML_IQ3_XXS_R ||
+           type == GGML_IQ3_S_R;
 }
 
 static inline const char *iq_name(int type) {
@@ -115,12 +131,15 @@ static inline const char *iq_name(int type) {
     case GGML_IQ2_S: return "IQ2_S";
     case GGML_IQ4_XS: return "IQ4_XS";
     case GGML_IQ1_M: return "IQ1_M";
+    case GGML_IQ3_XXS_R: return "IQ3_XXS/r";
+    case GGML_IQ3_S_R: return "IQ3_S/r";
     }
     return "?";
 }
 
 static inline int iq_block_bytes(int type) {
-    switch (type) {
+    // a block of the file (*_R: of the base type)
+    switch (iq_base(type)) {
     case GGML_Q2_K: return 84;
     case GGML_IQ2_XXS: return 66;
     case GGML_IQ2_XS: return 74;
@@ -144,6 +163,7 @@ static inline int iq_sb_bytes(int type) {
     case GGML_IQ3_S: return 1760;
     case GGML_IQ4_XS: return 2240;
     case GGML_IQ1_M: return 1248;
+    case GGML_IQ3_XXS_R: case GGML_IQ3_S_R: return 2144; // (32 D + 64 scales + 8 groups x 256 nibble bytes)
     }
     return 0;
 }
@@ -157,13 +177,14 @@ static inline size_t lq_size(int type, int d, int k) { return iq_type(type) ? iq
 
 static inline float iq_dmul(int type) {
     // D = fp32 d * this (exact): the constant factors of the scales (see the table above)
+    type = iq_base(type);
     return type == GGML_IQ3_XXS ? 0.25f : type == GGML_IQ2_XXS || type == GGML_IQ2_XS || type == GGML_IQ2_S ||
            type == GGML_IQ1_S || type == GGML_IQ1_M ? 0.125f : 1.0f;
 }
 
 static inline int iq_bias(int type) {
     // the AVX-512 kernels' code bias B (v + B in 0..255)
-    switch (type) {
+    switch (iq_base(type)) {
     case GGML_IQ2_XXS: case GGML_IQ2_XS: case GGML_IQ2_S: return 43;
     case GGML_IQ3_XXS: return 62;
     case GGML_IQ3_S: return 15;
@@ -185,6 +206,7 @@ static inline uint16_t iq1m_d(const uint8_t *blk) {
 
 static int iq_block_ok(int type, const uint8_t *blk) {
     // the fp16 scales are finite; 0 for a corrupt block
+    type = iq_base(type);
     if (type == GGML_Q2_K) return (kq_u16(blk + 80) & 0x7c00) != 0x7c00 && (kq_u16(blk + 82) & 0x7c00) != 0x7c00;
     if (type == GGML_IQ1_M) return (iq1m_d(blk) & 0x7c00) != 0x7c00;
     return (kq_u16(blk) & 0x7c00) != 0x7c00;
@@ -195,6 +217,7 @@ static int iq_block_ok(int type, const uint8_t *blk) {
 static void iq_dequant_row(int type, const uint8_t *blk, int n, float *y) {
     // n values (n % 256 == 0) from their blocks: ggml's dequantize_row_* (see the header comment)
     int bb = iq_block_bytes(type);
+    type = iq_base(type); // (*_R: the file's blocks are the base type's)
     for (int s = 0; s < n / QK_K; s++, y += QK_K) {
         const uint8_t *b = blk + (size_t)s * bb;
         switch (type) {
@@ -345,136 +368,151 @@ static inline void iq_signs4(uint8_t *sgn, int r, int t, unsigned s4) {
     iq_or64(sgn + 8 * t, (uint64_t)(s4 & 15) << 4 * r);
 }
 
+static void iq_pack_sb(int type, uint8_t *o, const uint8_t *src, int rb, int s, int nsb) {
+    // super-block s of 16-row block rb (row-major GGUF blocks at src, nsb per row) in the repacked layout of type at o.
+    // Every output byte is built from the file's bytes (the header comment)
+    int bb = iq_block_bytes(type);
+    memset(o, 0, iq_sb_bytes(type));
+    for (int r = 0; r < KQ_ROWS; r++) {
+        const uint8_t *b = src + ((size_t)(rb * KQ_ROWS + r) * nsb + s) * bb;
+        switch (type) {
+        case GGML_Q2_K:
+            memcpy(o + 2 * r, b + 80, 2);
+            memcpy(o + 32 + 2 * r, b + 82, 2);
+            for (int j = 0; j < 16; j++)
+                o[64 + 16 * j + r] = b[j];
+            for (int i = 0; i < QK_K; i++) {
+                int q = (b[16 + 32 * (i / 128) + i % 32] >> (2 * (i / 32 % 4))) & 3;
+                int g = i / 32, h = i / 16 % 2, t = i % 16 / 4, c = i % 4;
+                o[320 + 128 * g + 64 * h + 4 * r + c] |= (uint8_t)(q << 2 * t);
+            }
+            break;
+        case GGML_IQ2_XXS:
+            memcpy(o + 2 * r, b, 2);
+            for (int g = 0; g < 8; g++) {
+                uint32_t a0 = iq_u32(b + 2 + 8 * g), a1 = iq_u32(b + 6 + 8 * g);
+                uint8_t *gp = o + 96 + 128 * g;
+                iq_or32(o + 32 + 4 * r, (a1 >> 28) << 4 * g);
+                for (int l = 0; l < 4; l++) {
+                    gp[4 * r + l] = (uint8_t)(a0 >> 8 * l);
+                    iq_signs8(gp + 64, r, l, iq_ksigns(a1 >> 7 * l & 127));
+                }
+            }
+            break;
+        case GGML_IQ2_XS: case GGML_IQ2_S: {
+            int xs = type == GGML_IQ2_XS;
+            memcpy(o + 2 * r, b, 2);
+            const uint8_t *sc = b + (xs ? 66 : 74);
+            for (int g = 0; g < 8; g++) {
+                uint8_t *gp = o + 160 + 144 * g;
+                iq_or32(o + 32 + 64 * (g / 4) + 4 * r, (uint32_t)sc[g] << 8 * (g % 4));
+                for (int l = 0; l < 4; l++) {
+                    if (xs) {
+                        int q = kq_u16(b + 2 + 2 * (4 * g + l));
+                        gp[4 * r + l] = (uint8_t)q;
+                        gp[64 + r] |= (uint8_t)((q >> 8 & 1) << 2 * l);
+                        iq_signs8(gp + 80, r, l, iq_ksigns(q >> 9));
+                    } else {
+                        gp[4 * r + l] = b[2 + 4 * g + l];
+                        iq_signs8(gp + 80, r, l, b[34 + 4 * g + l]);
+                    }
+                }
+                if (!xs) gp[64 + r] = b[66 + g];
+            }
+            break;
+        }
+        case GGML_IQ3_XXS:
+            memcpy(o + 2 * r, b, 2);
+            for (int g = 0; g < 8; g++) {
+                uint32_t a = iq_u32(b + 66 + 4 * g);
+                uint8_t *gp = o + 96 + 192 * g;
+                iq_or32(o + 32 + 4 * r, (a >> 28) << 4 * g);
+                for (int t = 0; t < 8; t++)
+                    gp[64 * (t / 4) + 4 * r + t % 4] = b[2 + 8 * g + t];
+                for (int l = 0; l < 4; l++)
+                    iq_signs8(gp + 128, r, l, iq_ksigns(a >> 7 * l & 127));
+            }
+            break;
+        case GGML_IQ3_S:
+            memcpy(o + 2 * r, b, 2);
+            for (int g = 0; g < 8; g++) {
+                uint8_t *gp = o + 96 + 208 * g;
+                iq_or32(o + 32 + 4 * r, (uint32_t)(b[106 + g / 2] >> 4 * (g % 2) & 15) << 4 * g);
+                for (int t = 0; t < 8; t++)
+                    gp[64 * (t / 4) + 4 * r + t % 4] = b[2 + 8 * g + t];
+                gp[128 + r] = b[66 + g];
+                for (int l = 0; l < 4; l++)
+                    iq_signs8(gp + 144, r, l, b[74 + 4 * g + l]);
+            }
+            break;
+        case GGML_IQ1_S:
+            memcpy(o + 2 * r, b, 2);
+            for (int g = 0; g < 8; g++) {
+                uint8_t *gp = o + 112 + 128 * g;
+                int qh = kq_u16(b + 34 + 2 * g);
+                iq_or32(o + 32 + 4 * r, (uint32_t)(qh >> 12 & 7) << 4 * g);
+                if (qh & 0x8000) o[96 + 2 * g + r / 8] |= (uint8_t)(1 << r % 8);
+                for (int l = 0; l < 4; l++) {
+                    int c = iq1s_code[b[2 + 4 * g + l] | (qh >> 3 * l & 7) << 8];
+                    gp[4 * r + l] = (uint8_t)c;
+                    gp[64 + 4 * r + l] = (uint8_t)(c >> 8);
+                }
+            }
+            break;
+        case GGML_IQ1_M: {
+            uint16_t d = iq1m_d(b);
+            memcpy(o + 2 * r, &d, 2);
+            for (int g = 0; g < 8; g++) {
+                uint8_t *gp = o + 160 + 136 * g;
+                int sc = kq_u16(b + 48 + 2 * (g / 2)) >> 6 * (g % 2);
+                iq_or32(o + 32 + 64 * (g / 4) + 4 * r, (uint32_t)((sc & 7) | (sc >> 3 & 7) << 4) << 8 * (g % 4));
+                for (int l = 0; l < 4; l++) {
+                    int q = b[32 + 2 * g + l / 2] >> 4 * (l % 2);
+                    int c = iq1s_code[b[4 * g + l] | (q & 7) << 8];
+                    gp[4 * r + l] = (uint8_t)c;
+                    gp[64 + 4 * r + l] = (uint8_t)(c >> 8);
+                    if (q & 8) iq_or64(gp + 128, 1ull << (4 * r + l));
+                }
+            }
+            break;
+        }
+        case GGML_IQ4_XS: {
+            memcpy(o + 2 * r, b, 2);
+            int sh = kq_u16(b + 2);
+            for (int g = 0; g < 8; g++) {
+                int ls = (b[4 + g / 2] >> 4 * (g % 2) & 15) | (sh >> 2 * g & 3) << 4;
+                o[32 + 16 * g + r] = (uint8_t)(int8_t)(ls - 32);
+                const uint8_t *qs = b + 8 + 16 * g;
+                uint8_t q[32];
+                for (int j = 0; j < 16; j++) {
+                    q[j] = qs[j] & 15;
+                    q[16 + j] = qs[j] >> 4;
+                }
+                for (int c = 0; c < 4; c++)
+                    for (int e = 0; e < 4; e++)
+                        o[192 + 256 * g + 64 * c + 4 * r + e] = (uint8_t)(q[8 * c + e] | q[8 * c + 4 + e] << 4);
+            }
+            break;
+        }
+        }
+    }
+}
+
+static void iq_r_convert(int type, uint8_t *o, const uint8_t *sb); // (a *_R super-block from the base layout's: below)
+
 static void iq_pack_blocks(int type, uint8_t *kp, const uint8_t *src, int nblk, int k) {
     // nblk blocks of 16 rows (k values each, row-major GGUF blocks at src) -> the repacked layout at kp (block 0 of the
-    // run); serial (the caller splits the work). Every output byte is built from the file's bytes (the header comment)
-    int nsb = k / QK_K, bb = iq_block_bytes(type), sbb = iq_sb_bytes(type);
+    // run); serial (the caller splits the work). *_R: each super-block in the base type's layout, then its 4-bit codes
+    int nsb = k / QK_K, sbb = iq_sb_bytes(type), base = iq_base(type);
+    uint8_t tmp[1760]; // (the largest base super-block: IQ3_S)
     for (int rb = 0; rb < nblk; rb++)
         for (int s = 0; s < nsb; s++) {
             uint8_t *o = kp + ((size_t)rb * nsb + s) * sbb;
-            memset(o, 0, sbb);
-            for (int r = 0; r < KQ_ROWS; r++) {
-                const uint8_t *b = src + ((size_t)(rb * KQ_ROWS + r) * nsb + s) * bb;
-                switch (type) {
-                case GGML_Q2_K:
-                    memcpy(o + 2 * r, b + 80, 2);
-                    memcpy(o + 32 + 2 * r, b + 82, 2);
-                    for (int j = 0; j < 16; j++)
-                        o[64 + 16 * j + r] = b[j];
-                    for (int i = 0; i < QK_K; i++) {
-                        int q = (b[16 + 32 * (i / 128) + i % 32] >> (2 * (i / 32 % 4))) & 3;
-                        int g = i / 32, h = i / 16 % 2, t = i % 16 / 4, c = i % 4;
-                        o[320 + 128 * g + 64 * h + 4 * r + c] |= (uint8_t)(q << 2 * t);
-                    }
-                    break;
-                case GGML_IQ2_XXS:
-                    memcpy(o + 2 * r, b, 2);
-                    for (int g = 0; g < 8; g++) {
-                        uint32_t a0 = iq_u32(b + 2 + 8 * g), a1 = iq_u32(b + 6 + 8 * g);
-                        uint8_t *gp = o + 96 + 128 * g;
-                        iq_or32(o + 32 + 4 * r, (a1 >> 28) << 4 * g);
-                        for (int l = 0; l < 4; l++) {
-                            gp[4 * r + l] = (uint8_t)(a0 >> 8 * l);
-                            iq_signs8(gp + 64, r, l, iq_ksigns(a1 >> 7 * l & 127));
-                        }
-                    }
-                    break;
-                case GGML_IQ2_XS: case GGML_IQ2_S: {
-                    int xs = type == GGML_IQ2_XS;
-                    memcpy(o + 2 * r, b, 2);
-                    const uint8_t *sc = b + (xs ? 66 : 74);
-                    for (int g = 0; g < 8; g++) {
-                        uint8_t *gp = o + 160 + 144 * g;
-                        iq_or32(o + 32 + 64 * (g / 4) + 4 * r, (uint32_t)sc[g] << 8 * (g % 4));
-                        for (int l = 0; l < 4; l++) {
-                            if (xs) {
-                                int q = kq_u16(b + 2 + 2 * (4 * g + l));
-                                gp[4 * r + l] = (uint8_t)q;
-                                gp[64 + r] |= (uint8_t)((q >> 8 & 1) << 2 * l);
-                                iq_signs8(gp + 80, r, l, iq_ksigns(q >> 9));
-                            } else {
-                                gp[4 * r + l] = b[2 + 4 * g + l];
-                                iq_signs8(gp + 80, r, l, b[34 + 4 * g + l]);
-                            }
-                        }
-                        if (!xs) gp[64 + r] = b[66 + g];
-                    }
-                    break;
-                }
-                case GGML_IQ3_XXS:
-                    memcpy(o + 2 * r, b, 2);
-                    for (int g = 0; g < 8; g++) {
-                        uint32_t a = iq_u32(b + 66 + 4 * g);
-                        uint8_t *gp = o + 96 + 192 * g;
-                        iq_or32(o + 32 + 4 * r, (a >> 28) << 4 * g);
-                        for (int t = 0; t < 8; t++)
-                            gp[64 * (t / 4) + 4 * r + t % 4] = b[2 + 8 * g + t];
-                        for (int l = 0; l < 4; l++)
-                            iq_signs8(gp + 128, r, l, iq_ksigns(a >> 7 * l & 127));
-                    }
-                    break;
-                case GGML_IQ3_S:
-                    memcpy(o + 2 * r, b, 2);
-                    for (int g = 0; g < 8; g++) {
-                        uint8_t *gp = o + 96 + 208 * g;
-                        iq_or32(o + 32 + 4 * r, (uint32_t)(b[106 + g / 2] >> 4 * (g % 2) & 15) << 4 * g);
-                        for (int t = 0; t < 8; t++)
-                            gp[64 * (t / 4) + 4 * r + t % 4] = b[2 + 8 * g + t];
-                        gp[128 + r] = b[66 + g];
-                        for (int l = 0; l < 4; l++)
-                            iq_signs8(gp + 144, r, l, b[74 + 4 * g + l]);
-                    }
-                    break;
-                case GGML_IQ1_S:
-                    memcpy(o + 2 * r, b, 2);
-                    for (int g = 0; g < 8; g++) {
-                        uint8_t *gp = o + 112 + 128 * g;
-                        int qh = kq_u16(b + 34 + 2 * g);
-                        iq_or32(o + 32 + 4 * r, (uint32_t)(qh >> 12 & 7) << 4 * g);
-                        if (qh & 0x8000) o[96 + 2 * g + r / 8] |= (uint8_t)(1 << r % 8);
-                        for (int l = 0; l < 4; l++) {
-                            int c = iq1s_code[b[2 + 4 * g + l] | (qh >> 3 * l & 7) << 8];
-                            gp[4 * r + l] = (uint8_t)c;
-                            gp[64 + 4 * r + l] = (uint8_t)(c >> 8);
-                        }
-                    }
-                    break;
-                case GGML_IQ1_M: {
-                    uint16_t d = iq1m_d(b);
-                    memcpy(o + 2 * r, &d, 2);
-                    for (int g = 0; g < 8; g++) {
-                        uint8_t *gp = o + 160 + 136 * g;
-                        int sc = kq_u16(b + 48 + 2 * (g / 2)) >> 6 * (g % 2);
-                        iq_or32(o + 32 + 64 * (g / 4) + 4 * r, (uint32_t)((sc & 7) | (sc >> 3 & 7) << 4) << 8 * (g % 4));
-                        for (int l = 0; l < 4; l++) {
-                            int q = b[32 + 2 * g + l / 2] >> 4 * (l % 2);
-                            int c = iq1s_code[b[4 * g + l] | (q & 7) << 8];
-                            gp[4 * r + l] = (uint8_t)c;
-                            gp[64 + 4 * r + l] = (uint8_t)(c >> 8);
-                            if (q & 8) iq_or64(gp + 128, 1ull << (4 * r + l));
-                        }
-                    }
-                    break;
-                }
-                case GGML_IQ4_XS: {
-                    memcpy(o + 2 * r, b, 2);
-                    int sh = kq_u16(b + 2);
-                    for (int g = 0; g < 8; g++) {
-                        int ls = (b[4 + g / 2] >> 4 * (g % 2) & 15) | (sh >> 2 * g & 3) << 4;
-                        o[32 + 16 * g + r] = (uint8_t)(int8_t)(ls - 32);
-                        const uint8_t *qs = b + 8 + 16 * g;
-                        uint8_t q[32];
-                        for (int j = 0; j < 16; j++) {
-                            q[j] = qs[j] & 15;
-                            q[16 + j] = qs[j] >> 4;
-                        }
-                        for (int c = 0; c < 4; c++)
-                            for (int e = 0; e < 4; e++)
-                                o[192 + 256 * g + 64 * c + 4 * r + e] = (uint8_t)(q[8 * c + e] | q[8 * c + 4 + e] << 4);
-                    }
-                    break;
-                }
-                }
+            if (base == type)
+                iq_pack_sb(type, o, src, rb, s, nsb);
+            else {
+                iq_pack_sb(base, tmp, src, rb, s, nsb);
+                iq_r_convert(type, o, tmp);
             }
         }
 }
@@ -567,6 +605,13 @@ static void iq_unpack_group(int type, const uint8_t *o, int g, int8_t v[KQ_ROWS]
                 int neg = m ? (int)(kq_u64(gp + 128) >> (4 * r + l) & 1) : o[96 + 2 * g + r / 8] >> r % 8 & 1;
                 v[r][i] = (int8_t)(8 * ((c >> 2 * (i % 8) & 3) - 1) + (neg ? -1 : 1));
             }
+            break;
+        }
+        case GGML_IQ3_XXS_R: case GGML_IQ3_S_R: { // (the 4-bit codes in IQ4_XS's nibble layout, the scales as the base's)
+            const uint8_t *gp = o + 96 + 256 * g;
+            S[r][0] = S[r][1] = 2 * (int)(iq_u32(o + 32 + 4 * r) >> 4 * g & 15) + 1;
+            for (int i = 0; i < 32; i++)
+                v[r][i] = (int8_t)iq_r_value(type, gp[64 * (i / 8) + 4 * r + i % 4] >> 4 * (i % 8 / 4) & 15);
             break;
         }
         case GGML_IQ4_XS: {
@@ -925,6 +970,22 @@ static inline __attribute__((always_inline)) void iq512_group(const int type, co
         }
         break;
     }
+    case GGML_IQ3_XXS_R: case GGML_IQ3_S_R: {
+        // the 4-bit codes (--repack): B + v by vpshufb on a 16-entry table, as IQ4_XS (no codebook)
+        static const uint8_t lut[2][16] = {
+            { 66, 74, 82, 90, 98, 106, 114, 124, 58, 50, 42, 34, 26, 18, 10, 0 }, // IQ3_XXS: 62 +- |v|
+            { 16, 18, 20, 22, 24, 26, 28, 30, 14, 12, 10, 8, 6, 4, 2, 0 } };     // IQ3_S: 15 +- |v|
+        const uint8_t *gp = o + 96 + 256 * g;
+        *S0 = *S1 = iq512_s21(_mm512_and_si512(_mm512_srli_epi32(_mm512_loadu_si512((const void *)(o + 32)), 4 * g), n15));
+        const __m512i tab = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)lut[type == GGML_IQ3_S_R]));
+        const __m512i m4 = _mm512_set1_epi8(15);
+        for (int c = 0; c < 4; c++) {
+            __m512i q = _mm512_loadu_si512((const void *)(gp + 64 * c));
+            w[2 * c] = _mm512_shuffle_epi8(tab, _mm512_and_si512(q, m4));
+            w[2 * c + 1] = _mm512_shuffle_epi8(tab, _mm512_and_si512(_mm512_srli_epi16(q, 4), m4));
+        }
+        break;
+    }
     case GGML_IQ4_XS: {
         const uint8_t *gp = o + 192 + 256 * g;
         *S0 = *S1 = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(o + 32 + 16 * g)));
@@ -950,7 +1011,7 @@ static inline __attribute__((always_inline)) void iq512_blk(const int type, cons
     // iq_dot for nc <= NC activation rows, on the group's decoded codes (each operation rounded: kq6_fold's intrinsics)
     const int sbb = iq_sb_bytes(type), Bi = iq_bias(type), q2 = type == GGML_Q2_K;
     const int per32 = type == GGML_IQ2_XXS || type == GGML_IQ3_XXS || type == GGML_IQ3_S || type == GGML_IQ1_S ||
-                      type == GGML_IQ4_XS;
+                      type == GGML_IQ4_XS || type == GGML_IQ3_XXS_R || type == GGML_IQ3_S_R;
     const float cm = iq_dmul(type);
     __m512 val[NC];
     for (int c = 0; c < NC; c++)
@@ -1006,6 +1067,8 @@ IQ512_INST(iq512_i3s, GGML_IQ3_S)
 IQ512_INST(iq512_i1s, GGML_IQ1_S)
 IQ512_INST(iq512_i1m, GGML_IQ1_M)
 IQ512_INST(iq512_i4xs, GGML_IQ4_XS)
+IQ512_INST(iq512_i3xxsr, GGML_IQ3_XXS_R)
+IQ512_INST(iq512_i3sr, GGML_IQ3_S_R)
 typedef void (*Iq512Fn)(IQ512_ARGS);
 
 static inline void iq512_fns(int type, Iq512Fn *f1, Iq512Fn *f8) {
@@ -1018,10 +1081,48 @@ static inline void iq512_fns(int type, Iq512Fn *f1, Iq512Fn *f8) {
     case GGML_IQ3_S: *f1 = iq512_i3s_1; *f8 = iq512_i3s_8; break;
     case GGML_IQ1_S: *f1 = iq512_i1s_1; *f8 = iq512_i1s_8; break;
     case GGML_IQ1_M: *f1 = iq512_i1m_1; *f8 = iq512_i1m_8; break;
+    case GGML_IQ3_XXS_R: *f1 = iq512_i3xxsr_1; *f8 = iq512_i3xxsr_8; break;
+    case GGML_IQ3_S_R: *f1 = iq512_i3sr_1; *f8 = iq512_i3sr_8; break;
     default: *f1 = iq512_i4xs_1; *f8 = iq512_i4xs_8; break;
     }
 }
 #endif // RUNQ_VNNI
+
+static void iq_r_convert(int type, uint8_t *o, const uint8_t *sb) {
+    // super-block sb in the layout of iq_base(type) (IQ3_XXS / IQ3_S) -> the 4-bit codes of type at o (iq_pack_blocks;
+    // rq_repack_info's samples): D and the scales copied, n = e | (v < 0) << 3 with e = |v| >> 1 (IQ3_S) or >> 3 (IQ3_XXS)
+    int base = iq_base(type), sh = type == GGML_IQ3_S_R ? 1 : 3;
+    memcpy(o, sb, 96); // (D: 16 fp16; the scales: a nibble per group and row, as both bases)
+#ifdef RUNQ_VNNI
+    const __m512i B = _mm512_set1_epi8((char)iq_bias(base)), m7 = _mm512_set1_epi8(7), b8 = _mm512_set1_epi8(8);
+    for (int g = 0; g < 8; g++) {
+        __m512i w[8], S0, S1, M0, M1;
+        iq512_group(base, sb, g, w, &S0, &S1, &M0, &M1); // (B + v per step: the kernels' own decode)
+        for (int c = 0; c < 4; c++) {
+            __m512i n[2];
+            for (int p = 0; p < 2; p++) {
+                __m512i v = _mm512_sub_epi8(w[2 * c + p], B);
+                __m512i e = _mm512_and_si512(_mm512_srli_epi16(_mm512_abs_epi8(v), sh), m7);
+                n[p] = _mm512_mask_add_epi8(e, _mm512_movepi8_mask(v), e, b8);
+            }
+            _mm512_storeu_si512((void *)(o + 96 + 256 * g + 64 * c), _mm512_or_si512(n[0], _mm512_slli_epi16(n[1], 4)));
+        }
+    }
+#else
+    for (int g = 0; g < 8; g++) {
+        int8_t v[KQ_ROWS][32];
+        int32_t S[KQ_ROWS][2], M[KQ_ROWS][2];
+        iq_unpack_group(base, sb, g, v, S, M);
+        uint8_t *gp = o + 96 + 256 * g;
+        for (int r = 0; r < KQ_ROWS; r++)
+            for (int i = 0; i < 32; i++) {
+                int x = v[r][i], n = (x < 0 ? -x : x) >> sh | (x < 0) << 3;
+                if (i % 8 < 4) gp[64 * (i / 8) + 4 * r + i % 4] = (uint8_t)n;
+                else gp[64 * (i / 8) + 4 * r + i % 4] |= (uint8_t)(n << 4);
+            }
+    }
+#endif
+}
 
 // ---------------------------------------------------------------------------- NEON (AArch64 + dot product)
 
@@ -1418,6 +1519,15 @@ static void iq_rows(int type, float *out, size_t ldo, const int8_t *xq, size_t l
                    xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs);
     }
 #endif
+}
+
+static inline int iq_repack_type(int type) {
+    // the layout --repack gives a matmul weight of this type: IQ3_XXS / IQ3_S -> their 4-bit codes (*_R) on the AVX-512
+    // builds (the only kernels for them; elsewhere unchanged), any other type unchanged
+#ifdef RUNQ_IQX
+    if (type == GGML_IQ3_XXS || type == GGML_IQ3_S) return type | IQ_R;
+#endif
+    return type;
 }
 
 #endif // RUNQ_IQUANTS_H

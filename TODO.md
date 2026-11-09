@@ -385,6 +385,14 @@ Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M (Qwen3.8-27B Q4_K_M, the same
   today, `iq_rows`; no tiles, no small-batch kernels): Saluki prefills at ~0.72x the 27B Q3_K_M's tok/s (30 / 54 vs
   42 / 74 at 8 / 16 threads). Decode the 16-row block's codes once into a scratch tile (as `kq_unpack_tile`) and run
   more activation rows per pass; maybe 32-row tiles sharing the activation broadcasts.
+- [x] **`--repack`** (2026-11-09; docs/iquants.md, `--repack: 4-bit codes`): IQ3_S / IQ3_XXS stored as 4-bit codes at load,
+  bit-identical; `--repack[=LIST]`, `--no-repack`, `--repack-info` (CLI, `runq serve`, `spec_sweep`). ISTA 27B, 8 threads:
+  `--repack=IQ3_S` +0.74 GiB, decode 1.15x, 4-row pass 1.14x; all +1.37 GiB, 1.25x / 1.19x; 16 threads ~1.05x / 1.15x.
+- [ ] **`--repack`, open:** (a) tok/s end to end on the 27B under `scripts/s9_gate.sh` (`build/spec_sweep $G --repack[=IQ3_S]`,
+  plain and `-S "mtp -G 3"`, 8 and 16 threads; the gate was closed on 2026-11-09 evening: lcb-bench, the saluki server
+  swapped); (b) prefill with the codes (the 64-row kernel 0.0074 vs 0.0116 ns: the i-quant prefill item below); (c) a
+  default: off now; maybe `--repack=IQ3_S` when the estimate fits MemAvailable with a margin; (d) the launch-server
+  configs (`ista-iq3s`); (e) NEON kernels for the codes.
 - [x] **NEON kernels for the i-quants** (2026-10-30; `iqn_*` in `src/iquants.h`, `make iq-neon-test`): bit-identical to
   `iq_dot`; Saluki on an M1 Pro (8 threads): decode 0.6 -> 4.7 tok/s, prefill ~1 -> 15.8 tok/s (docs/iquants.md).
 - [ ] **NEON i-quants, faster.** GEMV is instruction-bound (~6 IPC at ~1 instruction per weight, the codebook gathers

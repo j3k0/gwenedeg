@@ -48,6 +48,7 @@ V1REF=""
 if [[ -z "${RUNQ:-}" ]]; then
     make -s -j8 runq runq-generic api-test tools-test
     if [[ "$(uname -m)" == x86_64 ]]; then make -s -j8 build/bf16dp_test build/bf16dp_test-emu; fi
+    if grep -qw avx512_vnni /proc/cpuinfo 2>/dev/null; then make -s build/iq_repack_test; fi # (--repack's kernels)
     RUNQ="$ROOT/runq"
     RUNQ_GENERIC="${RUNQ_GENERIC:-$ROOT/runq-generic}"
     API_TEST="$ROOT/build/api_test"

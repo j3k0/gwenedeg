@@ -11,6 +11,7 @@ __pycache__/
 /runq-debug.dSYM/
 /tests/kernels/kq_neon_test
 /tests/kernels/iq_neon_test
+/tests/kernels/iq_repack_test
 /build/
 .pi/
 /.venv-hf5/

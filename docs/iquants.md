@@ -103,6 +103,52 @@ instruction per weight); 36 GB/s of weights, far from the memory bandwidth. Trie
 the integer side (`umov` +42%, a store and loads +15%); keeping the pair form's duplicated activations in memory for
 batched rows (+5%).
 
+## --repack: 4-bit codes
+
+`--repack[=IQ3_S,IQ3_XXS]` (`RqModelOpts.repack`, off by default; AVX-512 builds) stores the IQ3_S and IQ3_XXS matmul
+weights at load as one 4-bit code per value instead of their codebook indices: n = e | (v < 0) << 3 with e the
+magnitude's index (IQ3_S |v| = 2 e + 1, IQ3_XXS |v| = 4, 12, .. 52, 62), in IQ4_XS's nibble layout, D and the scales as
+before. Both types have 8 magnitudes and a sign, so the codes hold the same v exactly: the kernels compute the same
+integers and float folds, bit-identical logits. The decode is then one `vpshufb` per step (as IQ4_XS) instead of the
+`vpermi2b` blend tree over the codebook: 2144 bytes per 16 x 256 values, 4.19 bits per weight instead of 3.44 (IQ3_S) /
+3.19 (IQ3_XXS, runq's layout). The internal types `GGML_IQ3_S_R` / `GGML_IQ3_XXS_R` (never in a file; `iq_base`: the file's
+type for the block format, the embedding rows of a tied classifier and `-m dequant`'s block rows); the MTP view takes its
+target's choice. `runq MODEL --repack-info` prints the cost per type (exact) and the gain on the machine (below).
+
+Single-thread GEMV, Zen 4, 1024 x 5120, ns per weight and activation row (`make iq-repack-test`, `-b`; and the ggml
+kernels for scale, 2026-11-09, `/tmp/iqbench`: upstream llama.cpp cf34d31, ik_llama.cpp 308fb08, llama-modchip 3c1e89f):
+
+| | 1 row | 4 rows | 8 rows | 64 rows |
+|---|---|---|---|---|
+| IQ3_S (runq) | 0.043 | 0.0157 | 0.0117 | 0.0116 |
+| IQ3_S 4-bit codes | 0.0117 | 0.0081 | 0.0074 | 0.0074 |
+| IQ3_S llama.cpp / ik_llama.cpp / modchip | 0.107 / 0.101 / 0.107 | 0.107 / 0.038 / 0.106 | 0.035 / 0.029 / 0.106 | 0.0095 / 0.0081 / 0.106 |
+| IQ4_XS (runq) | 0.0127 | 0.0081 | 0.0073 | 0.0073 |
+
+On DRAM-resident weights (69632 x 5120, interleaved, best of 60) the codes win where the kernel was compute-bound: 1 row
+at 8 threads 1.12-1.28x (IQ3_S reads ~75 GB/s, the codes ~110 GB/s, the box's bandwidth), 4 rows 1.56x; from ~12
+threads 1 row is memory-bound and the extra bytes cancel the gain.
+
+The model, ISTA's `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (IQ3_S 31% / IQ3_XXS 20% of the weights), `--repack-info`
+(each choice loaded in turn, two rounds, the fastest of 7; a decode step and a 4-row pass at position 32; 2026-11-09,
+load 6-13, so +-10%):
+
+| | RAM | 8 threads: decode / 4-row pass | 16 threads: decode / 4-row pass |
+|---|---|---|---|
+| as in the file | 10.86 GiB | 123.5 / 210.7 ms | 76.2 / 128.9 ms |
+| `--repack=IQ3_S` | +0.74 GiB | 1.15x / 1.14x | 1.06x / 1.18x |
+| `--repack=IQ3_XXS` | +0.63 GiB | 1.00x / 1.04x | 0.91x / 0.95x |
+| `--repack` | +1.37 GiB | 1.25x / 1.19x | 1.04x / 1.14x |
+
+So IQ3_S is where the gain is (its decode was the expensive one: 0.043 vs IQ3_XXS's 0.034 ns); IQ3_XXS pays +31% bytes
+for a decode that was already cheaper. Not measured yet: tok/s end to end (`build/spec_sweep ... --repack`, plain and
+`-D mtp`), prefill, a quiet machine. The estimate `--repack-info` first had (the matrices of a type timed alone,
+one parallel region each) said "slower" where the loaded model was faster: the forward passes' scheduling matters, so it
+loads and times the model instead (peak RAM one model; ~1-2 min on the 27B).
+
+Not offered: IQ2_* (3 magnitudes: a code fits 3 bits, but at 4 bits the weight doubles from 2.06-2.5 bits), IQ1 (its
+codes are always stored, below), NEON (no kernels for the codes: `--repack` is ignored there, as in the generic build).
+
 ## Measurements
 
 16-vCPU AMD EPYC Genoa VM, 2026-10-30, `scripts/bench_models.py -t 8,16 -r 2` with Unsloth's Qwen3.8-27B Q3_K_M
@@ -130,6 +176,10 @@ the full model's). A 64-token greedy decode at 16 threads measured 14.2-15.1 tok
   dequantized weights (fp32 activations): cos mean 0.99994-0.99998, min 0.99989, top-1 62/62
   (`tests/golden/models/saluki-27b`, the models group's `saluki-27b` entry, opt-in, ~12 min); greedy golden; the 50
   chat renderings (tools, `-e low`) equal HF's; runq serve's greedy, thinking and a constrained reply.
+- `--repack`: `make iq-repack-test` (random blocks: the codes' kernels == the base types' VBMI and gather decodes, 1 .. 77
+  rows; `iq_dot` and `iq_packed_row` on both layouts); `make test` runs it and checks `synth-q35-iq.gguf`'s logits with
+  `--repack` / `--repack=IQ3_S` == without (`-b 7`, `-b 64`), `-m dequant --repack` of the IQ3_S / IQ3_XXS rows ==
+  ggufmini, and `synth-q35-ista-mtp.gguf`'s `-D mtp -G 3` greedy text with `--repack` == without.
 - `make test` (default suite, numpy only): `synth-q35-iq.gguf`, the 27B-shaped synthetic model with its matrices
   requantized to all nine types (tests/iqquant.py, mixed per role as in Saluki's file; IQ1_M embedding, IQ3_S
   classifier): logits vs the numpy reference (cos mean 0.9966-0.9982, top-1 280/338: the int8 activations), batched /

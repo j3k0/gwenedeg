@@ -31,6 +31,7 @@ curl -s localhost:8080/v1/chat/completions -d '{"messages": [{"role": "user", "c
 | `--checkpoints N` | 4 | Qwen3.5 / 3.8: copies of the recurrent state a slot keeps (1..32; ~19 MiB each for the 0.8B, ~150 MiB for the 27B), where an agent's next requests leave the cache (below, Prefix reuse); counted in the slot's size and in the load check |
 | `--mem GiB` | MemAvailable | the load check (README, Memory): refuse to load if the weights, the runtime and one sequence of `-c` positions do not fit; `0` or `force`: no check |
 | `--page-cache auto\|drop\|keep` | auto | the model file's page cache after the load (auto: dropped if the file is >= 1/4 of the RAM) |
+| `--repack[=LIST]`, `--no-repack` | off | the IQ3_S / IQ3_XXS weights as 4-bit codes (README; `runq MODEL --repack-info` measures the choice): bit-identical output, more RAM (counted in the load check) |
 | `-b N`, `--chunk N` | 512, 64 | prompt tokens per forward pass when no request is decoding / while others decode |
 | `--prefix-copy N` | 32 | copy a cached prompt prefix into a new request's slot if that saves N tokens (a running request's; an idle slot's that would otherwise be cut, slot affinity below; 0: never) |
 | `--kv-disk DIR` | off | the KV cache's disk tier (below, KV cache on disk): a slot's sequence is saved to `DIR` when a request would discard its tokens (and at shutdown), and loaded back when a prompt continues it, also after a restart; an SSD |

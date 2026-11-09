@@ -11,6 +11,7 @@
  *
  *   build/spec_sweep MODEL [-S SETTING]... [-P chat,code,math,summ] [-i TEXT]... [-r 1,0] [-n 256] [-c 4096] [-k f16]
  *                          [-b 512] [-t 0] [-p 0.95] [-K 0] [-s 42] [-R 1] [-D DRAFT.gguf] [--mem GiB] [--list]
+ *                          [--repack[=IQ3_S|IQ3_XXS]]
  * SETTING: plain, or mtp (the model's MTP block) / draft (-D's model), then runq's options for it: -G k (default 3),
  * --tau T, --mtp-vocab N (mtp; default 0 = all, not runq's 100000), --lookup N, --lookup-min L, --spec auto; e.g.
  * -S "mtp -G 6 --tau 0.3", -S "draft -G 3" (lookup alone: "plain --lookup 4"). Default settings: plain, "mtp -G 3". -P: built-in prompts (TODO S7's, from
@@ -20,7 +21,8 @@
  * too). --mem: the loads' budget in GiB, used up in turn (the model's estimate checked against it, the MTP view's
  * against what is left, the draft's against the rest; RqModelOpts.mem / RqMtpOpts.mem); not given: MemAvailable at
  * each load. --list: the plan only (no model loaded), one line "plan ctx C kv K kmax X mtp 0|1 vocabs V,.. draft
- * PATH|- runs N" for s9_gate.sh's estimate, then the runs. Threads: OMP_NUM_THREADS (else the default). */
+ * PATH|- runs N" for s9_gate.sh's estimate, then the runs. --repack[=TYPE]: RqModelOpts.repack (runq --repack; the model
+ * and a draft model). Threads: OMP_NUM_THREADS (else the default). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -127,7 +129,7 @@ int main(int argc, char **argv) {
     int top_k = 0;
     unsigned long long seed = 42;
     double mem = 0;
-    int mem_given = 0;
+    int mem_given = 0, repack = 0;
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-') {
             if (path) goto usage;
@@ -135,6 +137,12 @@ int main(int argc, char **argv) {
             continue;
         }
         if (!strcmp(argv[i], "--list")) { list = 1; continue; }
+        if (!strncmp(argv[i], "--repack", 8)) { // (--repack, --repack=IQ3_S, --repack=IQ3_XXS)
+            const char *t = argv[i] + 8;
+            repack = !*t ? RQ_REPACK_ALL : !strcmp(t, "=IQ3_S") ? RQ_REPACK_IQ3_S : !strcmp(t, "=IQ3_XXS") ? RQ_REPACK_IQ3_XXS : -2;
+            if (repack == -2) goto usage;
+            continue;
+        }
         if (i + 1 >= argc) goto usage;
         const char *f = argv[i], *v = argv[++i];
         if (!strcmp(f, "-S") && ns_arg < SMAX) sargs[ns_arg++] = v;
@@ -238,6 +246,7 @@ int main(int argc, char **argv) {
     int e;
     RqModelOpts o = { 0 };
     o.ctx_len = ctx;
+    o.repack = repack;
     o.mem = mem_given ? mem : 0;
     o.kv_bits = rq_kv_bits(kv);
     double t0 = rq_now();

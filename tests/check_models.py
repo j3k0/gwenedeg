@@ -288,16 +288,17 @@ def dequant_check(runq, model, golden, res, prefix):
         res.report(ok, f"{prefix}/{name}", f"{what}: " + ", ".join(detail) + " (gguf-py)")
 
 
-def dequant_vs_mini(runq, model, cases, prefix):
+def dequant_vs_mini(runq, model, cases, prefix, flags=()):
     """runq -m dequant of rows (blocks and repacked layout) == tests/ggufmini.py's dequantization of the file's blocks,
-    bitwise (ggufmini: == gguf-py, iq_mini_check): [(ok, name, detail)]; cases: (tensor, first row, rows)"""
+    bitwise (ggufmini: == gguf-py, iq_mini_check): [(ok, name, detail)]; cases: (tensor, first row, rows); flags: runq's
+    (--repack: the repacked layout is its 4-bit codes)"""
     f = G.GgufFile(model)
     out = []
     for name, r0, n in cases:
         ne, ty, _ = f.tensors[name]
         want = G.dequant(ty, f.tensor_bytes(name)[r0:r0 + n], n, int(ne[0]))
         d = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"dequant-{os.getpid()}-{abs(hash((model, name, r0)))}.bin")
-        p = run([runq, model, "-c", "64", "-m", "dequant", "-i", f"{name}:{r0}:{n}", "-o", d], 2)
+        p = run([runq, model, *flags, "-c", "64", "-m", "dequant", "-i", f"{name}:{r0}:{n}", "-o", d], 2)
         what = f"{G.TYPE_NAME.get(ty, ty)} rows {r0}..{r0 + n - 1} x {int(ne[0])}"
         if p.returncode != 0:
             out.append((False, f"{prefix}/{name}", f"runq -m dequant failed: {p.stderr.decode(errors='replace')[-300:]}"))
@@ -341,24 +342,52 @@ def iq_types_cases(model):
 
 
 def iq_synth_run(a, sd, tmp, texts):
-    """synth-q35-iq.gguf: ggufmini == gguf-py (iq_mini_check); runq's dequantization == ggufmini for every type; the
-    AVX-512 gather decode (RUNQ_IQ_GATHER=1, the decode of CPUs without VBMI) gives the same logits as the default"""
+    """synth-q35-iq.gguf: ggufmini == gguf-py (iq_mini_check); runq's dequantization == ggufmini for every type (and
+    with --repack: IQ3_XXS / IQ3_S as 4-bit codes); the AVX-512 gather decode (RUNQ_IQ_GATHER=1, the decode of CPUs
+    without VBMI) and --repack / --repack=IQ3_S give the same logits as the default; synth-q35-ista-mtp.gguf: -D mtp's
+    greedy text with --repack == without (the target and the MTP view repacked)"""
     import hashlib
     out = iq_mini_check()
+    kt = os.path.join(ROOT, "build", "iq_repack_test")  # (--repack's kernels vs the base types', random blocks; AVX-512)
+    if os.path.exists(kt):
+        p = run([kt], 1)
+        lines = p.stdout.decode(errors="replace").splitlines()
+        nok = sum(l.startswith("ok ") for l in lines)
+        out.append((p.returncode == 0 and nok > 0, "q35/iq_repack_test",
+                    f"{nok} cases bit-identical (iq_rows VBMI / gather / codes, iq_dot, iq_packed_row)" if p.returncode == 0
+                    else "; ".join(l for l in lines if l.startswith("FAIL"))[:300] or f"exit {p.returncode}"))
     model = os.path.join(sd, "synth-q35-iq.gguf")
     if not os.path.exists(model):
         return out
-    out += dequant_vs_mini(a.runq, model, iq_types_cases(model), "q35/synth-q35-iq/dequant")
+    cases = iq_types_cases(model)
+    out += dequant_vs_mini(a.runq, model, cases, "q35/synth-q35-iq/dequant")
+    f = G.GgufFile(model)
+    out += dequant_vs_mini(a.runq, model, [c for c in cases if G.TYPE_NAME.get(f.tensors[c[0]][1]) in ("IQ3_S", "IQ3_XXS")],
+                           "q35/synth-q35-iq/repack-dequant", ["--repack"])
+    variants = [("gather", [], {"RUNQ_IQ_GATHER": "1"}, "RUNQ_IQ_GATHER=1"), ("repack", ["--repack"], {}, "--repack"),
+                ("repack-iq3s", ["--repack=IQ3_S"], {}, "--repack=IQ3_S")]
     for name, chunk in (("en", 7), ("long2", 64)):
         hs = []
-        for env in ({}, {"RUNQ_IQ_GATHER": "1"}):
-            path = os.path.join(tmp, f"iq_gather_{name}_{len(env)}.bin")
-            p = run([a.runq, model, "-c", "4096", "-m", "logits", "-b", str(chunk), "-i", texts[name], "-o", path], 4, env)
+        for i, (_, flags, env, _) in enumerate([("", [], {}, "")] + variants):
+            path = os.path.join(tmp, f"iq_variant_{name}_{i}.bin")
+            p = run([a.runq, model, *flags, "-c", "4096", "-m", "logits", "-b", str(chunk), "-i", texts[name], "-o", path], 4, env)
             hs.append(hashlib.sha256(open(path, "rb").read()).hexdigest() if p.returncode == 0 else f"exit {p.returncode}")
             if os.path.exists(path):
                 os.remove(path)
-        out.append((hs[0] == hs[1] and not hs[0].startswith("exit"), f"q35/synth-q35-iq/gather/{name}_b{chunk}",
-                    "RUNQ_IQ_GATHER=1 vs the default decode: " + ("bit-identical" if hs[0] == hs[1] else f"DIFFER {hs}")))
+        for i, (tag, _, _, what) in enumerate(variants):
+            same = hs[0] == hs[i + 1] and not hs[0].startswith("exit")
+            out.append((same, f"q35/synth-q35-iq/{tag}/{name}_b{chunk}",
+                        f"{what} vs the default: " + ("bit-identical" if same else f"DIFFER {hs[0][:16]} {hs[i + 1][:16]}")))
+    mtp = os.path.join(sd, "synth-q35-ista-mtp.gguf")
+    if os.path.exists(mtp):
+        txt = []
+        for flags in ([], ["--repack"]):
+            p = run([a.runq, mtp, *flags, "-c", "1024", "-m", "generate", "-D", "mtp", "-G", "3", "-t", "0", "-n", "48",
+                     "-i", texts["en"]], 4)
+            txt.append(p.stdout.decode(errors="replace") if p.returncode == 0 else f"exit {p.returncode}")
+        same = txt[0] == txt[1] and not txt[0].startswith("exit")
+        out.append((same, "q35/synth-q35-ista-mtp/repack/mtp_greedy",
+                    "-D mtp -G 3 greedy, --repack vs the default: " + ("same text" if same else "DIFFER")))
     return out
 
 

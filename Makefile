@@ -29,7 +29,7 @@ HDR = $(wildcard src/*.h)
 Q8  = models/Qwen3-0.6B-q8.bin
 B   = build
 
-.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test iq-neon-test api-test tools-test bench-batch bench-verify long-ctx bench-long bench-mtp spec-sweep teacher-force mem-probe bf16dp-test FORCE
+.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test iq-neon-test iq-repack-test api-test tools-test bench-batch bench-verify long-ctx bench-long bench-mtp spec-sweep teacher-force mem-probe bf16dp-test FORCE
 
 all: runq
 
@@ -137,6 +137,10 @@ mem-probe: $(B)/mem_probe
 # vdpbf16ps vs the definition of the bf16 dot-product attention (tests/bf16dp_test.c: edge cases, random lanes, the
 # conversions; -emu: the AVX-512 kernel's emulation for CPUs without AVX512_BF16); make test runs both (group kv).
 # Not -Ofast: its finite-math-only folds isnan() and its no-signed-zeros the reference's zeros (the test sets MXCSR)
+# --repack's kernel test (tests/kernels/iq_repack_test.c; make test runs it: tests/check_models.py iq_synth_run)
+$(B)/iq_repack_test: tests/kernels/iq_repack_test.c src/kernels_avx512.h src/iquants.h src/iq_grids.h src/kquants.h
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $< -o $@
 $(B)/bf16dp_test: tests/bf16dp_test.c src/kernels_avx512.h src/kvtype.h src/runq.h
 	@mkdir -p $(@D)
 	$(CC) -O2 -march=native $(CPPFLAGS) $< $(LDLIBS) -o $@
@@ -155,6 +159,11 @@ kq-neon-test: tests/kernels/kq_neon_test.c src/kernels_neon.h src/kquants.h
 # (tests/kernels/iq_neon_test -b [nb]: single-thread ns per weight, NEON and generic)
 iq-neon-test: tests/kernels/iq_neon_test.c src/kernels_neon.h src/iquants.h src/iq_grids.h src/kquants.h
 	$(CC) $(CFLAGS) $< -o tests/kernels/iq_neon_test && tests/kernels/iq_neon_test
+
+# --repack's layouts (iquants.h: IQ3_XXS / IQ3_S as 4-bit codes) vs the base types, AVX-512 build, on random blocks:
+# bit-identical (tests/kernels/iq_repack_test -b [k]: single-thread ns per weight, base vs repacked)
+iq-repack-test: tests/kernels/iq_repack_test.c src/kernels_avx512.h src/iquants.h src/iq_grids.h src/kquants.h
+	$(CC) $(CFLAGS) $< -o tests/kernels/iq_repack_test && tests/kernels/iq_repack_test
 
 generic: runq-generic
 

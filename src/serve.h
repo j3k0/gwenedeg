@@ -22,6 +22,8 @@
 #include "json.h"
 
 int serve_main(int argc, char **argv); // `runq serve ...` (cli.c dispatches here)
+int rq_repack_parse(const char *v);     // cli.c: --repack=LIST -> RqModelOpts.repack bits, -1 if unknown
+void rq_repack_note(const RqModel *m);  // cli.c: --repack's line on stderr (what was repacked, its cost)
 
 // --------------------------------------------------------------------------- constrained decoding
 // A finite set of output strings (the canonical JSON texts a schema allows) and the token-level view

@@ -238,6 +238,8 @@ struct RqModel {
     int gs_counted;             // counted in model.c's gs_models (one group size per process)
     char warning[256];          // a load-time warning for the caller to show ("" if none)
     int kq;                     // K-quant weights (Q3_K .. Q6_K): the activation sums xf are needed
+    int repack;                 // RqModelOpts.repack (RQ_REPACK_*; 0 none): IQ3_XXS / IQ3_S matmul weights as 4-bit codes
+                                // (iq_repack_type; an MTP view: its target's)
     // derived shape parameters of the forward passes (checked at load)
     int kv_dim, all_heads_dim, kv_mul;
     int xs;                     // row stride of the batched xb / xq rows: max(dim, all_heads_dim)

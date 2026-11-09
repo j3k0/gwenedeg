@@ -1,0 +1,81 @@
+You are given a question (problem specification) and will generate a correct Python program that matches the specification and passes all tests.
+
+Question: There is a grid with H rows and W columns. The cell in the i-th row from the top and the j-th column from the left is denoted (i, j). Each cell is either empty (.) or a wall (#). Cell (1, 1) and cell (H, W) are empty.
+
+A robot starts at cell (1, 1) facing east. In one move the robot can do one of the following:
+
+- Move forward one cell in the direction it is facing, if that cell is inside the grid and empty. This costs 1.
+- Turn 90 degrees to the left or to the right without moving. This costs C.
+
+In addition, the robot carries K bombs. Using a bomb destroys the wall directly in front of the robot, making that cell empty for the rest of the journey; the robot does not move. Using a bomb costs 0 but each bomb can be used only once, and a bomb can only be used when the cell in front of the robot is inside the grid and is a wall.
+
+Find the minimum total cost for the robot to reach cell (H, W), facing any direction. If it is impossible, print -1.
+
+Input
+
+The input is given from Standard Input in the following format:
+
+H W C K
+S_1
+S_2
+...
+S_H
+
+S_i is a string of length W consisting of . and #, describing row i.
+
+Output
+
+Print the answer as an integer.
+
+Constraints
+
+- 1 <= H, W <= 300
+- 0 <= C <= 10^6
+- 0 <= K <= 5
+- H and W are integers, and so are C and K.
+- S_i is a string of length W consisting of . and #.
+- The first character of S_1 and the last character of S_H are both '.'.
+
+Sample Input 1
+
+3 4 2 0
+....
+.##.
+....
+
+Sample Output 1
+
+7
+
+The robot moves east three times (cost 3), turns right (cost 2) and moves south twice (cost 2), reaching (3, 4) with a total cost of 7.
+
+Sample Input 2
+
+3 3 10 0
+.#.
+##.
+#..
+
+Sample Output 2
+
+-1
+
+Without bombs the robot cannot leave cell (1, 1): the cells (1, 2) and (2, 1) are walls.
+
+Sample Input 3
+
+2 5 3 1
+..#..
+.###.
+
+Sample Output 3
+
+8
+
+The robot moves east once (cost 1), uses its bomb on the wall at (1, 3) (cost 0), moves east three times to (1, 5) (cost 3), turns right (cost 3) and moves south once (cost 1): 1 + 0 + 3 + 3 + 1 = 8. Going south first does not work: the walls at (2, 2), (2, 3) and (2, 4) need three bombs.
+
+Format: Read the inputs from stdin, solve the problem and write the answer to stdout (do not directly test on the sample inputs). Enclose your code within delimiters as follows. Ensure that when the python program runs, it reads the inputs, runs the algorithm and writes output to STDOUT.
+
+```python
+# YOUR CODE HERE
+```

@@ -1,0 +1,6 @@
+
+CI reports a failing test in tests/test_parser.py:
+
+FAILED tests/test_parser.py::test_parse_nested_lists - AssertionError: assert [1, [2, 3]] == [1, [2, [3]]]
+
+It started after yesterday's change to parsekit/parser.py. Inspect the test and the parser and fix the bug in the parser (not the test). Start by looking at the files.

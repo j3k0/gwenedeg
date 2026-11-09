@@ -1,0 +1,12 @@
+
+Implement an LRU cache in Python with O(1) get and put, and unit tests for it.
+
+Requirements:
+- A class `LRUCache(capacity: int)` in a new file `parsekit/lru.py`. `capacity` must be a positive integer; raise ValueError otherwise.
+- `get(key)` returns the value stored for key, or None if it is not there, and marks the key as the most recently used.
+- `put(key, value)` stores or updates the value and marks the key as the most recently used. When the cache is full, it first evicts the least recently used key.
+- `__len__` and `__contains__` (the latter must not change the order).
+- Both get and put must be O(1): use a dict plus a doubly linked list of your own, not collections.OrderedDict and not functools.lru_cache.
+- Unit tests with the standard unittest module in `tests/test_lru.py`: the eviction order, updates of an existing key, capacity 1, invalid capacities, and that `in` does not refresh a key.
+
+Write both files, then run the tests and tell me the result.

@@ -62,7 +62,10 @@ Steps:
     draft: 64 / 64 outputs == plain, 42-79% of the guesses accepted, 2.2-3.5 tokens per pass at k 2-4, 0.87-1.24x plain's
     tok/s on that small model (docs/qwen38-speculative.md, "The loop"). `runq serve --draft mtp` runs since S9c.3
     (2026-11-09, docs/server.md), its view loaded from `--kv-disk` to the prompt's prefix and in the `--admit` terms
-    since S9c.4; the 27B in the server: S9c.G.
+    since S9c.4; S9c.5 (2026-11-09) added the tools of the 27B's measurement in the server (`scripts/s9_gate.sh --server`,
+    `scripts/s9c_bench.py`, `bench/s9c/`; the commands in docs/qwen38-speculative.md, "In the server (S9c)") and the
+    trained 0.8B block's whole `--spec mtp` group (`models/3.5-0.8b-mtp/server_spec/*`); next: S9c.G (the 27B in the
+    server, gated: a window with saluki down).
     **S9d.1 done (2026-11-09):** `scripts/s9_gate.sh` (the 27B gate: the estimate from metadata, the servers' `/health`
     margin and the timers that start one, a capped scope without swap, the watchdog, the bench lock) and
     `build/spec_sweep` (`make spec-sweep`: settings x S7's prompts in one process, every output checked against plain);

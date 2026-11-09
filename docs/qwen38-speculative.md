@@ -1711,6 +1711,63 @@ removed at the start (logged, the targets kept), their conversations' views then
 (docs/memory-admission.md: 37.0 KB per position and 149.6 MiB on the 27B at q8, against 41.3 / 168.9 with the 0.8B). Not measured yet: the
 27B in the server (S9c.G: 14 threads, 4 parallel requests, 32k, auto with prior 0.8).
 
+**S9c.5 (2026-11-09): the tools of S9c.G, the trained block in the server.**
+- The models group's `3.5-0.8b-mtp` (`tests/run_tests.sh --models --model-tags 3.5-0.8b-mtp`) runs `server_test.py
+  --spec mtp --mtp-accepts` whole on the trained 0.8B block (`server_spec/*`, 29 checks; the spec group runs it
+  `--quick`): every case == the plain server and == `"speculative": false`, 97 replies with `mtp_approx` 0, 97 dumped
+  views == a fresh lockstep run. 1,374 of 2,089 guesses accepted over its cases (66%; k 1-8, auto, the lookup
+  combined).
+- `scripts/s9_gate.sh --server MODEL --server-ctx N --server-kv TYPE --server-kv-mem G [--server-draft mtp|FILE] --
+  COMMAND`: the gate for a `runq serve --admit bound --kv-mem G` job. The estimate is the target's probe without its
+  one sequence (its KV cache and states are the pool's) + G + the drafter (the view: block x 1.10 + norms + the
+  runtime; a draft model: its probe without its sequence). The command gets no `--mem`: the gate exports
+  `S9_GATE_MEM` (server_test.py `--one-server` and s9c_bench.py pass it to every server). On ISTA's IQ3_S-mtp at
+  98,304 q8-dot with an 8 GiB pool: **20.09 GiB** with the view (model 11.29 + 8 + 0.80), 20.01 with the 0.8B draft
+  (+ 0.72), cap 21.09 / 21.01: it opens at MemAvailable >= 24.1 GiB. Now **closed** (saluki's margin 23.9 GiB with
+  8.2 swapped out, SwapFree 0.7, the 22:00Z timer); `--meminfo FILE` / `--no-procs` (fixtures for testing the gate):
+  saluki down at 26 GiB opens (budget 23.00), its `/health` as a `file://` fixture closes it again (margin 15.74).
+- `scripts/s9c_bench.py` (stdlib): one server, `bench/s9c/`'s prompts, per request tok/s, prefill, what auto chose
+  (passes per source), drafted / accepted, `draft_rows`, `mtp_approx`, the output hash; `/health` and VmRSS / VmHWM
+  every second; the startup and `-v` shutdown lines; `--compare` checks the hashes across configurations. The prompts
+  (0.8B tokenizer = the 27B's): `task-lcb1` / `lcb2` 817 / 772 tokens, the agent block + `task-code` / `task-tool`
+  2,426 / 2,261, `long-32k.txt` + `task-long.txt` 31,703 (95,357 bytes; 915894a's engine.c, `head -c 95000`), the
+  turns' slices from `long-more.txt` (the rest of that file, 22,104 tokens).
+- Smoke runs (4 threads, `-c 16384 --admit bound --kv-mem 2 -v`, `--short --think 1,0 --long 6000 --turns 2`, a box
+  loaded by the suite: tok/s not results): the 0.8B-mtp with `--draft mtp -G 6 --tau 0.5`, with the 0.8B Q4_K_M
+  `-G 5 --tau 0.4` and plain, 105 replies of 19 requests, **every hash equal** (1 and 4 clients too); the 0.8B Q8_0
+  with the Q4_K_M and plain, 70 of 19, equal. (The two files' hashes differ: the -mtp file's trunk is not the Q8_0
+  file's bit for bit.) `mtp_approx` 0 everywhere; the view 2,971 of 3,532 guesses accepted; auto never chose the
+  Q4_K_M draft for a 0.8B target (its guess costs about a target step). Through the gate's server mode (fixtures:
+  saluki down, MemAvailable 7 GiB): the 0.8B-mtp `--short --think 0`, estimate 1.99 GiB, cap 2.99, the scope's peak
+  1.64, VmHWM 1.66, exit 0.
+
+**S9c.G's commands** (PLAN-S9c-server.md 7; a window the user opens: saluki down, outside 22:00-06:00Z, every
+`--until` <= 21:45Z; `--dry` first; each job one server, its references first under `--one-server`):
+```
+cd /opt/projects/tools/gwenedeg-s9; export TMPDIR=/var/tmp
+S=models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
+D8=models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf
+KM=8      # 7, then 6, if the gate is closed at 8 (both configurations alike; recorded)
+BASE="--ctx 98304 -k q8-dot --slots 6 --parallel 4 --admit bound --kv-mem $KM --kv-disk /var/tmp/s9c-kv --kv-disk-max 6 --timeout 0 --threads 14 -v"
+A="$BASE --draft mtp -G 6 --tau 0.5"; B="$BASE --draft $D8 -G 5 --tau 0.4"; C="$BASE --draft mtp -G 3"
+GATE="scripts/s9_gate.sh --until HH:MM --server $S --server-ctx 98304 --server-kv q8-dot --server-kv-mem $KM"
+# G1, the correctness smoke
+$GATE --server-draft mtp -- .venv/bin/python -I tests/server_test.py --runq ./runq --model $S --spec mtp --quick --threads 14 --one-server
+$GATE --server-draft mtp -- .venv/bin/python -I tests/server_test.py --runq ./runq --model $S --disk --draft mtp --threads 14 --one-server
+# G2, short context: A, B, A, B, A, B (optional: C, C), then the hashes
+for i in 1 2 3; do
+  $GATE --server-draft mtp -- .venv/bin/python -I scripts/s9c_bench.py --model $S --serve-args "$A" --short --think 1,0 --label A$i --json /var/tmp/s9c/G2-A$i.json
+  $GATE --server-draft $D8 -- .venv/bin/python -I scripts/s9c_bench.py --model $S --serve-args "$B" --short --think 1,0 --label B$i --json /var/tmp/s9c/G2-B$i.json
+done
+.venv/bin/python -I scripts/s9c_bench.py --compare /var/tmp/s9c/G2-*.json
+# G3, 32k: A first into /var/tmp/s9c-kv, then B on the same target files
+$GATE --server-draft mtp -- .venv/bin/python -I scripts/s9c_bench.py --model $S --serve-args "$A" --long 32768 --turns 3 --label G3-A --json /var/tmp/s9c/G3-A.json
+$GATE --server-draft $D8 -- .venv/bin/python -I scripts/s9c_bench.py --model $S --serve-args "$B" --long 32768 --turns 3 --label G3-B --json /var/tmp/s9c/G3-B.json
+.venv/bin/python -I scripts/s9c_bench.py --compare /var/tmp/s9c/G3-A.json /var/tmp/s9c/G3-B.json
+```
+G4 reads the JSON files (`startup`: the `admission bound:` terms; per request `lease_gib`; `peak` and `samples`:
+committed, VmHWM); G5's rule and records as in the plan.
+
 ## Not now
 
 DFlash 2 (a 2B block-diffusion drafter: a new architecture, a 4 GB BF16 download); multi-VM splits (~10-30% over

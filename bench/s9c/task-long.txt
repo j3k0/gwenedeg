@@ -1,0 +1,2 @@
+
+The code above is the first part of src/engine.c of a C inference server (runq). Explain how a request moves through it: where it is admitted, how its slot and KV cache are chosen, how speculative decoding is planned for it in a step, and where its memory lease is renewed or released. Name the functions involved, in order, with one or two sentences each.

@@ -36,12 +36,24 @@
 # --health URL (repeatable: replaces the default endpoints), --timer UNIT (repeatable: replaces the default timers),
 # --nice N (default 10). Numbers in GiB. Needs systemd (user manager with the memory controller), curl, choom, flock,
 # python3 with numpy (.venv/bin/python if present).
+#
+# The server mode (TODO S9c.5): --server MODEL --server-ctx N --server-kv TYPE --server-kv-mem G [--server-draft mtp|FILE]
+# -- COMMAND ARGS... (any command, e.g. tests/server_test.py or scripts/s9c_bench.py, that starts `runq serve MODEL --ctx N
+# -k TYPE --admit bound --kv-mem G [--draft mtp|FILE]` with --mem $S9_GATE_MEM; one server at a time). The estimate: the
+# target's probe (runq MODEL -c N -k TYPE --mem 0.01) without its one sequence (KV cache and recurrent state: the pool's)
+# + G (the pool: the leases' KV and states, the draft's sequences included) + the drafter: the MTP view's block bytes x
+# 1.10 + norms + R (its KV is in the pool), or a draft model's probe without its sequence. No checkpoint term (in the
+# pool). The command gets no --mem: the gate exports S9_GATE_MEM=<budget> to it instead (the driver and its server run
+# in the capped scope). Fixtures for testing the gate itself (not for a 27B job): --meminfo FILE (MemAvailable and
+# SwapFree read from FILE, a /proc/meminfo copy, for the decision; the watchdog reads /proc/meminfo), --no-procs (the
+# runq serve processes not looked for: only the --health endpoints count).
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PY=$ROOT/.venv/bin/python
 [ -x "$PY" ] || PY=python3
 DRY=0 UNTIL="" RESERVE=3 FLOOR=1 SWAP_MIN=4 WATCH=3 GUARD=5 LOCK=/tmp/cwayn-bench.lock LOCK_WAIT=0 NICE=10
 HEALTH=() TIMERS=()
+SRV="" SRV_CTX="" SRV_KV="" SRV_KVMEM="" SRV_DRAFT="" MEMINFO=/proc/meminfo PROCS=1
 die() { echo "s9_gate: $*" >&2; exit 2; }
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -56,13 +68,30 @@ while [ $# -gt 0 ]; do
         --health) HEALTH+=("$2"); shift 2 ;;
         --timer) TIMERS+=("$2"); shift 2 ;;
         --nice) NICE=$2; shift 2 ;;
+        --server) SRV=$2; shift 2 ;;
+        --server-ctx) SRV_CTX=$2; shift 2 ;;
+        --server-kv) SRV_KV=$2; shift 2 ;;
+        --server-kv-mem) SRV_KVMEM=$2; shift 2 ;;
+        --server-draft) SRV_DRAFT=$2; shift 2 ;;
+        --meminfo) MEMINFO=$2; shift 2 ;;
+        --no-procs) PROCS=0; shift ;;
         --) shift; break ;;
         *) die "unknown option $1 (usage: s9_gate.sh [--dry] [--until TIME] [options] -- COMMAND ARGS...)" ;;
     esac
 done
-[ $# -ge 2 ] || die "no command (s9_gate.sh [options] -- runq|spec_sweep MODEL ...)"
+[ -n "$SRV" ] || [ $# -ge 2 ] || die "no command (s9_gate.sh [options] -- runq|spec_sweep MODEL ...)"
 CMD=("$@")
 for a in "${CMD[@]}"; do [ "$a" = --mem ] && die "the command must not have --mem: the gate computes it"; done
+if [ -n "$SRV" ]; then
+    [ -f "$SRV" ] || die "--server: no file $SRV"
+    [[ "$SRV_CTX" =~ ^[0-9]+$ ]] || die "--server needs --server-ctx N"
+    [ -n "$SRV_KV" ] || die "--server needs --server-kv TYPE"
+    [[ "$SRV_KVMEM" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--server needs --server-kv-mem G (the command's --kv-mem)"
+    [ -z "$SRV_DRAFT" ] || [ "$SRV_DRAFT" = mtp ] || [ -f "$SRV_DRAFT" ] || die "--server-draft: no file $SRV_DRAFT"
+elif [ -n "$SRV_CTX$SRV_KV$SRV_KVMEM$SRV_DRAFT" ]; then
+    die "--server-ctx / --server-kv / --server-kv-mem / --server-draft need --server MODEL"
+fi
+[ -r "$MEMINFO" ] || die "--meminfo: cannot read $MEMINFO"
 [ ${#HEALTH[@]} -gt 0 ] || HEALTH=(http://100.67.84.55:8418/health http://100.67.84.55:8417/health)
 [ ${#TIMERS[@]} -gt 0 ] || TIMERS=(runq-day.timer lcb-bench.timer)
 for v in "$RESERVE" "$FLOOR" "$SWAP_MIN" "$WATCH" "$GUARD" "$LOCK_WAIT"; do
@@ -87,14 +116,14 @@ if flock -w "$LOCK_WAIT" 9; then LOCKED="held by the gate"
 else LOCKED="busy"; close "the bench lock $LOCK is held by another job"; fi
 
 # 2. memory
-mem_gib() { awk -v k="$1:" '$1 == k { printf "%.2f", $2 / 1048576 }' /proc/meminfo; }
+mem_gib() { awk -v k="$1:" '$1 == k { printf "%.2f", $2 / 1048576 }' "$MEMINFO"; }
 AVAIL=$(mem_gib MemAvailable)
 SWAPFREE=$(mem_gib SwapFree)
 
 # 3. the servers: runq serve processes and the --health endpoints
 declare -A URLS=() SWAPS=() PIDS=()
 ANSWERED=" "  # (the pids of the runq serve processes whose /health answered with a mem object)
-for pid in $(pgrep -x runq; pgrep -x runq-generic); do
+for pid in $([ "$PROCS" = 1 ] && { pgrep -x runq; pgrep -x runq-generic; }); do
     mapfile -d '' -t av < "/proc/$pid/cmdline" 2>/dev/null || continue
     [ "${av[1]:-}" = serve ] || continue
     host=127.0.0.1 port=8080
@@ -195,45 +224,19 @@ parse_needs() { # "needs ~X GiB (weights W, runtime R, a sequence of N positions
         head -1 | awk '{ s = 0; if (match($0, /recurrent state [0-9.]+ MiB/)) { split(substr($0, RSTART, RLENGTH), a, " "); s = a[3] }
                          printf "%s %s %s %s\n", $1, $2, $3, s }'
 }
-BIN=$(basename "${CMD[0]}")
-MODEL=${CMD[1]}
-KMAX=0 USE_MTP=0 DRAFT="" KV=f16
-case "$BIN" in
-    spec_sweep*)
-        plan=$(probe "${CMD[@]}" --list | sed -n 's/^plan //p' | head -1)
-        [ -n "$plan" ] || close "spec_sweep --list gave no plan"
-        read -r _ CTXA _ KV _ KMAX _ USE_MTP _ _ _ DRAFT _ _ <<< "$plan"
-        [ "$DRAFT" = - ] && DRAFT="" ;;
-    runq*)
-        G=-1 D="" mode=chat lk=0
-        for ((i = 2; i + 1 < ${#CMD[@]}; i++)); do
-            case "${CMD[i]}" in
-                -k) KV=${CMD[i + 1]} ;; -D) D=${CMD[i + 1]} ;; -G) G=${CMD[i + 1]} ;; -m) mode=${CMD[i + 1]} ;;
-                --lookup) lk=${CMD[i + 1]} ;;
-            esac
-        done
-        if [ "$mode" = generate ] || [ "$mode" = chat ]; then
-            [ -n "$D" ] && [ "$G" -lt 0 ] && G=3  # (runq's default -G with -D)
-            if [ -n "$D" ] && [ "$G" -gt 0 ]; then
-                KMAX=$G
-                if [ "$D" = mtp ]; then USE_MTP=1; else DRAFT=$D; fi
-            fi
-            [ "$lk" -gt "$KMAX" ] && KMAX=$lk
-        fi ;;
-    *) close "unknown command $BIN (runq or spec_sweep)" ;;
-esac
-out=""
-[[ "$BIN" == runq* || "$BIN" == spec_sweep* ]] && out=$(probe "${CMD[@]}" --mem 0.01) # (nothing else is run)
-read -r T_EST T_RT NPOS T_STATE <<< "$(echo "$out" | parse_needs)"
-if [ -z "${T_EST:-}" ]; then
-    close "the model's estimate: no 'needs ~X GiB' in the probe's output"
-    echo "$out" | tail -3 | sed 's/^/[gate]   probe: /' >&2
-    T_EST=0 T_RT=0 NPOS=0 T_STATE=0
-fi
-case "$KV" in f32) KVB=4 ;; bf16*|f16*) KVB=2 ;; q8*) KVB=1.1 ;; q4k4*) KVB=0.55 ;; q4*) KVB=0.85 ;; *) KVB=2 ;; esac
-MTP_EST=0
-if [ "$USE_MTP" = 1 ]; then
-    MTP_EST=$("$PY" -I -c '
+seqless() { # a probe's output -> "E R N": its estimate without its one sequence (the KV cache, the recurrent state x (1 +
+            # its checkpoints)), its runtime, the positions
+    "$PY" -I -c '
+import re, sys
+m = re.search(r"needs ~([0-9.]+) GiB \(weights [0-9.]+, runtime ([0-9.]+), a sequence of (\d+) positions: KV cache ([0-9.]+)"
+              r"(?: \+ recurrent state ([0-9.]+) MiB x \(1 \+ (\d+) checkpoints\))?", sys.stdin.read())
+if m:
+    st = float(m.group(5) or 0) * (1 + int(m.group(6) or 0)) / 1024
+    print("%.2f %s %s" % (float(m.group(1)) - float(m.group(4)) - st, m.group(2), m.group(3)))'
+}
+mtp_est() { # MODEL NPOS KVB RUNTIME: the MTP view's block bytes in the file x 1.10 (repacked) + its norms + its KV cache of NPOS
+            # positions at KVB bytes per value (0: none) + RUNTIME (its context: not more than the model's) in GiB
+    "$PY" -I -c '
 import sys
 sys.path.insert(0, sys.argv[1] + "/tests")
 import ggufmini as g
@@ -255,19 +258,79 @@ kvh = f.kv[a + ".attention.head_count_kv"]
 kvh = int(max(kvh)) if hasattr(kvh, "__len__") else int(kvh)
 hd = int(f.kv.get(a + ".attention.key_length", int(f.kv[a + ".embedding_length"]) // int(f.kv[a + ".attention.head_count"])))
 kv = 2 * kvh * hd * float(sys.argv[4]) * (int(sys.argv[3]) + 256)
-print("%.3f" % ((mats * 1.10 + norms + kv) / 2**30 + float(sys.argv[5])))' "$ROOT" "$MODEL" "$NPOS" "$KVB" "$T_RT" 2>&1)
-    [[ "$MTP_EST" =~ ^[0-9.]+$ ]] || { close "the MTP view's estimate: $MTP_EST"; MTP_EST=0; }
+print("%.3f" % ((mats * 1.10 + norms + kv) / 2**30 + float(sys.argv[5])))' "$ROOT" "$@" 2>&1
+}
+KMAX=0 USE_MTP=0 DRAFT="" KV=f16 T_STATE=0 MTP_EST=0 CK_EST=0 D_EST=0 D_CK=0
+if [ -n "$SRV" ]; then
+    # the server mode: the target without its sequence + the pool + the drafter (the probe and the header only)
+    out=$(probe "$ROOT/runq" "$SRV" -c "$SRV_CTX" -k "$SRV_KV" -m generate -i x --mem 0.01)
+    read -r T_EST T_RT NPOS <<< "$(echo "$out" | seqless)"
+    if [ -z "${T_EST:-}" ]; then
+        close "the model's estimate: no 'needs ~X GiB' in the probe's output"
+        echo "$out" | tail -3 | sed 's/^/[gate]   probe: /' >&2
+        T_EST=0 T_RT=0 NPOS=0
+    fi
+    DWHAT="none"
+    if [ "$SRV_DRAFT" = mtp ]; then
+        D_EST=$(mtp_est "$SRV" 0 0 "$T_RT")
+        [[ "$D_EST" =~ ^[0-9.]+$ ]] || { close "the MTP view's estimate: $D_EST"; D_EST=0; }
+        DWHAT="the MTP view (block x 1.10 + norms + runtime $T_RT)"
+    elif [ -n "$SRV_DRAFT" ]; then
+        dout=$(probe "$ROOT/runq" "$SRV_DRAFT" -c "$SRV_CTX" -k "$SRV_KV" -m generate -i x --mem 0.01)
+        read -r D_EST _ _ <<< "$(echo "$dout" | seqless)"
+        if [ -z "${D_EST:-}" ]; then close "the draft's estimate: no 'needs ~X GiB' from $ROOT/runq $SRV_DRAFT"; D_EST=0; fi
+        DWHAT="$(basename "$SRV_DRAFT") without its sequence"
+    fi
+    EST=$(calc "$T_EST + $SRV_KVMEM + $D_EST")
+else
+    BIN=$(basename "${CMD[0]}")
+    MODEL=${CMD[1]}
+    case "$BIN" in
+        spec_sweep*)
+            plan=$(probe "${CMD[@]}" --list | sed -n 's/^plan //p' | head -1)
+            [ -n "$plan" ] || close "spec_sweep --list gave no plan"
+            read -r _ CTXA _ KV _ KMAX _ USE_MTP _ _ _ DRAFT _ _ <<< "$plan"
+            [ "$DRAFT" = - ] && DRAFT="" ;;
+        runq*)
+            G=-1 D="" mode=chat lk=0
+            for ((i = 2; i + 1 < ${#CMD[@]}; i++)); do
+                case "${CMD[i]}" in
+                    -k) KV=${CMD[i + 1]} ;; -D) D=${CMD[i + 1]} ;; -G) G=${CMD[i + 1]} ;; -m) mode=${CMD[i + 1]} ;;
+                    --lookup) lk=${CMD[i + 1]} ;;
+                esac
+            done
+            if [ "$mode" = generate ] || [ "$mode" = chat ]; then
+                [ -n "$D" ] && [ "$G" -lt 0 ] && G=3  # (runq's default -G with -D)
+                if [ -n "$D" ] && [ "$G" -gt 0 ]; then
+                    KMAX=$G
+                    if [ "$D" = mtp ]; then USE_MTP=1; else DRAFT=$D; fi
+                fi
+                [ "$lk" -gt "$KMAX" ] && KMAX=$lk
+            fi ;;
+        *) close "unknown command $BIN (runq or spec_sweep)" ;;
+    esac
+    out=""
+    [[ "$BIN" == runq* || "$BIN" == spec_sweep* ]] && out=$(probe "${CMD[@]}" --mem 0.01) # (nothing else is run)
+    read -r T_EST T_RT NPOS T_STATE <<< "$(echo "$out" | parse_needs)"
+    if [ -z "${T_EST:-}" ]; then
+        close "the model's estimate: no 'needs ~X GiB' in the probe's output"
+        echo "$out" | tail -3 | sed 's/^/[gate]   probe: /' >&2
+        T_EST=0 T_RT=0 NPOS=0 T_STATE=0
+    fi
+    case "$KV" in f32) KVB=4 ;; bf16*|f16*) KVB=2 ;; q8*) KVB=1.1 ;; q4k4*) KVB=0.55 ;; q4*) KVB=0.85 ;; *) KVB=2 ;; esac
+    if [ "$USE_MTP" = 1 ]; then
+        MTP_EST=$(mtp_est "$MODEL" "$NPOS" "$KVB" "$T_RT")
+        [[ "$MTP_EST" =~ ^[0-9.]+$ ]] || { close "the MTP view's estimate: $MTP_EST"; MTP_EST=0; }
+    fi
+    [ "$KMAX" -gt 0 ] && CK_EST=$(calc "${T_STATE:-0} * ($KMAX + 2) / 1024")
+    if [ -n "$DRAFT" ]; then
+        dout=$(probe "$ROOT/runq" "$DRAFT" -c "$NPOS" -k "$KV" -m generate -i x --mem 0.01)
+        read -r D_EST _ _ D_STATE <<< "$(echo "$dout" | parse_needs)"
+        if [ -z "${D_EST:-}" ]; then close "the draft's estimate: no 'needs ~X GiB' from $ROOT/runq $DRAFT"; D_EST=0 D_STATE=0; fi
+        D_CK=$(calc "${D_STATE:-0} * ($KMAX + 2) / 1024")
+    fi
+    EST=$(calc "$T_EST + $MTP_EST + $CK_EST + $D_EST + $D_CK")
 fi
-CK_EST=0
-[ "$KMAX" -gt 0 ] && CK_EST=$(calc "${T_STATE:-0} * ($KMAX + 2) / 1024")
-D_EST=0 D_CK=0
-if [ -n "$DRAFT" ]; then
-    dout=$(probe "$ROOT/runq" "$DRAFT" -c "$NPOS" -k "$KV" -m generate -i x --mem 0.01)
-    read -r D_EST _ _ D_STATE <<< "$(echo "$dout" | parse_needs)"
-    if [ -z "${D_EST:-}" ]; then close "the draft's estimate: no 'needs ~X GiB' from $ROOT/runq $DRAFT"; D_EST=0 D_STATE=0; fi
-    D_CK=$(calc "${D_STATE:-0} * ($KMAX + 2) / 1024")
-fi
-EST=$(calc "$T_EST + $MTP_EST + $CK_EST + $D_EST + $D_CK")
 CAP=$(calc "$EST + 1")
 CAP_MIB=$(awk -v c="$CAP" 'BEGIN { printf "%d", c * 1024 + 0.999 }')
 BUDGET=$(calc "$AVAIL - $MARGIN - $RESERVE")
@@ -284,15 +347,23 @@ for s in "${SERVERS[@]}"; do say "server $s"; done
 for s in "${TIMES[@]}"; do say "scheduled: $s"; done
 [ -n "$UNTIL_S" ] && say "--until $(date -u -d @"$UNTIL_S" +%FT%TZ) (the job is killed then)"
 say "scope probe: memory.swap.max $SWAPMAX"
-say "estimate $EST GiB = model $T_EST (runtime $T_RT, $NPOS positions, KV $KV) + MTP view $MTP_EST + checkpoints $CK_EST" \
-    "(state $T_STATE MiB x (kmax $KMAX + 2)) + draft $D_EST + its checkpoints $D_CK"
+if [ -n "$SRV" ]; then
+    say "server mode: runq serve $SRV --ctx $SRV_CTX -k $SRV_KV --kv-mem $SRV_KVMEM${SRV_DRAFT:+ --draft $SRV_DRAFT}"
+    say "estimate $EST GiB = model $T_EST without its sequence (runtime $T_RT, $NPOS positions, KV $SRV_KV) + the pool" \
+        "$SRV_KVMEM + the drafter $D_EST ($DWHAT)"
+else
+    say "estimate $EST GiB = model $T_EST (runtime $T_RT, $NPOS positions, KV $KV) + MTP view $MTP_EST + checkpoints $CK_EST" \
+        "(state $T_STATE MiB x (kmax $KMAX + 2)) + draft $D_EST + its checkpoints $D_CK"
+fi
 say "cap $CAP GiB (MemoryMax ${CAP_MIB}M); budget $BUDGET GiB = MemAvailable $AVAIL - servers' margin $MARGIN - reserve $RESERVE"
 if [ ${#CLOSED[@]} -gt 0 ]; then
     for r in "${CLOSED[@]}"; do say "closed: $r"; done
     say "decision: CLOSED"
     exit 3
 fi
-say "decision: OPEN (--mem $BUDGET, MemoryMax ${CAP_MIB}M, MemorySwapMax 0, watchdog MemAvailable < $WATCH GiB${UNTIL_S:+, deadline $(date -u -d @"$UNTIL_S" +%FT%TZ)})"
+MEMHOW="--mem $BUDGET"
+[ -n "$SRV" ] && MEMHOW="S9_GATE_MEM=$BUDGET"
+say "decision: OPEN ($MEMHOW, MemoryMax ${CAP_MIB}M, MemorySwapMax 0, watchdog MemAvailable < $WATCH GiB${UNTIL_S:+, deadline $(date -u -d @"$UNTIL_S" +%FT%TZ)})"
 [ "$DRY" = 1 ] && exit 0
 
 # 8. the run: the scope, the job (its scope's limits checked first), the watchdog
@@ -303,8 +374,10 @@ mx=$(cat "$d/memory.max"); sw=$(cat "$d/memory.swap.max")
 echo "[gate] scope ${cg##*/}: memory.max $mx, memory.swap.max $sw, oom_score_adj $(cat /proc/self/oom_score_adj)" >&2
 if [ "$sw" != 0 ] || [ "$mx" != "$S9_GATE_MAX" ]; then echo "[gate] the scope is not as set: not run" >&2; exit 3; fi
 exec "$@"'
+MEMARG=(--mem "$BUDGET")
+if [ -n "$SRV" ]; then MEMARG=(); export S9_GATE_MEM=$BUDGET; fi  # (the server mode: the command passes it to runq serve)
 S9_GATE_MAX=$((CAP_MIB * 1048576)) systemd-run --user --scope -q --unit="$UNIT" -p MemoryMax="${CAP_MIB}M" -p MemorySwapMax=0 \
-    -- choom -n 1000 -- nice -n "$NICE" bash -c "$WRAP" s9gate "${CMD[@]}" --mem "$BUDGET" &
+    -- choom -n 1000 -- nice -n "$NICE" bash -c "$WRAP" s9gate "${CMD[@]}" "${MEMARG[@]}" &
 JOB=$!
 kill_job() { systemctl --user kill --signal=KILL "$UNIT.scope" 2>/dev/null || kill -KILL "$JOB" 2>/dev/null; }
 trap 'kill_job; exit 130' INT TERM

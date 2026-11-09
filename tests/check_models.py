@@ -26,7 +26,8 @@ models  (opt-in: tests/run_tests.sh --models, make test-models) every downloaded
         not cover it): logits vs HF fp32 (Qwen3-1.7B) and vs
         the dequantized-weights reference (tests/golden/models, tests/make_model_ref.py), bitwise invariants
         (batched vs sequential, threads, generic, api_test: batched decode rows), greedy goldens, the chat
-        template variant and its renderings, runq serve (greedy == the CLI, a constrained reply)
+        template variant and its renderings, runq serve (greedy == the CLI, a constrained reply); the trained
+        Qwen3.5-0.8B-mtp block (3.5-0.8b-mtp): the MTP checks only, and runq serve --draft mtp on it (server_spec/*)
 """
 import argparse
 import concurrent.futures as cf
@@ -400,8 +401,9 @@ FAMILY = [
     # the entry takes ~12 min (8 threads), most of it the generic build's kernels runs
     ("saluki-27b", "Underdog-Saluki-27B-1.0-GGUF/Underdog-Saluki-27B-1.0-IQ2-mix.gguf", "qwen3.8", [("saluki-27b", "ref")]),
     # Qwen3.5-0.8B with its MTP block kept (scripts/make_mtp_08b.sh, TODO S9.0b; docs/qwen38-speculative.md): the MTP
-    # drafter's checks only (MTP_ONLY: the block vs tests/ref_qwen35.py's mtp_forward, its teacher-forced top-1; its main
-    # model is the Q8_0 file's but 7 ssm_a ulps, covered by 3.5-0.8b-q8)
+    # drafter's checks only (MTP_ONLY: the block vs tests/ref_qwen35.py's mtp_forward, its teacher-forced top-1, the CLI's
+    # loop, runq serve --draft mtp: tests/server_test.py --spec mtp whole; its main model is the Q8_0 file's but 7 ssm_a
+    # ulps, covered by 3.5-0.8b-q8)
     ("3.5-0.8b-mtp", "Qwen3.5-0.8B-MTP-GGUF/Qwen3.5-0.8B-mtp-Q8_0.gguf", "qwen3.5", []),
 ]
 # FAMILY tags with only the MTP checks (mtp_ref_run; their thresholds: MTP_TH)
@@ -596,6 +598,17 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
                 res.report(l.startswith("PASS "), f"{prefix}/{tag}/spec/{n.strip()}", det.strip())
             if p.returncode not in (0, 1) or not lines:
                 res.report(False, f"{prefix}/{tag}/spec/run", f"exit status {p.returncode}: {p.stderr.decode(errors='replace')[-300:]}")
+            # runq serve --draft mtp with the trained block (TODO S9c.5): server_test.py --spec mtp whole (the spec group runs
+            # it --quick): every case == a plain server's and == "speculative": false, the MTP checks (mtp_lockstep on the
+            # dumps: B after accepted guesses), spec/mtp_accepts; the acceptance in the details ("N/M guesses accepted")
+            p = run([sys.executable, "-I", os.path.join(HERE, "server_test.py"), "--runq", a.runq, "--model", model, "--spec", "mtp",
+                     "--mtp-accepts", "--threads", "4", "--api-test", a.api_test], 4)
+            lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
+            for l in lines:
+                n, _, det = l[5:].partition("  ")
+                res.report(l.startswith("PASS "), f"{prefix}/{tag}/server_spec/{n.strip()}", det.strip())
+            if p.returncode not in (0, 1) or not lines:
+                res.report(False, f"{prefix}/{tag}/server_spec/run", f"exit status {p.returncode}: {p.stderr.decode(errors='replace')[-300:]}")
             print(f"      ({tag}: {time.time() - t0:.1f} s)")
             continue
 

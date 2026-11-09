@@ -12,8 +12,8 @@
  *   build/spec_sweep MODEL [-S SETTING]... [-P chat,code,math,summ] [-i TEXT]... [-r 1,0] [-n 256] [-c 4096] [-k f16]
  *                          [-b 512] [-t 0] [-p 0.95] [-K 0] [-s 42] [-R 1] [-D DRAFT.gguf] [--mem GiB] [--list]
  * SETTING: plain, or mtp (the model's MTP block) / draft (-D's model), then runq's options for it: -G k (default 3),
- * --tau T, --mtp-vocab N (mtp), --lookup N, --lookup-min L, --spec auto; e.g. -S "mtp -G 6 --tau 0.3", -S "draft -G 3"
- * (lookup alone: "plain --lookup 4"). Default settings: plain, "mtp -G 3". -P: built-in prompts (TODO S7's, from
+ * --tau T, --mtp-vocab N (mtp; default 0 = all, not runq's 100000), --lookup N, --lookup-min L, --spec auto; e.g.
+ * -S "mtp -G 6 --tau 0.3", -S "draft -G 3" (lookup alone: "plain --lookup 4"). Default settings: plain, "mtp -G 3". -P: built-in prompts (TODO S7's, from
  * scripts/spec_accept.py: chat TCP vs UDP, code a C linked-list reversal, math the train's average speed, summ the
  * bike-lane article in three bullet points); -i adds one of its own (custom1, ...). -r: the reasoning modes (1: on,
  * Qwen3.8's default effort; 0: off). -t / -p / -K / -s: sampling as runq's (-t 0: greedy; seeded runs equal plain's

@@ -557,7 +557,7 @@ typedef struct {
     // guessing; tau is not applied then. The output is the same for any guesses
     int (*guess_hook)(void *user, int pos, int depth, int guess, float p1);
     void *hook_user;
-    double prior;   // auto: the prior acceptance per guess of the draft (0: 0.6 for a draft model, 0.7 for an MTP view)
+    double prior;   // auto: the prior acceptance per guess of the draft (0: 0.6 for a draft model, 0.8 for an MTP view)
 } RqSpecOpts;
 typedef struct {
     RqGenStats gen;    // as rq_generate's (t_prefill: both models' prompt; t_gen: the loop)

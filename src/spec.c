@@ -403,7 +403,8 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
     memset(&mx, 0, sizeof(mx));
     int kmax = k > kl ? k : kl, guess[RQ_SPEC_K_MAX + 1], nck0 = s->nck, aut = o && o->cost, mlen = 0, mtp = k > 0 && ds->m->mtp_of;
     double acm[2] = { 0, 0 }, acl[RQ_LOOKUP_LMAX + 1][2]; // (auto: the model's guesses, the lookup's per match length)
-    double prior = o && o->prior > 0 ? o->prior : mtp ? 0.7 : 0.6; // (auto: the draft's prior acceptance per guess)
+    // (auto: the draft's prior acceptance per guess; an MTP view's from Qwen3.8-27B's: ~0.76-0.88 at k 3, TODO S9d)
+    double prior = o && o->prior > 0 ? o->prior : mtp ? 0.8 : 0.6;
     memset(acl, 0, sizeof(acl));
     if (kmax > 0) {
         if (!(out = malloc((size_t)(kmax + 1) * V * sizeof(float)))) return RQ_ERR_NOMEM;

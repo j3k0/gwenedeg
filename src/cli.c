@@ -16,6 +16,8 @@
 
 static int max_new_tokens = 0; // -n: stop after this many generated tokens, 0 = unlimited
 #define SPEC_K_DEFAULT 3       // -G with -D (the best fixed k for Qwen3-1.7B + 0.6B: docs/qwen38-speculative.md)
+#define MTP_VOCAB_DEFAULT 100000 // --mtp-vocab with -D mtp, for a larger vocabulary (Qwen3.8-27B: the acceptance of
+                                 // 151,643 and within 1% of all at -G 6 --tau 0.5, the most tok/s; TODO S9d)
 
 // speculative decoding (-D draft.gguf, -G k, --tau; --lookup N, --lookup-min L): the draft model, its context and
 // sequence (m NULL: no draft model), the options (o.k 0 and o.lookup 0: plain decoding); -D mtp: m is the model's MTP
@@ -654,7 +656,7 @@ static void error_usage(void) {
     fprintf(stderr, "  -D mtp      the model file's MTP block (multi-token prediction: Qwen3.8-27B's blk.64) as the draft, fed the\n");
     fprintf(stderr, "              model's hidden states (a draft file named mtp: -D ./mtp)\n");
     fprintf(stderr, "  --mtp-vocab <int> with -D mtp: guess among the tokens 0..N-1 and the added ones only (a part of the\n");
-    fprintf(stderr, "              classifier: faster guesses), default 0 = all\n");
+    fprintf(stderr, "              classifier: faster guesses), default %d (if the vocabulary is larger); 0 = all\n", MTP_VOCAB_DEFAULT);
     fprintf(stderr, "  -G <int>    with -D: guesses per pass of the model, at most %d, default %d; 0 = plain decoding (no draft)\n", RQ_SPEC_K_MAX, SPEC_K_DEFAULT);
     fprintf(stderr, "  --tau <float> with -D: adaptive guess count, stop guessing at a draft top-1 probability < tau, default 0 (off)\n");
     fprintf(stderr, "  --lookup <int> prompt lookup (generate, chat): guess up to N tokens by copying what followed the latest match of\n");
@@ -688,14 +690,15 @@ static void load_draft(const char *path, const RqModel *target, const char *targ
     char err[512];
     draft.mtp = -1;
     if (!strcmp(path, "mtp")) {
+        RqModelInfo ti;
+        rq_model_info(target, &ti);
+        if (mtp_vocab < 0) mtp_vocab = ti.vocab_size > MTP_VOCAB_DEFAULT ? MTP_VOCAB_DEFAULT : 0;
         RqMtpOpts mo = { mtp_vocab, o->mem };
         if (!(draft.m = rq_mtp_load(target, &mo, err, sizeof(err)))) {
             if (strstr(err, "no MTP block")) fprintf(stderr, "-D mtp: %s has no MTP block\n", target_path);
             else fprintf(stderr, "-D mtp: %s\n", err);
             exit(EXIT_FAILURE);
         }
-        RqModelInfo ti;
-        rq_model_info(target, &ti);
         draft.mtp = ti.n_layers;
         draft.vocab = mtp_vocab;
         if (mem_given) print_mtp_memory(draft.m, ti.seq_len);
@@ -741,7 +744,7 @@ int main(int argc, char *argv[]) {
     float spec_tau = 0;         // --tau
     int lookup = 0, lookup_min = 0; // --lookup, --lookup-min (0: RQ_LOOKUP_MIN_DEFAULT)
     int spec_auto = 0;          // --spec auto (G7: the cost model's choice per pass)
-    int mtp_vocab = 0;          // --mtp-vocab (-D mtp: RqMtpOpts.vocab; 0 all)
+    int mtp_vocab = -1;         // --mtp-vocab (-D mtp: RqMtpOpts.vocab; 0 all; -1: MTP_VOCAB_DEFAULT)
 
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }

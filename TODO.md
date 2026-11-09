@@ -64,44 +64,59 @@ Steps:
     **S9d.1 done (2026-11-09):** `scripts/s9_gate.sh` (the 27B gate: the estimate from metadata, the servers' `/health`
     margin and the timers that start one, a capped scope without swap, the watchdog, the bench lock) and
     `build/spec_sweep` (`make spec-sweep`: settings x S7's prompts in one process, every output checked against plain);
-    the 0.8B-mtp through the gate: 80 / 80 runs == plain (docs/qwen38-speculative.md, "The 27B gate"). **Open: S9d.2**
-    (below), then S9c only after a go.
-  - **Open, S9d.2 (the 27B's acceptance; gated):** IQ3_S-mtp needs ~13.1 GiB (MTP, k <= 3) / ~14.4 GiB (with the 0.8B
-    draft, k <= 6) + 1 GiB cap, i.e. MemAvailable >= ~17-18.5 GiB + the servers' margin. On 2026-11-09 the gate was
-    closed only by the timers (saluki's restore at 06:00Z, the nightly benchmark at 22:00Z); next to a running saluki it
-    is closed by its margin (06:02Z: budget 14.63 - committed 0.004 + 1 = 15.62 GiB against MemAvailable 14.6). A window: saluki down (the user's call) and `--until` 5+ min before the next server start.
-    Each step is one command (8 threads; `scripts/s9_gate.sh --dry ...` first; build: `make -s -j8 runq spec-sweep`):
+    the 0.8B-mtp through the gate: 80 / 80 runs == plain (docs/qwen38-speculative.md, "The 27B gate"). **S9d.2 done
+    (2026-11-09): go** (below). **Open: S9c** (the server), with the user's OK and an MTP file for production.
+  - **S9d.2, the 27B's acceptance (2026-11-09, a window the user opened: saluki stopped, no runq server up):** every job
+    through `scripts/s9_gate.sh --until 21:30`, `build/spec_sweep FILE -c 4096 -n 256`, 8 threads, S7's 4 prompts, box
+    load 5-10 from other jobs (plain 7.2-8.6 tok/s). **172 / 172 runs == plain** (164 speculative, 128 with the MTP),
+    `mtp_approx` 0. Tok/s, mean of the 4 prompts (docs/qwen38-speculative.md, "The 27B's acceptance and the go"):
+    | target, mode | plain | 0.8B `-G 3` | 0.8B `-G 6 --tau 0.4` | MTP `-G 3` | MTP `-G 6 --tau 0.5` |
+    |---|---|---|---|---|---|
+    | IQ3_S-mtp, greedy, thinking on | 7.96 | 9.95 (2.39 per pass) | 11.12 | 12.39 (3.01) | **12.85** (+16%) |
+    | IQ3_S-mtp, greedy, thinking off | 8.00 | 12.83 | **14.28** | 13.61 | 13.77 (-4%) |
+    | IQ3_S-mtp, seeded, on / off (100k subset) | 7.64 / 7.64 | | 10.34 / **13.41** | 11.21 / 13.13 | **12.05** (+17%) / 13.15 |
+    | Unsloth Q4_K_M, greedy, thinking on | 8.46 | 13.13 | 14.07 | 15.23 (16.10 with 100k) | **17.08** (100k; +21%) |
+    - Acceptance first: MTP k 3 3.01 tokens per pass (67% of the guesses, p 0.81 in S9w's model; go line 0.79 full) vs
+      the 0.8B's 2.39 (p 0.66, its per-prompt numbers as at S7); predicted with S9w's costs +20%, measured +25% (12.48
+      vs 10.02). The box's step was 128 ms, the 4-row verify 1.73 steps (Unsloth's 1.44), a guess 7.6-8.5 ms full /
+      5.3-6.2 with 100,000.
+    - **Go** (PLAN-S9-mtp.md 8): thinking on, the best fixed settings, +16% greedy (per prompt +12 / +9 / +27 / +12%), +17%
+      seeded, +21% on Unsloth's Q4_K_M (code -2% there; +27% at `-G 3` each). Thinking off the 0.8B is even or ahead
+      (its long runs on code); long contexts and `--spec auto` with the MTP not measured on the 27B.
+    - `--mtp-vocab`: 100,000 accepts as 151,643 (tokens per pass -0.8% thinking on / -1.6% off vs all; 65,536 -1.9 /
+      -4.1%) and gives the most tok/s: **the CLI's default** when the vocabulary is larger (`RqMtpOpts.vocab` 0 stays all).
+      `RqSpecOpts.prior` for an MTP view: **0.8** (p at k 3: 0.81 / 0.76 greedy / seeded on, 0.88 / 0.85 off; was 0.7).
+      `-G` stays 3; recommended `-D mtp -G 6 --tau 0.5` (+4% over `-G 3` thinking on).
+    - BF16 `ssm_alpha` / `ssm_beta` == the F32 rewrite on the real file: `-m logits` of `...IQ3_S.gguf`,
+      `...IQ3_S-f32ssm.gguf` and `...IQ3_S-mtp.gguf` byte-identical.
+    - Gate per job (wall; the scope's peak / estimate / cap GiB): acceptance 5 min 18 s, 12.76 / 13.87 / 14.87; sweep
+      30 min 51 s, 13.32 / 14.37 / 15.37; subsets 16 min 15 s, 12.61 / 13.52 / 14.52; seeded 12 min 38 s, 13.66 / 14.37 /
+      15.37; logits 14-15 s each, 11.59 / 11.54 / 12.54; Unsloth 7 min 38 s, 18.16 / 18.78 / 19.78. Load 11-17 s.
+    The commands (`G=models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO`, `D8=models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf`,
+    `export OMP_NUM_THREADS=8 TMPDIR=/var/tmp`; `scripts/s9_gate.sh --dry ...` first):
     ```
-    export OMP_NUM_THREADS=8 TMPDIR=/var/tmp; mkdir -p /var/tmp/s9d2; G=models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO
-    D8=models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf; U=05:40   # --until: before the next server start
-    # 1. BF16 alpha / beta == their F32 rewrite on the real file (two gated loads, then cmp)
-    scripts/s9_gate.sh --until $U -- ./runq $G-IQ3_S.gguf -m logits -c 512 -i "The capital of Australia is" -o /var/tmp/s9d2/bf16.bin
-    scripts/s9_gate.sh --until $U -- ./runq $G-IQ3_S-f32ssm.gguf -m logits -c 512 -i "The capital of Australia is" -o /var/tmp/s9d2/f32.bin
-    cmp /var/tmp/s9d2/bf16.bin /var/tmp/s9d2/f32.bin && rm /var/tmp/s9d2/*.bin
-    # 2. acceptance first: MTP k 3, greedy, thinking on, the full vocabulary (~5 min)
-    scripts/s9_gate.sh --until $U -- build/spec_sweep $G-IQ3_S-mtp.gguf -c 4096 -n 256 -r 1 -S plain -S "mtp -G 3" > /var/tmp/s9d2/accept.jsonl
-    # 3. only if section 7's model with S9w's costs predicts >= +10% over the 0.8B (p >= ~0.79 full, ~0.75 with 100k):
-    #    plain (best of 2), the 0.8B, MTP k 1-6 and tau, thinking on and off (~35 min)
-    scripts/s9_gate.sh --until $U -- build/spec_sweep $G-IQ3_S-mtp.gguf -c 4096 -n 256 -r 1,0 -D $D8 -S plain -S plain \
+    scripts/s9_gate.sh --until 21:30 -- build/spec_sweep $G-IQ3_S-mtp.gguf -c 4096 -n 256 -r 1 -D $D8 -S plain -S "mtp -G 3" -S "draft -G 3"
+    scripts/s9_gate.sh --until 21:30 -- build/spec_sweep $G-IQ3_S-mtp.gguf -c 4096 -n 256 -r 1,0 -D $D8 -S plain -S plain \
       -S "draft -G 3" -S "draft -G 6 --tau 0.4" -S "mtp -G 1" -S "mtp -G 2" -S "mtp -G 3" -S "mtp -G 4" -S "mtp -G 6" \
-      -S "mtp -G 6 --tau 0.3" -S "mtp -G 6 --tau 0.5" > /var/tmp/s9d2/sweep.jsonl
-    #    then the subsets at the best K / TAU of step 3:
-    scripts/s9_gate.sh --until $U -- build/spec_sweep $G-IQ3_S-mtp.gguf -c 4096 -n 256 -r 1,0 -S "mtp -G K --tau TAU" \
-      -S "mtp -G K --tau TAU --mtp-vocab 65536" -S "mtp -G K --tau TAU --mtp-vocab 100000" -S "mtp -G K --tau TAU --mtp-vocab 151643" > /var/tmp/s9d2/vocab.jsonl
-    # 4. seeded (the GGUF's T 1 / top-p 0.95 / top-k 20, -s 42) at the best settings
-    scripts/s9_gate.sh --until $U -- build/spec_sweep $G-IQ3_S-mtp.gguf -c 4096 -n 256 -r 1,0 -t 1 -p 0.95 -K 20 -s 42 -D $D8 \
-      -S "draft -G 6 --tau 0.4" -S "mtp -G K --tau TAU --mtp-vocab N" > /var/tmp/s9d2/seeded.jsonl
+      -S "mtp -G 6 --tau 0.3" -S "mtp -G 6 --tau 0.5"
+    S="mtp -G 6 --tau 0.5"; scripts/s9_gate.sh --until 21:30 -- build/spec_sweep $G-IQ3_S-mtp.gguf -c 4096 -n 256 -r 1,0 \
+      -S "$S" -S "$S --mtp-vocab 65536" -S "$S --mtp-vocab 100000" -S "$S --mtp-vocab 151643" -S "mtp -G 3 --mtp-vocab 100000"
+    scripts/s9_gate.sh --until 21:30 -- build/spec_sweep $G-IQ3_S-mtp.gguf -c 4096 -n 256 -r 1,0 -t 1 -p 0.95 -K 20 -s 42 -D $D8 \
+      -S "draft -G 6 --tau 0.4" -S "mtp -G 6 --tau 0.5 --mtp-vocab 100000" -S "mtp -G 3 --mtp-vocab 100000"
+    for f in IQ3_S IQ3_S-f32ssm IQ3_S-mtp; do scripts/s9_gate.sh --until 21:30 -- ./runq $G-$f.gguf -m logits -c 512 \
+      -i "The capital of Australia is" -o /var/tmp/s9d2/$f.bin; done   # then cmp
+    scripts/s9_gate.sh --until 21:30 -- build/spec_sweep models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf -c 4096 -n 256 -r 1 \
+      -D $D8 -S plain -S "draft -G 3" -S "draft -G 6 --tau 0.4" -S "mtp -G 3" -S "mtp -G 3 --mtp-vocab 100000" \
+      -S "mtp -G 6 --tau 0.5 --mtp-vocab 100000"
     ```
-    Then: the tables in docs/qwen38-speculative.md, the go / no-go (PLAN-S9-mtp.md 8), `--mtp-vocab`'s default and
-    `RqSpecOpts.prior`'s MTP default (a commit with TEST and CMP).
   - **Acceptance measured (2026-11-08, llama.cpp cf34d31 `--spec-type draft-mtp` vs `draft-simple -md` the 0.8B
     Q4_K_M; k 3, thinking on, T 0.6 / top_p 0.95 / top_k 20, 12 threads, CPU):** MTP 410 / 765 drafted tokens accepted
     (54%) vs the 0.8B 233 / 714 (33%), MTP ahead on each of the 4 prompts (38-70% vs 25-42%; LCB medium + 2 coding
     prompts, 96-192 tokens). Small sample; details `/home/jeko/JC/lcb_timebox/mtp/results.md`. llama.cpp's speed there
     is no guide (plain 3.5 tok/s vs runq's 11 on the same IQ3_S; its verify batch costs ~k steps, so no draft helped).
     Published, GPU: Qwopus3.8-27B-Flash-V2 card 80.7% (MTP) vs 66.1% base; Qwen3.5-27B n 1/2/3 -> 49/66/74%.
-  - **Expected here (costs measured at S9w, 2026-11-08, on full-width synthetic files, 8 threads; acceptance still
-    to measure, S9d):** a guess (a one-row MTP pass) costs ~9 ms with the full vocabulary and ~5.7 ms with
+  - **Expected here (costs measured at S9w, 2026-11-08, on full-width synthetic files, 8 threads; the acceptance:
+    S9d.2 above, p 0.81 at k 3 full, the go line's 0.79 met):** a guess (a one-row MTP pass) costs ~9 ms with the full vocabulary and ~5.7 ms with
     `--mtp-vocab 100000` on IQ3_S-mtp (Q4_K classifier) at short context, 11.9 / 9.3 ms at 98k (f16 MTP cache; q8 is
     slower there); Unsloth's Q6_K classifier ~9-10 / ~6. On IQ3_S-mtp at k = 3, thinking on, against the 0.8B's ~18.0
     tok/s (S7's `-G 3` mean of 2.53 tokens per pass, measured on the Q4_K_M target): p 0.70 / 0.75 / 0.80 per guess

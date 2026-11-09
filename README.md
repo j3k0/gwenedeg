@@ -70,7 +70,7 @@ CLI options (`./runq` without arguments prints them all):
 | `--mem GiB` | memory budget of the load check (below), default MemAvailable; `0` or `force`: no check. Given, prints the estimate (a `[memory]` line) |
 | `--page-cache auto\|drop\|keep` | the model file's page cache after the load; `auto` (default) drops it if the file is >= 1/4 of the RAM |
 | `-D FILE` | speculative decoding (generate and chat): a smaller draft model of the same vocabulary (e.g. Qwen3-0.6B for Qwen3-1.7B, Qwen3.5-0.8B for Qwen3.5) guesses, the model verifies; the output is exactly plain decoding's (below) |
-| `-D mtp`, `--mtp-vocab N` | the model file's own MTP block as the draft (multi-token prediction: Qwen3.8-27B's `blk.64`; a draft file named `mtp`: `-D ./mtp`); `--mtp-vocab`: its guesses among the tokens 0..N-1 and the added ones only (a part of the classifier: faster guesses), default 0 = all (below) |
+| `-D mtp`, `--mtp-vocab N` | the model file's own MTP block as the draft (multi-token prediction: Qwen3.8-27B's `blk.64`; a draft file named `mtp`: `-D ./mtp`); `--mtp-vocab`: its guesses among the tokens 0..N-1 and the added ones only (a part of the classifier: faster guesses), default 100000 if the vocabulary is larger, 0 = all (below) |
 | `-G K`, `--tau T` | with `-D`: at most K guesses per pass of the model (default 3, at most 30; `-G 0`: plain decoding, the draft not loaded); adaptive length: stop guessing at the first guess whose draft top-1 probability is < T (default 0 = off, always K) |
 | `--lookup N`, `--lookup-min M` | prompt lookup (generate and chat), with or without `-D`: guess up to N tokens (at most 30) by copying what followed the latest, longest match (>= M tokens, default 2; up to 16 counted) of the last tokens earlier in the context; no model, exact as any draft; with `-D` the draft model guesses where the lookup finds no match (below) |
 | `OMP_NUM_THREADS` | threads; default nproc - nproc/8 (Apple Silicon: the performance cores) |
@@ -110,12 +110,13 @@ Measurements: [docs/qwen38-speculative.md](docs/qwen38-speculative.md#the-27b-br
 
 **The MTP drafter** (`-D mtp`, TODO S9): a file with a multi-token-prediction block (Qwen3.8-27B's `blk.64`, e.g.
 ISTA-DASLab's IQ3_S-mtp, Unsloth's Q4_K_M) guesses with it: one attention layer fed the model's own final hidden state
-and the next token, through the model's classifier (`--mtp-vocab 100000`: a part of it, 99.9% of agentic replies'
-tokens). It follows the model in lockstep (its rows over the prompt and after every pass), so no second model, no
-second 64-layer state per sequence; the output is still plain decoding's. On Qwen3.5-0.8B with its block (a test file,
-`scripts/make_mtp_08b.sh`) 42-79% of the guesses are accepted; the 27B's speed is open (S9d,
-[docs/qwen38-speculative.md](docs/qwen38-speculative.md#the-loop-todo-s9b-2026-11-08)). `runq serve` does not take it yet
-(`--draft mtp` is refused).
+and the next token, through the model's classifier (by default `--mtp-vocab 100000`: a part of it, 99.9% of agentic
+replies' tokens). It follows the model in lockstep (its rows over the prompt and after every pass), so no second model,
+no second 64-layer state per sequence; the output is still plain decoding's. On the 27B with thinking on it is ahead of
+the 0.8B draft: IQ3_S-mtp 12.8 vs 11.1 tok/s at each one's best fixed settings (`-D mtp -G 6 --tau 0.5` vs `-G 6 --tau
+0.4`; 1.6x plain), Unsloth's Q4_K_M 17.1 vs 14.1 (2.0x plain); with thinking off the two are even (TODO S9d,
+[docs/qwen38-speculative.md](docs/qwen38-speculative.md#the-27bs-acceptance-and-the-go-todo-s9d2-2026-11-09)).
+`runq serve` does not take it yet (`--draft mtp` is refused).
 
 **Prompt lookup** (`--lookup N`, no model needed): replies that copy from their context (code being edited, paths,
 tool output) are guessed from the context itself, verified in the same loop (so the output is still plain decoding's).

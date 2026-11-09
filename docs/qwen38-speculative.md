@@ -1426,7 +1426,8 @@ llama.cpp's first row takes a stale `pending_h`; runq the target's (`H`, `hprev`
 
 **Costs in the loop** (S9w's tables): the catch-up rows ride in the round's first guess (~+0.25 ms per row at short
 context); a non-MTP round pays them in a pass of its own (~3 ms on IQ3_S-mtp); the prompt +2% / +4-5% at 96k. The
-`--spec auto` prior for the MTP's guesses is `RqSpecOpts.prior`, 0.7 by default (0.6 for a draft model; S9d sets it).
+`--spec auto` prior for the MTP's guesses is `RqSpecOpts.prior`, 0.8 by default (0.6 for a draft model; set at S9d.2,
+[below](#the-27bs-acceptance-and-the-go-todo-s9d2-2026-11-09); it was 0.7).
 `[timing] speculative:` adds `draft mtp (blk.N, vocab V)` and `mtp rows R (approx A)`; `--mem` prints the view's
 estimate as `[memory] mtp estimate`.
 
@@ -1509,6 +1510,128 @@ and off, plain + MTP k 2 / 3 / 4, k 3 with the 100k subset and the 0.8B Q4_K_M a
 seeded (T 1, top-p 0.95, top-k 20, `-s 42`) with tau, auto, lookup and a 65,536 subset: 40 / 40 == plain;
 `mtp_approx` 0 everywhere; the scope's peak 0.96-1.07 GiB against estimates of 1.20-1.26 GiB. Their tok/s are not
 results (box load 12-24 from the test suite and other jobs).
+
+### The 27B's acceptance and the go (TODO S9d.2, 2026-11-09)
+
+A measurement window the user opened (saluki and `runq-day.timer` stopped, no runq server up, MemAvailable 22-25 GiB):
+every job through `scripts/s9_gate.sh --until 21:30` (the nightly benchmark at 22:00Z), `build/spec_sweep FILE -c 4096
+-n 256`, 8 threads, S7's four prompts, under the bench lock; box load 5-10 from other jobs (plain 7.2-8.6 tok/s on
+IQ3_S-mtp, not an idle box's). Cells: tok/s (guesses accepted, tokens per pass); mean of the prompts; x plain = the mean
+of the prompts' ratios to plain in the same process. **Every output == plain's: 172 of 172 runs** (164 speculative,
+128 of them with the MTP; tokens, stop, RNG state), `mtp_approx` 0 everywhere.
+
+| job (each one process) | wall | load | the scope's peak / estimate / cap (GiB) |
+|---|---|---|---|
+| IQ3_S-mtp acceptance: plain, MTP k 3, the 0.8B Q4_K_M k 3; thinking on | 5 min 18 s | 16.2 s | 12.76 / 13.87 / 14.87 |
+| IQ3_S-mtp sweep: plain x 2, the 0.8B x 2, MTP x 7; on and off | 30 min 51 s | 15.6 s | 13.32 / 14.37 / 15.37 |
+| IQ3_S-mtp vocabulary subsets; on and off | 16 min 15 s | 11.3 s | 12.61 / 13.52 / 14.52 |
+| IQ3_S-mtp seeded; on and off | 12 min 38 s | 12.5 s | 13.66 / 14.37 / 15.37 |
+| BF16 vs F32 `ssm_alpha` / `ssm_beta` (`runq -m logits`, three loads) | 14-15 s each | | 11.59 / 11.54 / 12.54 |
+| Unsloth Q4_K_M (S7's target): plain, the 0.8B, MTP; thinking on | 7 min 38 s | 16.5 s | 18.16 / 18.78 / 19.78 |
+
+**BF16 = F32 on the real file:** `runq ...IQ3_S.gguf -m logits -c 512 -i "The capital of Australia is"` (BF16 alpha /
+beta widened at load, S9.1) and the same on `...IQ3_S-f32ssm.gguf` (the file rewritten to F32): byte-identical logits
+(sha256 42407ec1...), and so are `...IQ3_S-mtp.gguf`'s (the same trunk with the block).
+
+**Acceptance first** (IQ3_S-mtp, greedy, thinking on, the full vocabulary):
+
+| setting | chat | code | math | summ | mean | x plain |
+|---|---|---|---|---|---|---|
+| `plain` | 7.9 | 7.7 | 7.8 | 8.0 | 7.85 | 1.00x |
+| `mtp -G 3` | 11.7 (65%, 2.94) | 10.7 (57%, 2.69) | 15.1 (90%, 3.69) | 12.4 (70%, 3.10) | 12.48 | 1.59x |
+| `draft -G 3` (the 0.8B) | 9.2 (44%, 2.31) | 8.6 (38%, 2.13) | 11.9 (63%, 2.90) | 10.4 (53%, 2.58) | 10.02 | 1.28x |
+
+The MTP's 3.01 tokens per pass are a per-guess p of **0.81** in [S9w's model](#costs-on-a-full-width-synthetic-file-todo-s9w-measured-2026-11-08)
+(1 + p + p^2 + p^3), above its go line for the full vocabulary (0.79); the 0.8B's 2.39 on this target are p 0.66 (its
+per-prompt tokens per pass as on S7's Q4_K_M: 2.30 / 1.98 / 3.12 / 2.71). **Predicted** with S9w's costs (step 91 ms,
+verify 1.32 steps, a guess 9.0 ms full / the 0.8B's 5.1): MTP 20.4 tok/s, the 0.8B 17.0, **+20%**; **measured: +25%**
+(12.48 vs 10.02; per prompt +27 / +25 / +27 / +19%). The absolute numbers are lower because the box's target step was
+128 ms (not 91) and the 4-row verify 221 ms (1.73 steps; Unsloth's Q4_K_M below: 1.44, S7's ~1.4): with the measured
+step, verify and guess (7.65 ms full, 6.5 the 0.8B) the model gives 12.3 / 9.9 tok/s against 12.5 / 10.0 measured.
+A guess in the loop: 7.6-8.5 ms with the full vocabulary, 5.3-6.2 with 100,000 (S9w: ~9.0 / ~5.7).
+
+**The sweep** (IQ3_S-mtp, greedy, the full vocabulary; plain the best of 2):
+
+| thinking on | chat | code | math | summ | mean | x plain |
+|---|---|---|---|---|---|---|
+| `plain` | 7.7 | 8.0 | 8.1 | 8.0 | 7.96 | 1.00x |
+| `draft -G 3` | 8.9 (44%, 2.31) | 8.7 (38%, 2.13) | 11.8 (63%, 2.90) | 10.4 (53%, 2.58) | 9.95 | 1.25x |
+| `draft -G 6 --tau 0.4` | 10.6 (63%, 2.33) | 10.4 (61%, 2.23) | 12.4 (62%, 3.77) | 11.1 (55%, 3.10) | 11.12 | 1.40x |
+| `mtp -G 1` | 10.9 (88%, 1.88) | 10.3 (79%, 1.79) | 11.4 (95%, 1.95) | 10.7 (85%, 1.85) | 10.85 | 1.36x |
+| `mtp -G 2` | 12.1 (77%, 2.54) | 11.4 (68%, 2.37) | 13.9 (93%, 2.85) | 11.9 (74%, 2.48) | 12.32 | 1.55x |
+| `mtp -G 3` | 11.5 (65%, 2.94) | 10.7 (57%, 2.69) | 15.1 (90%, 3.69) | 12.2 (70%, 3.10) | 12.39 | 1.56x |
+| `mtp -G 4` | 10.2 (50%, 3.01) | 10.1 (48%, 2.94) | 14.6 (80%, 4.21) | 11.2 (57%, 3.26) | 11.54 | 1.45x |
+| `mtp -G 6` | 8.9 (38%, 3.24) | 8.6 (35%, 3.12) | 15.1 (76%, 5.53) | 10.9 (50%, 4.00) | 10.87 | 1.36x |
+| `mtp -G 6 --tau 0.3` | 10.7 (55%, 3.20) | 10.5 (52%, 2.98) | 15.2 (77%, 5.53) | 12.0 (62%, 4.00) | 12.12 | 1.52x |
+| `mtp -G 6 --tau 0.5` | 11.9 (73%, 2.94) | 11.3 (75%, 2.59) | 15.8 (82%, 5.21) | 12.4 (69%, 3.35) | **12.85** | **1.61x** |
+| **thinking off** | | | | | | |
+| `plain` | 8.0 | 8.0 | 8.0 | 8.0 | 8.00 | 1.00x |
+| `draft -G 3` | 11.1 (58%, 2.75) | 14.3 (82%, 3.46) | 15.6 (91%, 3.72) | 10.3 (60%, 2.81) | 12.83 | 1.60x |
+| `draft -G 6 --tau 0.4` | 11.3 (59%, 3.01) | 17.4 (90%, 5.70) | 17.1 (85%, 5.75) | 11.3 (60%, 3.29) | **14.28** | **1.78x** |
+| `mtp -G 1` | 10.9 (90%, 1.91) | 11.7 (97%, 1.97) | 11.7 (99%, 1.99) | 10.6 (89%, 1.89) | 11.21 | 1.40x |
+| `mtp -G 2` | 12.1 (76%, 2.51) | 14.0 (92%, 2.85) | 13.9 (94%, 2.88) | 12.1 (81%, 2.61) | 13.02 | 1.63x |
+| `mtp -G 3` | 11.8 (67%, 3.01) | 14.6 (85%, 3.56) | 14.9 (89%, 3.67) | 13.2 (79%, 3.38) | 13.61 | 1.70x |
+| `mtp -G 4` | 10.8 (54%, 3.16) | 13.7 (77%, 4.07) | 15.9 (88%, 4.52) | 11.7 (65%, 3.59) | 13.04 | 1.63x |
+| `mtp -G 6` | 9.5 (42%, 3.51) | 13.3 (66%, 4.96) | 15.1 (75%, 5.50) | 11.1 (54%, 4.26) | 12.23 | 1.53x |
+| `mtp -G 6 --tau 0.3` | 10.1 (47%, 3.46) | 13.6 (68%, 4.96) | 15.1 (77%, 5.50) | 12.9 (70%, 4.26) | 12.93 | 1.62x |
+| `mtp -G 6 --tau 0.5` | 11.9 (69%, 2.98) | 13.7 (72%, 4.75) | 16.7 (90%, 5.50) | 12.8 (76%, 3.71) | 13.77 | 1.72x |
+
+The MTP's per-guess acceptance falls with depth faster than a geometric p: k 1 accepts 86% (thinking on), k 3 67%, k 6
+44%; so a longer k pays only with tau (0.5 here: it stops at a top-1 below 0.5). Thinking off, the 0.8B's long accepted
+runs at k 6 on code and math (5.7 tokens per pass) beat the MTP there; the MTP wins chat and the summary.
+
+**The vocabulary subset** (at the best setting, `-G 6 --tau 0.5`; the last row the default k with the default subset):
+
+| `--mtp-vocab` | thinking on: tokens per pass, tok/s (x plain) | thinking off |
+|---|---|---|
+| all (248,320) | 3.163, 12.39 (1.62x) | 3.947, 13.81 (1.80x) |
+| 65,536 | 3.103 (-1.9%), 12.63 (1.65x) | 3.785 (-4.1%), 14.02 (1.82x) |
+| 100,000 | 3.139 (-0.8%), **12.78 (1.67x)** | 3.884 (-1.6%), **14.06 (1.83x)** |
+| 151,643 | 3.139 (-0.8%), 12.59 (1.65x) | 3.884 (-1.6%), 14.04 (1.83x) |
+| 100,000 at `-G 3` | 2.989, 12.42 (1.63x) | 3.295, 13.83 (1.80x) |
+
+(Per prompt: math 5.21 -> 5.06 tokens per pass thinking on, the others within 0.03.) 151,643 accepts exactly what
+100,000 accepts; the gap to the full vocabulary is the ids >= 151,643 and tau's top-1 taken over the subset (it is
+renormalised: a subset's top-1 is higher). **100,000 is the default** (`--mtp-vocab`, when the vocabulary is larger):
+its tokens per pass are within 1% of all thinking on (1.6% off) and its tok/s the best in both modes.
+
+**Seeded** (the GGUF's T 1 / top-p 0.95 / top-k 20, `-s 42`):
+
+| setting | chat | code | math | summ | mean | x plain |
+|---|---|---|---|---|---|---|
+| thinking on: `plain` | 8.0 | 7.6 | 7.6 | 7.4 | 7.64 | 1.00x |
+| `draft -G 6 --tau 0.4` | 10.3 (59%, 2.27) | 9.1 (55%, 1.78) | 11.7 (60%, 3.62) | 10.2 (52%, 2.81) | 10.34 | 1.35x |
+| `mtp -G 6 --tau 0.5 --mtp-vocab 100000` | 12.0 (71%, 2.78) | 10.7 (72%, 2.25) | 13.9 (72%, 4.58) | 11.6 (62%, 3.08) | **12.05** | **1.58x** |
+| `mtp -G 3 --mtp-vocab 100000` | 11.2 (60%, 2.78) | 9.8 (49%, 2.46) | 13.2 (78%, 3.35) | 10.6 (58%, 2.72) | 11.21 | 1.47x |
+| thinking off: `plain` | 7.2 | 7.7 | 7.7 | 7.9 | 7.64 | 1.00x |
+| `draft -G 6 --tau 0.4` | 10.2 (55%, 2.78) | 15.8 (81%, 5.20) | 16.7 (87%, 5.91) | 11.0 (56%, 3.02) | **13.41** | **1.75x** |
+| `mtp -G 6 --tau 0.5 --mtp-vocab 100000` | 11.4 (64%, 3.01) | 12.6 (62%, 4.33) | 16.6 (84%, 5.51) | 11.9 (65%, 3.18) | 13.15 | 1.72x |
+| `mtp -G 3 --mtp-vocab 100000` | 11.5 (61%, 2.81) | 13.9 (78%, 3.35) | 15.3 (90%, 3.70) | 11.8 (65%, 2.95) | 13.13 | 1.72x |
+
+**Unsloth's Q4_K_M** (S7's target; Q6_K classifier; greedy, thinking on):
+
+| setting | chat | code | math | summ | mean | x plain |
+|---|---|---|---|---|---|---|
+| `plain` | 8.4 | 8.6 | 8.4 | 8.4 | 8.46 | 1.00x |
+| `draft -G 3` | 12.3 (43%, 2.30) | 9.9 (33%, 1.98) | 16.1 (71%, 3.12) | 14.2 (57%, 2.71) | 13.13 | 1.56x |
+| `draft -G 6 --tau 0.4` | 13.0 (58%, 2.43) | 11.3 (51%, 2.03) | 17.4 (68%, 4.30) | 14.6 (56%, 3.22) | 14.07 | 1.67x |
+| `mtp -G 3` | 14.3 (65%, 2.96) | 13.7 (58%, 2.72) | 16.9 (89%, 3.68) | 16.0 (77%, 3.31) | 15.23 | 1.80x |
+| `mtp -G 3 --mtp-vocab 100000` | 15.1 (64%, 2.92) | 14.3 (58%, 2.72) | 17.3 (89%, 3.68) | 17.8 (77%, 3.31) | 16.10 | 1.90x |
+| `mtp -G 6 --tau 0.5 --mtp-vocab 100000` | 16.1 (67%, 3.43) | 13.9 (61%, 2.59) | 21.0 (80%, 5.70) | 17.3 (70%, 4.41) | **17.08** | **2.02x** |
+
+(The 0.8B's tokens per pass here are S7's to the second decimal: the same model and prompts, a reproduction.) A guess
+on its Q6_K classifier: 10.3 ms full, 5.9 with 100,000 (S9w: ~9-10 / ~6); its 4-row verify 1.44 steps.
+
+**The go / no-go** (PLAN-S9-mtp.md 8: >= +10% over the 0.8B on the mean of the thinking-on prompts, not worse on any):
+**go.** IQ3_S-mtp, greedy, the best fixed settings of the sweep: MTP `-G 6 --tau 0.5` 12.85 tok/s vs the 0.8B's `-G 6
+--tau 0.4` 11.12, **+16%** (per prompt +12 / +9 / +27 / +12%); at `-G 3` each, +25%. Seeded +17% (12.05 vs 10.34, every
+prompt ahead). Unsloth's Q4_K_M: +21% (17.08 vs 14.07; code -2% at those settings, +27% at `-G 3` each). Thinking off
+the two are even (greedy -4%, seeded -2%: the 0.8B's long runs on code), so the 0.8B stays an option there. Not
+measured: long contexts (S9w's costs favour the MTP: a guess at 98k ~9-12 ms vs the 0.8B's 19), `--spec auto` with
+the MTP on the 27B. Defaults set from these: `--mtp-vocab` 100,000 (CLI; `RqMtpOpts.vocab` 0 stays all), the auto
+prior for an MTP view's guesses 0.8 (`RqSpecOpts.prior`; the measured p at k 3: 0.81 greedy / 0.76 seeded thinking
+on, 0.88 / 0.85 off; it was 0.7); `-G` keeps 3 (the best MTP fixed setting is `-G 6 --tau 0.5`, +4% over `-G 3`
+thinking on, as the 0.8B's `-G 6 --tau 0.4` is over its `-G 3`).
 
 ## Not now
 

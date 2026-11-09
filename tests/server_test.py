@@ -54,7 +54,14 @@ first), the disk tier group only (--kv-disk; its own servers, one slot each, so 
              prompt gets the system block from its file (Qwen3.5: that checkpoint), == the reference; the log (saves, loads, the draft's
              sequence); after a restart the files serve the next turn again (== the reference); a second server on the same
              directory refused (its lock); a corrupted file and a leftover .tmp removed at the start (the request then
-             prefilled, == the reference); a budget too small for any save: none, replies unchanged
+             prefilled, == the reference); a budget too small for any save: none, replies unchanged. --draft mtp (TODO
+             S9c.4; tests/check_spec.py's spec group on synth-q35-ista-mtp; thinking off, RUNQ_TEST_MTP_CHECK): the view's
+             files (version 2: its kept state); disk/mtp_lockstep (each saved pair == a fresh lockstep run: api_test
+             --mtp-seqcheck), disk/mtp_approx (the loaded conversations' next turns, after the restart too: 0; the view
+             loaded to the prompt's prefix, ahead of a target cut back to a checkpoint), disk/mtp_invariant; with
+             --foreign-draft FILE, disk/mtp_foreign_draft (a directory written with that draft model, then served with
+             --draft mtp: its draft files removed and logged, the targets kept and loaded, == the reference, the loaded
+             prefix's rows counted, the next turn 0). --one-server: disk/lock not run (SKIP), --mem $S9_GATE_MEM
 With --admit [--draft DRAFT] (tests/check.py's server group on the Qwen3 file and Qwen3.5-0.8B, with its Q4_K_M as the draft),
 the memory admission group only (--admit bound; its own servers, -c 4096 --parallel 8, the budget from the startup line:
 one -c job fits, four short ones too, a -c job beside three short ones not):
@@ -65,7 +72,9 @@ one -c job fits, four short ones too, a -c job beside three short ones not):
              first and a conversation's next turn loads its file back (cached_tokens), == a fresh prefill; a -c job asking for
              16 guesses fits (capped to what one -c job holds), == the default; the live budget (RUNQ_TEST_MEMAVAILABLE=FILE, --kv-mem
              large): /health's mem consistent, MemAvailable lowered to 0 while a stream holds a slot: a new request waits
-             (/health waiting_for_memory 1), raised: admitted, mem_wait_ms > 0, == alone
+             (/health waiting_for_memory 1), raised: admitted, mem_wait_ms > 0, == alone. --draft mtp (TODO S9c.4):
+             admit/mtp_terms (the leases' KV per position == the target's + the view's, the state the target's alone),
+             admit/mtp_invariant (RUNQ_TEST_MTP_CHECK: no '[engine] bug:' line)
 With --admit-chunk [--draft DRAFT] (tests/check.py's server group, the same files and drafts), the chunked leases group only
 (--admit chunk --admit-chunk 16 --kv-disk TMP; its own servers, RUNQ_TEST_MEMAVAILABLE set to 0 once the requests run, so
 that a renewal needing a new KV block is denied, and with --admit-margin 1 the live budget is then -1 GiB: the oldest's
@@ -162,6 +171,11 @@ class T:
         self.n += 1
         self.failed += not ok
         print(f"{'PASS' if ok else 'FAIL'} {name}" + (f"  {detail}" if detail else ""))
+        sys.stdout.flush()
+
+    def skip(self, name, why):
+        """a check not run (--one-server: it needs a second process); not counted"""
+        print(f"SKIP  {name}  {why}")
         sys.stdout.flush()
 
 
@@ -328,17 +342,23 @@ def run_disk(a, t):
     # (RUNQ_DISK_TMP, else /var/tmp: usually a disk, where the files are written with O_DIRECT; /tmp is often a tmpfs)
     d = tempfile.mkdtemp(prefix="runq-kvdisk-", dir=os.environ.get("RUNQ_DISK_TMP") or ("/var/tmp" if os.access("/var/tmp", os.W_OK) else None))
     env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
-    base = ["--port", "0", "-c", "2048", "--parallel", "1", "--slots", "1", "-v"] + (["-D", a.draft] if a.draft else [])
+    mtp = a.draft == "mtp"  # (--draft mtp: the view's file (version 2: its kept state), loaded to the prompt's prefix; checked at rest)
+    if mtp:
+        env["RUNQ_TEST_MTP_CHECK"] = "1"
+    base = ["--port", "0", "-c", "2048", "--parallel", "1", "--slots", "1", "-v"] + (["-D", a.draft] if a.draft else []) + gate_mem(a)
+    logs = []  # (--draft mtp: every server's log, for the invariant)
 
-    def start(args):
+    def start(args, b=None):
         log = tempfile.NamedTemporaryFile(prefix="runq-serve-disk-", suffix=".log", delete=False)
-        p = subprocess.Popen([a.runq, "serve", a.model] + base + args, stderr=log, stdout=subprocess.DEVNULL, env=env)
-        for _ in range(600):
+        p = subprocess.Popen([a.runq, "serve", a.model] + (base if b is None else b) + args, stderr=log, stdout=subprocess.DEVNULL, env=env)
+        live(1)
+        for _ in range(1200 if mtp else 600):
             text = open(log.name).read()
             m = re.search(r"listening on http://127\.0\.0\.1:(\d+)", text)
             if m:
                 return p, int(m.group(1)), log.name
             if p.poll() is not None:
+                live(-1)  # (exited: the caller does not stop it)
                 break
             time.sleep(0.05)
         return p, None, log.name
@@ -350,27 +370,41 @@ def run_disk(a, t):
         except subprocess.TimeoutExpired:
             p.kill()
             rc = "timeout"
+        live(-1)
         text = open(logname).read()
         os.unlink(logname)
+        logs.append(text)
         return rc, text
 
     def ask(port, msgs, **kw):
         body = dict({"messages": msgs, "temperature": 0, "max_tokens": 16, "logprobs": True, "top_logprobs": 2}, **kw)
         if a.draft:  # (the draft model on every pass: its sequence follows the slot's, and is saved with it)
             body.setdefault("speculative", {"mode": "fixed", "k": 3, "lookup": 0})
+        if mtp:  # (thinking off: a synthetic reply that is all reasoning does not come back in the history; SPEC_CONV)
+            body.setdefault("reasoning_effort", "none")
         st, r, _ = chat(port, body, timeout=300)
         if st != 200:
             return None
         return {"text": text_of(r), "lp": json.dumps(r["choices"][0]["logprobs"]), "prompt": r["usage"]["prompt_tokens"],
-                "cached": r["usage"]["prompt_tokens_details"]["cached_tokens"]}
+                "cached": r["usage"]["prompt_tokens_details"]["cached_tokens"], "tm": r.get("timings") or {}}
 
     def files():
         return sorted(os.path.relpath(os.path.join(r, f), d) for r, _, fs in os.walk(d) for f in fs if f != "lock")
+
+    approx = []  # (--draft mtp: the replies on a loaded conversation, for disk/mtp_approx)
+
+    def note(what, r):
+        if mtp and r:
+            approx.append((what, r))
 
     log_lines = " ".join(f"Entry {i}: the keeper logged wind {i % 7} knots, swell {i % 5} m, visibility {i % 9} km." for i in range(24))
     X = [{"role": "system", "content": LONG_SYS}, {"role": "user", "content": log_lines + "\nWhich entry had the most wind?"}]
     Y = [{"role": "system", "content": PIRATE_SYS}, {"role": "user", "content": "Describe your ship, its crew and its last voyage. " * 4}]
     disk = ["--kv-disk", d, "--kv-disk-min", "64"]
+    # (--draft mtp, thinking off: Qwen3.8's template drops a reply's empty think block from the history, so a next turn
+    # reuses its prompt up to the checkpoint before it, a few tokens short of the previous prompt; that conversation's
+    # next save does not replace the older file, one more file)
+    back = 12 if mtp else 0
     p, port, lg = start(disk)
     if not port:
         rep(False, "disk/start", open(lg).read()[-500:])
@@ -380,12 +414,15 @@ def run_disk(a, t):
     X2 = X + [{"role": "assistant", "content": x["text"]}, {"role": "user", "content": "And the least?"}]
     x2 = ask(port, X2, temperature=0.8, seed=7)  # (X loaded back; seeded: the RNG after a load)
     y2 = ask(port, Y + [{"role": "assistant", "content": y["text"]}, {"role": "user", "content": "Where next?"}])
-    rep(x2["cached"] >= x["prompt"] and y2["cached"] >= y["prompt"], "disk/evict_load",
+    note("X's next turn, loaded", x2)
+    note("Y's next turn, loaded", y2)
+    rep(x2["cached"] >= x["prompt"] - back and y2["cached"] >= y["prompt"] - back, "disk/evict_load",
         f"X {x['prompt']} prompt tokens, its next turn {x2['cached']} of {x2['prompt']} cached; Y {y['prompt']}, then {y2['cached']} of {y2['prompt']}")
     # a new conversation on X's system prompt (a compaction's next request): the system block from X's file (Qwen3.5: its
     # checkpoint at the end of the system block), while the slot held Y's conversation
     Z = [{"role": "system", "content": LONG_SYS}, {"role": "user", "content": "Summarize the borrowing rules in one sentence."}]
     z = ask(port, Z)
+    note("a new conversation on X's system block, loaded", z)
     # references: the same requests with nothing cached (cache_prompt: false; the slot's tokens saved first)
     rz = ask(port, Z, cache_prompt=False)
     rep(z["cached"] >= 40 and z["lp"] == rz["lp"], "disk/shared_prefix", f"{z['cached']} of {z['prompt']} cached (the system block), "
@@ -398,24 +435,32 @@ def run_disk(a, t):
     rep(rc == 0 and saved >= 3 and loaded >= 2 and "[engine] disk:" in log1 and (not a.draft or "+ the draft's" in log1), "disk/log",
         f"exit {rc}, {saved} saves, {loaded} loads" + ("" if not a.draft else ", the draft's sequence with them"))
     fs = files()  # (one file per conversation: X's, Y's, Z's; the draft's beside each)
-    rep(all(f.endswith(".rqseq") for f in fs) and len(fs) == 3 * (2 if a.draft else 1), "disk/files", " ".join(fs))
+    nt = len([f for f in fs if not f.endswith(".draft.rqseq")])
+    rep(all(f.endswith(".rqseq") for f in fs) and (nt == 3 or mtp and nt == 4) and len(fs) == nt * (2 if a.draft else 1), "disk/files",
+        " ".join(fs))
+    if mtp:  # the saved pairs (at rest: the view as long as the target, its kept state in its version 2 file) == a fresh lockstep run
+        disk_lockstep(a, t, d, fs)
     # restart: the conversations come back from the files
     p, port, lg = start(disk)
     desc = open(lg).read()
     m = re.search(r"disk tier [^:]+: (\d+) saved sequence", desc)
     x3 = ask(port, X2, temperature=0.8, seed=7)
-    rep(m is not None and int(m.group(1)) >= 1 and x3 and x3["cached"] >= x["prompt"] and x3["lp"] == rx2["lp"], "disk/restart",
+    note("X's next turn after the restart", x3)
+    rep(m is not None and int(m.group(1)) >= 1 and x3 and x3["cached"] >= x["prompt"] - back and x3["lp"] == rx2["lp"], "disk/restart",
         f"{m.group(1) if m else '?'} saved sequence(s) at the start; X's next turn {x3['cached'] if x3 else '?'} of "
         f"{x3['prompt'] if x3 else '?'} cached, == the reference: {bool(x3) and x3['lp'] == rx2['lp']}")
-    # a second server on the same directory: refused
-    q, qport, qlg = start(disk)
-    qrc = q.wait(timeout=30) if not qport else None
-    qtext = open(qlg).read()
-    if qport:
-        stop(q, qlg)
+    # a second server on the same directory: refused (--one-server: not run; the lock is taken after the whole model's load)
+    if a.one_server:
+        t.skip("disk/lock", "(--one-server: a second server on the directory)")
     else:
-        os.unlink(qlg)
-    rep(qport is None and qrc != 0 and "in use by another runq serve" in qtext, "disk/lock", qtext.strip()[-120:])
+        q, qport, qlg = start(disk)
+        qrc = q.wait(timeout=30) if not qport else None
+        qtext = open(qlg).read()
+        if qport:
+            stop(q, qlg)
+        else:
+            os.unlink(qlg)
+        rep(qport is None and qrc != 0 and "in use by another runq serve" in qtext, "disk/lock", qtext.strip()[-120:])
     rc, _ = stop(p, lg)
     # a corrupted file and a save cut short: removed at the start; the request served from a fresh prefill, == the reference
     fs = [f for f in files() if f.endswith(".rqseq") and ".draft" not in f]
@@ -441,6 +486,89 @@ def run_disk(a, t):
     rc, log4 = stop(p, lg)
     rep(rc == 0 and x5 and y5 and x6 and x6["lp"] == rx2["lp"] and "saved as entry" not in log4 and "no room" in log4 and
         not [f for f in files() if f.endswith(".rqseq")], "disk/budget", "--kv-disk-max 0.0001: nothing saved, the replies unchanged")
+    shutil.rmtree(d, ignore_errors=True)
+    if not mtp:
+        return
+    # --draft mtp: the next turns of loaded conversations (after an eviction, after the restart, a new one on a saved system
+    # block) without approximate rows: the view loaded to the prompt's prefix with its kept state (the whole file), ahead of
+    # a target cut back to a checkpoint; at most 1 for a restart exactly at a divergence (the target's restart point the
+    # prompt's common prefix with the saved tokens: the view cut there, no kept state)
+    bad, det = [], []
+    for what, r in approx:
+        ap = (r["tm"].get("speculative") or {}).get("mtp_approx", -1)
+        det.append(f"{what}: cached {r['cached']}, mtp_approx {ap}")
+        if ap != 0:
+            bad.append(what)
+    rep(len(approx) == 4 and not bad, "disk/mtp_approx", "; ".join(det))
+    bugs = [b for lg_ in logs for b in re.findall(r"\[engine\] bug:.*", lg_)]
+    rep(not bugs, "disk/mtp_invariant", "; ".join(bugs[:3]) or f"{len(logs)} servers, no '[engine] bug:' line")
+    if a.foreign_draft:
+        disk_foreign_draft(a, t, X, Y, start, stop, ask)
+
+
+def disk_lockstep(a, t, d, fs):
+    """--disk --draft mtp: each saved pair (<id>.rqseq, <id>.draft.rqseq; saved at rest after SIGTERM and at evictions) ==
+    a fresh lockstep run over the target's tokens (api_test --mtp-seqcheck: the view's KV cache bitwise, its kept state
+    (version 2) and a probe row with it)"""
+    api = a.api_test or os.path.join(os.path.dirname(os.path.abspath(a.runq)), "build", "api_test")
+    env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
+    pairs = [f[:-len(".rqseq")] for f in fs if f.endswith(".rqseq") and not f.endswith(".draft.rqseq") and
+             f[:-len(".rqseq")] + ".draft.rqseq" in fs]
+    res = []
+    for p in pairs:
+        q = subprocess.run([api, "--mtp-seqcheck", a.model, os.path.join(d, p + ".rqseq"), os.path.join(d, p + ".draft.rqseq")],
+                           capture_output=True, env=env)
+        res.append((p, q.returncode == 0 and q.stdout.startswith(b"PASS "), q.stdout.decode(errors="replace").strip()[-200:]))
+    fails = [f"{os.path.basename(p)}: {o}" for p, ok, o in res if not ok]
+    v2 = sum(1 for _, ok, o in res if ok and "the kept state" in o)
+    t.report(len(pairs) == len([f for f in fs if f.endswith(".draft.rqseq")]) and pairs and not fails and v2 == len(pairs),
+             "disk/mtp_lockstep", f"{len(pairs)} saved pairs, each == a fresh lockstep run ({v2} with the kept state and a probe row)"
+             + ("; " + "; ".join(fails[:3]) if fails else ""))
+
+
+def disk_foreign_draft(a, t, X, Y, start, stop, ask):
+    """--disk --draft mtp --foreign-draft FILE (TODO S9c.D's situation): a directory written by a server with another draft
+    model (FILE, the same vocabulary: its .draft.rqseq files beside the targets), then served with --draft mtp: its log
+    names each draft file removed (not the draft's) and no target file; a saved conversation's next turn loads the target
+    (the view: none, it follows the loaded prefix as a gap, zeros for h: mtp_approx > 0) and == the reference bitwise; the
+    turn after it has no approximate row (at most 1 at a divergence); no '[engine] bug:' line"""
+    rep = t.report
+    d = tempfile.mkdtemp(prefix="runq-kvforeign-", dir=os.environ.get("RUNQ_DISK_TMP") or ("/var/tmp" if os.access("/var/tmp", os.W_OK) else None))
+    disk = ["--kv-disk", d, "--kv-disk-min", "64"]
+    p, port, lg = start(disk, ["--port", "0", "-c", "2048", "--parallel", "1", "--slots", "1", "-v", "-D", a.foreign_draft] + gate_mem(a))
+    if not port:
+        rep(False, "disk/mtp_foreign_draft", open(lg).read()[-500:])
+        shutil.rmtree(d, ignore_errors=True)
+        return
+    x, y = ask(port, X), ask(port, Y)  # (X saved at Y's admission, Y at the stop: each with the other draft's file)
+    rc0, _ = stop(p, lg)
+    fs = sorted(os.path.relpath(os.path.join(r, f), d) for r, _, ff in os.walk(d) for f in ff if f.endswith(".rqseq"))
+    drafts = {os.path.basename(f) for f in fs if f.endswith(".draft.rqseq")}
+    p, port, lg = start(disk)  # (--draft mtp)
+    if not port:
+        rep(False, "disk/mtp_foreign_draft", open(lg).read()[-500:])
+        shutil.rmtree(d, ignore_errors=True)
+        return
+    X2 = X + [{"role": "assistant", "content": x["text"] if x else ""}, {"role": "user", "content": "And the least?"}]
+    x2 = ask(port, X2, temperature=0.8, seed=7)
+    X3 = X2 + [{"role": "assistant", "content": x2["text"] if x2 else ""}, {"role": "user", "content": "And the calmest?"}]
+    x3 = ask(port, X3)
+    rx2 = ask(port, X2, temperature=0.8, seed=7, cache_prompt=False)
+    rc, log = stop(p, lg)
+    gone = re.findall(r"--kv-disk: (\S+): not the draft's \(([^)]*)\), removed", log)
+    tgone = [ln for ln in log.splitlines() if re.search(r"--kv-disk: \S*/\d+\.rqseq: .*removed", ln)]
+    bugs = re.findall(r"\[engine\] bug:.*", log)
+    ap = lambda r: ((r or {}).get("tm", {}).get("speculative") or {}).get("mtp_approx", -1)  # noqa: E731
+    tm3 = (x3 or {}).get("tm", {})
+    div = tm3.get("cache_n", 0) > 0 and tm3.get("cache_n") == tm3.get("common_tokens") and tm3.get("common_tokens", 0) < tm3.get("slot_tokens", 0)
+    ok = (rc0 == 0 and rc == 0 and x and y and len(drafts) >= 2 and {os.path.basename(f) for f, _ in gone} == drafts and not tgone and
+          x2 and rx2 and x2["cached"] >= x["prompt"] - 12 and x2["lp"] == rx2["lp"] and ap(x2) > 0 and x3 and 0 <= ap(x3) <= (1 if div else 0)
+          and not bugs)
+    rep(ok, "disk/mtp_foreign_draft", f"{len(drafts)} draft files of {os.path.basename(a.foreign_draft)}: removed {len(gone)} "
+        f"({gone[0][1] if gone else '-'}), target files removed {len(tgone)}; X's next turn {x2['cached'] if x2 else '?'} of "
+        f"{x2['prompt'] if x2 else '?'} cached, == the reference {bool(x2) and bool(rx2) and x2['lp'] == rx2['lp']}, mtp_approx "
+        f"{ap(x2)}; the turn after it mtp_approx {ap(x3)}" + (" (a restart at a divergence)" if div else "") +
+        ("; " + "; ".join(bugs[:2]) if bugs else ""))
     shutil.rmtree(d, ignore_errors=True)
 
 
@@ -552,18 +680,24 @@ def run_admit(a, t):
     job fits, four short ones do too, but not a -c job beside three short ones"""
     rep = t.report
     env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
+    mtp = a.draft == "mtp"  # (--draft mtp: the view's KV in the terms (one attention layer, no state); checked at rest)
+    if mtp:
+        env["RUNQ_TEST_MTP_CHECK"] = "1"
     d = tempfile.mkdtemp(prefix="runq-admit-", dir=os.environ.get("RUNQ_DISK_TMP") or ("/var/tmp" if os.access("/var/tmp", os.W_OK) else None))
     base = ["--port", "0", "-c", "4096", "--parallel", "8", "--slots", "6", "--chunk", "16", "--checkpoints", "1", "-v"] + \
         (["-D", a.draft, "--spec-calibrate", "1024"] if a.draft else [])
+    bugs = []
 
     def start(args, xenv=None):
         log = tempfile.NamedTemporaryFile(prefix="runq-serve-admit-", suffix=".log", delete=False)
         p = subprocess.Popen([a.runq, "serve", a.model] + base + args, stderr=log, stdout=subprocess.DEVNULL, env=dict(env, **(xenv or {})))
+        live(1)
         for _ in range(1200):
             m = re.search(r"listening on http://127\.0\.0\.1:(\d+)", open(log.name).read())
             if m:
                 return p, int(m.group(1)), log.name
             if p.poll() is not None:
+                live(-1)  # (exited: the caller does not stop it)
                 break
             time.sleep(0.05)
         return p, None, log.name
@@ -575,8 +709,10 @@ def run_admit(a, t):
         except subprocess.TimeoutExpired:
             p.kill()
             rc = "timeout"
+        live(-1)
         text = open(logname).read()
         os.unlink(logname)
+        bugs.extend(re.findall(r"\[engine\] bug:.*", text))
         return rc, text
 
     def ask(port, msgs, **kw):
@@ -616,6 +752,13 @@ def run_admit(a, t):
     rep("admission bound:" in desc and B < J + 3 * S - 0.05 * S, "admit/startup_line",
         f"short lease {S / MiB:.1f} MiB, -c job {J / MiB:.1f} MiB: --kv-mem {B / MiB:.1f} MiB (a -c job + 3 short ones: "
         f"{(J + 3 * S) / MiB:.1f})")
+    if mtp:  # the view's terms: its KV per position in the leases' (target + the view's one attention layer), no state of its own
+        sl = re.search(r"KV (\d+) KB per position \+ recurrent state ([\d.]+) MiB.*?; the MTP view's sequence ([\d.]+) MiB \(blk\.(\d+), one "
+                       r"attention layer\)", desc)
+        vkv = float(sl.group(3)) * MiB / 4096 if sl else -1
+        rep(bool(sl) and stm is not None and abs(kv - (float(sl.group(1)) * 1000 + vkv)) < 600 and float(stm.group(1)) == float(sl.group(2)),
+            "admit/mtp_terms", f"KV per position {kv / 1000:.1f} KB = the target's {sl.group(1) if sl else '?'} + the view's "
+            f"{vkv / 1000:.2f} (blk.{sl.group(4) if sl else '?'}); state {stm.group(1) if stm else '?'} MiB = the target's")
     kvmem = ["--admit", "bound", "--kv-mem", f"{B / 1073741824.0:.6f}"]
     # refusals: one -c job must fit; a chunk of 0 tokens
     q = subprocess.run([a.runq, "serve", a.model] + base + ["--admit", "bound", "--kv-mem", f"{0.5 * J / 1073741824.0:.6f}"],
@@ -787,6 +930,8 @@ def run_admit(a, t):
         rc, log = stop(p, lg)
     rep(rc == 0 and "over the memory budget" not in log and "job waits for memory" in log and "live " in log, "admit/stop_live",
         f"exit {rc}")
+    if mtp:
+        rep(not bugs, "admit/mtp_invariant", "; ".join(bugs[:3]) or "no '[engine] bug:' line")
     shutil.rmtree(d, ignore_errors=True)
 
 
@@ -1982,7 +2127,10 @@ def main():
                     "auto (and with --spec mtp its own checks)")
     ap.add_argument("--mtp-accepts", action="store_true", help="with --spec mtp: a trained block (its guesses accepted: spec/mtp_accepts)")
     ap.add_argument("--mtp-g0", action="store_true", help="runq serve --draft mtp -G 0 only (the block not loaded; == no --draft)")
-    ap.add_argument("--api-test", help="with --spec mtp: tests/api_test for --mtp-seqcheck (default: build/api_test next to --runq)")
+    ap.add_argument("--api-test", help="with --spec mtp, --disk --draft mtp: tests/api_test for --mtp-seqcheck (default: build/api_test "
+                    "next to --runq)")
+    ap.add_argument("--foreign-draft", metavar="FILE", help="with --disk --draft mtp: a directory written with this draft model "
+                    "first, then served with --draft mtp (disk/mtp_foreign_draft)")
     ap.add_argument("--one-server", action="store_true", help="never two runq serve processes at once (the 27B: S9c.G); with "
                     "S9_GATE_MEM set, --mem S9_GATE_MEM for every server")
     a = ap.parse_args()

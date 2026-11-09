@@ -61,7 +61,8 @@ Steps:
     `mtp_lockstep` check after every run). On Qwen3.5-0.8B with its own block (the opt-in test file) as target and
     draft: 64 / 64 outputs == plain, 42-79% of the guesses accepted, 2.2-3.5 tokens per pass at k 2-4, 0.87-1.24x plain's
     tok/s on that small model (docs/qwen38-speculative.md, "The loop"). `runq serve --draft mtp` runs since S9c.3
-    (2026-11-09, docs/server.md); the 27B in the server: S9c.G.
+    (2026-11-09, docs/server.md), its view loaded from `--kv-disk` to the prompt's prefix and in the `--admit` terms
+    since S9c.4; the 27B in the server: S9c.G.
     **S9d.1 done (2026-11-09):** `scripts/s9_gate.sh` (the 27B gate: the estimate from metadata, the servers' `/health`
     margin and the timers that start one, a capped scope without swap, the watchdog, the bench lock) and
     `build/spec_sweep` (`make spec-sweep`: settings x S7's prompts in one process, every output checked against plain);

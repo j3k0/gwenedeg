@@ -156,7 +156,7 @@ struct Engine {
     DiskEnt *dk;
     long long dk_bytes;
     double dk_max;
-    struct { int spill, slot, load, L; } plan; // (slots / entry id, -1: none)
+    struct { int spill, slot, load, L, Lv; } plan; // (slots / entry id, -1: none; Lv: the saved tokens' common prefix with the prompt)
     unsigned long long dk_saves, dk_loads;
     double dk_save_s, dk_load_s;
     int *rv;              // --admit bound: the idle slots a reclaim may take (nslot)
@@ -1016,13 +1016,16 @@ static int dk_add(Engine *e, int id, double used) {
     d.bytes = d.f.bytes;
     dk_path(e, id, 1, p, sizeof(p));
     struct stat st;
-    if (!stat(p, &st)) { // the draft's: used if it is the draft model's and follows these tokens; kept (counted) without one
+    if (!stat(p, &st)) { // the draft's: used if it is the draft model's and follows these tokens; kept (counted) without one;
+        // else removed, said (e.g. another draft model's files when a server switches to --draft mtp: the targets stay)
         RqSeqFile df;
-        int *dt = NULL;
-        if (e->dm && rq_seq_file_info(e->dm, p, &df, &dt) == RQ_OK && df.kv_type == e->o.kv_type && df.len <= d.f.len &&
-            !memcmp(dt, d.tok, (size_t)df.len * sizeof(int)))
+        int *dt = NULL, drc = e->dm ? rq_seq_file_info(e->dm, p, &df, &dt) : RQ_OK;
+        const char *why = !e->dm ? NULL : drc != RQ_OK ? rq_strerror(drc) : df.kv_type != e->o.kv_type ? "another KV type"
+                          : df.len > d.f.len || memcmp(dt, d.tok, (size_t)df.len * sizeof(int)) ? "other tokens" : NULL;
+        if (e->dm && !why)
             d.dlen = df.len;
         else if (e->dm) {
+            fprintf(stderr, "runq serve: --kv-disk: %s: not the draft's (%s), removed\n", p, why);
             unlink(p);
             st.st_size = 0;
         }
@@ -1150,17 +1153,20 @@ static int dk_wants(const Engine *e, const Slot *sl, int keep) {
     return e->dk_dir && sl->gen != sl->dk_gen && len >= e->o.kv_disk_min && len - keep >= e->o.kv_disk_min;
 }
 
-static int dk_best(const Engine *e, const int *P, int n, int *best) {
+static int dk_best(const Engine *e, const int *P, int n, int *best, int *lv) {
     // the saved sequence with the longest usable prefix of the prompt (as start_run would keep it: up to n - 1;
-    // Qwen3.5: a checkpointed length); its length, *best = its index (-1: none)
+    // Qwen3.5: a checkpointed length); its length, *best = its index (-1: none), *lv = its tokens' common prefix with
+    // the prompt (the MTP view's usable prefix: no state, not capped at the target's)
     int L = 0;
     *best = -1;
+    *lv = 0;
     for (int k = 0; k < e->ndk; k++) {
         const DiskEnt *d = &e->dk[k];
         int c = lcp(d->tok, d->f.len, P, n), u = rq_seq_file_keep(&d->f, c < n - 1 ? c : n - 1);
         if (u > L) {
             L = u;
             *best = k;
+            *lv = c;
         }
     }
     return L;
@@ -1224,8 +1230,10 @@ static void dk_spill(Engine *e, int si, int keep_id) {
     }
 }
 
-static void dk_load(Engine *e, int si, int id, int L) {
-    // slot si := the saved sequence id's first L positions (and its draft's, as far as they go)
+static void dk_load(Engine *e, int si, int id, int L, int Lv) {
+    // slot si := the saved sequence id's first L positions (and its draft's, as far as they go: a draft model's to the
+    // target's length; the MTP view's to Lv, the prompt's common prefix, ahead of a target cut back to a checkpoint: its
+    // rows' h were the target's, mtp_start keeps them; the whole file: its kept state too, the next row's h)
     int k = dk_find(e, id);
     if (k < 0) return;
     Slot *sl = &e->slot[si];
@@ -1244,7 +1252,7 @@ static void dk_load(Engine *e, int si, int id, int L) {
     sl->dk_gen = sl->gen;
     sl->used = rq_now();
     if (sl->dseq) {
-        int dn = d->dlen < rq_seq_len(sl->seq) ? d->dlen : rq_seq_len(sl->seq);
+        int top = e->mtp ? Lv : rq_seq_len(sl->seq), dn = d->dlen < top ? d->dlen : top;
         dk_path(e, id, 1, p, sizeof(p));
         if (dn < 1 || rq_seq_load(sl->dseq, p, dn) != RQ_OK) rq_seq_reset(sl->dseq);
     }
@@ -1253,14 +1261,14 @@ static void dk_load(Engine *e, int si, int id, int L) {
     e->dk_load_s += dt;
     dk_touch(e, d);
     if (e->o.verbose)
-        fprintf(stderr, "[engine] disk: entry %d -> slot %d: %d of %d tokens%s, %.3f s\n", id, si, rq_seq_len(sl->seq), d->f.len,
-                sl->dseq && rq_seq_len(sl->dseq) ? " + the draft's" : "", dt);
+        fprintf(stderr, "[engine] disk: entry %d -> slot %d: %d of %d tokens%s%.0d, %.3f s\n", id, si, rq_seq_len(sl->seq), d->f.len,
+                sl->dseq && rq_seq_len(sl->dseq) ? " + the draft's " : "", sl->dseq ? rq_seq_len(sl->dseq) : 0, dt);
 }
 
 static void dk_run(Engine *e) {
     // (the engine thread, without mu) the I/O admit planned: a spill, then a load into that slot
     if (e->plan.spill >= 0) dk_spill(e, e->plan.spill, e->plan.load);
-    if (e->plan.load >= 0) dk_load(e, e->plan.slot, e->plan.load, e->plan.L);
+    if (e->plan.load >= 0) dk_load(e, e->plan.slot, e->plan.load, e->plan.L, e->plan.Lv);
     e->plan.spill = e->plan.load = e->plan.slot = -1;
 }
 
@@ -2244,7 +2252,7 @@ static int admit(Engine *e, Job *j) {
     if (j->no_cache) // (the least recently used slot: keeps the useful caches)
         return go(e, j, lru, -1, 0);
     if (e->ndk && !j->dk_tried) { // a saved sequence shares a longer prefix (by a real margin: it is read whole up to there)
-        int k, Ld = dk_best(e, P, n, &k), have = li > lb ? li : lb, gain = Ld - have;
+        int k, lv, Ld = dk_best(e, P, n, &k, &lv), have = li > lb ? li : lb, gain = Ld - have;
         if (k >= 0 && real_reuse(Ld, n) && gain >= (e->o.copy_min > 0 ? e->o.copy_min : 32) && 8 * gain >= Ld) {
             int ma = mem_admit(e, j, lru, -1, 0); // (the load fills lru: its room first)
             if (ma != 1) return ma;
@@ -2253,6 +2261,7 @@ static int admit(Engine *e, Job *j) {
             e->plan.slot = lru;
             e->plan.load = e->dk[k].id;
             e->plan.L = Ld;
+            e->plan.Lv = lv;
             return 2;
         }
     }
@@ -3479,7 +3488,9 @@ void engine_describe(Engine *e, char *buf, size_t n) {
     if (e->sm.state)
         snprintf(st, sizeof(st), " + recurrent state %.1f MiB x (1 + %d checkpoints)", e->sm.state / 1048576.0, e->sm.checkpoints);
     char dr[160] = "";
-    if (e->dm)
+    if (e->mtp) // (no state: KV only, the block's one attention layer)
+        snprintf(dr, sizeof(dr), "; the MTP view's sequence %.1f MiB (blk.%d, one attention layer)", e->dsm.total / 1048576.0, e->o.draft_mtp);
+    else if (e->dm)
         snprintf(dr, sizeof(dr), "; the draft's sequence %.1f MiB", e->dsm.total / 1048576.0);
     if (e->spec_res > 0) {
         size_t l = strlen(dr);

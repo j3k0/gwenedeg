@@ -67,12 +67,15 @@ half the RAM", and 3 x 4.61 GiB (slots) + 3 x 0.99 GiB (verify rows) = 16.8 GiB.
 ## The memory model
 
 All terms come from quantities the engine already has. Numbers: Saluki IQ2-mix, `-k q8-dot`, draft Qwen3.5-0.8B
-Q4_K_M, `--checkpoints 4`, `-G 5`, from the startup line of the running server (2026-11-07).
+Q4_K_M, `--checkpoints 4`, `-G 5`, from the startup line of the running server (2026-11-07). The drafter is a draft
+model (`--draft FILE`) or the MTP view (`--draft mtp`, TODO S9c: the model's own MTP block, one attention layer and no
+recurrent state); the last column is any Qwen3.8-27B file with its MTP block (ISTA's IQ3_S-mtp: the terms depend on
+the shapes only), derived from the shapes (TODO S9c.4; the 27B's startup line confirms it in S9c.G).
 
-| term | what | Saluki q8 |
-|---|---|---|
-| `kv(n)` | KV bytes of positions 0..n-1, target + draft: whole blocks of ATT_P = 256 positions, page-rounded per (layer, K / V) range, + the token arrays | 34.8 KB + 6.5 KB = **41.3 KB per position** (10.1 MiB per 256-position block) |
-| `st` | one copy of the recurrent state, target + draft (0 for Qwen3) | 149.6 + 19.3 = **168.9 MiB** |
+| term | what | Saluki q8, 0.8B draft | Qwen3.8-27B q8, `--draft mtp` |
+|---|---|---|---|
+| `kv(n)` | KV bytes of positions 0..n-1, target + the drafter (a draft model, or the MTP view: one attention layer, no state): whole blocks of ATT_P = 256 positions, page-rounded per (layer, K / V) range, + the token arrays | 34.8 KB + 6.5 KB = **41.3 KB per position** (10.1 MiB per 256-position block) | 34.8 KB + 2.2 KB = **37.0 KB per position** |
+| `st` | one copy of the recurrent state, target + the drafter (the MTP view: none; 0 for Qwen3) | 149.6 + 19.3 = **168.9 MiB** | **149.6 MiB** (the target's) |
 | `ck` | `--checkpoints` | 4 |
 | `kk(j)` | the job's guesses per pass at most: `max(spec_k, spec_lookup)` if it speculates (`spec_start`'s rule: no constraint, no forced reply), else 0 | 5 |
 | `C` | the lease chunk, in generated tokens: unlimited in steps 1-3 (`--admit bound`), `--admit-chunk` in step 4 (`--admit chunk`) | 1,024 |
@@ -98,6 +101,15 @@ reserved whole from the start (they are allocated lazily, but a job may take the
 
 For short requests ~96% of the lease is state copies (11 x 168.9 MiB = 1.81 GiB), not KV. Each renewal of step 4 adds
 `kv(C)`: 41 MiB on Saluki.
+
+With the MTP view instead of the 0.8B draft (the same `ck` and `kk`; 11 x 149.6 MiB = 1.61 GiB of state copies): the
+short request's lease is **1.68 GiB** (1.89), the pi turn's **4.24 GiB** (4.76), a 98,304-position job's **4.99 GiB**
+(5.60); the drafter's sequence at 98,304 positions ~0.20 GiB of KV and no state (the 0.8B's: ~0.6 GiB + 19.3 MiB per
+state copy). Outside the pool (process memory, not leases): the view's weights (ISTA's Q6_K block ~0.33 GiB; the
+0.8B's ~0.5), its context (at most the target's runtime) and the hidden-state buffers (21 MB). The formulas do not
+change: the engine's terms take the view as the draft (`rq_seq_mem` of the view: KV only), and the startup line's
+`admission bound:` KV per position and state are the sums above (tests/server_test.py `--admit --draft mtp`:
+`admit/mtp_terms`).
 
 **A slot's resident memory** (running or idle):
 
@@ -498,7 +510,9 @@ As built (engine.c, `mem_yield`, `mem_resume`, in `mem_renewals`; `--admit-yield
 
 - The startup line with `bound` / `chunk`: the mode, the static budget, the margin, `per position 41.3 KB, state
   168.9 MiB`, the largest job (`-c`, speculating) that fits; with `chunk` the chunk and the swap directory's free space
-  (and the yield's N).
+  (and the yield's N). With `--draft mtp` the slot line names the view's sequence (`the MTP view's sequence X MiB
+  (blk.N, one attention layer)`) and the terms are target + view (Qwen3.8-27B q8: 37.0 KB, 149.6 MiB).
+- The options take `--draft mtp` as any draft (no option of its own).
 - `/health`: `"mem": {"budget", "live", "committed", "resident", "waiting_for_memory", "parked", "swapped_out"}` in
   GiB / jobs (`bound`: without `parked`, `swapped_out`; `live` is `null` without MemAvailable), + `"yielded"` with
   `--admit-yield`.
@@ -541,6 +555,11 @@ As built (engine.c, `mem_yield`, `mem_resume`, in `mem_renewals`; `--admit-yield
   - as built, also: a swap-out that fails (a 500 for that request only); a swap mid-prefill (`-c 4096 --chunk 8`, a
     ~2,400-token prompt swapped out by the oldest's block and continued after the swap-in); the draft's save, then its
     load, made to fail (`RUNQ_TEST_SWAP_FAIL`): the draft reset, the outputs unchanged; `--admit-yield` (above).
+- **With the MTP view** (TODO S9c.3 / S9c.4; tests/check_spec.py, the spec group, on the ISTA-shaped synthetic file):
+  `spec_server/mtp_admit/*` (`server_test.py --admit --draft mtp`: the budgets from the startup line as above, so the
+  view's terms enter by themselves; `admit/mtp_terms`: the leases' KV per position == the target's + the view's, the
+  state == the target's; no `[engine] bug:` line under `RUNQ_TEST_MTP_CHECK`) and `spec_server/mtp_admit_chunk/*` (the
+  view swapped with every job, its kept state in the version 2 file).
 - `--admit worst` (the default): every existing group unchanged.
 
 ## Measurements (the 16-vCPU box)

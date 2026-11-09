@@ -177,7 +177,13 @@ down), 504. Not supported: tools with Qwen3's templates (400), `tool_choice` req
   renamed; O_DIRECT where the file system takes it (the page cache is not filled with them; tmpfs: buffered), one
   thread per layer and K / V. The MTP drafter's file (`--draft mtp`, TODO S9c; the view at rest keeps the target's
   last hidden state) is format version 2: that state is in it too, under the file's hash (+20 KB per conversation on
-  Qwen3.8-27B: dim 5,120 floats in one 4 KiB-aligned section), so a loaded or swapped-in view goes on exactly. Every
+  Qwen3.8-27B: dim 5,120 floats in one 4 KiB-aligned section), so a loaded or swapped-in view goes on exactly. A loaded
+  view goes to the prompt's common prefix with the saved tokens (TODO S9c.4), not to the target's loaded length: a
+  hybrid target restarts at a checkpoint below it, and the view's rows above wait for the prefill (their h was the
+  target's); the whole file, its kept state too. A draft file that does not check out against the server's drafter
+  (another draft model's, e.g. after switching to `--draft mtp`; another KV type; other tokens) is removed at the
+  start, logged (`runq serve: --kv-disk: DIR/N.draft.rqseq: not the draft's (...), removed`), its target file kept: such
+  a conversation's view then follows the loaded prefix as a gap (zeros for h, counted in `mtp_approx`; outputs exact). Every
   other file is version 1, byte for byte as before (tested against 915894a's: `seqfile/v1_same`, and `server_test.py
   --disk-compat`: one directory served by an older build, this one and the older one again, nothing removed); a
   build before version 2 takes a version 2 file for one that does not check out and removes that draft file only (its

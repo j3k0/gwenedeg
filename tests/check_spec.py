@@ -218,7 +218,7 @@ def mtp_start(a, d, ex):
     # runq serve --draft mtp (TODO S9c.3; tests/server_test.py --spec mtp: == a plain server, the MTP checks): the ISTA-shaped
     # file (Q6_K block and eh_proj, Q4_K classifier) whole, the 27B-shaped one and the trained 0.8B block quick (its guesses
     # accepted: B after them), the generic build quick; the chunked leases' swap with the view (--admit-yield included);
-    # -G 0; the refusals
+    # --admit bound and the disk tier with the view (S9c.4); -G 0; the refusals
     ista = os.path.join(sd, "synth-q35-ista-mtp.gguf")
     mtp08 = os.path.join(os.path.dirname(os.path.dirname(a.q35)), "Qwen3.5-0.8B-MTP-GGUF", "Qwen3.5-0.8B-mtp-Q8_0.gguf")
     srv = [sys.executable, "-I", os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_test.py"), "--threads", str(SPEC_THREADS)]
@@ -236,6 +236,13 @@ def mtp_start(a, d, ex):
     if os.path.exists(ista):
         futs.append(("api", "spec_server/mtp_admit_chunk", ex.submit(run, srv + ["--runq", a.runq, "--model", ista, "--admit-chunk", "--draft",
                                                                                  "mtp"], SPEC_THREADS)))
+        # (TODO S9c.4) the leases with the view's terms; the disk tier with the view's files (loaded to the prompt's prefix, its
+        # kept state), and a directory of the 0.8B draft's files served with --draft mtp (S9c.D's switch: those removed)
+        futs.append(("api", "spec_server/mtp_admit", ex.submit(run, srv + ["--runq", a.runq, "--model", ista, "--admit", "--draft", "mtp"],
+                                                               SPEC_THREADS)))
+        q35d = os.path.join(os.path.dirname(a.q35), "Qwen3.5-0.8B-Q4_K_M.gguf")
+        futs.append(("api", "spec_server/mtp_disk", ex.submit(run, srv + ["--runq", a.runq, "--model", ista, "--disk", "--draft", "mtp",
+                                                                          "--foreign-draft", q35d], SPEC_THREADS)))
 
     def server_refused():  # a file without a block; --mtp-vocab negative
         out = []

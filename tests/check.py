@@ -31,7 +31,7 @@ Tests (see tests/README.md):
   server     runq serve over HTTP (tests/server_test.py, in the background from the start): endpoints,
              completions == runq -m chat, prefix reuse bitwise, streaming, json_schema constrained
              decoding, errors, queue / cancellation, fuzzing, shutdown; the disk tier (--kv-disk: Qwen3 with a
-             draft, Qwen3.5); the tool call parser
+             draft, Qwen3.5; --ref-runq OLD: one directory across builds, disk_v1_compat); the tool call parser
              (build/tools_test, tests/tools_test.c: no model)
   kv         the KV cache types other than the default f16 (-k f32, -k bf16; -k bf16-dot / f16-dot: the bf16
              dot-product attention): logits vs HF (en, code, long2), batched vs sequential, threads and AVX-512 vs
@@ -519,6 +519,10 @@ def server_run(a, ex):
     futs.append(("admit_chunk_qwen3", ex.submit(run, st + ["--model", model, "--admit-chunk"] + (["--draft", a.q4] if a.q4 else []))))
     if a.q35:
         futs.append(("admit_chunk_qwen35", ex.submit(run, st + ["--model", a.q35, "--admit-chunk"] + (["--draft", q35d] if os.path.exists(q35d) else []))))
+    # --ref-runq (TODO S9c.2 / S9c.4): one --kv-disk directory served by that build (e.g. 915894a's), this one, that one again:
+    # the files read as they are (the 0.8B pair: its draft's files too)
+    if a.ref_runq and a.q35 and os.path.exists(q35d):
+        futs.append(("disk_v1_compat", ex.submit(run, st + ["--model", a.q35, "--draft", q35d, "--disk-compat", a.ref_runq])))
     return futs
 
 
@@ -1331,6 +1335,8 @@ def main():
     ap.add_argument("--q35", default="", help="Qwen3.5-0.8B Q8_0 GGUF for the q35 group (empty: skip)")
     ap.add_argument("--v1ref-api-test", default="", help="q35 group: 915894a's api_test with --seqfile-out / --seqfile-load "
                     "(tests/make_seqfile_v1ref.sh) for seqfile/v1_same and seqfile/v2_on_v1_reader (empty: skip)")
+    ap.add_argument("--ref-runq", default="", help="server group: a runq of an older build (e.g. 915894a's) for server/disk_v1_compat: "
+                    "one --kv-disk directory served by it, this build, it again (empty: skip)")
     ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv,api,server,synth,q35,spec",
                     help="comma-separated subset of tests to run (models: the bigger Qwen3 models, long: the "
                          "long-context checks; both opt-in)")

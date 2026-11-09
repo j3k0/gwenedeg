@@ -486,9 +486,10 @@ struct Run {
     // --draft mtp ("the MTP drafter"): a guess's own hidden state h' (2 x dim: the passes' input and output, mcur the
     // input's); this pass's rows in the target's hidden rows (hrow: its first in Engine.H, hp0 its position, hn of them, hk
     // those still in the target after the sampling); the follow passes run so far (mfol) and the rows a failed one left
-    // behind (mgap); the follow pass's end (mend), its current segment's rows that took zeros (map), a failure logged (mlog)
+    // behind (mgap); the follow pass's end (mend), its current segment's rows that took zeros (map), a failure logged (mlog);
+    // the rows that took zeros after the job's end was published (mlate: B of its last step, its Job no longer written)
     float *mh;
-    int mcur, hrow, hp0, hn, hk, mfol, mgap, mend, map, mlog;
+    int mcur, hrow, hp0, hn, hk, mfol, mgap, mend, map, mlog, mlate;
     // --admit bound ("memory admission"): the positions it can ever write (P), its lease's end (E; P while the chunk is
     // unlimited, step 4 renews it), its guesses per pass at most, the lease's KV and state bytes (target + draft)
     int P, E, kk;
@@ -2640,7 +2641,8 @@ static int mtp_pass(Engine *e, int nds, int rows, float **lg, double *t) {
     *t += took;
     if (err == RQ_OK && pred > 0) cost_learn(&e->dcost, &e->dcal, &e->dlr, pred, took);
     if (err == RQ_OK)
-        for (int i = 0; i < nds; i++) e->dsegrun[i]->j->sp_draft_rows += g[i].n;
+        for (int i = 0; i < nds; i++) // (a job that ended in this step: published, the connection thread may read its Job)
+            if (!e->dsegrun[i]->done) e->dsegrun[i]->j->sp_draft_rows += g[i].n;
     else if (e->o.verbose)
         fprintf(stderr, "[engine] the MTP view's pass failed (%d rows): %s (only the speed changes)\n", rows,
                 rq_ctx_error(e->dc)[0] ? rq_ctx_error(e->dc) : rq_strerror(err));
@@ -2785,7 +2787,8 @@ static void mtp_follow(Engine *e, int nseg) {
             RqSeq *v = e->dseg[i].seq;
             if (err == RQ_OK) {
                 rq_mtp_final(v, rq_seq_len(v) - e->dseg[i].n);
-                r->j->sp_mtp_approx += r->map;
+                if (r->done) r->mlate += r->map; // (published: job_finish ran in this step)
+                else r->j->sp_mtp_approx += r->map;
                 e->m_approx += r->map;
                 any |= rq_seq_len(v) < r->mend;
                 continue;
@@ -2838,9 +2841,9 @@ static void mtp_check(Engine *e) {
 
 static void mtp_dump(Engine *e, Run *r) {
     // RUNQ_TEST_MTP_DUMP=DIR (tests only; reap): a job that finished (no error status) with "mtp_approx" 0 in its timings
-    // ("speculative" not off) after a follow pass: its target's and view's sequences as DIR/<job>.rqseq and .draft.rqseq
+    // ("speculative" not off; and none after it was published: mlate) after a follow pass: its target's and view's sequences as DIR/<job>.rqseq and .draft.rqseq
     // (the view's in version 2 with its kept state), for api_test --mtp-seqcheck
-    if (r->si < 0 || r->mfol == 0 || r->j->status || r->j->spec == SPEC_OFF || r->j->sp_mtp_approx != 0) return;
+    if (r->si < 0 || r->mfol == 0 || r->j->status || r->j->spec == SPEC_OFF || r->j->sp_mtp_approx != 0 || r->mlate) return;
     Slot *sl = &e->slot[r->si];
     char p[4096];
     snprintf(p, sizeof(p), "%s/%d.rqseq", e->mtp_dump, r->id);

@@ -1642,6 +1642,56 @@ prior for an MTP view's guesses 0.8 (`RqSpecOpts.prior`; the measured p at k 3: 
 on, 0.88 / 0.85 off; it was 0.7); `-G` keeps 3 (the best MTP fixed setting is `-G 6 --tau 0.5`, +4% over `-G 3`
 thinking on; the 0.8B's `-G 6 --tau 0.4` is +12% over its `-G 3`, and `-G` stays 3 for it too).
 
+### In the server (S9c)
+
+`runq serve --draft mtp` (TODO S9c, in stages; the target: ISTA's IQ3_S-mtp, launch-server's `ista-iq3s`). The design
+(the engine: S9c.3): the engine runs the view as its draft model, one view sequence per slot, in two pass kinds per
+step: A (the guesses, before the target's pass) and B (the follow pass, after the sampling: the view's rows of the
+target's accepted tokens, with the hidden states of the pass that just ran). Every job is followed, so a view at rest
+is as long as the target, with the target's last hidden state kept with it (the CLI's end-of-call state).
+
+**S9c.1 (2026-11-09): the library parts.** The engine batches the view's rows itself, so spec.c's h rule and the
+view's bookkeeping are now public, and the CLI's loop calls the same functions (behaviour-neutral: CMP 792/792 and
+`tests/compare_mtp.py`, 144 of 144 `-D mtp` runs identical to the 915894a build):
+- `rq_mtp_hin` gives the h inputs of the view's next rows (the given H rows, else the kept state, else zeros, counted).
+- `rq_mtp_final` marks the rows run with them final.
+- `rq_mtp_keep` / `rq_mtp_kept` set and read the kept state. Any position >= 0 is taken, also past the view's end at
+  its capacity, and h NULL clears it.
+- `rq_decode_hidden` is `rq_decode` with the hidden state and a view's h input.
+- `rq_spec_prior` gives auto's prior (0.8 for a view, 0.6 for a draft model), and `RQ_MTP_VOCAB_DEFAULT` the 100,000
+  default.
+
+The ISTA-shaped synthetic file `synth-q35-ista-mtp.gguf` (tests/make_synth_q35.py) is the first test file with
+IQ3_S-mtp's types: an i-quant trunk, an IQ2_S embedding, a Q4_K classifier, BF16 alpha / beta, and an all-Q6_K MTP
+block with a Q6_K `eh_proj` (k = 2 dim). Every MTP file before it had a Q8_0 `eh_proj`, so the K-quant activation sums
+over 2 dim and a Q4_K classifier under a vocabulary subset had never been compared with a reference. They are correct:
+- vs `ref_qwen35.py`, the trunk's logits: cos mean 0.99763 / 0.99776 / 0.99462 (en, code, long2), min 0.97821, top-1
+  283/338;
+- the MTP block's: 0.99874 / 0.99889 / 0.99722, min 0.98844, top-1 304/338;
+- every path bitwise (`mtp_paths`, `decode_hidden`, AVX-512 == generic). S9d.2's acceptance numbers stand.
+
+The synthetic files are 768 wide, so the view's row buffers widened to 2 dim (model.c's `xs`) are exercised only at
+full width: ASan on `api_test --mtp synth-q38-wide-cls4.gguf --quick` (make_synth_wide.py) is clean, 14/14.
+
+**The one-row path** (`tests/bench_mtp.c`'s `row` / `dec` lines; 8 threads, best of 9, ms; a loaded box, loadavg
+6.5-8). One row with its logits and hidden state, as a 1-row `rq_forward_batch` vs `rq_decode_hidden`, for the view (with
+h_in: A's guesses) and the target. `B 1`: one view row without logits (B's), `catch 1` (the batch path) vs `dec 1`:
+
+| file, KV q8-dot | L | guess, 100k: row / dec | guess, full: row / dec | B 1: batch / dec | target: row / dec |
+|---|---|---|---|---|---|
+| synth-q35-ista-mtp (dim 768) | 1k | 0.43 / 0.34 | 0.53 / 0.61 | 0.19 / 0.14 | 1.50 / 1.35 |
+| | 16k | 0.92 / 0.81 | 1.14 / 1.13 | 0.55 / 0.54 | 2.44 / 2.31 |
+| Qwen3.5-0.8B-mtp (dim 1024) | 1k | 0.83 / 0.74 | 1.44 / 1.32 | 0.25 / 0.20 | 6.30 / 6.10 |
+| | 16k | 1.54 / 1.33 | 2.21 / 2.11 | 0.66 / 0.64 | 9.62 / 9.66 |
+| synth-q38-wide-cls4 (dim 5120, the 27B's view) | 1k | 4.70 / 4.22 | 6.51 / 6.32 | 2.28 / 2.25 | 10.69 / 10.85 |
+| | 16k | 5.74 / 5.17 | 7.45 / 7.29 | 3.16 / 3.26 | 11.83 / 11.93 |
+| | 49k | 7.52 / 7.54 | 10.62 / 10.49 | 5.35 / 5.43 | 15.35 / 15.33 |
+
+The f16 runs are alike (wide, 1k: 4.90 / 4.51, 7.57 / 7.45, 2.37 / 2.50, 11.99 / 11.72). The decode path is never
+slower beyond the noise (+-3%), and up to ~10% faster for the guesses with the 100k subset. So the engine's "one row:
+the decode path" stays with hidden states: `rq_decode_hidden` for a one-row pass of either model. Both are bitwise
+equal (`decode_hidden/*`).
+
 ## Not now
 
 DFlash 2 (a 2B block-diffusion drafter: a new architecture, a 4 GB BF16 download); multi-VM splits (~10-30% over

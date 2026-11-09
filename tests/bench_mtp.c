@@ -8,6 +8,10 @@
  *              cost model's estimate without a calibration: RqModelMem.read)
  *   catch r    a segment of r = a + 1 MTP rows without logits (the catch-up of a round after a accepted guesses) and
  *              the same with the last row's logits (the round's first guess riding in it), first view of -V, a = 0..-A
+ *   row V / dec V  (TODO S9c.1) one MTP row with its logits and hidden state (runq serve's guesses: h' kept) as a 1-row
+ *              rq_forward_batch, resp. through rq_decode_hidden (the decode path); dec 1: rq_decode_hidden without logits
+ *              (the follow pass's one row; vs catch 1); with the prompt rows also the target's one row with its logits and
+ *              hidden state (trow: a 1-row rq_forward_batch, tdec: rq_decode_hidden): the engine's one-row path choice
  *   prompt     a chunk of -P rows of the target without logits (a prompt chunk), the same with every row's hidden state
  *              (RqSegment.hidden, as the lockstep prefill asks), and the MTP's chunk over it (its rows' h_in, no
  *              logits); then extrapolated to a trunk of -X layers (the target's trunk is repeated: the 27B's 64 = 16 x
@@ -138,7 +142,8 @@ int main(int argc, char **argv) {
     for (int i = 0; i < extra; i++) tok[i] = (1000 + 7919 * i) % 100000;
     for (size_t i = 0; i < (size_t)extra * dim; i++) h[i] = (float)((int)(i * 2654435761u % 2001) - 1000) * 1e-3f;
     // configurations: per view a guess, the catch-up segments (none / the last row's logits), the prompt's three
-    int cfg_catch = nV, ncatch = 2 * (A + 1), cfg_pre = cfg_catch + ncatch, ncfg = cfg_pre + (preps ? 3 : 0);
+    int cfg_catch = nV, ncatch = 2 * (A + 1), cfg_dec = cfg_catch + ncatch, ndec = 2 * nV + 1 + (preps ? 2 : 0), cfg_pre = cfg_dec + ndec;
+    int ncfg = cfg_pre + (preps ? 3 : 0);
     int rmax = reps > preps ? reps : preps;
     double *t = malloc((size_t)ncfg * rmax * sizeof(double));
     for (int ki = 0; ki < nK; ki++) {
@@ -165,7 +170,7 @@ int main(int argc, char **argv) {
             for (int v = 0; v < nV; v++)
                 if ((e = rq_seq_fill_synthetic(vs[v], L, 101 + li)) != RQ_OK) die("rq_seq_fill_synthetic (MTP)", e, NULL);
             tf = rq_now() - tf;
-            int nrep[VMAX + 2 * (AMAX + 1) + 3] = { 0 };
+            int nrep[3 * VMAX + 2 * (AMAX + 1) + 6] = { 0 };
             for (int r = -1; r < rmax; r++) // (rep -1: a warm-up)
                 for (int ci = 0; ci < ncfg; ci++) {
                     int pre = ci >= cfg_pre;
@@ -178,6 +183,19 @@ int main(int argc, char **argv) {
                         if ((e = rq_forward_batch(vc[ci], &sg, 1, NULL, &lg)) != RQ_OK) die("rq_forward_batch (guess)", e, vc[ci]);
                         b = rq_now();
                         back_to(vs[ci], L, 0);
+                    } else if (ci >= cfg_dec && !pre) { // one row with logits and hidden: 1-row batch / decode path
+                        int k = ci - cfg_dec, tgt = k >= 2 * nV + 1, v = k < 2 * nV ? k / 2 : 0, dec = tgt ? k - 2 * nV - 1 : k == 2 * nV || k % 2;
+                        RqCtx *xc = tgt ? c : vc[v];
+                        RqSeq *xs = tgt ? s : vs[v];
+                        float *lg = NULL, *hp = k == 2 * nV ? NULL : hid; // (dec 1: no logits, no hidden)
+                        const float *hi = tgt ? NULL : h;
+                        RqSegment sg = { xs, tok, 1, RQ_LOGITS_LAST, hid, hi };
+                        a = rq_now();
+                        e = dec ? rq_decode_hidden(xc, xs, tok[0], k == 2 * nV ? NULL : &lg, hp, hi) : rq_forward_batch(xc, &sg, 1, NULL, &lg);
+                        b = rq_now();
+                        if (e != RQ_OK) die(dec ? "rq_decode_hidden" : "rq_forward_batch (1 row)", e, xc);
+                        if (tgt) back_to(s, L, hybrid);
+                        else back_to(xs, L, 0);
                     } else if (!pre) { // a catch-up segment of a + 1 rows: no logits, or the last row's
                         int k = ci - cfg_catch, rows = k % (A + 1) + 1, last = k > A;
                         float *lg;
@@ -197,7 +215,7 @@ int main(int argc, char **argv) {
                     }
                     if (r >= 0) t[(size_t)ci * rmax + nrep[ci]++] = b - a;
                 }
-            double md[VMAX + 2 * (AMAX + 1) + 3], bs[VMAX + 2 * (AMAX + 1) + 3];
+            double md[3 * VMAX + 2 * (AMAX + 1) + 6], bs[3 * VMAX + 2 * (AMAX + 1) + 6];
             for (int ci = 0; ci < ncfg; ci++) md[ci] = median(t + (size_t)ci * rmax, nrep[ci], &bs[ci]) * 1e3, bs[ci] *= 1e3;
             for (int v = 0; v < nV; v++) {
                 RqPassCost pc;
@@ -212,6 +230,12 @@ int main(int argc, char **argv) {
                 char nm[32];
                 snprintf(nm, sizeof(nm), "catch %d%s", k % (A + 1) + 1, k > A ? "+lg" : "");
                 printf("  %6d %-14s %10.2f %10.2f\n", L, nm, md[cfg_catch + k], bs[cfg_catch + k]);
+            }
+            for (int k = 0; k < ndec; k++) {
+                char nm[32];
+                if (k < 2 * nV) snprintf(nm, sizeof(nm), "%s %d", k % 2 ? "dec" : "row", Vs[k / 2]);
+                else snprintf(nm, sizeof(nm), "%s", k == 2 * nV ? "dec 1" : k == 2 * nV + 1 ? "trow" : "tdec");
+                printf("  %6d %-14s %10.2f %10.2f\n", L, nm, md[cfg_dec + k], bs[cfg_dec + k]);
             }
             if (preps) {
                 double tn = md[cfg_pre], th = md[cfg_pre + 1], tm = md[cfg_pre + 2], sc = (double)X / I.n_layers;

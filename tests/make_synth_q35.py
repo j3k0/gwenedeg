@@ -49,6 +49,15 @@ synth-q35-r2-bf16.gguf, synth-q35-r2-bf16w.gguf, synth-q35-r2-bf16bad.gguf (~87 
 synth-q35-27b-mtpbad.gguf (TODO S9a): synth-q35-27b-mtp.gguf + an optional MTP tensor of llama.cpp's layout,
   blk.8.nextn.shared_head_head.weight (16 zero Q8_0 rows: only its presence matters), which rq_mtp_load refuses (the
   main model loads as before). Built last, from synth-q35-27b-mtp.gguf, without random numbers.
+synth-q35-ista-mtp.gguf (~220 MB; TODO S9c.1): ISTA-DASLab's Qwen3.8-27B GSQ-RCO IQ3_S-mtp file's types at the small
+  scale (docs/qwen38-speculative.md; the target of runq serve --draft mtp): synth-q35-27b-mtp.gguf's tensors and order
+  with synth-q35-iq.gguf's trunk matrices (Q2_K and the i-quants; ISTA's trunk is an i-quant mix with some Q4_K, which
+  synth-q35-27b covers), an IQ2_S token_embd (synth-q35-27b-mtp's Q4_K one requantized), a Q4_K classifier (the bytes
+  of that Q4_K token_embd: real super-blocks, as if tied), BF16 ssm_alpha / ssm_beta (the Q8_0 rows rounded, as
+  build_bf16), the MTP block blk.8 all Q6_K, nextn.eh_proj [2 dim -> dim] included (the K-quant activation sums over
+  2 dim: every other MTP file has a Q8_0 eh_proj); its matrices that are not Q6_K already are requantized by
+  q6k_quantize (checked against ggufmini's dequantizer at build time); synth-q35-27b-f32.gguf's metadata (Qwen3.8's
+  template and bos). Built last, from the files above, without random numbers.
 synth-tok-qwen3.8.gguf, synth-tok-qwen3.8-hf.gguf (~8 MB): tokenizer-only files (the 0.8B's tokenizer and metadata, a
   token_embd entry of an unknown type without data) with Qwen3.8's template: the 27B GGUF's (Unsloth's) resp. Qwen's
   own (qwen3.8-hf.jinja): `runq -m render` vs tests/golden/chat_render.json (needs the Q8_0 source only).
@@ -162,6 +171,7 @@ M27 = "synth-q35-27b.gguf"
 M27_MTP = "synth-q35-27b-mtp.gguf"
 M27_F32 = "synth-q35-27b-f32.gguf"
 M27_IQ = "synth-q35-iq.gguf"
+M27_ISTA = "synth-q35-ista-mtp.gguf"
 # synth-q35-iq.gguf: the type of role r (index in IQ_ROLES) of layer l: IQ_ROT[(3 r + l) % 9]
 IQ_ROT = [G.IQ2_XXS, G.IQ1_S, G.IQ3_S, G.IQ2_XS, G.IQ1_M, G.Q2_K, G.IQ3_XXS, G.IQ2_S, G.IQ4_XS]
 IQ_ROLES = ["attn_q", "attn_k", "attn_v", "attn_output", "attn_qkv", "attn_gate", "ssm_out", "ffn_gate", "ffn_up", "ffn_down"]
@@ -361,6 +371,79 @@ def build_mtpbad(src, path):
     G.write_gguf(path, kvs, t)
 
 
+def q6k_quantize(x):
+    """float32 rows (cols % 256 == 0) -> Q6_K blocks (ggml's block_q6_K: ql[128], qh[64], scales[16] int8, d fp16) and the
+    values they dequantize to: per super-block of 16 sub-blocks of 16, s_j = max|x| / 31, d = fp16(max_j s_j / 127), sc_j
+    = rint(s_j / d) (0..127), q = rint(x / (d sc_j)) in -32..31 (round half to even), stored q + 32 (the inverse of
+    dequantize_row_q6_K's packing). Deterministic: float32 throughout"""
+    x = np.asarray(x, np.float32)
+    nr, nc = x.shape
+    assert nc % 256 == 0
+    nb = nr * nc // 256
+    xb = x.reshape(nb, 16, 16)
+    s = (np.abs(xb).max(2) / np.float32(31)).astype(np.float32)
+    d16 = (s.max(1) / np.float32(127)).astype(np.float16)
+    df = d16.astype(np.float32)
+    sc = np.where(df[:, None] > 0, np.clip(np.rint(s / np.where(df > 0, df, 1)[:, None]), 0, 127), 0).astype(np.int8)
+    step = (df[:, None] * sc.astype(np.float32)).astype(np.float32)
+    q = np.where(step[:, :, None] > 0, np.clip(np.rint(xb / np.where(step > 0, step, 1)[:, :, None]), -32, 31), 0)
+    q = q.astype(np.int64).reshape(nb, 256)
+    u = (q + 32).astype(np.uint8)
+    out = np.zeros((nb, 210), np.uint8)
+    l = np.arange(32)
+    for n in range(2):  # (value 128 n + 32 p + l)
+        h = u[:, 128 * n:128 * n + 128]
+        out[:, 64 * n + l] = (h[:, l] & 15) | ((h[:, l + 64] & 15) << 4)
+        out[:, 64 * n + l + 32] = (h[:, l + 32] & 15) | ((h[:, l + 96] & 15) << 4)
+        out[:, 128 + 32 * n + l] = (h[:, l] >> 4) | ((h[:, l + 32] >> 4) << 2) | ((h[:, l + 64] >> 4) << 4) | ((h[:, l + 96] >> 4) << 6)
+    out[:, 192:208] = sc.view(np.uint8)
+    out[:, 208:210] = d16.view(np.uint8).reshape(nb, 2)
+    want = (step[:, :, None] * q.reshape(nb, 16, 16).astype(np.float32)).astype(np.float32).reshape(nr, nc)
+    return out.reshape(nr, nc // 256 * 210), want
+
+
+def build_ista(f27f32, fiq, fmtp, path):
+    """synth-q35-ista-mtp.gguf (module doc) from synth-q35-27b-f32.gguf (metadata), synth-q35-iq.gguf (the trunk's
+    matrices) and synth-q35-27b-mtp.gguf (the rest; tensor order and shapes); written as path.part, renamed when done"""
+    fm, fi = G.GgufFile(fmtp), G.GgufFile(fiq)
+    title = ("gwenedeg-synth-q35-ista-mtp (ISTA IQ3_S-mtp's types: i-quant trunk, IQ2_S embedding, Q4_K classifier, BF16 "
+             "alpha / beta, Q6_K MTP block)")
+    kvs = [(k, G.raw_kv(G.GV_STR, title) if k == "general.name" else raw) for k, raw in G.GgufFile(f27f32).kv_raw]
+    t = []
+    for name in fm.order:
+        ne, ty, _ = fm.tensors[name]
+        data = fm.tensor_bytes(name)
+        parts = name.split(".")
+        nr, nc = (int(ne[1]), int(ne[0])) if len(ne) > 1 else (1, int(ne[0]))
+        if name == "token_embd.weight":  # IQ2_S (iqquant works per 256-value block: the chunking does not change the bytes)
+            data = np.concatenate([iqquant.quantize(G.IQ2_S, G.dequant(ty, data[r:r + 16384], len(data[r:r + 16384]), nc))
+                                   for r in range(0, nr, 16384)])
+            ty = G.IQ2_S
+        elif name == "output.weight":  # Q4_K: the Q4_K token_embd's bytes (the same shape)
+            assert fm.tensors["token_embd.weight"][0] == ne and fm.tensors["token_embd.weight"][1] == G.Q4_K
+            data, ty = fm.tensor_bytes("token_embd.weight"), G.Q4_K
+        elif len(parts) == 4 and parts[0] == "blk" and int(parts[1]) < L27 and parts[2] in IQ_ROLES:
+            assert fi.tensors[name][0] == ne, name
+            data, ty = fi.tensor_bytes(name), fi.tensors[name][1]
+        elif len(parts) == 4 and parts[2] in ("ssm_alpha", "ssm_beta"):
+            data, ty = bf16_bits(G.dequant(ty, data, nr, nc)), G.BF16
+        elif parts[:2] == ["blk", str(L27)] and ty != G.F32 and ty != G.Q6_K:  # the MTP block's matrices: Q6_K
+            x = G.dequant(ty, data, nr, nc)
+            data, want = q6k_quantize(x)
+            got = G.dequant(G.Q6_K, data, nr, nc)
+            rel = float(np.linalg.norm(got - x) / np.linalg.norm(x))
+            assert np.array_equal(got.view(np.uint32), want.view(np.uint32)), f"{name}: q6k_quantize's packing != ggufmini's Q6_K"
+            assert rel < 0.03, f"{name}: Q6_K relative RMS error {rel:.4f}"
+            ty = G.Q6_K
+        t.append((name, ne, ty, np.ascontiguousarray(data).tobytes()))
+    try:
+        G.write_gguf(path + ".part", kvs, t)
+        os.replace(path + ".part", path)
+    finally:
+        if os.path.exists(path + ".part"):
+            os.remove(path + ".part")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--src", default=SRC)
@@ -386,7 +469,7 @@ def main():
     if q4:
         st = os.stat(q4)
         stamp.update(src_q4=os.path.abspath(q4), size_q4=st.st_size, mtime_q4=int(st.st_mtime))
-    names = list(MODELS) + BAD + list(TOK38) + ([M27, M27_MTP, M27_F32, M27_IQ, M27_MTPBAD] if q4 else []) + list(R2_BF16)
+    names = list(MODELS) + BAD + list(TOK38) + ([M27, M27_MTP, M27_F32, M27_IQ, M27_MTPBAD, M27_ISTA] if q4 else []) + list(R2_BF16)
     sp = os.path.join(a.out, "stamp.json")
     if not a.force and os.path.exists(sp) and all(os.path.exists(os.path.join(a.out, n)) for n in names):
         with open(sp) as fh:
@@ -405,7 +488,7 @@ def main():
     build_bad(f, os.path.join(a.out, BAD[2]), {"qwen35.nextn_predict_layers": (G.GV_U32, int(f.kv["qwen35.block_count"]))})
     for n, t in TOK38.items():
         build_tok(f, os.path.join(a.out, n), template(t), BOS38 if t == "qwen3.8" else None)
-    for n in (M27, M27_MTP, M27_F32, M27_IQ, M27_MTPBAD):
+    for n in (M27, M27_MTP, M27_F32, M27_IQ, M27_MTPBAD, M27_ISTA):
         if os.path.exists(os.path.join(a.out, n)):
             os.remove(os.path.join(a.out, n))
     if q4:
@@ -418,6 +501,7 @@ def main():
         build_bf16(os.path.join(a.out, "synth-q35-r2.gguf"), os.path.join(a.out, n), mode)
     if q4:  # (last)
         build_mtpbad(os.path.join(a.out, M27_MTP), os.path.join(a.out, M27_MTPBAD))
+        build_ista(*(os.path.join(a.out, n) for n in (M27_F32, M27_IQ, M27_MTP, M27_ISTA)))
     with open(sp, "w") as fh:
         json.dump(stamp, fh)
     print(a.out)

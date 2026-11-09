@@ -2823,6 +2823,20 @@ int rq_decode(RqCtx *c, RqSeq *s, int token, float **logits) {
     return e;
 }
 
+int rq_decode_hidden(RqCtx *c, RqSeq *s, int token, float **logits, float *hidden, const float *h_in) {
+    // rq_decode + the hidden state / an MTP view's h input (decode_step takes both: fw_rows' decode path)
+    c->err[0] = 0;
+    if (logits) *logits = NULL;
+    int e = ctx_check_seq(c, s);
+    if (e != RQ_OK) return e;
+    if (h_in && !c->m->mtp_of) return ctx_fail(c, RQ_ERR_ARG, "h_in on a model that is not an MTP view");
+    if (token < 0 || token >= c->m->config.vocab_size) return ctx_fail(c, RQ_ERR_ARG, "token %d out of range", token);
+    if (s->len >= s->cap) return ctx_fail(c, RQ_ERR_CONTEXT, "sequence full (%d positions)", s->cap);
+    e = decode_step(c, s, token, logits ? c->logits : NULL, hidden, h_in);
+    if (logits && e == RQ_OK) *logits = c->logits;
+    return e;
+}
+
 // ---------------------------------------------------------------------------------- batched passes
 
 static inline QuantizedTensor qrow(QuantizedTensor *t, int b, int ld) {

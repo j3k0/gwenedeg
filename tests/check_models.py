@@ -16,7 +16,9 @@ q35     (default suite, if models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf is th
         types at a small scale, 330 MB): logits vs tests/ref_qwen35.py, bitwise invariants, api_test; the 0.8B file and
         the r = 3 model in one process (api_test --two: interleaved == each alone); files that must be refused (bad
         metadata); the 27B-shaped model with its MTP block (logits == without it, bitwise), with F32 alpha / beta and
-        Qwen3.8's template (the checks above, a CLI chat, runq serve's prompts), Qwen3.8's renderings (tokenizer-only
+        Qwen3.8's template (the checks above, a CLI chat, runq serve's prompts), with ISTA's IQ3_S-mtp types (i-quant
+        trunk, IQ2_S embedding, Q4_K classifier, BF16 alpha / beta, a Q6_K MTP block: the checks above and the MTP
+        view's vs the reference and on every path), Qwen3.8's renderings (tokenizer-only
         files with its two templates vs tests/golden/chat_render.json, incl. requests with tools); runq serve's tool
         calls on the 0.8B (tests/server_test.py --tools)
 models  (opt-in: tests/run_tests.sh --models, make test-models) every downloaded family model
@@ -723,14 +725,19 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
 # synth-q35-r2-bf16.gguf: synth-q35-r2 with BF16 alpha / beta (TODO S9.1: widened to F32 at load, fp32 activations
 # there): measured cos mean 0.99964 / 0.99980 / 0.99963, min 0.99690, top-1 325/338 (synth-q35-r2's Q8_0 ones 0.99967 /
 # 0.99981 / 0.99962, 0.99711, 321/338); bitwise as synth-q35-r2, and its logits == its F32 twin's (q35_bf16_run)
+# synth-q35-ista-mtp.gguf (TODO S9c.1): ISTA's IQ3_S-mtp 27B file's types (synth-q35-iq's trunk, an IQ2_S embedding, a Q4_K
+# classifier, BF16 alpha / beta, the MTP block all Q6_K with a Q6_K eh_proj): measured cos mean 0.99763 / 0.99776 / 0.99462,
+# min 0.97821, top-1 283/338 (the IQ2_S embedding and the Q4_K classifier on synth-q35-iq's error); bounds ~2x the error
 Q35_SYNTH = {"synth-q35-r2.gguf": True, "synth-q35-r3.gguf": False, "synth-q35-27b.gguf": True,
              "synth-q35-27b-f32.gguf": True, "synth-q35-iq.gguf": True,
-             "synth-q35-r2-bf16.gguf": False}  # file: full api_test (else digests)
+             "synth-q35-r2-bf16.gguf": False, "synth-q35-ista-mtp.gguf": False}  # file: full api_test (else digests)
 Q35_SYNTH_REF = ["en", "code", "long2"]
 TH_Q35_SYNTH = dict(cos_mean=0.999, cos_pos=0.99, top1=0.8)
 TH_Q35_SYNTH_KQ = {"synth-q35-27b": dict(cos_mean=0.993, cos_pos=0.95, top1=0.7),
                    "synth-q35-27b-f32": dict(cos_mean=0.993, cos_pos=0.95, top1=0.7),
-                   "synth-q35-iq": dict(cos_mean=0.993, cos_pos=0.95, top1=0.7)}  # (per model, else TH_Q35_SYNTH)
+                   "synth-q35-iq": dict(cos_mean=0.993, cos_pos=0.95, top1=0.7),
+                   "synth-q35-ista-mtp": dict(cos_mean=0.989, cos_pos=0.956, top1=0.67)}  # (per model, else TH_Q35_SYNTH)
+TH_Q35_ISTA = TH_Q35_SYNTH_KQ["synth-q35-ista-mtp"]
 Q35_SYNTH_SAME = [(("en", 1), ("en", 7)), (("en", 1), ("en", 64)), (("all", 1), ("all", 64)), (("long2", 1), ("long2", 64)),
                   (("long2", 64), ("long2", 512)), (("long2", 64), ("long2", 64, 3)),
                   (("en", 1), ("en", 1, "gen")), (("en", 7), ("en", 7, "gen")), (("long2", 64), ("long2", 64, "gen"))]
@@ -857,7 +864,10 @@ def q35_bf16_run(a, d, tmp, texts):
 # of tests/README.md (concat swapped, h before output_norm, no hnorm, h unshifted) fail them. The real 0.8B-mtp
 # (models group tag 3.5-0.8b-mtp): cos mean 0.99975 / 0.99970 / 0.99969, min 0.99857, top-1 324/338; top-1 vs the next
 # token 0.529 on all (45/85), 0.828 on long2 (246/297: it repeats all), bounds ~0.75x
+# synth-q35-ista-mtp (TODO S9c.1: a Q6_K eh_proj, k = 2 dim, and the Q4_K classifier): measured cos mean 0.99874 / 0.99889 /
+# 0.99722, min 0.98844, top-1 304/338 (TH_MTP_ISTA ~2x the error)
 TH_MTP_SYNTH = dict(cos_mean=0.996, cos_pos=0.975, top1=0.8)
+TH_MTP_ISTA = dict(cos_mean=0.994, cos_pos=0.976, top1=0.8)
 TH_MTP_08B = dict(cos_mean=0.9994, cos_pos=0.997, top1=0.85)
 MTP_TOP1 = {"all": 0.40, "long2": 0.62}
 MTP_TH = {"3.5-0.8b-mtp": (TH_MTP_08B, MTP_TOP1)}  # (MTP_ONLY's: thresholds, top-1 minimums)
@@ -923,21 +933,24 @@ def mtp_ref_run(a, model, tmp, texts, pre, th, top1=None, threads=SYNTH_THREADS)
     return out
 
 
-def q35_mtp_api_run(a, d):
-    """api_test --mtp on synth-q35-27b-mtp.gguf (hidden_rows, mtp_paths, mtp_load: the hidden rows and the MTP view on
-    every path; refusals: synth-q35-27b.gguf (no block), synth-q35-27b-mtpbad.gguf (an optional nextn tensor)); its
-    digest at 3 threads (--quick) and of the generic build (--quick, which passes too) == its: [(ok, name, detail)]"""
+def q35_mtp_api_run(a, d, fn="synth-q35-27b-mtp.gguf", pre="q35/synth"):
+    """api_test --mtp on fn (synth-q35-27b-mtp.gguf; synth-q35-ista-mtp.gguf as q35/synth-q35-ista-mtp/*: hidden_rows,
+    mtp_paths, decode_hidden, mtp_follow, mtp_load: the hidden rows and the MTP view on every path, rq_decode_hidden, the
+    follower API; refusals: synth-q35-27b.gguf (no block), synth-q35-27b-mtpbad.gguf (an optional nextn tensor), with
+    synth-q35-27b-mtp.gguf); its digest at 3 threads (--quick) and of the generic build (--quick, which passes too) ==
+    its: [(ok, name, detail)]"""
     import re
-    mtp, base, bad = (os.path.join(d, f"synth-q35-27b{x}.gguf") for x in ("-mtp", "", "-mtpbad"))
+    mtp = os.path.join(d, fn)
+    base, bad = (os.path.join(d, f"synth-q35-27b{x}.gguf") for x in ("", "-mtpbad"))
     if not (a.api_test and os.path.exists(mtp)):
         return []
     dig = lambda p: (re.findall(r"^mtp digest: ([0-9a-f]+)$", p.stdout.decode(errors="replace"), re.M) or [None])[0]  # noqa: E731
     lines = lambda p: [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]  # noqa: E731
-    p = run([a.api_test, "--mtp", mtp] + [x for f, o in ((base, "--plain"), (bad, "--optional")) if os.path.exists(f) for x in (o, f)],
-            SYNTH_THREADS)
-    out = [(l.startswith("PASS "), f"q35/synth/{l[5:].partition('  ')[0].strip()}", l[5:].partition("  ")[2].strip()) for l in lines(p)]
+    refuse = [(base, "--plain"), (bad, "--optional")] if fn == "synth-q35-27b-mtp.gguf" else []
+    p = run([a.api_test, "--mtp", mtp] + [x for f, o in refuse if os.path.exists(f) for x in (o, f)], SYNTH_THREADS)
+    out = [(l.startswith("PASS "), f"{pre}/{l[5:].partition('  ')[0].strip()}", l[5:].partition("  ")[2].strip()) for l in lines(p)]
     if p.returncode not in (0, 1) or not out or dig(p) is None:
-        out.append((False, "q35/synth/mtp_api", f"exit status {p.returncode}: {(p.stdout + p.stderr).decode(errors='replace')[-300:]}"))
+        out.append((False, f"{pre}/mtp_api", f"exit status {p.returncode}: {(p.stdout + p.stderr).decode(errors='replace')[-300:]}"))
     for exe, th, name in ((a.api_test, 3, "threads"), (a.api_test + "-generic", SYNTH_GEN_THREADS, "generic")):
         if not os.path.exists(exe):
             continue
@@ -945,7 +958,7 @@ def q35_mtp_api_run(a, d):
         ls = lines(q)
         bad_ = [l[5:].split("  ")[0] for l in ls if l.startswith("FAIL ")]
         ok = q.returncode == 0 and ls and not bad_ and dig(q) is not None and dig(q) == dig(p)
-        out.append((ok, f"q35/synth/mtp_digest_{name}", f"{'the generic build' if name == 'generic' else 'the AVX-512 build'}, {th} "
+        out.append((ok, f"{pre}/mtp_digest_{name}", f"{'the generic build' if name == 'generic' else 'the AVX-512 build'}, {th} "
                     f"threads, --quick: digest {dig(q)} == {dig(p)} ({SYNTH_THREADS} threads), {len(ls) - len(bad_)}/{len(ls)} passed"
                     + (f"; failed: {', '.join(bad_)}" if bad_ else "")))
     return out
@@ -1240,9 +1253,11 @@ def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
     synth = [ex.submit(q35_synth_run, a, os.path.join(t, "synth"), os.path.join(sd, fn), texts, full)
              for fn, full in Q35_SYNTH.items() if os.path.exists(os.path.join(sd, fn))] + [ex.submit(q35_bad_run, a, sd)] + \
         [ex.submit(q35_mtp_run, a, sd, os.path.join(t, "synth"), texts), ex.submit(q35_server38, a, sd),
-         ex.submit(q35_bf16_run, a, sd, os.path.join(t, "synth"), texts), ex.submit(q35_mtp_api_run, a, sd)] + \
-        [ex.submit(mtp_ref_run, a, os.path.join(sd, fn), os.path.join(t, "synth"), texts, f"q35/{fn[:-5]}", TH_MTP_SYNTH)
-         for fn in ("synth-q35-27b-mtp.gguf", "synth-q35-27b-f32.gguf") if a.api_test and os.path.exists(os.path.join(sd, fn))] + \
+         ex.submit(q35_bf16_run, a, sd, os.path.join(t, "synth"), texts), ex.submit(q35_mtp_api_run, a, sd),
+         ex.submit(q35_mtp_api_run, a, sd, "synth-q35-ista-mtp.gguf", "q35/synth-q35-ista-mtp")] + \
+        [ex.submit(mtp_ref_run, a, os.path.join(sd, fn), os.path.join(t, "synth"), texts, f"q35/{fn[:-5]}", th)
+         for fn, th in (("synth-q35-27b-mtp.gguf", TH_MTP_SYNTH), ("synth-q35-27b-f32.gguf", TH_MTP_SYNTH),
+                        ("synth-q35-ista-mtp.gguf", TH_MTP_ISTA)) if a.api_test and os.path.exists(os.path.join(sd, fn))] + \
         [ex.submit(render_run, a.runq, os.path.join(sd, fn), "qwen3.8", f"q35/synth/render_{fn[10:-5]}")
          for fn in ("synth-tok-qwen3.8.gguf", "synth-tok-qwen3.8-hf.gguf")] + \
         ([ex.submit(q35_two_run, a, sd)] if a.api_test else []) if sd else []

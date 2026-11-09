@@ -286,20 +286,48 @@ static int mtp_init(Mtp *x, RqCtx *dc, RqSeq *ms, int hrows, int rrows, RqSpecSt
     return RQ_OK;
 }
 
-static int mtp_h(const Mtp *x, int q, float *h) {
-    // row q's h input (h_{q-1}) into h: 1 if it is the target's (or q is 0), 0 for zeros in place of an unknown one
-    size_t D = (size_t)x->dim * sizeof(float);
-    if (q > 0 && q - 1 >= x->h0 && q - 1 < x->h0 + x->hn) {
-        memcpy(h, x->H + (size_t)(q - 1 - x->h0) * x->dim, D);
-        return 1;
+// the h rule and the view's bookkeeping, public for a caller that batches the view's rows itself (runq serve: runq.h)
+int rq_mtp_hin(const RqSeq *view, const float *H, int h0, int hn, int n, float *hin) {
+    // rows q = len .. len + n - 1: h_{q-1} from H, else the kept one (hprev at hpos), else zeros (row 0: exact)
+    if (!view || !view->m->mtp_of || n < 0) return RQ_ERR_ARG;
+    int dim = view->m->config.dim, approx = 0;
+    size_t D = (size_t)dim * sizeof(float);
+    if (!H) hn = 0;
+    for (int i = 0; i < n; i++) {
+        int q = view->len + i;
+        float *h = hin + (size_t)i * dim;
+        if (q > 0 && q - 1 >= h0 && q - 1 < h0 + hn) memcpy(h, H + (size_t)(q - 1 - h0) * dim, D);
+        else if (q > 0 && q - 1 == view->hpos) memcpy(h, view->hprev, D);
+        else {
+            memset(h, 0, D);
+            approx += q > 0;
+        }
     }
-    if (q > 0 && q - 1 == x->s->hpos) {
-        memcpy(h, x->s->hprev, D);
-        return 1;
-    }
-    memset(h, 0, D);
-    return q == 0;
+    return approx;
 }
+
+void rq_mtp_final(RqSeq *view, int len0) {
+    if (view && view->m->mtp_of && view->hvalid == len0) view->hvalid = view->len;
+}
+
+int rq_mtp_keep(RqSeq *view, int pos, const float *h) {
+    if (!view || !view->m->mtp_of || (h && pos < 0)) return RQ_ERR_ARG;
+    if (!h) {
+        view->hpos = -1;
+        return RQ_OK;
+    }
+    if (view->hprev != h) memcpy(view->hprev, h, (size_t)view->m->config.dim * sizeof(float));
+    view->hpos = pos;
+    return RQ_OK;
+}
+
+int rq_mtp_kept(const RqSeq *view, float *h) {
+    if (!view || !view->m->mtp_of || view->hpos < 0) return -1;
+    if (h) memcpy(h, view->hprev, (size_t)view->m->config.dim * sizeof(float));
+    return view->hpos;
+}
+
+double rq_spec_prior(const RqModel *draft) { return draft && draft->mtp_of ? 0.8 : 0.6; }
 
 static int mtp_catchup(Mtp *x, const int *toks, int n, int t, float **lg) {
     // the view's rows from its length to n - 1 (tokens toks[..]), then t at n if t >= 0, up to its capacity, in passes
@@ -312,13 +340,11 @@ static int mtp_catchup(Mtp *x, const int *toks, int n, int t, float **lg) {
     int want = lg && t >= 0 && end == n + 1;
     for (int q = rq_seq_len(ms); q < end;) {
         int r = end - q < x->rcap ? end - q : x->rcap, last = want && q + r == end;
-        for (int i = 0; i < r; i++) {
-            x->tok[i] = q + i < n ? toks[q + i] : t;
-            if (!mtp_h(x, q + i, x->hin + (size_t)i * x->dim)) x->st->mtp_approx++;
-        }
+        for (int i = 0; i < r; i++) x->tok[i] = q + i < n ? toks[q + i] : t;
+        x->st->mtp_approx += rq_mtp_hin(ms, x->H, x->h0, x->hn, r, x->hin);
         e = fw_rows(x->c, ms, x->tok, r, last ? RQ_LOGITS_LAST : RQ_LOGITS_NONE, NULL, last ? lg : NULL, last ? x->hout : NULL, x->hin);
         if (e != RQ_OK) break;
-        if (ms->hvalid == q) ms->hvalid = q + r;
+        rq_mtp_final(ms, q);
         if (last) memcpy(x->g[0], x->hout + (size_t)(r - 1) * x->dim, (size_t)x->dim * sizeof(float));
         x->st->draft_steps++;
         x->st->mtp_rows += r;
@@ -330,12 +356,8 @@ static int mtp_catchup(Mtp *x, const int *toks, int n, int t, float **lg) {
 static void mtp_hkeep(Mtp *x, int pos) {
     // the target's hidden state at pos kept with the view's sequence (hprev; the next call's), if the last pass has it
     RqSeq *ms = x->s;
-    if (pos >= x->h0 && pos < x->h0 + x->hn) {
-        memcpy(ms->hprev, x->H + (size_t)(pos - x->h0) * x->dim, (size_t)x->dim * sizeof(float));
-        ms->hpos = pos;
-    } else if (ms->hpos != pos) {
-        ms->hpos = -1;
-    }
+    if (pos >= x->h0 && pos < x->h0 + x->hn) rq_mtp_keep(ms, pos, x->H + (size_t)(pos - x->h0) * x->dim);
+    else if (ms->hpos != pos) rq_mtp_keep(ms, 0, NULL);
 }
 
 static int mtp_prefix(const RqSeq *ms, const RqSeq *s, const int *tokens, int n) {
@@ -404,7 +426,7 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
     int kmax = k > kl ? k : kl, guess[RQ_SPEC_K_MAX + 1], nck0 = s->nck, aut = o && o->cost, mlen = 0, mtp = k > 0 && ds->m->mtp_of;
     double acm[2] = { 0, 0 }, acl[RQ_LOOKUP_LMAX + 1][2]; // (auto: the model's guesses, the lookup's per match length)
     // (auto: the draft's prior acceptance per guess; an MTP view's from Qwen3.8-27B's: ~0.76-0.88 at k 3, TODO S9d)
-    double prior = o && o->prior > 0 ? o->prior : mtp ? 0.8 : 0.6;
+    double prior = o && o->prior > 0 ? o->prior : rq_spec_prior(k > 0 ? ds->m : NULL);
     memset(acl, 0, sizeof(acl));
     if (kmax > 0) {
         if (!(out = malloc((size_t)(kmax + 1) * V * sizeof(float)))) return RQ_ERR_NOMEM;
@@ -549,7 +571,7 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
         if (e != RQ_OK || r < 0) { // (an error: its final rows that follow the target)
             int L = ds->hvalid < rq_seq_len(s) ? ds->hvalid : rq_seq_len(s);
             if (L < rq_seq_len(ds)) rq_seq_truncate(ds, L);
-            ds->hpos = -1;
+            rq_mtp_keep(ds, 0, NULL);
         }
         mtp_free(&mx);
     }

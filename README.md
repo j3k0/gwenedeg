@@ -369,8 +369,11 @@ token at a time, for loops that feed the tokens themselves), `rq_generate_spec` 
 speculative decoding, the output exactly `rq_generate`'s; `rq_spec_run` is its loop alone, `rq_prefill_spec` the prompt
 with the draft following; `rq_mtp_load` makes a qwen35 file's MTP block a model of its own, a view sharing the target's
 weights and tokenizer, fed the target's final hidden states from `RqSegment.hidden` through its `RqSegment.h_in`: as the
-draft of `rq_generate_spec` it follows the target in lockstep, TODO S9; `RqSpecOpts.guess_hook` replaces the guesses in
-tests), `rq_tokenize`, `rq_detok_push`
+draft of `rq_generate_spec` it follows the target in lockstep, TODO S9; a caller that batches the view's rows itself
+(runq serve, TODO S9c) uses `rq_decode_hidden` (`rq_decode` with the hidden state and a view's h input) and
+`rq_mtp_hin` / `rq_mtp_final` / `rq_mtp_keep` / `rq_mtp_kept` (the view's h inputs from the target's hidden rows or the
+state kept with it, its final rows, the kept state: the loop's own rule); `rq_spec_prior` is auto's prior per draft;
+`RqSpecOpts.guess_hook` replaces the guesses in tests), `rq_tokenize`, `rq_detok_push`
 (incremental, UTF-8 safe) and `rq_chat_render`. Errors come back as `RQ_ERR_*` codes and messages; the
 library never prints or exits. `RqModelOpts.mem` / `.page_cache` set the load's memory check and page-cache policy
 (Memory, above); `rq_model_mem` and `rq_seq_mem` return the estimates (the server sizes its slot pool with the latter;

@@ -104,6 +104,24 @@ typedef struct {
     double mem;  // as RqModelOpts.mem: the view's estimate must fit in this many GiB; 0 = MemAvailable, < 0 = no check
 } RqMtpOpts;
 RqModel *rq_mtp_load(const RqModel *target, const RqMtpOpts *o, char *err, size_t errlen);
+// RqMtpOpts.vocab for a larger vocabulary (runq -D mtp / runq serve --draft mtp without --mtp-vocab; Qwen3.8-27B: the
+// acceptance of 151,643 and within 1% of all at -G 6 --tau 0.5, the most tok/s; TODO S9d)
+#define RQ_MTP_VOCAB_DEFAULT 100000
+// An MTP view's sequence followed by a caller that batches its rows itself (runq serve; rq_spec_run does this inside).
+// The h inputs of the view's next n rows (positions rq_seq_len(view) ..): row q takes the target's final hidden state at
+// q - 1 from H (hn rows for positions h0 ..; H NULL or hn 0: none), else the one kept with the sequence (rq_mtp_keep),
+// else zeros (row 0: zeros, exact). Returns how many took zeros for an unknown state (RqSpecStats.mtp_approx's);
+// RQ_ERR_ARG: not a view
+struct RqSeq; // (the sequence API: below)
+int rq_mtp_hin(const struct RqSeq *view, const float *H, int h0, int hn, int n, float *hin);
+// the rows appended since length len0 (with rq_mtp_hin's inputs, or a guess's own h') are final (rq_seq_common_prefix
+// keeps them): hvalid len0 -> the length, if hvalid == len0; else nothing
+void rq_mtp_final(struct RqSeq *view, int len0);
+// the target's final hidden state at pos (>= 0; may be past the view's end at its capacity) kept with the view's
+// sequence: the h of row pos + 1. h NULL: none kept (pos ignored). RQ_ERR_ARG: not a view, pos < 0 with h
+int rq_mtp_keep(struct RqSeq *view, int pos, const float *h);
+// the kept state's position (-1: none, or not a view's sequence) and, if h != NULL and it has one, the state (dim floats)
+int rq_mtp_kept(const struct RqSeq *view, float *h);
 
 typedef struct {
     int dim, hidden_dim, n_layers, n_heads, n_kv_heads, head_dim, vocab_size;
@@ -291,6 +309,10 @@ enum { RQ_LOGITS_NONE = 0, RQ_LOGITS_LAST = 1, RQ_LOGITS_ALL = 2 };
 // 256 positions). logits != NULL: the next-token logits, *logits = the context's buffer (vocab_size
 // floats, valid until the next call); NULL: the KV cache only
 int rq_decode(RqCtx *c, RqSeq *s, int token, float **logits);
+// rq_decode with the row's final hidden state (hidden != NULL: dim floats, as RqSegment.hidden) and, on an MTP view's
+// sequence, its h input (h_in: dim floats, as RqSegment.h_in; NULL: zeros; RQ_ERR_ARG on other models). The same
+// results, bit for bit, as a one-row rq_forward_batch with them
+int rq_decode_hidden(RqCtx *c, RqSeq *s, int token, float **logits, float *hidden, const float *h_in);
 
 // n >= 1 tokens at the sequence's next positions, in chunks of max_batch rows (max_batch <= 1: token
 // by token through rq_decode). mode RQ_LOGITS_LAST: *logits = the last row's logits (the context's
@@ -576,6 +598,9 @@ typedef struct {
 // the reason in err (RQ_ERR_STATE: a model without its tokenizer). rq_generate_spec / rq_spec_run check it too
 // (RQ_ERR_ARG, before any pass)
 int rq_spec_check(const RqModel *target, const RqModel *draft, char *err, size_t errlen);
+// auto's prior acceptance per guess of a draft (RqSpecOpts.prior 0): 0.8 for an MTP view (Qwen3.8-27B's block: 0.76-0.88
+// at k 3, TODO S9d), else 0.6 (draft NULL too)
+double rq_spec_prior(const RqModel *draft);
 // rq_generate on (c, s) with the draft (dc, ds): prefills tokens on s (and brings ds up to s's tokens), then
 // rq_spec_run. o NULL or o->k 0: rq_generate itself (dc, ds unused, may be NULL). st (may be NULL) is filled
 int rq_generate_spec(RqCtx *c, RqSeq *s, RqCtx *dc, RqSeq *ds, const int *tokens, int n, const RqSampling *cfg,

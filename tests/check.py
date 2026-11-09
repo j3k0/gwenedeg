@@ -1329,6 +1329,8 @@ def main():
     ap.add_argument("--q4", default="", help="GGUF Q4_K_M file for the q4 tests and greedy goldens (empty: skip)")
     ap.add_argument("--api-test", default="", help="tests/api_test binary for the api group (empty: skip)")
     ap.add_argument("--q35", default="", help="Qwen3.5-0.8B Q8_0 GGUF for the q35 group (empty: skip)")
+    ap.add_argument("--v1ref-api-test", default="", help="q35 group: 915894a's api_test with --seqfile-out / --seqfile-load "
+                    "(tests/make_seqfile_v1ref.sh) for seqfile/v1_same and seqfile/v2_on_v1_reader (empty: skip)")
     ap.add_argument("--only", default="tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv,api,server,synth,q35,spec",
                     help="comma-separated subset of tests to run (models: the bigger Qwen3 models, long: the "
                          "long-context checks; both opt-in)")

@@ -354,7 +354,8 @@ has three kinds of objects:
   and chat templates. It is read-only after loading and shared by any number of sequences.
 - **RqSeq** (`rq_seq_new`): one sequence with its own KV cache (capacity and type per sequence), tokens
   and sampling RNG. `rq_seq_truncate`, `rq_seq_common_prefix` and `rq_seq_copy` handle prefix reuse;
-  `rq_seq_save` / `rq_seq_load` write a sequence to a file and read it back (whole or a prefix; the same bits),
+  `rq_seq_save` / `rq_seq_load` write a sequence to a file and read it back (whole or a prefix; the same bits;
+  an MTP view's kept hidden state too when it is at its last row and the file is loaded whole, TODO S9c.2),
   `rq_seq_file_info` reads a saved one's tokens.
 - **RqCtx** (`rq_ctx_new`): a compute context (activation buffers for up to `max_batch` rows, logits).
   The threads are one process-wide pool (`rq_threads_init`) running one pass at a time: the passes of

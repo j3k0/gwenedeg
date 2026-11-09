@@ -388,8 +388,9 @@ struct RqSeq {
     // mtp_approx), the rows past it provisional (a guess's, fed the view's own hidden state); rq_seq_common_prefix keeps
     // at most hvalid rows, so a provisional row is never kept as a final one. hprev (dim floats, views only): the target's
     // hidden state at position hpos (-1: none), the next call's h for its row hpos + 1. rq_seq_truncate(n): hvalid =
-    // min(hvalid, n), hpos > n - 1 -> -1; rq_seq_copy as a truncation of the source; reset: 0, -1; a loaded view
-    // sequence (seqfile.c): hvalid = its length, hpos -1. The forward passes leave them as they are (spec.c sets them)
+    // min(hvalid, n), hpos > n - 1 -> -1; rq_seq_copy as a truncation of the source; reset: 0, -1; a saved view sequence
+    // (seqfile.c) keeps hprev if hpos == len - 1 (a version 2 file); loaded: hvalid = its length, hpos len - 1 with
+    // hprev from such a file loaded whole, else -1. The forward passes leave them as they are (spec.c sets them)
     int hvalid, hpos;
     float *hprev;
 };

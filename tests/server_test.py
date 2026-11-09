@@ -416,6 +416,108 @@ def run_disk(a, t):
     shutil.rmtree(d, ignore_errors=True)
 
 
+def run_disk_compat(a, t):
+    """the disk tier across builds (TODO S9c.2: seqfile.c's version 2 is an MTP view's only): one --kv-disk directory
+    written by a reference build (--disk-compat REF_RUNQ, e.g. 915894a's), then served by this build, then by the reference
+    again, each with --draft (its .draft.rqseq files too). At each restart, before its first request, the directory's
+    files (names and sizes) are those the previous server left (915894a's dk_add removes a draft file that does not check
+    out without a word, so the log alone cannot show it) and no file is reported removed; its first reply has cached
+    tokens and == the reference (the same request with nothing cached, on the reference build)"""
+    rep = t.report
+    d = tempfile.mkdtemp(prefix="runq-kvcompat-", dir=os.environ.get("RUNQ_DISK_TMP") or ("/var/tmp" if os.access("/var/tmp", os.W_OK) else None))
+    env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
+    base = ["--port", "0", "-c", "2048", "--parallel", "1", "--slots", "1", "-v", "--kv-disk", d, "--kv-disk-min", "64"] + (
+        ["-D", a.draft] if a.draft else [])
+
+    def start(exe):
+        log = tempfile.NamedTemporaryFile(prefix="runq-serve-compat-", suffix=".log", delete=False)
+        p = subprocess.Popen([exe, "serve", a.model] + base, stderr=log, stdout=subprocess.DEVNULL, env=env)
+        for _ in range(600):
+            m = re.search(r"listening on http://127\.0\.0\.1:(\d+)", open(log.name).read())
+            if m:
+                return p, int(m.group(1)), log.name
+            if p.poll() is not None:
+                break
+            time.sleep(0.05)
+        return p, None, log.name
+
+    def stop(p, logname):
+        p.send_signal(signal.SIGTERM)
+        try:
+            rc = p.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            rc = "timeout"
+        text = open(logname).read()
+        os.unlink(logname)
+        return rc, text
+
+    def ask(port, msgs, **kw):
+        body = dict({"messages": msgs, "temperature": 0, "max_tokens": 16, "logprobs": True, "top_logprobs": 2}, **kw)
+        if a.draft:
+            body.setdefault("speculative", {"mode": "fixed", "k": 3, "lookup": 0})
+        st, r, _ = chat(port, body, timeout=300)
+        if st != 200:
+            return None
+        return {"text": text_of(r), "lp": json.dumps(r["choices"][0]["logprobs"]), "prompt": r["usage"]["prompt_tokens"],
+                "cached": r["usage"]["prompt_tokens_details"]["cached_tokens"]}
+
+    def files():  # (names and sizes)
+        return sorted((os.path.relpath(os.path.join(r, f), d), os.path.getsize(os.path.join(r, f)))
+                      for r, _, fs in os.walk(d) for f in fs if f != "lock")
+
+    def removed(text):
+        return [ln for ln in text.splitlines() if re.search(r"--kv-disk: .*removed|not loaded", ln)]
+
+    log_lines = " ".join(f"Entry {i}: the keeper logged wind {i % 7} knots, swell {i % 5} m, visibility {i % 9} km." for i in range(24))
+    X = [{"role": "system", "content": LONG_SYS}, {"role": "user", "content": log_lines + "\nWhich entry had the most wind?"}]
+    Y = [{"role": "system", "content": PIRATE_SYS}, {"role": "user", "content": "Describe your ship, its crew and its last voyage. " * 4}]
+    # the reference build: X, Y (X saved), the references; at its stop both saved
+    p, port, lg = start(a.disk_compat)
+    if not port:
+        rep(False, "disk/v1_compat/start", open(lg).read()[-500:])
+        shutil.rmtree(d, ignore_errors=True)
+        return
+    x, y = ask(port, X), ask(port, Y)
+    X2 = X + [{"role": "assistant", "content": x["text"]}, {"role": "user", "content": "And the least?"}]
+    Y2 = Y + [{"role": "assistant", "content": y["text"]}, {"role": "user", "content": "Where next?"}]
+    W = [{"role": "user", "content": "Name the colours of the rainbow, one per line, with a short note on each. " * 4}]
+    refs = {k: ask(port, m, temperature=0.8, seed=7, cache_prompt=False) for k, m in (("X2", X2), ("Y2", Y2))}
+    rc, log0 = stop(p, lg)
+    nd = len([f for f, _ in files() if f.endswith(".draft.rqseq")])
+    rep(rc == 0 and x and y and all(refs.values()) and len(files()) >= 2 and (not a.draft or nd >= 1), "disk/v1_compat/start",
+        f"{a.disk_compat}: exit {rc}, files {' '.join(f'{f} ({n})' for f, n in files())}")
+    # this build on the reference's files (X2 and Y2 loaded), and a new conversation W (saved at its stop: a slot loaded
+    # from a file is not saved again unless it moves on); then the reference on this build's file (W first, then Y2's
+    # from its own; W's reference: the same request with nothing cached, on the reference after it)
+    for name, exe, first, then in (("new_on_ref", a.runq, "X2", "Y2"), ("ref_on_new", a.disk_compat, "W", "Y2")):
+        before = files()
+        p, port, lg = start(exe)
+        if not port:
+            rep(False, f"disk/v1_compat/{name}", open(lg).read()[-500:])
+            break
+        after = files()
+        msgs = {"X2": X2, "Y2": Y2, "W": W}
+        r1 = ask(port, msgs[first], temperature=0.8, seed=7)
+        r2 = ask(port, msgs[then], temperature=0.8, seed=7)
+        if name == "new_on_ref":
+            w = ask(port, W, temperature=0.8, seed=7)
+        else:
+            refs["W"] = ask(port, W, temperature=0.8, seed=7, cache_prompt=False)
+        rc, text = stop(p, lg)
+        rm, saves = removed(text), text.count("saved as entry")
+        ok = (rc == 0 and before == after and not rm and r1 and r1["cached"] > 0 and r2 and refs.get(first) and
+              r1["lp"] == refs[first]["lp"] and r2["lp"] == refs[then]["lp"])
+        if name == "new_on_ref":  # (W's file this build's: what the reference loads next)
+            ok = ok and w and saves >= 1
+        rep(ok, f"disk/v1_compat/{name}", f"{'this build' if exe == a.runq else 'the reference'} on the previous server's "
+            f"{len(before)} files: {'unchanged at the start' if before == after else f'{before} -> {after}'}; removed: {rm or 'none'}; "
+            f"{first} {r1['cached'] if r1 else '?'} of {r1['prompt'] if r1 else '?'} cached, == the reference: "
+            f"{bool(r1) and bool(refs.get(first)) and r1['lp'] == refs[first]['lp']}; {then} == the reference: "
+            f"{bool(r2) and r2['lp'] == refs[then]['lp']}; {saves} saved by it")
+    shutil.rmtree(d, ignore_errors=True)
+
+
 def run_admit(a, t):
     """--admit bound: a request admitted on its lease (prompt + max tokens, its state copies) within --kv-mem; its own servers
     (-c 4096, --parallel 8: only the memory makes a request wait), the budget chosen from the startup line so that one -c
@@ -1528,9 +1630,21 @@ def main():
     ap.add_argument("--draft", help="with --disk / --admit / --admit-chunk: the servers with this draft model (its sequences saved too)")
     ap.add_argument("--admit", action="store_true", help="the memory admission group only (--admit bound: its own servers)")
     ap.add_argument("--admit-chunk", action="store_true", help="the chunked leases group only (--admit chunk: its own servers)")
+    ap.add_argument("--disk-compat", metavar="REF_RUNQ", help="the disk tier across builds only: one --kv-disk directory served by "
+                    "REF_RUNQ, this build, REF_RUNQ again (with --spec DRAFT or --draft: the draft's files too)")
     a = ap.parse_args()
     a.q35_spec = False
     t = T(a)
+    if a.disk_compat:
+        if a.spec and a.spec != "none" and not a.draft:
+            a.draft = a.spec
+        try:
+            run_disk_compat(a, t)
+        except Exception as e:
+            import traceback
+            t.report(False, "disk/v1_compat/error", f"{type(e).__name__}: {e} {traceback.format_exc()[-600:]}")
+        print(f"server tests: {t.n - t.failed} passed, {t.failed} failed")
+        return 1 if t.failed else 0
     if a.admit_chunk:
         try:
             run_admit_chunk(a, t)

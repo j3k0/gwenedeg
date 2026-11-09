@@ -254,7 +254,10 @@ int rq_seq_copy(RqSeq *dst, const RqSeq *src, int n);
 // never sees a partial file); O_DIRECT where the file system takes it (the page cache is not filled). The bits are
 // the sequence's: a sequence loaded from the file continues exactly as the saved one would. The file is tied to the
 // model file (a fingerprint of its contents) and the KV type. len >= 1, else RQ_ERR_ARG; RQ_ERR_IO (e.g. no space;
-// nothing is left at path then)
+// nothing is left at path then). An MTP view's sequence (rq_mtp_load) whose kept state is at its last row
+// (rq_mtp_kept == len - 1) also saves that state (dim floats, under the file's hash: a newer file format, which builds
+// before it refuse as RQ_ERR_MISMATCH); rq_seq_load restores it when it loads the whole file (rq_seq_copy keeps it
+// when the copy includes its position). Every other sequence's file is as before
 int rq_seq_save(const RqSeq *s, const char *path);
 long long rq_seq_save_bytes(const RqSeq *s); // the size of the file rq_seq_save(s) would write (0: len 0, or Windows)
 typedef struct {
@@ -274,8 +277,8 @@ int rq_seq_file_keep(const RqSeqFile *f, int n);
 // dst := the first n positions of a saved sequence (as rq_seq_copy from it: rq_seq_file_keep's length, which
 // rq_seq_len(dst) tells; only the blocks up to it are read); n <= the saved length and dst's capacity, the same model
 // and KV type, else RQ_ERR_ARG / RQ_ERR_MISMATCH. dst's RNG := the saved one; Qwen3.5: the saved checkpoints at or
-// below the kept length come along (the highest ones if dst has fewer slots), dst's pending ones are forgotten.
-// RQ_ERR_IO: dst is then empty
+// below the kept length come along (the highest ones if dst has fewer slots), dst's pending ones are forgotten; an MTP
+// view's: the kept state if saved and n is the saved length (rq_seq_save), else none. RQ_ERR_IO: dst is then empty
 int rq_seq_load(RqSeq *dst, const char *path, int n);
 void rq_seq_seed(RqSeq *s, unsigned long long seed);
 // the sampling RNG state (xorshift), read / write: a copy of it predicts the sequence's next draws without

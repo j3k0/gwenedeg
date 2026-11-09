@@ -173,7 +173,13 @@ down), 504. Not supported: tools with Qwen3's templates (400), `tool_choice` req
   second one is refused); at the start, saves cut short (`.tmp`) and files that do not check out (corrupt, another
   model) are removed, and the rest are indexed with their mtime as their last use. Written as `.tmp`, synced,
   renamed; O_DIRECT where the file system takes it (the page cache is not filled with them; tmpfs: buffered), one
-  thread per layer and K / V. A file holds the blocks of 256 positions in use: 115 KB per position for the 0.6B
+  thread per layer and K / V. The MTP drafter's file (`--draft mtp`, TODO S9c; the view at rest keeps the target's
+  last hidden state) is format version 2: that state is in it too, under the file's hash (+20 KB per conversation on
+  Qwen3.8-27B: dim 5,120 floats in one 4 KiB-aligned section), so a loaded or swapped-in view goes on exactly. Every
+  other file is version 1, byte for byte as before (tested against 915894a's: `seqfile/v1_same`, and `server_test.py
+  --disk-compat`: one directory served by an older build, this one and the older one again, nothing removed); a
+  build before version 2 takes a version 2 file for one that does not check out and removes that draft file only (its
+  target file stays and loads). A file holds the blocks of 256 positions in use: 115 KB per position for the 0.6B
   (f16), 64 KiB for Qwen3.8-27B (its 16 attention layers; + 150 MiB per recurrent state, ~6.6 GiB for a 98k session
   with 3 checkpoints). The I/O runs between passes, without the queue's lock (queueing and `/health` never wait for
   it), but the running requests do: on the dev box's disk (a virtual SSD; `dd` 1.4 GB/s written, 7.3 GB/s read with

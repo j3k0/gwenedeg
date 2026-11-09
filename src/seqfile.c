@@ -18,8 +18,14 @@
 // themselves (alloc_big: whole pages, so the rounded length stays inside their mapping). The I/O runs on the thread
 // pool, one item per (attention layer, K / V) and per state section (a deep queue for an SSD: ~1.4 GB/s written,
 // up to ~7 GB/s read on the dev box). Not on Windows (RQ_ERR_STATE).
+// Version 2 (TODO S9c.2): an MTP view's sequence that keeps the target's hidden state at its last row (RqSeq.hpos ==
+// len - 1: runq serve's view at rest) adds it, so that a loaded or swapped-in view goes on exactly: SeqFileExt after
+// the header in its page, the state (dim floats) at off_h = version 1's file_bytes, padded to SF_ALIGN, all of it under
+// the hash. Every other sequence is written as version 1, byte for byte as before (a reader of version 1 only refuses a
+// version 2 file: RQ_ERR_MISMATCH)
 #define SF_ALIGN 4096
 #define SF_VERSION 1
+#define SF_VERSION_H 2
 static const char sf_magic[8] = { 'R', 'Q', 'S', 'E', 'Q', '\r', '\n', 0x1a };
 
 typedef struct {
@@ -30,8 +36,14 @@ typedef struct {
     int32_t ck[RQ_SEQ_CK_MAX];     // the checkpoints' lengths, ascending (nck of them)
     uint64_t ssm_bytes, ssm_stride, blk_bytes; // a state section's bytes / on disk, a K block's bytes (V's: sf_blk_bytes)
     uint64_t off_kv, off_ssm, file_bytes, rng; // (the tokens at SF_ALIGN; the checkpoints after the state)
-    uint64_t hash;                 // FNV-1a of this header (hash 0) and the tokens
+    uint64_t hash;                 // FNV-1a of this header (hash 0) and the tokens (version 2: SeqFileExt and the state too)
 } SeqFileHdr;
+_Static_assert(sizeof(SeqFileHdr) == 264, "SeqFileHdr: version 1's layout");
+
+typedef struct {                   // version 2 only, after SeqFileHdr
+    int32_t hpos, dim;             // the kept state's position (len - 1) and length (the model's dim)
+    uint64_t off_h;                // its offset: version 1's file_bytes (file_bytes = off_h + sf_round(dim x 4))
+} SeqFileExt;
 
 static inline uint64_t sf_round(uint64_t n) { return (n + SF_ALIGN - 1) / SF_ALIGN * SF_ALIGN; }
 // the header's kv_esz: V's bytes per element, rounded down (4, 2; q8 1, q4 0); a K (kv 0) or V (kv 1) block's bytes (all
@@ -119,16 +131,22 @@ static void sf_worker(void *arg, int tid, int nt) {
     }
 }
 
-static uint64_t sf_hash(const SeqFileHdr *h, const int *tokens) {
+static uint64_t sf_hash(const SeqFileHdr *h, const SeqFileExt *x, const int *tokens, const float *hs) {
+    // version 1: the header (hash 0) and the tokens; version 2: the header, x, the tokens and the state hs
     SeqFileHdr c = *h;
     c.hash = 0;
-    return fnv1a64(fnv1a64(1469598103934665603ull, &c, sizeof(c)), tokens, (size_t)h->len * sizeof(int));
+    uint64_t r = fnv1a64(1469598103934665603ull, &c, sizeof(c));
+    if (h->version == SF_VERSION_H) r = fnv1a64(r, x, sizeof(*x));
+    r = fnv1a64(r, tokens, (size_t)h->len * sizeof(int));
+    return h->version == SF_VERSION_H ? fnv1a64(r, hs, (size_t)x->dim * sizeof(float)) : r;
 }
 
-static void sf_header(const RqSeq *s, SeqFileHdr *h) {
-    // the header of s as it would be saved (the checkpoints held: taken, not being written)
+static void sf_header(const RqSeq *s, SeqFileHdr *h, SeqFileExt *x) {
+    // the header of s as it would be saved (the checkpoints held: taken, not being written); version 2 (x) for an MTP
+    // view's sequence with the target's hidden state kept at its last row
     const RqModel *m = s->m;
     memset(h, 0, sizeof(*h));
+    memset(x, 0, sizeof(*x));
     memcpy(h->magic, sf_magic, 8);
     h->version = SF_VERSION;
     h->endian = 0x01020304;
@@ -152,13 +170,21 @@ static void sf_header(const RqSeq *s, SeqFileHdr *h) {
     h->off_ssm = h->off_kv + (uint64_t)m->n_attn * h->nblk * (h->blk_bytes + sf_blk_bytes(s->att, m->config.n_kv_heads, m->config.head_dim, 1));
     h->file_bytes = h->off_ssm + (m->hy.on ? (uint64_t)(1 + h->nck) * h->ssm_stride : 0);
     h->rng = s->rng;
+    if (m->mtp_of && s->hprev && s->len > 0 && s->hpos == s->len - 1) {
+        h->version = SF_VERSION_H;
+        x->hpos = s->hpos;
+        x->dim = m->config.dim;
+        x->off_h = h->file_bytes;
+        h->file_bytes = x->off_h + sf_round((uint64_t)x->dim * sizeof(float));
+    }
 }
 
-static int sf_check(const RqModel *m, const SeqFileHdr *h, uint64_t size) {
-    // the header against the model (and itself): RQ_OK or RQ_ERR_MISMATCH. (Its length is bounded by the model's
-    // context, not the loaded ctx_len cap: a prefix of a longer save still loads into a shorter sequence)
+static int sf_check(const RqModel *m, const SeqFileHdr *h, const SeqFileExt *x, uint64_t size) {
+    // the header (and version 2's x) against the model (and itself): RQ_OK or RQ_ERR_MISMATCH. (Its length is bounded by
+    // the model's context, not the loaded ctx_len cap: a prefix of a longer save still loads into a shorter sequence)
     SeqFileHdr w;
-    if (memcmp(h->magic, sf_magic, 8) || h->version != SF_VERSION || h->endian != 0x01020304 || h->model_fp != m->fp ||
+    int v2 = h->version == SF_VERSION_H && m->mtp_of; // (version 2: an MTP view's only)
+    if (memcmp(h->magic, sf_magic, 8) || (h->version != SF_VERSION && !v2) || h->endian != 0x01020304 || h->model_fp != m->fp ||
         h->n_attn != m->n_attn || h->kv_dim != m->kv_dim || h->n_kv_heads != m->config.n_kv_heads ||
         h->head_dim != m->config.head_dim || h->att_p != ATT_P || h->att_t != ATT_T || !kv_type_fits(h->att, h->head_dim) ||
         h->kv_esz != sf_esz(h->att, h->head_dim) || h->n_lin != (m->hy.on ? m->hy.n_lin : 0) ||
@@ -175,17 +201,22 @@ static int sf_check(const RqModel *m, const SeqFileHdr *h, uint64_t size) {
     w.off_kv = SF_ALIGN + sf_round((uint64_t)h->len * sizeof(int));
     w.off_ssm = w.off_kv + (uint64_t)h->n_attn * h->nblk * (w.blk_bytes + sf_blk_bytes(h->att, h->n_kv_heads, h->head_dim, 1));
     w.file_bytes = w.off_ssm + (m->hy.on ? (uint64_t)(1 + h->nck) * w.ssm_stride : 0);
+    if (v2) { // the state at the last row, after version 1's sections
+        if (x->hpos != h->len - 1 || x->dim != m->config.dim || x->off_h != w.file_bytes) return RQ_ERR_MISMATCH;
+        w.file_bytes = x->off_h + sf_round((uint64_t)x->dim * sizeof(float));
+    }
     if (h->ssm_stride != w.ssm_stride || h->blk_bytes != w.blk_bytes || h->off_kv != w.off_kv ||
         h->off_ssm != w.off_ssm || h->file_bytes != w.file_bytes || size != h->file_bytes)
         return RQ_ERR_MISMATCH;
     return RQ_OK;
 }
 
-static int sf_read_head(const RqModel *m, const char *path, int *fd, SeqFileHdr *h, char **buf) {
-    // open path, read and check its header and tokens: *buf = an alloc_big of h->off_kv bytes (the header, then the
-    // tokens at SF_ALIGN), *fd open; RQ_OK, else nothing left open or allocated
+static int sf_read_head(const RqModel *m, const char *path, int *fd, SeqFileHdr *h, SeqFileExt *x, char **buf, size_t *bufn) {
+    // open path, read and check its header and tokens (version 2: and the kept state): *buf = an alloc_big of *bufn
+    // bytes (the header, the tokens at SF_ALIGN; version 2: the state at h->off_kv), *fd open; RQ_OK, else nothing left
+    // open or allocated
     struct stat st;
-    size_t bn = SF_ALIGN;
+    size_t bn = SF_ALIGN, hn = 0;
     int e = RQ_ERR_IO;
     char *b = NULL;
     *buf = NULL;
@@ -193,15 +224,19 @@ static int sf_read_head(const RqModel *m, const char *path, int *fd, SeqFileHdr 
     if (!(b = alloc_big(bn))) { e = RQ_ERR_NOMEM; goto fail; }
     if (fstat(*fd, &st) || (uint64_t)st.st_size < SF_ALIGN || sf_io(*fd, 0, b, SF_ALIGN, 0)) goto fail;
     memcpy(h, b, sizeof(*h));
-    if ((e = sf_check(m, h, (uint64_t)st.st_size)) != RQ_OK) goto fail;
+    memcpy(x, b + sizeof(*h), sizeof(*x));
+    if ((e = sf_check(m, h, x, (uint64_t)st.st_size)) != RQ_OK) goto fail;
+    if (h->version == SF_VERSION_H) hn = sf_round((uint64_t)x->dim * sizeof(float));
+    else memset(x, 0, sizeof(*x));
     free_big(b, bn);
-    bn = h->off_kv;
+    bn = h->off_kv + hn;
     if (!(b = alloc_big(bn))) { e = RQ_ERR_NOMEM; goto fail; }
     e = RQ_ERR_IO;
-    if (sf_io(*fd, 0, b, bn, 0)) goto fail;
+    if (sf_io(*fd, 0, b, h->off_kv, 0) || (hn && sf_io(*fd, 0, b + h->off_kv, hn, x->off_h))) goto fail;
     e = RQ_ERR_MISMATCH;
-    if (sf_hash(h, (const int *)(b + SF_ALIGN)) != h->hash) goto fail;
+    if (sf_hash(h, x, (const int *)(b + SF_ALIGN), (const float *)(b + h->off_kv)) != h->hash) goto fail;
     *buf = b;
+    *bufn = bn;
     return RQ_OK;
 fail:
     free_big(b, bn);
@@ -213,10 +248,11 @@ fail:
 int rq_seq_save(const RqSeq *s, const char *path) {
     if (!s || !path || s->len < 1) return RQ_ERR_ARG;
     SeqFileHdr h;
-    sf_header(s, &h);
-    size_t pl = strlen(path);
+    SeqFileExt x;
+    sf_header(s, &h, &x);
+    size_t pl = strlen(path), hn = h.version == SF_VERSION_H ? sf_round((uint64_t)x.dim * sizeof(float)) : 0;
     char *tmp = malloc(pl + 5);
-    char *b = alloc_big(h.off_kv);
+    char *b = alloc_big(h.off_kv + hn); // (version 2: the state at h.off_kv, its padding zeros)
     int e = RQ_ERR_NOMEM, fd = -1;
     if (!tmp || !b) goto done;
     memcpy(tmp, path, pl);
@@ -230,7 +266,11 @@ int rq_seq_save(const RqSeq *s, const char *path) {
     if (ftruncate(fd, (off_t)h.file_bytes)) goto fail;
 #endif
     memcpy(b + SF_ALIGN, s->tokens, (size_t)s->len * sizeof(int));
-    h.hash = sf_hash(&h, s->tokens);
+    if (hn) {
+        memcpy(b + h.off_kv, s->hprev, (size_t)x.dim * sizeof(float));
+        memcpy(b + sizeof(h), &x, sizeof(x));
+    }
+    h.hash = sf_hash(&h, &x, s->tokens, s->hprev);
     memcpy(b, &h, sizeof(h));
     SfJob j = { fd, 1, h.nblk, 0, 0, 0, (RqSeq *)s, &h, { 0 }, { 0 } };
     if (s->m->hy.on) { // the state, then the checkpoints by their lengths
@@ -244,7 +284,7 @@ int rq_seq_save(const RqSeq *s, const char *path) {
         }
         j.nst = 1 + h.nck;
     }
-    if (sf_io(fd, 1, b, h.off_kv, 0)) goto fail;
+    if (sf_io(fd, 1, b, h.off_kv, 0) || (hn && sf_io(fd, 1, b + h.off_kv, hn, x.off_h))) goto fail;
     rq_parallel(sf_worker, &j);
     if (j.err || fdatasync(fd)) goto fail;
 #if defined POSIX_FADV_DONTNEED
@@ -262,22 +302,25 @@ fail:
 done:
     if (fd >= 0) close(fd);
     free(tmp);
-    free_big(b, h.off_kv);
+    free_big(b, h.off_kv + hn);
     return e;
 }
 
 long long rq_seq_save_bytes(const RqSeq *s) {
     SeqFileHdr h;
+    SeqFileExt x;
     if (!s || s->len < 1) return 0;
-    sf_header(s, &h);
+    sf_header(s, &h, &x);
     return (long long)h.file_bytes;
 }
 
 int rq_seq_file_info(const RqModel *m, const char *path, RqSeqFile *info, int **tokens) {
     if (!m || !path || !info) return RQ_ERR_ARG;
     SeqFileHdr h;
+    SeqFileExt x;
     char *b;
-    int fd, e = sf_read_head(m, path, &fd, &h, &b);
+    size_t bn;
+    int fd, e = sf_read_head(m, path, &fd, &h, &x, &b, &bn);
     if (e != RQ_OK) return e;
     close(fd);
     memset(info, 0, sizeof(*info));
@@ -291,7 +334,7 @@ int rq_seq_file_info(const RqModel *m, const char *path, RqSeqFile *info, int **
         if (!(*tokens = malloc((size_t)h.len * sizeof(int)))) e = RQ_ERR_NOMEM;
         else memcpy(*tokens, b + SF_ALIGN, (size_t)h.len * sizeof(int));
     }
-    free_big(b, h.off_kv);
+    free_big(b, bn);
     return e;
 }
 
@@ -299,8 +342,10 @@ int rq_seq_load(RqSeq *dst, const char *path, int n) {
     if (!dst || !path || n < 0 || n > dst->cap) return RQ_ERR_ARG;
     const RqModel *m = dst->m;
     SeqFileHdr h;
+    SeqFileExt x;
     char *b;
-    int fd, e = sf_read_head(m, path, &fd, &h, &b);
+    size_t bn;
+    int fd, e = sf_read_head(m, path, &fd, &h, &x, &b, &bn);
     if (e != RQ_OK) return e;
     RqSeqFile f = { h.len, h.att, h.n_lin > 0, h.nck, { 0 }, (long long)h.file_bytes };
     memcpy(f.ck, h.ck, (size_t)h.nck * sizeof(int));
@@ -337,11 +382,15 @@ int rq_seq_load(RqSeq *dst, const char *path, int n) {
     memcpy(dst->tokens, b + SF_ALIGN, (size_t)L * sizeof(int));
     seq_grow(dst, L);
     dst->rng = h.rng;
-    dst->hvalid = L; // (an MTP view's: every row taken as final, no hidden state of the target: internal.h)
+    dst->hvalid = L; // (an MTP view's: every row taken as final, internal.h)
+    if (h.version == SF_VERSION_H && L == h.len && dst->hprev) { // (the whole file: the kept state too; else none)
+        memcpy(dst->hprev, b + h.off_kv, (size_t)x.dim * sizeof(float));
+        dst->hpos = x.hpos;
+    }
 done:
     if (e == RQ_ERR_IO) rq_seq_reset(dst);
     close(fd);
-    free_big(b, h.off_kv);
+    free_big(b, bn);
     return e;
 }
 

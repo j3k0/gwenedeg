@@ -964,6 +964,44 @@ def q35_mtp_api_run(a, d, fn="synth-q35-27b-mtp.gguf", pre="q35/synth"):
     return out
 
 
+def q35_seqfile_v1(a, d, tmp, fn="synth-q35-ista-mtp.gguf"):
+    """seqfile.c's version 2 (TODO S9c.2) against 915894a's api_test (check.py --v1ref-api-test; tests/make_seqfile_v1ref.sh):
+    `api_test --seqfile-out` of both builds on fn; v1_same: the target's file and the view's without a kept state byte for
+    byte 915894a's, and this build's view file with the kept state version 2 (one page longer); v2_on_v1_reader: 915894a's
+    reads this build's version 1 files (whole, the same lengths) and refuses the version 2 one (RQ_ERR_MISMATCH: runq
+    serve's dk_add then removes that draft file only). [(ok, name, detail)]"""
+    import filecmp
+    import re
+    model, pre = os.path.join(d, fn), f"q35/{fn[:-5]}/seqfile"
+    if not os.path.exists(model):
+        return []
+    dirs = {k: os.path.join(tmp, f"seqfile_{k}") for k in ("new", "v1ref")}
+    for k, exe in (("new", a.api_test), ("v1ref", a.v1ref_api_test)):
+        os.makedirs(dirs[k], exist_ok=True)
+        p = run([exe, "--seqfile-out", model, dirs[k]], SYNTH_THREADS)
+        if p.returncode != 0:
+            return [(False, f"{pre}/v1_same", f"{exe} --seqfile-out: exit status {p.returncode}: "
+                     f"{(p.stdout + p.stderr).decode(errors='replace')[-300:]}")]
+    f = lambda k, n: os.path.join(dirs[k], n)  # noqa: E731
+    names = ("target.rqseq", "view.rqseq")
+    same = {n: os.path.exists(f("v1ref", n)) and filecmp.cmp(f("new", n), f("v1ref", n), shallow=False) for n in names}
+    sz = {n: os.path.getsize(f("new", n)) if os.path.exists(f("new", n)) else -1 for n in names + ("view-h.rqseq",)}
+    ver = lambda p: int.from_bytes(open(p, "rb").read(12)[8:12], "little") if os.path.exists(p) else -1  # noqa: E731
+    v2 = ver(f("new", "view-h.rqseq")) == 2 and sz["view-h.rqseq"] == sz["view.rqseq"] + 4096 and not os.path.exists(f("v1ref", "view-h.rqseq"))
+    out = [(all(same.values()) and v2, f"{pre}/v1_same", ", ".join(f"{n} ({sz[n]} bytes) {'==' if same[n] else '!='} 915894a's" for n in names)
+            + f"; with the kept state: version {ver(f('new', 'view-h.rqseq'))}, {sz['view-h.rqseq']} bytes")]
+    got = []
+    for n, view in (("target.rqseq", False), ("view.rqseq", True), ("view-h.rqseq", True)):
+        p = run([a.v1ref_api_test, "--seqfile-load", model, f("new", n)] + (["--view"] if view else []), SYNTH_THREADS)
+        m = re.search(r"^seqfile-load: info (-?\d+) load (-?\d+) len (-?\d+)", p.stdout.decode(errors="replace"), re.M)
+        got.append((n, tuple(int(x) for x in m.groups()) if p.returncode == 0 and m else None))
+    MISMATCH = -7  # RQ_ERR_MISMATCH (src/runq.h)
+    ok = got[0][1] == (0, 0, 300) and got[1][1] == (0, 0, 300) and got[2][1] is not None and got[2][1][:2] == (MISMATCH, MISMATCH)
+    out.append((ok, f"{pre}/v2_on_v1_reader", "915894a's api_test on this build's files: " + ", ".join(
+        f"{n}: " + (f"info {g[0]} load {g[1]} len {g[2]}" if g else "failed") for n, g in got) + f" (0: RQ_OK, {MISMATCH}: RQ_ERR_MISMATCH)"))
+    return out
+
+
 def q35_server38(a, d):
     """runq serve on synth-q35-27b-f32.gguf (Qwen3.8's template): the prompt of each request == `-m render` of its
     messages with the request's thinking / effort (usage.prompt_tokens; and a greedy reply == the CLI's): thinking
@@ -1273,6 +1311,8 @@ def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
         synth.append(ex.submit(q35_synth_run, a, os.path.join(t, "synth_dot"), s27, texts, True, "bf16-dot"))
     if a.api_test:
         synth.append(ex.submit(q35_api_dot, a))
+    if sd and a.api_test and getattr(a, "v1ref_api_test", ""):
+        synth.append(ex.submit(q35_seqfile_v1, a, sd, os.path.join(t, "synth")))
     # the Q3_K_M file (lean) on a worker of its own from the start: on mx, after the other two, it made the suite's
     # tail (that chain) ~35 s longer; next to them the suite took as long as without it (185.4 / 186.5 s vs 181.0 /
     # 187.1 s, interleaved, load ~25)

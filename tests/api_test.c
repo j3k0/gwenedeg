@@ -51,12 +51,20 @@
  * decode path, logits and hidden bitwise, also without logits; mtp_follow/*: the view followed by a caller that batches
  * its rows (runq serve): rq_mtp_hin's h rule and count (hin_rule), rq_mtp_final / rq_mtp_keep / rq_mtp_kept
  * (final_keep: also a kept state past the view's end at its capacity), and --mtp-seqcheck's comparison on a saved
- * lockstep pair (seqcheck: passes; the view fed zeros for h: fails)
+ * lockstep pair (seqcheck: passes, with the kept state saved; the view fed zeros for h: fails). TODO S9c.2: seqfile/*:
+ * the view's kept state on disk (mtp_h: saved with it as version 2, restored by a whole load only; without it, or kept
+ * before the last row: version 1), a corrupted state or extension and a file cut before the state refused
+ * (mtp_h_corrupt)
  *   tests/api_test --mtp-seqcheck MODEL TARGET.rqseq VIEW.rqseq
  * A saved target sequence and its MTP view's (runq serve's RUNQ_TEST_MTP_DUMP) against a fresh lockstep run over the
  * target file's tokens (S9b's mtp_lockstep on files): the target's hidden rows of a fresh prefill, the view's prefill
  * over them shifted by one; the view's length and tokens == the target's, its KV cache bitwise over the whole
- * 16-position tiles. One PASS / FAIL line (mtp_seqcheck)
+ * 16-position tiles; a view file with the kept state (version 2): the state == the target's last hidden row bitwise, a
+ * probe row with it == the reference's. One PASS / FAIL line (mtp_seqcheck)
+ *   tests/api_test --seqfile-out MODEL DIR, tests/api_test --seqfile-load MODEL FILE [--view]
+ * A target sequence and its MTP view's (without and with the kept state) saved into DIR; a file's info and whole load
+ * (their error codes, the length and the kept state). Built into 915894a's api_test too (tests/make_seqfile_v1ref.sh),
+ * for tests/check_models.py's seqfile/v1_same (version 1 files byte for byte 915894a's) and seqfile/v2_on_v1_reader
  *   tests/api_test --mtp-dump MODEL TEXTFILE OUT.bin [-b N] [--vocab N]
  * The MTP view's logits teacher-forced on TEXTFILE's tokens (raw text, as runq -m logits): the target's prefill with
  * hidden rows, then the view's over the same tokens with h shifted by one (row 0: zeros), every row's logits, in
@@ -375,8 +383,111 @@ static int sample_main(int argc, char **argv) {
     return 0;
 }
 
+// seqfile-out: begin (tests/make_seqfile_v1ref.sh copies this block into 915894a's api_test.c: its API only, plus
+// rq_mtp_keep where runq.h has it)
+static int sfo_rows(RqCtx *c, RqSeq *s, const int *t, int n, int dim, float *H, const float *hin) {
+    // t on s in passes of 64 rows: their hidden rows into H, their h inputs from hin (each NULL: none)
+    int e = RQ_OK;
+    for (int q = 0; q < n && e == RQ_OK; q += 64) {
+        RqSegment g = { s, t + q, n - q < 64 ? n - q : 64, RQ_LOGITS_NONE, H ? H + (size_t)q * dim : NULL, hin ? hin + (size_t)q * dim : NULL };
+        e = rq_forward_batch(c, &g, 1, NULL, NULL);
+    }
+    return e;
+}
+
+static int seqfile_out_main(int argc, char **argv) {
+    // api_test --seqfile-out MODEL DIR: DIR/target.rqseq (300 positions: two attention blocks; seeded; Qwen3.5: the
+    // checkpoints at 40 and 260) and, for a file with an MTP block, its view's over the same tokens (h shifted by one):
+    // DIR/view.rqseq (no kept state) and, in a build with rq_mtp_keep, DIR/view-h.rqseq (the target's state at 299 kept).
+    // The files of seqfile.c's version 1 must be those 915894a writes (tests/check_models.py's seqfile/v1_same)
+    if (argc != 4) {
+        fprintf(stderr, "usage: api_test --seqfile-out MODEL DIR\n");
+        return 2;
+    }
+    char err[512], p[1024];
+    int n = 300, e, *t = malloc((size_t)n * sizeof(int));
+    rq_threads_init(0);
+    RqModel *m = rq_model_load(argv[2], NULL, err, sizeof(err));
+    if (!m || !t) { fprintf(stderr, "%s\n", m ? "out of memory" : err); return 1; }
+    RqModelInfo mi;
+    rq_model_info(m, &mi);
+    for (int i = 0; i < n; i++) t[i] = 100 + (int)((i * 7919u + 13u) % 3000u);
+    float *H = malloc((size_t)n * mi.dim * sizeof(float)), *hin = calloc((size_t)n * mi.dim, sizeof(float));
+    RqCtx *c = rq_ctx_new(m, 64, 0, &e);
+    RqSeq *s = c ? rq_seq_new(m, 512, RQ_KV_DEFAULT, &e) : NULL;
+    if (!H || !hin || !s) { fprintf(stderr, "setup: %s\n", rq_strerror(e)); return 1; }
+    rq_seq_seed(s, 0x5eedf11eULL);
+    if (mi.linear_layers && (rq_seq_checkpoint_at(s, 40) != RQ_OK || rq_seq_checkpoint_at(s, 260) != RQ_OK)) return 1;
+    snprintf(p, sizeof(p), "%s/target.rqseq", argv[3]);
+    if ((e = sfo_rows(c, s, t, n, mi.dim, H, NULL)) != RQ_OK || (e = rq_seq_save(s, p)) != RQ_OK) { fprintf(stderr, "%s: %s\n", p, rq_strerror(e)); return 1; }
+    printf("seqfile-out: %s\n", p);
+    RqMtpOpts mo = { 0, -1 };
+    RqModel *v = rq_mtp_load(m, &mo, err, sizeof(err));
+    if (v) {
+        RqCtx *vc = rq_ctx_new(v, 64, 0, &e);
+        RqSeq *vs = vc ? rq_seq_new(v, 512, RQ_KV_DEFAULT, &e) : NULL;
+        if (!vs) { fprintf(stderr, "the view: %s\n", rq_strerror(e)); return 1; }
+        memcpy(hin + mi.dim, H, (size_t)(n - 1) * mi.dim * sizeof(float));
+        snprintf(p, sizeof(p), "%s/view.rqseq", argv[3]);
+        if ((e = sfo_rows(vc, vs, t, n, mi.dim, NULL, hin)) != RQ_OK || (e = rq_seq_save(vs, p)) != RQ_OK) { fprintf(stderr, "%s: %s\n", p, rq_strerror(e)); return 1; }
+        printf("seqfile-out: %s\n", p);
+#ifdef RQ_MTP_VOCAB_DEFAULT // (rq_mtp_keep: TODO S9c.1)
+        snprintf(p, sizeof(p), "%s/view-h.rqseq", argv[3]);
+        if ((e = rq_mtp_keep(vs, n - 1, H + (size_t)(n - 1) * mi.dim)) != RQ_OK || (e = rq_seq_save(vs, p)) != RQ_OK) {
+            fprintf(stderr, "%s: %s\n", p, rq_strerror(e));
+            return 1;
+        }
+        printf("seqfile-out: %s\n", p);
+#endif
+        rq_seq_free(vs);
+        rq_ctx_free(vc);
+        rq_model_free(v);
+    }
+    free(t);
+    free(H);
+    free(hin);
+    rq_seq_free(s);
+    rq_ctx_free(c);
+    rq_model_free(m);
+    return 0;
+}
+
+static int seqfile_load_main(int argc, char **argv) {
+    // api_test --seqfile-load MODEL FILE [--view]: FILE's rq_seq_file_info and its whole rq_seq_load into a fresh
+    // sequence of MODEL (--view: of its MTP view): "seqfile-load: info CODE load CODE len N" (and "kept P" in a build
+    // with rq_mtp_kept); exit status 0 if both ran
+    if (argc < 4 || argc > 5 || (argc == 5 && strcmp(argv[4], "--view"))) {
+        fprintf(stderr, "usage: api_test --seqfile-load MODEL FILE [--view]\n");
+        return 2;
+    }
+    char err[512];
+    int e;
+    rq_threads_init(0);
+    RqModel *m = rq_model_load(argv[2], NULL, err, sizeof(err)), *v = NULL;
+    RqMtpOpts mo = { 0, -1 };
+    if (m && argc == 5) v = rq_mtp_load(m, &mo, err, sizeof(err));
+    if (!m || (argc == 5 && !v)) { fprintf(stderr, "%s\n", err); return 1; }
+    RqSeqFile f;
+    int ei = rq_seq_file_info(v ? v : m, argv[3], &f, NULL);
+    RqSeq *s = rq_seq_new(v ? v : m, 512, RQ_KV_DEFAULT, &e);
+    if (!s) { fprintf(stderr, "rq_seq_new: %s\n", rq_strerror(e)); return 1; }
+    int el = rq_seq_load(s, argv[3], ei == RQ_OK ? f.len : 1);
+    printf("seqfile-load: info %d load %d len %d", ei, el, rq_seq_len(s));
+#ifdef RQ_MTP_VOCAB_DEFAULT
+    printf(" kept %d", v ? rq_mtp_kept(s, NULL) : -1);
+#endif
+    printf("\n");
+    rq_seq_free(s);
+    rq_model_free(v);
+    rq_model_free(m);
+    return 0;
+}
+// seqfile-out: end
+
 int main(int argc, char **argv) {
     int only_digest = 0;
+    if (argc > 1 && !strcmp(argv[1], "--seqfile-out")) return seqfile_out_main(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "--seqfile-load")) return seqfile_load_main(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "--two")) return two_main(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "--spec")) return spec_main(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "--mtp")) return mtp_main(argc, argv);
@@ -399,6 +510,8 @@ int main(int argc, char **argv) {
                         "       api_test --mtp TARGET [--quick] [--plain MODEL_WITHOUT_BLOCK] [--optional MODEL_WITH_OPTIONAL_NEXTN]\n"
                         "       api_test --mtp-dump MODEL TEXTFILE OUT.bin [-b N] [--vocab N]\n"
                         "       api_test --mtp-seqcheck MODEL TARGET.rqseq VIEW.rqseq\n"
+                        "       api_test --seqfile-out MODEL DIR\n"
+                        "       api_test --seqfile-load MODEL FILE [--view]\n"
                         "       api_test MODEL --sample LOGITS_FILE < PLAN (lines: T P K ROW SEED...)\n");
         return 2;
     }
@@ -1972,7 +2085,8 @@ static int sp_lockstep(RqCtx *c, RqCtx *dc, RqSeq *s, RqSeq *ms, const SpLock *l
         }
     }
     if (e != RQ_OK) LK_FAIL("reference: %s (%s)", rq_strerror(e), rq_ctx_error(dc));
-    // the KV cache: copies of the whole tiles below the length (fresh sequences: zeros past them), saved, byte for byte
+    // the KV cache: copies of the whole tiles below the length (fresh sequences: zeros past them; the kept state cleared:
+    // a copy to the length keeps it, which rq_seq_save would add), saved, byte for byte
     int L16 = ML / 16 * 16;
     if (ok && L16 > 0) {
         RqSeq *a = rq_seq_new(SD, capm, RQ_KV_DEFAULT, &e), *b = rq_seq_new(SD, capm, RQ_KV_DEFAULT, &e);
@@ -1980,8 +2094,8 @@ static int sp_lockstep(RqCtx *c, RqCtx *dc, RqSeq *s, RqSeq *ms, const SpLock *l
         const char *tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
         snprintf(pa, sizeof(pa), "%s/api_test_lock_%d_a.rqseq", tmp, (int)getpid());
         snprintf(pb, sizeof(pb), "%s/api_test_lock_%d_b.rqseq", tmp, (int)getpid());
-        int okk = a && b && rq_seq_copy(a, ms, L16) == RQ_OK && rq_seq_copy(b, rv, L16) == RQ_OK && rq_seq_save(a, pa) == RQ_OK &&
-                  rq_seq_save(b, pb) == RQ_OK && file_same(pa, pb);
+        int okk = a && b && rq_seq_copy(a, ms, L16) == RQ_OK && rq_seq_copy(b, rv, L16) == RQ_OK && rq_mtp_keep(a, 0, NULL) == RQ_OK &&
+                  rq_mtp_keep(b, 0, NULL) == RQ_OK && rq_seq_save(a, pa) == RQ_OK && rq_seq_save(b, pb) == RQ_OK && file_same(pa, pb);
         if (!okk) LK_FAIL("the KV cache of rows 0..%d differs from the reference's", L16 - 1);
         remove(pa);
         remove(pb);
@@ -2754,9 +2868,11 @@ static int mt_seqcheck(RqModel *m, RqModel *view, const char *tp, const char *vp
     // a saved target / MTP view pair (runq serve's RUNQ_TEST_MTP_DUMP) against a fresh lockstep run over the target
     // file's tokens: the target's hidden rows of a fresh prefill (its KV type), the view's prefill over them shifted by one
     // (row 0 zeros; the file's KV type). The view's length == the target's, its tokens the target's, its KV cache == the
-    // reference's bitwise over the whole 16-position tiles (copies with the kept state cleared, rq_seq_save, byte for byte)
+    // reference's bitwise over the whole 16-position tiles (copies with the kept state cleared, rq_seq_save, byte for byte);
+    // a view file with the kept state (TODO S9c.2: version 2): the state == the target's at L - 1 bitwise, and a probe row
+    // at L with it == the reference's with h_{L-1}
     RqSeqFile ti, vi;
-    int *tok = NULL, e, ok = 1;
+    int *tok = NULL, e, ok = 1, kept = -1;
     char why[256] = "";
 #define SQ_FAIL(...) do { if (ok) snprintf(why, sizeof(why), __VA_ARGS__); ok = 0; } while (0)
     if ((e = rq_seq_file_info(m, tp, &ti, &tok)) != RQ_OK) {
@@ -2792,8 +2908,22 @@ static int mt_seqcheck(RqModel *m, RqModel *view, const char *tp, const char *vp
         remove(pa);
         remove(pb);
     }
-    snprintf(d, dn, "%d rows (KV %s), the KV cache over %d rows%s%s", Lv, rq_kv_name(vi.kv_type), L16, ok ? "" : ": ", why);
+    float *hk = malloc((size_t)D * sizeof(float));
+    if (!hk) die("mt_seqcheck", RQ_ERR_NOMEM);
+    if (ok && (kept = rq_mtp_kept(lv, hk)) >= 0) {
+        float *lg;
+        int pt = 1000 % V;
+        unsigned long long h1 = 0, h2 = 1;
+        if (kept != L - 1) SQ_FAIL("the kept state at %d, the target's last position %d", kept, L - 1);
+        else if (!same(hk, H + (size_t)(L - 1) * D, D)) SQ_FAIL("the kept state differs from the target's at %d", L - 1);
+        if (ok && fw_rows(vc, lv, &pt, 1, RQ_LOGITS_LAST, NULL, &lg, NULL, hk) == RQ_OK) h1 = rq_logits_hash(lg, V);
+        if (ok && fw_rows(vc, rv, &pt, 1, RQ_LOGITS_LAST, NULL, &lg, NULL, H + (size_t)(L - 1) * D) == RQ_OK) h2 = rq_logits_hash(lg, V);
+        if (ok && h1 != h2) SQ_FAIL("the probe row at %d differs", L);
+    }
+    snprintf(d, dn, "%d rows (KV %s), the KV cache over %d rows, %s%s%s", Lv, rq_kv_name(vi.kv_type), L16,
+             kept >= 0 ? "the kept state (version 2) and a probe row with it" : "no kept state", ok ? "" : ": ", why);
 #undef SQ_FAIL
+    free(hk);
     free(tok);
     free(H);
     free(hin);
@@ -2805,6 +2935,94 @@ static int mt_seqcheck(RqModel *m, RqModel *view, const char *tp, const char *vp
     rq_ctx_free(c);
     rq_ctx_free(vc);
     return ok;
+}
+
+static long long file_size(const char *p) {
+    FILE *f = fopen(p, "rb");
+    long long n = f && !fseek(f, 0, SEEK_END) ? (long long)ftell(f) : -1;
+    if (f) fclose(f);
+    return n;
+}
+
+static int file_flip(const char *src, const char *dst, long long n, long long off) {
+    // dst := the first n bytes of src with the byte at off flipped (off < 0: none)
+    FILE *fi = fopen(src, "rb"), *fo = fopen(dst, "wb");
+    int ok = fi && fo, ch;
+    for (long long i = 0; ok && i < n && (ch = fgetc(fi)) != EOF; i++) ok = fputc(i == off ? ch ^ 0x10 : ch, fo) != EOF;
+    if (fi) fclose(fi);
+    if (fo && fclose(fo)) ok = 0;
+    return ok;
+}
+
+static int mt_seqfile(RqModel *view, RqCtx *v64, const int *t, int n, const float *hR, const float *Hs, int corrupt, char *d, size_t dn) {
+    // the view's n rows (all final) with the target's state at n - 1 kept, saved (version 2: the file's version field, its
+    // size == rq_seq_save_bytes == version 1's + the state's page); rq_seq_file_info reads it; loaded whole: the kept
+    // state bitwise, a row after it == the saved sequence's; loaded to n - 5: none kept; saved without a kept state or
+    // with one before the last row: version 1, a page smaller, nothing kept by a load. corrupt: a flipped byte in the
+    // state, in SeqFileExt, the file cut before the state's page: RQ_ERR_MISMATCH (rq_seq_file_info and rq_seq_load),
+    // the destination unchanged
+    char p[512], q[512];
+    const char *tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
+    snprintf(p, sizeof(p), "%s/api_test_sf_%d.draft.rqseq", tmp, (int)getpid());
+    snprintf(q, sizeof(q), "%s/api_test_sf_%d_x.draft.rqseq", tmp, (int)getpid());
+    RqSeq *w = mt_seq(view), *x = mt_seq(view);
+    float *h = malloc((size_t)D * sizeof(float)), *lg;
+    int bad = 0, *tk = NULL;
+    long long hb = ((long long)D * 4 + 4095) / 4096 * 4096, n2 = -1, n1 = -1;
+    unsigned long long h1 = 0, h2 = 1;
+    uint32_t ver = 0;
+    RqSeqFile f;
+#define SF_CHECK(c) do { if (!(c) && !bad) bad = __LINE__; } while (0)
+    SF_CHECK(fw_rows(v64, w, t, n, RQ_LOGITS_NONE, NULL, NULL, NULL, Hs) == RQ_OK);
+    rq_mtp_final(w, 0);
+    SF_CHECK(rq_mtp_keep(w, n - 1, hR + (size_t)(n - 1) * D) == RQ_OK && rq_seq_save(w, p) == RQ_OK);
+    FILE *fv = fopen(p, "rb");
+    SF_CHECK(fv && !fseek(fv, 8, SEEK_SET) && fread(&ver, 4, 1, fv) == 1 && ver == 2);
+    if (fv) fclose(fv);
+    SF_CHECK((n2 = file_size(p)) == rq_seq_save_bytes(w));
+    if (!corrupt) {
+        int pt = 1000 % V;
+        SF_CHECK(rq_seq_file_info(view, p, &f, &tk) == RQ_OK && f.len == n && f.bytes == n2 && tk && !memcmp(tk, t, (size_t)n * sizeof(int)));
+        SF_CHECK(rq_seq_load(x, p, n) == RQ_OK && rq_seq_len(x) == n && rq_seq_common_prefix(x, t, n) == n && rq_mtp_kept(x, h) == n - 1 &&
+                 same(h, hR + (size_t)(n - 1) * D, D));
+        SF_CHECK(fw_rows(v64, x, &pt, 1, RQ_LOGITS_LAST, NULL, &lg, NULL, h) == RQ_OK && (h1 = rq_logits_hash(lg, V), 1) &&
+                 fw_rows(v64, w, &pt, 1, RQ_LOGITS_LAST, NULL, &lg, NULL, hR + (size_t)(n - 1) * D) == RQ_OK && (h2 = rq_logits_hash(lg, V)) == h1);
+        SF_CHECK(rq_seq_truncate(w, n) == RQ_OK && rq_mtp_keep(w, n - 1, hR + (size_t)(n - 1) * D) == RQ_OK); // (as saved)
+        SF_CHECK(rq_seq_load(x, p, n - 5) == RQ_OK && rq_seq_len(x) == n - 5 && rq_mtp_kept(x, NULL) == -1);
+        // version 1: no kept state, one before the last row
+        SF_CHECK(rq_mtp_keep(w, 0, NULL) == RQ_OK && rq_seq_save(w, q) == RQ_OK && (n1 = file_size(q)) == n2 - hb && n1 == rq_seq_save_bytes(w));
+        SF_CHECK(rq_seq_load(x, q, n) == RQ_OK && rq_seq_len(x) == n && rq_mtp_kept(x, NULL) == -1);
+        SF_CHECK(rq_mtp_keep(w, n - 2, hR + (size_t)(n - 2) * D) == RQ_OK && rq_seq_save(w, q) == RQ_OK && file_size(q) == n1);
+        SF_CHECK(rq_seq_load(x, q, n) == RQ_OK && rq_mtp_kept(x, NULL) == -1);
+        snprintf(d, dn, "%d rows, the target's state at %d kept: version 2, %lld bytes (version 1's + %lld); its info; loaded whole: "
+                 "the state bitwise, a row after it == the saved sequence's; loaded to %d: none kept; without a kept state, or "
+                 "one at %d: version 1, nothing kept by a load%s", n, n - 1, n2, hb, n - 5, n - 2, bad ? " FAILED" : "");
+    } else {
+        int e1, e2, e3, e4, e5;
+        SF_CHECK(rq_seq_load(x, p, n) == RQ_OK && rq_seq_truncate(x, 7) == RQ_OK); // (the destination: 7 rows)
+        SF_CHECK(file_flip(p, q, n2, n2 - hb + 4 * (D / 2)));
+        e1 = rq_seq_file_info(view, q, &f, NULL);
+        e2 = rq_seq_load(x, q, n);
+        SF_CHECK(file_flip(p, q, n2, 264 + 1)); // (SeqFileExt.hpos)
+        e3 = rq_seq_load(x, q, n);
+        SF_CHECK(file_flip(p, q, n2 - hb, -1)); // (cut before the state)
+        e4 = rq_seq_file_info(view, q, &f, NULL);
+        e5 = rq_seq_load(x, q, n);
+        SF_CHECK(e1 == RQ_ERR_MISMATCH && e2 == RQ_ERR_MISMATCH && e3 == RQ_ERR_MISMATCH && e4 == RQ_ERR_MISMATCH && e5 == RQ_ERR_MISMATCH);
+        SF_CHECK(rq_seq_len(x) == 7);
+        snprintf(d, dn, "version 2, %lld bytes: a byte of the state flipped: info %s, load %s; SeqFileExt's: load %s; the file cut "
+                 "before the state: info %s, load %s; the destination unchanged%s", n2, rq_strerror(e1), rq_strerror(e2),
+                 rq_strerror(e3), rq_strerror(e4), rq_strerror(e5), bad ? " FAILED" : "");
+    }
+#undef SF_CHECK
+    if (bad) snprintf(d + strlen(d), dn - strlen(d), " (api_test.c:%d)", bad);
+    remove(p);
+    remove(q);
+    free(tk);
+    free(h);
+    rq_seq_free(w);
+    rq_seq_free(x);
+    return !bad;
 }
 
 static int mtp_seqcheck_main(int argc, char **argv) {
@@ -2950,6 +3168,7 @@ static int mtp_main(int argc, char **argv) {
         rq_seq_reset(w);
         ok &= fw_rows(v64, w, T.v, n, RQ_LOGITS_NONE, NULL, NULL, NULL, NULL) == RQ_OK && (rq_mtp_final(w, 0), rq_seq_save(w, vp) == RQ_OK) &&
               !mt_seqcheck(M, view, tp, vp, d2, sizeof(d2)) && strstr(d2, "differs");
+        ok &= strstr(d, "(version 2)") != NULL; // (rq_prefill_spec's view keeps the target's last state: saved with it)
         size_t dl = strlen(d);
         snprintf(d + dl, sizeof(d) - dl, " (rq_prefill_spec's pair, saved); the view fed zeros for h: %s", d2);
         report(ok, "mtp_follow/seqcheck", d);
@@ -2958,6 +3177,9 @@ static int mtp_main(int argc, char **argv) {
         rq_seq_free(x);
         rq_seq_free(w);
     }
+    // seqfile (TODO S9c.2): the view's kept state on disk (seqfile.c's version 2)
+    report(mt_seqfile(view, v64, T.v, n, hR, Hs, 0, d, sizeof(d)), "seqfile/mtp_h", d);
+    report(mt_seqfile(view, v64, T.v, n, hR, Hs, 1, d, sizeof(d)), "seqfile/mtp_h_corrupt", d);
     // mtp_load
     {
         RqModelInfo vi;

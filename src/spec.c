@@ -21,7 +21,9 @@
  * Prompt lookup (TODO G6, RqSpecOpts.lookup): before the draft, the guesses may come from the target's own tokens: the
  * longest recent match of its last tokens + t earlier in the sequence (RqLookup, below), the tokens after it; when it
  * finds one (>= lookup_min tokens), the draft model is not run that round (it catches up on the next one it drafts:
- * draft_follow's common prefix). The verify and accept steps are the same, so is the output. */
+ * draft_follow's common prefix). The verify and accept steps are the same, so is the output.
+ * The MTP drafter (TODO S9): the draft may be the target's MTP view, which follows the target in lockstep (below,
+ * "the MTP drafter"); the verify and accept steps are the same. */
 #include "internal.h"
 
 static uint64_t vocab_hash(const RqModel *m) {
@@ -96,6 +98,21 @@ static int buf_fit(Buf *b, int n) {
     if (!v) return RQ_ERR_NOMEM;
     b->v = v;
     b->cap = n;
+    return RQ_OK;
+}
+
+static int spec_guess(const RqSpecOpts *o, const float *lg, int V, const unsigned char *allow, float tau, int pos, int depth,
+                      int *d) {
+    // the draft's guess at pos from its logits (rq_spec_pick; -1: none, or its p1 below tau), or the test hook's
+    // (RqSpecOpts.guess_hook: tau not applied; -1 stops, a token it may not give: RQ_ERR_ARG)
+    float p1;
+    *d = rq_spec_pick(lg, V, allow, tau, &p1);
+    if (o && o->guess_hook) {
+        *d = o->guess_hook(o->hook_user, pos, depth, *d, p1);
+        if (*d < -1 || *d >= V || (*d >= 0 && allow && !allow[*d])) return RQ_ERR_ARG;
+    } else if (*d >= 0 && tau > 0 && p1 < tau) {
+        *d = -1;
+    }
     return RQ_OK;
 }
 
@@ -202,34 +219,200 @@ static void ck_slots(RqSeq *s, int n) {
     if (s->m->hy.on && s->nck < n) rq_seq_set_checkpoints(s, n);
 }
 
+// ------------------------------------------------------------------------------------------- the MTP drafter
+// (TODO S9; runq.h, docs/qwen38-speculative.md "The MTP drafter (S9)") The draft is the target's MTP view (rq_mtp_load):
+// its row q, (x_q, h_{q-1}), predicts x_{q+1}, h_{q-1} = the target's final hidden state at q - 1, which exists only
+// during the target's pass that computes it. So the view follows the target in lockstep, from the hidden rows of the
+// target's last pass only (H: positions h0 .. h0 + hn - 1) and the one kept with its sequence (hprev at hpos):
+//   row q's h  q == 0: zeros (h_{-1} = 0, as llama.cpp's); q - 1 in H: that row; q - 1 == hpos: hprev; else zeros,
+//              counted (RqSpecStats.mtp_approx; still a final row: no better h will come for it)
+//   a round    (the target at length P, t sampled from its row P - 1) the view's rows from its length ML to P (the
+//              target's tokens, then t) in one pass, with row P's logits (the first guess) and its hidden state h' if it
+//              drafts, else without logits: in every round (MTP, lookup, plain), so that the h they need is always in
+//              the last pass's H; then guess j = 2 .. k: one row (d_{j-1}, h_in = h') at P + j - 1, provisional (each
+//              needs the previous one's hidden state: one row per pass). After the verify pass (its hidden rows: the new
+//              H) and the accept (the target at keep), the view is cut to P + 1 (row P's inputs were true; the
+//              provisional rows go: a plain KV cache, truncatable anywhere) and hprev := H[keep - 1 - P], hpos keep - 1:
+//              the next round's rows P + 1 .. keep take H[0 .. keep - 1 - P]
+//   the end    on every exit, a last catch-up to the target's length (the view's capacity: its rows past it are never
+//              run, it guesses nothing there), hprev the target's last row: the next call (a chat's next turn) goes on
+//              exactly; an error: the view cut to its final rows that follow the target, hpos -1
+// The view's rows are bit-identical batched or alone (forward.c), so its guesses do not depend on how its rows are
+// grouped into passes, nor do the target's rows on hidden being asked for: the output stays plain decoding's.
+// llama.cpp (common/speculative.cpp, draft-mtp) differs: it drops row P after drafting and runs it again with the next
+// verify batch (the same inputs: runq keeps it), and a request after a prefix reuse starts from a stale h (runq: the
+// target's, or zeros counted)
+typedef struct {
+    RqCtx *c;           // the view's context and sequence
+    RqSeq *s;
+    int dim;
+    float *H;           // the target's last pass's hidden rows: positions h0 .. h0 + hn - 1 (hcap rows)
+    int h0, hn, hcap;
+    float *hin, *hout;  // a catch-up pass's h input rows and hidden rows, its tokens (rcap rows)
+    int *tok, rcap;
+    float *g[2];        // a guess pass's h input (h', the view's previous row's hidden state) and hidden state (dim each)
+    RqSpecStats *st;
+} Mtp;
+
+static void mtp_free(Mtp *x) {
+    free(x->H);
+    free(x->hin);
+    free(x->hout);
+    free(x->tok);
+    free(x->g[0]);
+    free(x->g[1]);
+    memset(x, 0, sizeof(*x));
+}
+
+static int mtp_init(Mtp *x, RqCtx *dc, RqSeq *ms, int hrows, int rrows, RqSpecStats *st) {
+    memset(x, 0, sizeof(*x));
+    x->c = dc;
+    x->s = ms;
+    x->dim = ms->m->config.dim;
+    x->hcap = hrows;
+    x->rcap = rrows;
+    x->st = st;
+    size_t D = (size_t)x->dim * sizeof(float);
+    x->H = malloc(hrows * D);
+    x->hin = malloc(rrows * D);
+    x->hout = malloc(rrows * D);
+    x->tok = malloc((size_t)rrows * sizeof(int));
+    x->g[0] = malloc(D);
+    x->g[1] = malloc(D);
+    if (!x->H || !x->hin || !x->hout || !x->tok || !x->g[0] || !x->g[1]) {
+        mtp_free(x);
+        return RQ_ERR_NOMEM;
+    }
+    return RQ_OK;
+}
+
+static int mtp_h(const Mtp *x, int q, float *h) {
+    // row q's h input (h_{q-1}) into h: 1 if it is the target's (or q is 0), 0 for zeros in place of an unknown one
+    size_t D = (size_t)x->dim * sizeof(float);
+    if (q > 0 && q - 1 >= x->h0 && q - 1 < x->h0 + x->hn) {
+        memcpy(h, x->H + (size_t)(q - 1 - x->h0) * x->dim, D);
+        return 1;
+    }
+    if (q > 0 && q - 1 == x->s->hpos) {
+        memcpy(h, x->s->hprev, D);
+        return 1;
+    }
+    memset(h, 0, D);
+    return q == 0;
+}
+
+static int mtp_catchup(Mtp *x, const int *toks, int n, int t, float **lg) {
+    // the view's rows from its length to n - 1 (tokens toks[..]), then t at n if t >= 0, up to its capacity, in passes
+    // of at most rcap rows; all of them final. lg: row n's logits (t's: the first guess; NULL if it does not fit) and its
+    // hidden state (g[0])
+    RqSeq *ms = x->s;
+    int end = n + (t >= 0), e = RQ_OK;
+    if (lg) *lg = NULL;
+    if (end > rq_seq_capacity(ms)) end = rq_seq_capacity(ms);
+    int want = lg && t >= 0 && end == n + 1;
+    for (int q = rq_seq_len(ms); q < end;) {
+        int r = end - q < x->rcap ? end - q : x->rcap, last = want && q + r == end;
+        for (int i = 0; i < r; i++) {
+            x->tok[i] = q + i < n ? toks[q + i] : t;
+            if (!mtp_h(x, q + i, x->hin + (size_t)i * x->dim)) x->st->mtp_approx++;
+        }
+        e = fw_rows(x->c, ms, x->tok, r, last ? RQ_LOGITS_LAST : RQ_LOGITS_NONE, NULL, last ? lg : NULL, last ? x->hout : NULL, x->hin);
+        if (e != RQ_OK) break;
+        if (ms->hvalid == q) ms->hvalid = q + r;
+        if (last) memcpy(x->g[0], x->hout + (size_t)(r - 1) * x->dim, (size_t)x->dim * sizeof(float));
+        x->st->draft_steps++;
+        x->st->mtp_rows += r;
+        q += r;
+    }
+    return e;
+}
+
+static void mtp_hkeep(Mtp *x, int pos) {
+    // the target's hidden state at pos kept with the view's sequence (hprev; the next call's), if the last pass has it
+    RqSeq *ms = x->s;
+    if (pos >= x->h0 && pos < x->h0 + x->hn) {
+        memcpy(ms->hprev, x->H + (size_t)(pos - x->h0) * x->dim, (size_t)x->dim * sizeof(float));
+        ms->hpos = pos;
+    } else if (ms->hpos != pos) {
+        ms->hpos = -1;
+    }
+}
+
+static int mtp_prefix(const RqSeq *ms, const RqSeq *s, const int *tokens, int n) {
+    // the view's rows that stay for the target's tokens followed by tokens[0..n-1]: their common prefix (final rows only)
+    int P = rq_seq_len(s), L = rq_seq_common_prefix(ms, rq_seq_tokens(s), P);
+    if (L == P)
+        while (L < ms->len && L < ms->hvalid && L - P < n && ms->tokens[L] == tokens[L - P]) L++;
+    return L;
+}
+
+static int mtp_prefill(RqCtx *c, RqSeq *s, RqCtx *dc, RqSeq *ms, const int *tokens, int n, int mode, float *out,
+                       float **logits, RqSpecStats *st) {
+    // the target's rq_prefill (its chunks) with every row's hidden state, after each chunk the view's rows up to its end
+    // (its kept prefix first: a chat's rows past the target's cut that the conversation keeps stay, their h was true)
+    int nb = rq_ctx_max_batch(c) > 1 ? rq_ctx_max_batch(c) : 64, V = s->m->config.vocab_size, e;
+    float *lg = NULL;
+    Mtp x;
+    if (logits) *logits = NULL;
+    if (ms->m->mtp_of != s->m || !dc || n < 1 || (mode == RQ_LOGITS_ALL && !out)) return RQ_ERR_ARG;
+    if ((e = mtp_init(&x, dc, ms, nb, nb, st)) != RQ_OK) return e;
+    e = rq_seq_truncate(ms, mtp_prefix(ms, s, tokens, n));
+    for (int i = 0; i < n && e == RQ_OK; i += nb) {
+        int r = n - i < nb ? n - i : nb;
+        int md = mode == RQ_LOGITS_ALL ? RQ_LOGITS_ALL : mode == RQ_LOGITS_LAST && i + r == n ? RQ_LOGITS_LAST : RQ_LOGITS_NONE;
+        if ((e = fw_rows(c, s, tokens + i, r, md, md == RQ_LOGITS_ALL ? out + (size_t)i * V : NULL, &lg, x.H, NULL)) != RQ_OK) break;
+        x.h0 = rq_seq_len(s) - r;
+        x.hn = r;
+        if ((e = mtp_catchup(&x, rq_seq_tokens(s), rq_seq_len(s), -1, NULL)) == RQ_OK) mtp_hkeep(&x, rq_seq_len(s) - 1);
+    }
+    mtp_free(&x);
+    if (logits && e == RQ_OK) *logits = mode == RQ_LOGITS_ALL ? out : mode == RQ_LOGITS_LAST ? lg : NULL;
+    return e;
+}
+
+void mtp_seq_state(const RqSeq *s, int *hvalid, int *hpos, const float **hprev) {
+    *hvalid = s->hvalid;
+    *hpos = s->hpos;
+    *hprev = s->hprev;
+}
+
 int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const RqSpecOpts *o, RqSpecStats *st) {
     RqSeq *s = g->s;
     RqSpecStats z;
-    if (!st) st = &z;
+    if (!st) {
+        memset(&z, 0, sizeof(z));
+        st = &z;
+    }
     int k = o ? o->k : 0, kl = o ? o->lookup : 0, V = s->m->config.vocab_size, e = RQ_OK;
     int lmin = o && o->lookup_min > 0 ? o->lookup_min : RQ_LOOKUP_MIN_DEFAULT;
     float tau = o ? o->tau : 0;
     if (k < 0 || k > RQ_SPEC_K_MAX || kl < 0 || kl > RQ_SPEC_K_MAX || (o && o->lookup_min < 0) ||
         (k > 0 && (!dc || !ds || ds == s)) || !logits)
         return RQ_ERR_ARG;
+    if (k > 0 && ds->m->mtp_of && ds->m->mtp_of != s->m) return RQ_ERR_ARG; // (the MTP block of another model)
     if (k > 0 && rq_spec_check(s->m, ds->m, NULL, 0) != RQ_OK) return RQ_ERR_ARG;
     double t0 = rq_now();
     float *out = NULL;
     Buf buf = { NULL, 0 };
     RqLookup *lk = NULL;
-    int kmax = k > kl ? k : kl, guess[RQ_SPEC_K_MAX + 1], nck0 = s->nck, aut = o && o->cost, mlen = 0;
+    Mtp mx; // (the MTP drafter)
+    memset(&mx, 0, sizeof(mx));
+    int kmax = k > kl ? k : kl, guess[RQ_SPEC_K_MAX + 1], nck0 = s->nck, aut = o && o->cost, mlen = 0, mtp = k > 0 && ds->m->mtp_of;
     double acm[2] = { 0, 0 }, acl[RQ_LOOKUP_LMAX + 1][2]; // (auto: the model's guesses, the lookup's per match length)
+    double prior = o && o->prior > 0 ? o->prior : mtp ? 0.7 : 0.6; // (auto: the draft's prior acceptance per guess)
     memset(acl, 0, sizeof(acl));
     if (kmax > 0) {
         if (!(out = malloc((size_t)(kmax + 1) * V * sizeof(float)))) return RQ_ERR_NOMEM;
         ck_slots(s, kmax + 2);
         if (k > 0) ck_slots(ds, k + 2);
     }
-    if (kl > 0 && !(lk = rq_lookup_new(rq_seq_capacity(s)))) {
+    if ((kl > 0 && !(lk = rq_lookup_new(rq_seq_capacity(s)))) || (mtp && mtp_init(&mx, dc, ds, kmax + 1, kmax + 1 > 64 ? kmax + 1 : 64, st) != RQ_OK)) {
         free(out);
+        rq_lookup_free(lk);
         return RQ_ERR_NOMEM;
     }
-    int r = rq_gen_step(g, c, rq_seq_len(s) - 1, logits);
+    if (mtp) e = rq_seq_truncate(ds, mtp_prefix(ds, s, NULL, 0)); // (the view's rows that follow the target)
+    int r = e == RQ_OK ? rq_gen_step(g, c, rq_seq_len(s) - 1, logits) : 0;
     while (r > 0) {
         int P = rq_seq_len(s), t = g->token, cap = rq_seq_capacity(s);
         // guesses: at most k (kl from the lookup), the tokens left before max_new but one (the pass's last row gives
@@ -256,20 +439,36 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
         if (aut && lim > 0) { // (G7: the source and the count from the cost model at P, the acceptance seen so far)
             int km = k < lim ? k : lim, mlc = ml > RQ_LOOKUP_LMAX ? RQ_LOOKUP_LMAX : ml;
             if (k > 0 && km > rq_seq_capacity(ds) - P) km = rq_seq_capacity(ds) - P;
-            double pmd = (acm[1] + 8 * 0.6) / (acm[0] + 8), plk = (acl[mlc][1] + 8 * rq_lookup_prior(mlc)) / (acl[mlc][0] + 8);
+            double pmd = (acm[1] + 8 * prior) / (acm[0] + 8), plk = (acl[mlc][1] + 8 * rq_lookup_prior(mlc)) / (acl[mlc][0] + 8);
             RqSpecChoice x = rq_spec_choose(o->cost, k > 0 && o->dcost ? o->dcost : NULL, P, km, pmd, nd, plk);
             src = x.src == RQ_SPEC_LOOKUP;
             nd = src ? x.n : 0;
             kk = x.src == RQ_SPEC_MODEL ? x.n : 0;
             mlen = mlc;
         }
-        if (kk > 0) {
+        if (mtp) { // the view's rows up to t at P (every round), with the first guess's logits if it drafts; then its guesses
             double td = rq_now();
-            float *lg = NULL, p1;
+            float *lg = NULL;
+            e = mtp_catchup(&mx, rq_seq_tokens(s), P, t, kk > 0 ? &lg : NULL);
+            for (int d; e == RQ_OK && lg;) {
+                if ((e = spec_guess(o, lg, V, g->cfg->allow, tau, P + nd + 1, nd, &d)) != RQ_OK || d < 0) break;
+                guess[++nd] = d;
+                if (nd == kk) break;
+                st->draft_steps++;
+                st->mtp_rows++;
+                e = fw_rows(dc, ds, &d, 1, RQ_LOGITS_LAST, NULL, &lg, mx.g[1], mx.g[0]); // (a provisional row: h')
+                float *h = mx.g[0];
+                mx.g[0] = mx.g[1];
+                mx.g[1] = h;
+            }
+            st->t_draft += rq_now() - td;
+            if (e != RQ_OK) break;
+        } else if (kk > 0) {
+            double td = rq_now();
+            float *lg = NULL;
             e = draft_follow(dc, ds, rq_seq_tokens(s), P, t, kk, &buf, &lg, st);
-            while (e == RQ_OK) {
-                int d = rq_spec_pick(lg, V, g->cfg->allow, tau, &p1);
-                if (d < 0 || (tau > 0 && p1 < tau)) break;
+            for (int d; e == RQ_OK;) {
+                if ((e = spec_guess(o, lg, V, g->cfg->allow, tau, P + nd + 1, nd, &d)) != RQ_OK || d < 0) break;
                 guess[++nd] = d;
                 if (nd == kk) break;
                 st->draft_steps++;
@@ -278,15 +477,20 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
             st->t_draft += rq_now() - td;
             if (e != RQ_OK) break;
         }
-        // verify [t, d1..dn] (RQ_GEN_LAST: t fed alone, no logits)
+        // verify [t, d1..dn] (RQ_GEN_LAST: t fed alone, no logits); the MTP drafter: every row's hidden state (H)
         double tv = rq_now();
         float *rows = NULL;
         guess[0] = t;
         if (nd == 0) {
-            e = rq_decode(c, s, t, r == RQ_GEN_LAST ? NULL : &rows);
+            if (mtp) e = fw_rows(c, s, &t, 1, r == RQ_GEN_LAST ? RQ_LOGITS_NONE : RQ_LOGITS_LAST, NULL, r == RQ_GEN_LAST ? NULL : &rows, mx.H, NULL);
+            else e = rq_decode(c, s, t, r == RQ_GEN_LAST ? NULL : &rows);
         } else {
             if ((e = rq_seq_checkpoint_rows(s, P, nd)) == RQ_OK)
-                e = rq_prefill(c, s, guess, nd + 1, RQ_LOGITS_ALL, out, &rows);
+                e = mtp ? fw_rows(c, s, guess, nd + 1, RQ_LOGITS_ALL, out, &rows, mx.H, NULL) : rq_prefill(c, s, guess, nd + 1, RQ_LOGITS_ALL, out, &rows);
+        }
+        if (mtp && e == RQ_OK) {
+            mx.h0 = P;
+            mx.hn = nd + 1;
         }
         st->t_verify += rq_now() - tv;
         if (e != RQ_OK || r == RQ_GEN_LAST) break;
@@ -325,7 +529,24 @@ int rq_spec_run(RqGen *g, RqCtx *c, float *logits, RqCtx *dc, RqSeq *ds, const R
                 if ((e = rq_prefill(c, s, guess + (L - P), keep - L, RQ_LOGITS_NONE, NULL, NULL)) != RQ_OK) break;
             }
         }
+        if (mtp) { // the view back to P + 1 (its provisional rows go), the target's hidden state at keep - 1 kept
+            if ((e = rq_seq_truncate(ds, rq_seq_len(ds) < P + 1 ? rq_seq_len(ds) : P + 1)) != RQ_OK) break;
+            mtp_hkeep(&mx, keep - 1);
+        }
         if (fed) break;
+    }
+    if (mtp) {
+        if (e == RQ_OK && r >= 0) { // every exit: the view as long as the target (to its capacity), its last hidden state kept
+            double td = rq_now();
+            if ((e = mtp_catchup(&mx, rq_seq_tokens(s), rq_seq_len(s), -1, NULL)) == RQ_OK) mtp_hkeep(&mx, rq_seq_len(s) - 1);
+            st->t_draft += rq_now() - td;
+        }
+        if (e != RQ_OK || r < 0) { // (an error: its final rows that follow the target)
+            int L = ds->hvalid < rq_seq_len(s) ? ds->hvalid : rq_seq_len(s);
+            if (L < rq_seq_len(ds)) rq_seq_truncate(ds, L);
+            ds->hpos = -1;
+        }
+        mtp_free(&mx);
     }
     free(out);
     free(buf.v);
@@ -358,22 +579,24 @@ int rq_generate_spec(RqCtx *c, RqSeq *s, RqCtx *dc, RqSeq *ds, const int *tokens
     if (k < 0 || k > RQ_SPEC_K_MAX || kl < 0 || kl > RQ_SPEC_K_MAX || o->lookup_min < 0 ||
         (k > 0 && (!dc || !ds || ds == s)))
         return RQ_ERR_ARG;
+    if (k > 0 && ds->m->mtp_of && ds->m->mtp_of != s->m) return RQ_ERR_ARG; // (the MTP block of another model)
     if (k > 0 && rq_spec_check(s->m, ds->m, NULL, 0) != RQ_OK) return RQ_ERR_ARG;
     double t0 = rq_now();
     float *logits = NULL;
-    int e = rq_prefill(c, s, tokens, n, RQ_LOGITS_LAST, NULL, &logits);
+    int mtp = k > 0 && ds->m->mtp_of; // (the MTP view: in lockstep over the prompt)
+    int e = mtp ? mtp_prefill(c, s, dc, ds, tokens, n, RQ_LOGITS_LAST, NULL, &logits, st) : rq_prefill(c, s, tokens, n, RQ_LOGITS_LAST, NULL, &logits);
     if (e != RQ_OK) return e;
     st->gen.n_prompt = n;
     // the draft follows the prompt (its first round feeds the sampled token; a draft context shorter than the prompt:
     // what fits, the loop guesses nothing past it)
-    if (k > 0) {
+    if (k > 0 && !mtp) {
         Buf buf = { NULL, 0 };
         int nd = rq_seq_len(s) < rq_seq_capacity(ds) ? rq_seq_len(s) : rq_seq_capacity(ds);
         e = draft_follow(dc, ds, rq_seq_tokens(s), nd, -1, 0, &buf, NULL, st);
         free(buf.v);
         if (e != RQ_OK) return e;
     }
-    st->draft_steps = st->refed = 0; // (the loop's only: a chat's rollback to its checkpoint is not the loop's)
+    st->draft_steps = st->refed = st->mtp_rows = 0; // (the loop's only: a chat's rollback to its checkpoint is not the loop's)
     RqGen g;
     rq_gen_start(&g, s, cfg, max_new, cb, n);
     st->gen.t_prefill = rq_now() - t0;
@@ -381,6 +604,23 @@ int rq_generate_spec(RqCtx *c, RqSeq *s, RqCtx *dc, RqSeq *ds, const int *tokens
     e = rq_spec_run(&g, c, logits, dc, ds, o, st);
     st->gen.n_prompt = gs.n_prompt;
     st->gen.t_prefill = gs.t_prefill;
+    return e;
+}
+
+int rq_prefill_spec(RqCtx *c, RqSeq *s, RqCtx *dc, RqSeq *ds, const int *tokens, int n, int mode, float *out, float **logits) {
+    if (!dc || !ds) return rq_prefill(c, s, tokens, n, mode, out, logits);
+    if (ds == s) return RQ_ERR_ARG;
+    RqSpecStats st;
+    memset(&st, 0, sizeof(st));
+    if (ds->m->mtp_of) return mtp_prefill(c, s, dc, ds, tokens, n, mode, out, logits, &st);
+    if (rq_spec_check(s->m, ds->m, NULL, 0) != RQ_OK) return RQ_ERR_ARG;
+    int e = rq_prefill(c, s, tokens, n, mode, out, logits);
+    if (e != RQ_OK) return e;
+    // (as rq_generate_spec: the draft model follows what fits)
+    Buf buf = { NULL, 0 };
+    int nd = rq_seq_len(s) < rq_seq_capacity(ds) ? rq_seq_len(s) : rq_seq_capacity(ds);
+    e = draft_follow(dc, ds, rq_seq_tokens(s), nd, -1, 0, &buf, NULL, &st);
+    free(buf.v);
     return e;
 }
 

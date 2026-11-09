@@ -18,8 +18,9 @@ static int max_new_tokens = 0; // -n: stop after this many generated tokens, 0 =
 #define SPEC_K_DEFAULT 3       // -G with -D (the best fixed k for Qwen3-1.7B + 0.6B: docs/qwen38-speculative.md)
 
 // speculative decoding (-D draft.gguf, -G k, --tau; --lookup N, --lookup-min L): the draft model, its context and
-// sequence (m NULL: no draft model), the options (o.k 0 and o.lookup 0: plain decoding)
-static struct { RqModel *m; RqCtx *c; RqSeq *s; RqSpecOpts o; RqPassCost tc, dc; } draft;
+// sequence (m NULL: no draft model), the options (o.k 0 and o.lookup 0: plain decoding); -D mtp: m is the model's MTP
+// view (rq_mtp_load), mtp its block's index, vocab --mtp-vocab
+static struct { RqModel *m; RqCtx *c; RqSeq *s; RqSpecOpts o; RqPassCost tc, dc; int mtp, vocab; } draft;
 #define SPECULATIVE (draft.m || draft.o.lookup > 0)
 
 static void die(const char *msg) {
@@ -47,9 +48,15 @@ static void report_timing(int n_prompt, double pf, int n_gen, double dc) {
 
 static void report_spec(const RqSpecStats *st) {
     // the speculative loop's counters (after report_timing); with the prompt lookup, its share after the totals
-    char tau[32] = "", how[96] = "", lk[160] = "";
+    char tau[32] = "", how[160] = "", lk[160] = "";
     if (draft.o.tau > 0) snprintf(tau, sizeof(tau), ", tau %g", draft.o.tau);
+    char mtp[96] = "";
     if (draft.o.cost) snprintf(how, sizeof(how), "auto, ");
+    if (draft.m && draft.mtp >= 0) {
+        snprintf(how + strlen(how), sizeof(how) - strlen(how), "draft mtp (blk.%d, vocab %s%.0d), ", draft.mtp,
+                 draft.vocab ? "" : "all", draft.vocab);
+        snprintf(mtp, sizeof(mtp), " | mtp rows %d (approx %d)", st->mtp_rows, st->mtp_approx);
+    }
     if (draft.m) snprintf(how + strlen(how), sizeof(how) - strlen(how), "k %s%d%s", draft.o.cost ? "<= " : "", draft.o.k, tau);
     if (draft.o.lookup > 0) {
         size_t l = strlen(how);
@@ -59,9 +66,9 @@ static void report_spec(const RqSpecStats *st) {
                  st->lookup_drafted, st->lookup_accepted, 100.0 * st->lookup_accepted / (st->lookup_drafted > 0 ? st->lookup_drafted : 1));
     }
     fprintf(stderr, "[timing] speculative: %s: %d passes, %d drafted, %d accepted (%.1f%%), %.2f tok/pass | draft %.3f s "
-            "(%d steps), verify %.3f s%s\n", how, st->passes, st->drafted, st->accepted,
+            "(%d steps), verify %.3f s%s%s\n", how, st->passes, st->drafted, st->accepted,
             100.0 * st->accepted / (st->drafted > 0 ? st->drafted : 1), (double)st->gen.n_gen / (st->passes > 0 ? st->passes : 1),
-            st->t_draft, st->draft_steps, st->t_verify, lk);
+            st->t_draft, st->draft_steps, st->t_verify, lk, mtp);
 }
 
 // -m generate with a draft: the output of generate()'s loop (the prompt, then at most -n - 1 generated tokens, those
@@ -104,13 +111,10 @@ static void generate(RqModel *m, RqCtx *c, RqSeq *s, const RqSampling *cfg, char
     float *pre_logits = NULL; // logits of the last prompt token, from the batched prefill
 
     if (SPECULATIVE && num_prompt_tokens <= seq_len) {
-        // speculative: the prompt (both models), then the loop (rq_spec_run) prints what generate's loop would
+        // speculative: the prompt (both models: the draft what fits; the MTP view in lockstep), then the loop (rq_spec_run)
+        // prints what generate's loop would
         float *logits;
-        check(rq_prefill(c, s, prompt_tokens, num_prompt_tokens, RQ_LOGITS_LAST, NULL, &logits), c);
-        if (draft.m) {
-            int nd = num_prompt_tokens < rq_seq_capacity(draft.s) ? num_prompt_tokens : rq_seq_capacity(draft.s);
-            check(rq_prefill(draft.c, draft.s, prompt_tokens, nd, RQ_LOGITS_NONE, NULL, NULL), draft.c);
-        }
+        check(rq_prefill_spec(c, s, draft.c, draft.s, prompt_tokens, num_prompt_tokens, RQ_LOGITS_LAST, NULL, &logits), c);
         for (int i = 0; i < num_prompt_tokens; i++)
             print_token(m, prompt_tokens[i]);
         fflush(stdout);
@@ -645,7 +649,12 @@ static void error_usage(void) {
     fprintf(stderr, "  --page-cache auto|drop|keep  the model file's page cache after the load: auto (default) drops it if the file\n");
     fprintf(stderr, "              is >= 1/4 of the RAM\n");
     fprintf(stderr, "  -D <string> draft model for speculative decoding (generate, chat): a smaller model of the same vocabulary\n");
-    fprintf(stderr, "              (e.g. Qwen3-0.6B for Qwen3-1.7B) guesses, the model checks; the output is exactly plain decoding's\n");
+    fprintf(stderr, "              (e.g. Qwen3-0.6B for Qwen3-1.7B), or mtp: the file's own MTP block; it guesses, the model\n");
+    fprintf(stderr, "              checks; the output is exactly plain decoding's\n");
+    fprintf(stderr, "  -D mtp      the model file's MTP block (multi-token prediction: Qwen3.8-27B's blk.64) as the draft, fed the\n");
+    fprintf(stderr, "              model's hidden states (a draft file named mtp: -D ./mtp)\n");
+    fprintf(stderr, "  --mtp-vocab <int> with -D mtp: guess among the tokens 0..N-1 and the added ones only (a part of the\n");
+    fprintf(stderr, "              classifier: faster guesses), default 0 = all\n");
     fprintf(stderr, "  -G <int>    with -D: guesses per pass of the model, at most %d, default %d; 0 = plain decoding (no draft)\n", RQ_SPEC_K_MAX, SPEC_K_DEFAULT);
     fprintf(stderr, "  --tau <float> with -D: adaptive guess count, stop guessing at a draft top-1 probability < tau, default 0 (off)\n");
     fprintf(stderr, "  --lookup <int> prompt lookup (generate, chat): guess up to N tokens by copying what followed the latest match of\n");
@@ -661,11 +670,38 @@ static void error_usage(void) {
 
 int serve_main(int argc, char **argv); // serve.c: `runq serve <checkpoint> ...` (the HTTP server)
 
-static void load_draft(const char *path, const RqModel *target, const RqModelOpts *o, int kv_type, int prefill_chunk) {
+static void print_mtp_memory(const RqModel *v, int seq_len) {
+    // --mem with -D mtp: the MTP view's estimate (rq_mtp_load's check; s9_gate.sh reads it)
+    RqModelMem mm;
+    if (rq_model_mem(v, &mm) != RQ_OK) return;
+    const double G = 1073741824.0;
+    fprintf(stderr, "[memory] mtp estimate %.2f GiB: weights %.2f + runtime %.2f + a sequence of %d positions %.2f (KV cache %.2f); ",
+            mm.total / G, mm.weights / G, mm.runtime / G, seq_len, mm.seq.total / G, mm.seq.kv / G);
+    if (mm.budget_src) fprintf(stderr, "%s %.2f GiB\n", mm.budget_src == 2 ? "--mem" : "MemAvailable", mm.budget / G);
+    else fprintf(stderr, "not checked\n");
+}
+
+static void load_draft(const char *path, const RqModel *target, const char *target_path, const RqModelOpts *o, int kv_type,
+                       int prefill_chunk, int mtp_vocab, int mem_given) {
     // -D: the draft model (the same load options as the model), its context and sequence; refused unless its
-    // vocabulary is the model's
+    // vocabulary is the model's. -D mtp: the model's own MTP block (rq_mtp_load; its estimate checked as the model's)
     char err[512];
-    if (!(draft.m = rq_model_load(path, o, err, sizeof(err)))) die(err);
+    draft.mtp = -1;
+    if (!strcmp(path, "mtp")) {
+        RqMtpOpts mo = { mtp_vocab, o->mem };
+        if (!(draft.m = rq_mtp_load(target, &mo, err, sizeof(err)))) {
+            if (strstr(err, "no MTP block")) fprintf(stderr, "-D mtp: %s has no MTP block\n", target_path);
+            else fprintf(stderr, "-D mtp: %s\n", err);
+            exit(EXIT_FAILURE);
+        }
+        RqModelInfo ti;
+        rq_model_info(target, &ti);
+        draft.mtp = ti.n_layers;
+        draft.vocab = mtp_vocab;
+        if (mem_given) print_mtp_memory(draft.m, ti.seq_len);
+    } else if (!(draft.m = rq_model_load(path, o, err, sizeof(err)))) {
+        die(err);
+    }
     RqModelInfo info;
     rq_model_info(draft.m, &info);
     if (info.warning) fprintf(stderr, "warning: draft: %s\n", info.warning);
@@ -705,6 +741,7 @@ int main(int argc, char *argv[]) {
     float spec_tau = 0;         // --tau
     int lookup = 0, lookup_min = 0; // --lookup, --lookup-min (0: RQ_LOOKUP_MIN_DEFAULT)
     int spec_auto = 0;          // --spec auto (G7: the cost model's choice per pass)
+    int mtp_vocab = 0;          // --mtp-vocab (-D mtp: RqMtpOpts.vocab; 0 all)
 
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
@@ -733,6 +770,13 @@ int main(int argc, char *argv[]) {
             int mn = argv[i][8] == '-';
             if (end == argv[i + 1] || *end || v < (mn ? 2 : 0) || v > (mn ? RQ_LOOKUP_LMAX : RQ_SPEC_K_MAX)) error_usage();
             *(mn ? &lookup_min : &lookup) = (int)v;
+            continue;
+        }
+        if (!strcmp(argv[i], "--mtp-vocab")) {
+            char *end;
+            long v = strtol(argv[i + 1], &end, 10);
+            if (end == argv[i + 1] || *end || v < 0 || v > 1 << 24) error_usage();
+            mtp_vocab = (int)v;
             continue;
         }
         if (!strcmp(argv[i], "--spec")) {
@@ -845,7 +889,7 @@ int main(int argc, char *argv[]) {
     }
     // -D (generate, chat; -G 0: plain decoding, not loaded)
     if (draft_path && spec_k > 0 && (strcmp(mode, "generate") == 0 || strcmp(mode, "chat") == 0)) {
-        load_draft(draft_path, m, &o, kv_type, prefill_chunk);
+        load_draft(draft_path, m, checkpoint_path, &o, kv_type, prefill_chunk, mtp_vocab, mem_given);
         draft.o.k = spec_k;
         draft.o.tau = spec_tau;
     }
@@ -915,14 +959,14 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < np; i++)
         fprintf(stderr, "[profile]   %-18s %8.3f s  %5.1f%%\n", pn[i], pt[i], 100 * pt[i] / (pf_total > 0 ? pf_total : 1));
 
-    // memory and file handles cleanup
-    rq_ctx_free(ctx);
-    rq_seq_free(seq);
-    rq_model_free(m);
+    // memory and file handles cleanup (the draft first: an MTP view shares the model's mapping, tokenizer and classifier)
     if (draft.m) {
         rq_ctx_free(draft.c);
         rq_seq_free(draft.s);
         rq_model_free(draft.m);
     }
+    rq_ctx_free(ctx);
+    rq_seq_free(seq);
+    rq_model_free(m);
     return 0;
 }

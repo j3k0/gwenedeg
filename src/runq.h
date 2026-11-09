@@ -526,6 +526,17 @@ unsigned long long rq_logits_hash(const float *logits, int n);
 // a draft: combined) or none (a plain step). Agentic replies copy from their context (an edit's old text, paths,
 // identifiers, tool output). The verify loop is the same, so the output is still rq_generate's exactly. ds / dc may be
 // NULL with k 0 and lookup > 0
+// The MTP drafter (TODO S9): the draft may be the target's own MTP block, an MTP view of it (rq_mtp_load(target); a
+// view of another model: RQ_ERR_ARG). Its row q takes the target's final hidden state at q - 1 (RqSegment.hidden of
+// the target's passes), so it follows the target in lockstep: over the whole prompt (rq_generate_spec, rq_prefill_spec:
+// after each prompt chunk of the target its rows), and at every pass of the loop (MTP, lookup and plain rounds alike)
+// its rows up to the target's sampled token, with the first guess's logits in the same pass; its further guesses feed
+// its own hidden state (provisional rows, cut again after the verify pass). Every call ends with the view's sequence as
+// long as the target's (to its capacity) and the target's hidden state at the last position kept with it, so that the
+// next call (a chat's next turn) goes on exactly; rq_seq_common_prefix on it counts its final rows only. Where the
+// target's hidden state at a row's previous position is not known (a cut that lands exactly where the kept rows end:
+// the target does not compute that position again), the row takes zeros (RqSpecStats.mtp_approx): worse guesses for a
+// while, the same output
 #define RQ_SPEC_K_MAX 30
 #define RQ_LOOKUP_MIN_DEFAULT 2
 typedef struct {
@@ -537,9 +548,16 @@ typedef struct {
     int lookup_min; // the shortest match the lookup uses, in tokens (>= 2; 0: RQ_LOOKUP_MIN_DEFAULT)
     // G7, auto (cost not NULL): per pass the source and the guess count from the cost models (target, draft; below,
     // rq_spec_choose) at the sequence's position, with the acceptance seen so far in this call (the model's per guess,
-    // the lookup's per match length; priors 0.6 and rq_lookup_prior): a plain step when no guess pays off. k and lookup
+    // the lookup's per match length; priors prior and rq_lookup_prior): a plain step when no guess pays off. k and lookup
     // are then the maximums (the lookup's matches from 2 tokens unless lookup_min); the output is the same either way
     const struct RqPassCost *cost, *dcost;
+    // a test hook (NULL in normal use): called at every guess of the draft (model or MTP), up to k per pass, with the
+    // guess's position, its depth (0 for the first guess of a pass), the draft's own pick and its top-1 probability p1
+    // (as rq_spec_pick gives it for tau); its return is the guess (an allowed token, else RQ_ERR_ARG), or -1 to stop
+    // guessing; tau is not applied then. The output is the same for any guesses
+    int (*guess_hook)(void *user, int pos, int depth, int guess, float p1);
+    void *hook_user;
+    double prior;   // auto: the prior acceptance per guess of the draft (0: 0.6 for a draft model, 0.7 for an MTP view)
 } RqSpecOpts;
 typedef struct {
     RqGenStats gen;    // as rq_generate's (t_prefill: both models' prompt; t_gen: the loop)
@@ -551,6 +569,8 @@ typedef struct {
     double t_draft, t_verify; // seconds: the draft (passes, picking the guesses; the lookup's), the target's passes
     int lookup_passes, lookup_drafted, lookup_accepted; // the passes whose guesses came from the prompt lookup, their
                        // guesses and accepted ones (included in passes / drafted / accepted; the model's: the rest)
+    int mtp_rows;      // an MTP view: its rows run by the loop (catching up, guesses, the last catch-up; draft_steps: its passes)
+    int mtp_approx;    // its rows that took zeros for the target's unknown hidden state (the call's, its prompt's included)
 } RqSpecStats;
 // RQ_OK if draft can draft for target (vocabulary size and a hash of every token's bytes equal), else RQ_ERR_ARG with
 // the reason in err (RQ_ERR_STATE: a model without its tokenizer). rq_generate_spec / rq_spec_run check it too
@@ -560,6 +580,12 @@ int rq_spec_check(const RqModel *target, const RqModel *draft, char *err, size_t
 // rq_spec_run. o NULL or o->k 0: rq_generate itself (dc, ds unused, may be NULL). st (may be NULL) is filled
 int rq_generate_spec(RqCtx *c, RqSeq *s, RqCtx *dc, RqSeq *ds, const int *tokens, int n, const RqSampling *cfg,
                      int max_new, const RqSpecOpts *o, const RqCallbacks *cb, RqSpecStats *st);
+// rq_prefill on (c, s) with the draft following it, for a caller that runs rq_spec_run itself: a draft model's sequence
+// keeps its common prefix with s's tokens and is fed the rest (what fits); an MTP view's goes in lockstep, its rows after
+// each chunk of the target's (the hidden states it needs exist only during the target's pass; rq_prefill alone leaves
+// the loop's first pass to feed it the whole gap with zeros). The target's logits and cache are rq_prefill's. dc / ds
+// NULL: rq_prefill
+int rq_prefill_spec(RqCtx *c, RqSeq *s, RqCtx *dc, RqSeq *ds, const int *tokens, int n, int mode, float *out, float **logits);
 // the loop alone, for a caller that prefills and starts the reply itself (rq_gen_start: e.g. the CLI's generate
 // mode, which draws nothing for the prompt): g started on the target sequence g->s, logits = those of its last
 // position; runs until g is done, as rq_generate's loop after rq_gen_start would. Adds to st's counters, sets

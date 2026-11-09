@@ -173,6 +173,8 @@ RqSeq *rq_seq_new(const RqModel *m, int capacity, int kv_type, int *err) {
     s->nck = RQ_SEQ_CK;
     for (int i = 0; i < RQ_SEQ_CK_MAX; i++)
         s->ck[i].pos = -1;
+    s->hpos = -1;
+    if (m->mtp_of && !(s->hprev = malloc((size_t)p->dim * sizeof(float)))) { e = RQ_ERR_NOMEM; goto fail; }
     if (m->hy.on) {
         s->ssm_bytes = (size_t)m->hy.n_lin * m->ssm_layer * sizeof(float);
         s->ssm = alloc_big(s->ssm_bytes);
@@ -195,6 +197,7 @@ void rq_seq_free(RqSeq *s) {
     for (int i = 0; i < RQ_SEQ_CK_MAX; i++)
         free_big(s->ck[i].st, s->ssm_bytes);
     free(s->tokens);
+    free(s->hprev);
     free(s);
 }
 
@@ -290,6 +293,8 @@ static void ck_forget_pending(RqSeq *s) {
 
 void rq_seq_reset(RqSeq *s) {
     s->len = 0;
+    s->hvalid = 0;
+    s->hpos = -1;
     ck_forget_pending(s);
     ck_drop(s, -1);
 }
@@ -415,6 +420,8 @@ int rq_seq_truncate(RqSeq *s, int n) {
         }
     }
     s->len = n;
+    if (s->hvalid > n) s->hvalid = n; // (an MTP view's rows: internal.h)
+    if (s->hpos > n - 1) s->hpos = -1;
     return RQ_OK;
 }
 
@@ -503,8 +510,9 @@ int rq_seq_release(RqSeq *s, int keep) {
 }
 
 int rq_seq_common_prefix(const RqSeq *s, const int *tokens, int n) {
-    int L = 0;
-    while (L < s->len && L < n && s->tokens[L] == tokens[L]) L++;
+    // (an MTP view: its final rows only, hvalid)
+    int L = 0, e = s->m->mtp_of && s->hvalid < s->len ? s->hvalid : s->len;
+    while (L < e && L < n && s->tokens[L] == tokens[L]) L++;
     return L;
 }
 
@@ -560,6 +568,10 @@ int rq_seq_copy(RqSeq *dst, const RqSeq *src, int n) {
     }
     memcpy(dst->tokens, src->tokens, (size_t)n * sizeof(int));
     seq_grow(dst, n);
+    // (an MTP view's rows, as a truncation of src: internal.h)
+    dst->hvalid = src->hvalid < n ? src->hvalid : n;
+    dst->hpos = src->hpos <= n - 1 ? src->hpos : -1;
+    if (dst->hpos >= 0 && dst->hprev && src->hprev) memcpy(dst->hprev, src->hprev, (size_t)src->m->config.dim * sizeof(float));
     return RQ_OK;
 }
 

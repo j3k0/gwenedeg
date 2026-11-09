@@ -1263,8 +1263,8 @@ The cheapest mitigations, in order:
 ## The MTP drafter (S9)
 
 The 27B's own MTP block (`blk.64`) as the guess source (TODO S9; loading it as a view model and its forward pass:
-[Loader](#loader-the-mtp-block-and-the-f32-matrices); the loop: S9b). Its acceptance needs the 27B (S9d); its costs
-do not.
+[Loader](#loader-the-mtp-block-and-the-f32-matrices); the loop: [below](#the-loop-todo-s9b-2026-11-08)). Its
+acceptance needs the 27B (S9d); its costs do not.
 
 ### Costs on a full-width synthetic file (TODO S9w, measured 2026-11-08)
 
@@ -1383,6 +1383,84 @@ As on the 27B's own answers of the 2026-10-27 measurement (`logs/specmeas-2026-1
 replies, and 151,643 adds almost nothing (0.002%); the last 0.1% (ids 151,643-248,043: mostly non-English text and
 symbols) needs the full vocabulary, so the subset stays an option. The 0.83% added tokens (`<|im_end|>`, `<think>`,
 `<tool_call>`, ...) are always in it.
+
+### The loop (TODO S9b, 2026-11-08)
+
+`runq FILE -D mtp` (CLI: generate and chat; `--mtp-vocab N` the subset; `-G`, `--tau`, `--lookup`, `--spec auto` as
+with a draft model) and the API's `rq_generate_spec` / `rq_spec_run` with the target's MTP view as the draft
+(`rq_mtp_load`; `src/spec.c`, "the MTP drafter"). The verify and accept steps are the S1 loop's, so the output is plain
+decoding's (tokens, RNG draws, every emitted token's logits bits); the MTP only proposes. `runq serve --draft mtp` is
+refused (TODO S9c).
+
+**Lockstep.** MTP row q is (x_q, h_{q-1}) with h the target's final hidden state (after `output_norm`; `RqSegment.hidden`)
+and predicts x_{q+1}. Those hidden states exist only during the target's pass that computes them, so the view follows
+the target from the last pass's hidden rows `H` alone plus one row kept with its sequence (`hprev` at `hpos`):
+- **Prompt** (`rq_generate_spec`; `rq_prefill_spec` for a caller that prefills itself, the CLI's generate mode): the
+  target's `rq_prefill` chunks with every row's hidden state, after each chunk the view's rows up to its end. First the
+  view keeps its common prefix with the target's tokens followed by the new ones (a chat's rows past the target's
+  checkpoint cut stay; their h was true).
+- **Every round** (target at length P, t sampled): the view's rows from its length to P (the target's tokens, then t),
+  with row P's logits (the first guess) and its own hidden state h' in the same pass when the round drafts, without
+  logits otherwise (lookup rounds, plain steps, `--spec auto`'s choices, the `-n` limit's last round). So every h a row
+  needs is in the last pass's `H` (rev-math M1). Guesses 2..k: one row each, (d_{j-1}, h'), provisional.
+- **Verify** asks for every row's hidden state (the new `H`); **accept** as before; then the view is cut back to P + 1
+  (row P's inputs were true, the provisional rows go; a plain KV cache: exact at any length) and `hprev` := `H[keep - 1 -
+  P]`.
+- **Every exit** (end token, callback, `-n`, the context's end; rev-math M2): a last catch-up pass to the target's length
+  (the view's capacity: no rows past it, no guesses there), `hprev` = the target's last row: the next call (a chat's
+  next turn) continues exactly. An error: the view cut to its final rows that follow the target, `hpos` -1.
+- **Final rows** (`RqSeq.hvalid`; rev-math M3): `rq_seq_common_prefix` on a view counts its final rows only, so a
+  provisional row whose token happens to match is never kept as a final one (the CLI's chat truncation, the loop's
+  start). truncate: `min(hvalid, n)`, `hpos` past it dropped; copy as a truncation; a loaded view sequence: all rows
+  final, no `hprev`.
+- **Unknown h:** a row whose h_{q-1} is neither in `H` nor `hprev` takes zeros, is counted (`RqSpecStats.mtp_approx`;
+  `[timing]`'s `approx`) and stays a final row (no better h will come for it). That happens only for the first row of a
+  call after a cut that lands exactly where the view's kept rows end (the target does not compute that position again:
+  Qwen3's exact truncations, Qwen3.5's checkpoint at the cut); a checkpoint below it re-runs the target's rows and the
+  view's h is known. So 0 per single call and at most 1 per later call.
+
+**Differences from llama.cpp** (cf34d31, `common/speculative.cpp` draft-mtp, server-context.cpp): llama.cpp cuts the
+MTP context after drafting and recomputes row P with the next verify batch; runq keeps it (the same inputs). llama.cpp's
+`p_min` is on a top-10-renormalised distribution, runq's `tau` on the full softmax's top-1. After a prefix reuse
+llama.cpp's first row takes a stale `pending_h`; runq the target's (`H`, `hprev`) or zeros, counted.
+
+**Costs in the loop** (S9w's tables): the catch-up rows ride in the round's first guess (~+0.25 ms per row at short
+context); a non-MTP round pays them in a pass of its own (~3 ms on IQ3_S-mtp); the prompt +2% / +4-5% at 96k. The
+`--spec auto` prior for the MTP's guesses is `RqSpecOpts.prior`, 0.7 by default (0.6 for a draft model; S9d sets it).
+`[timing] speculative:` adds `draft mtp (blk.N, vocab V)` and `mtp rows R (approx A)`; `--mem` prints the view's
+estimate as `[memory] mtp estimate`.
+
+**Tests** (spec group, `tests/check_spec.py`, `spec_api/mtp_synth*`, `spec_mtp/*`, `spec_server/mtp_refused`): `api_test
+--spec FILE mtp` on synth-q35-27b-mtp (and -f32, the generic build: `--quick`): every case and setting == plain, each
+case also with `RqSpecOpts.guess_hook` replacing the guesses (all right: every guess accepted; all wrong; wrong at a
+depth rotating per round; a seeded mix), which reaches every acceptance depth on the untrained block, and after every
+run `mtp_lockstep`: the view's sequence == a fresh lockstep prefill over the final tokens (length, `mtp_approx` ==
+expected, `hvalid`, `hpos`, the KV cache bitwise, a probe row with the kept `hprev`, the hook's depth-0 picks == the
+reference's). New cases for the exits and cuts: an end token and a callback stop inside a verify pass, a second call
+without a cut (the kept `hprev`), with the target's checkpoint at the cut (1 approximate row) and below it (none). The
+mutations "a provisional row kept", "`hprev` from `H[a + 1]`" and "h unshifted in the catch-up" pass exactness and
+fail `mtp_lockstep` (tests/README.md). CLI: 8 cases x 6 settings byte for byte, `-G 0 -D mtp`, the refusals.
+
+**The real small MTP** (Qwen3.5-0.8B-mtp as target and drafter; opt-in `models/3.5-0.8b-mtp/spec/*`: `api_test --spec
+FILE mtp --quick`, every check incl. `mtp_lockstep` passes, the cut case's 1 approximate row as expected): `runq FILE -c
+4096 -m chat -n 256 -D mtp`, 4 prompts (chat / code / math / summary), greedy and `-s 42` (the CLI's T 1 / top-p 0.9:
+the file has no `general.sampling`), thinking off / on, 8 threads, under the bench lock, 2026-11-09 with no runq server
+up (box load ~6 from other jobs; a first run at load ~16, during the user's LiveCodeBench window, gave the same
+acceptance and 0.76-1.20x): **64 of 64 outputs == plain byte for byte** (both runs), `mtp_approx` 0. The mean over the
+4 prompts, per cell the share of guesses accepted, tokens per pass, tok/s (speed-up, mean of the prompts' ratios):
+
+| mode | plain tok/s | k 2 | k 3 | k 4 |
+|---|---|---|---|---|
+| thinking off, greedy | 132.9 | 66%, 2.31, 149.5 (1.13x) | 57%, 2.70, 151.3 (1.14x) | 48%, 2.89, 139.0 (1.04x) |
+| thinking off, seeded | 141.1 | 58%, 2.16, 144.2 (1.01x) | 48%, 2.45, 131.6 (0.92x) | 42%, 2.67, 127.0 (0.89x) |
+| thinking on, greedy | 139.9 | 79%, 2.57, 172.0 (1.24x) | 71%, 3.13, 163.9 (1.20x) | 64%, 3.54, 162.8 (1.19x) |
+| thinking on, seeded | 144.4 | 60%, 2.21, 159.3 (1.10x) | 50%, 2.49, 141.9 (0.98x) | 43%, 2.71, 125.5 (0.87x) |
+
+A sanity check of the whole loop with a trained block, not a speed result for the 27B: on the 0.8B a guess reads its
+tied 248k x 1024 Q8_0 classifier (~250 MB, a third of the model), so a guess costs ~1/3 of a target step and only high
+acceptance pays; on the 27B a guess is ~6-9% of a step (S9w). The acceptance (42-79% per guess, 2.2-3.5 tokens per
+pass at k 2-4) is in the range llama.cpp's measurement suggests for the 27B's block (54% at k 3). Not done: llama.cpp's
+`--spec-type draft-mtp` on the same file and prompts (the plan's optional comparison).
 
 ## Not now
 

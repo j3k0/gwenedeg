@@ -1189,6 +1189,10 @@ int serve_main(int argc, char **argv) {
         copy_min < 0 || kv_disk_max < 0 || ckpts < 1 || ckpts > RQ_CHECKPOINTS_MAX || queue < 1 || conns < 1 || maxbody < 1024 || temp < 0 || temp > 2 || topp <= 0 || topp > 1 || topk < 0 || maxtok < 0 || batch < 1)
         usage();
     if (batch > RQ_BATCH_MAX) batch = RQ_BATCH_MAX;
+    if (draft_path && !strcmp(draft_path, "mtp")) { // (before any load; a draft file named mtp: --draft ./mtp)
+        fprintf(stderr, "runq serve: --draft mtp: not supported yet (TODO S9c); the CLI's -D mtp works\n");
+        return 1;
+    }
 
     // signals first: every thread created from here on has SIGINT / SIGTERM blocked
     if (http_signals()) { fprintf(stderr, "runq serve: cannot install the signal handlers\n"); return 1; }

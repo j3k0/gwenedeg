@@ -15,7 +15,13 @@
              0.8B with the prompt lookup alone): every request with "speculative": false and with fixed settings / auto,
              outputs identical (content, reasoning, tool calls, finish, usage, logprobs; streamed and not; concurrent
              requests; a conversation's next turn reuses what plain decoding's would)
+  mtp        the MTP drafter (TODO S9b) on build/synth-q35's synth-q35-27b-mtp.gguf (built here with check_models'
+             q35_synth_build, cached; needs the Qwen3.5-0.8B files): api_test --spec FILE mtp (every case, setting and hook
+             pattern, mtp_lockstep after each case), the generic build's --quick, synth-q35-27b-f32.gguf --quick; the CLI
+             cases with -D mtp (MTP_CASES) == plain as above; -G 0 -D mtp == plain byte for byte; -D mtp on a file without
+             a block refused, --mem prints the MTP's estimate; runq serve --draft mtp refused (TODO S9c)
 """
+import check_models  # (q35_synth_build: the synthetic MTP files)
 import concurrent.futures as cf
 import os
 import sys
@@ -61,6 +67,11 @@ CLI_CASES = [
 ]
 # on the generic build (fewer: its kernels are slower)
 GENERIC_CASES = [("gen_greedy", ["-G", "3"]), ("chat_greedy", ["-G", "8", "--tau", "0.5"]), ("gen_copy", COMBINED)]
+# the MTP drafter (-D mtp: the file's own MTP block) on synth-q35-27b-mtp.gguf (an untrained block: its guesses are
+# rejected; the acceptance paths are api_test's hook patterns): CLI_CASES by name, these settings
+MTP_K = [["-G", "1"], ["-G", "3"], ["-G", "8"], ["-G", "8", "--tau", "0.5"], ["-G", "3", "--spec", "auto"], ["-G", "3", "--lookup", "4"]]
+MTP_CASES = ["gen_greedy", "gen_seeded_topk", "gen_context", "gen_seeded_context_b1", "chat_greedy", "chat_seeded_think",
+             "chat_context_full", "chat_reply_cut"]
 # Qwen3.5-0.8B Q8_0 + its Q4_K_M: a thinking chat whose second turn rolls the recurrent state back to a checkpoint
 Q35_CASES = [("q35_chat_think", ["-m", "chat", "-r", "1", "-t", "0", "-n", "48"], CHAT_USERS[:2], K_TWO, {"dump": True}),
              ("q35_gen_seeded", ["-m", "generate", "-t", "1", "-K", "20", "-s", "4", "-n", "40", "-i", STORY], None, K_TWO, {})]
@@ -150,13 +161,72 @@ def cli_case(runq, model, draft, case, tmp, tag, ks=None, suffix=""):
     return out
 
 
+def mtp_start(a, d, ex):
+    """the MTP drafter's runs on synth-q35-27b-mtp.gguf / -f32.gguf (module doc): futures"""
+    try:
+        sd = check_models.q35_synth_build(a)
+    except RuntimeError as e:
+        return [("cli", "spec_mtp", ex.submit(lambda: [(False, "synth", str(e))]))]
+    mtp, f32, base = (os.path.join(sd, f"synth-q35-27b{x}.gguf") for x in ("-mtp", "-f32", ""))
+    if not os.path.exists(mtp):
+        return []
+    futs = []
+    if a.api_test:
+        futs.append(("api", "spec_api/mtp_synth", ex.submit(run, [a.api_test, "--spec", mtp, "mtp"], SPEC_THREADS)))
+        gen = a.api_test + "-generic"
+        if os.path.exists(gen):
+            futs.append(("api", "spec_api/mtp_synth_generic", ex.submit(run, [gen, "--spec", mtp, "mtp", "--quick"], GEN_THREADS)))
+        if os.path.exists(f32):
+            futs.append(("api", "spec_api/mtp_synth_f32", ex.submit(run, [a.api_test, "--spec", f32, "mtp", "--quick"], SPEC_THREADS)))
+    for name in MTP_CASES:
+        case = next(c for c in CLI_CASES if c[0] == name)
+        futs.append(("cli", "spec_mtp", ex.submit(cli_case, a.runq, mtp, "mtp", case, d, f"m{name}", MTP_K)))
+
+    def g0():  # -G 0 -D mtp: plain decoding, byte for byte (nothing loaded, nothing printed)
+        args = ["-m", "generate", "-t", "1", "-s", "2", "-n", "20", "-i", STORY]
+        ref = cli_run(a.runq, mtp, args, None, d, "mg0_ref")
+        got = cli_run(a.runq, mtp, args, None, d, "mg0", "mtp", ["-G", "0"])
+        ok, why = compare(ref, got, "-G 0", timing_ok=True)
+        strip = lambda e: bytes(x for x in e if not chr(x).isdigit())  # noqa: E731  (the timing line's numbers vary)
+        ok &= strip(got[2]) == strip(ref[2])
+        return [(ok, "g0", "-G 0 -D mtp == no -D: stdout, stderr (the [timing] line's numbers aside)" + (f"; {why}" if why else ""))]
+    futs.append(("cli", "spec_mtp", ex.submit(g0)))
+
+    def refused():
+        out = []
+        if os.path.exists(base):
+            p = run([a.runq, base, "-m", "generate", "-n", "4", "-i", "hi", "-D", "mtp"], 2)
+            e = p.stderr.decode(errors="replace")
+            out.append((p.returncode == 1 and not p.stdout and f"-D mtp: {base} has no MTP block" in e, "refused_no_block",
+                        f"-D mtp on synth-q35-27b.gguf (no block): exit status {p.returncode}, {e.strip()[-150:]!r}"))
+        p = run([a.runq, mtp, "-m", "generate", "-n", "4", "-t", "0", "-i", "hi", "-D", "mtp", "--mem", "64", "--mtp-vocab", "1000"], 2)
+        e = p.stderr.decode(errors="replace")
+        ok = p.returncode == 0 and "[memory] mtp estimate" in e and "--mem 64.00 GiB" in e and "vocab 1000)" in e
+        out.append((ok, "mem_line", f"--mem with -D mtp: the MTP's estimate line (exit status {p.returncode}): "
+                    + (next((l for l in e.splitlines() if l.startswith("[memory] mtp")), "none")[:160])))
+        p = run([a.runq, mtp, "-m", "generate", "-n", "4", "-i", "hi", "-D", "mtp", "--mtp-vocab", "-3"], 2)
+        out.append((p.returncode == 1 and b"Usage:" in p.stderr, "bad_mtp_vocab", f"--mtp-vocab -3: exit status {p.returncode}"))
+        return out
+    futs.append(("cli", "spec_mtp", ex.submit(refused)))
+
+    def server_refused():  # runq serve --draft mtp: refused before any load (TODO S9c)
+        p = run([a.runq, "serve", mtp, "--draft", "mtp", "--port", "0"], 2)
+        e = p.stderr.decode(errors="replace")
+        return [(p.returncode == 1 and "runq serve: --draft mtp: not supported yet (TODO S9c); the CLI's -D mtp works" in e,
+                 "mtp_refused", f"runq serve --draft mtp: exit status {p.returncode}, {e.strip()[-120:]!r}")]
+    futs.append(("cli", "spec_server", ex.submit(server_refused)))
+    return futs
+
+
 def spec_start(a, tmp, ex):
     """start the group's runs on ex (api_test --spec, the CLI cases); futures"""
     futs = []
-    if not (a.gguf and a.q4):
-        return futs
     d = os.path.join(tmp, "spec")
     os.makedirs(d, exist_ok=True)
+    if a.q35 and os.path.exists(os.path.join(os.path.dirname(a.q35), "Qwen3.5-0.8B-Q4_K_M.gguf")):
+        futs += mtp_start(a, d, ex)
+    if not (a.gguf and a.q4):
+        return futs
     q35d = os.path.join(os.path.dirname(a.q35), "Qwen3.5-0.8B-Q4_K_M.gguf") if a.q35 else ""
     if a.api_test:
         futs.append(("api", "spec_api/qwen3", ex.submit(run, [a.api_test, "--spec", a.gguf, a.q4] + (["--other", a.q35] if a.q35 else []),
@@ -222,7 +292,7 @@ def spec_start(a, tmp, ex):
 
 def test_spec(a, res, futs):
     if not futs:
-        print("   (skipped: needs the GGUF Q8_0 and Q4_K_M files)")
+        print("   (skipped: needs the GGUF Q8_0 and Q4_K_M files, or the Qwen3.5-0.8B ones)")
         return
     for kind, name, f in futs:
         if kind == "api":

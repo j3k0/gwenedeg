@@ -337,6 +337,7 @@ int rq_seq_load(RqSeq *dst, const char *path, int n) {
     memcpy(dst->tokens, b + SF_ALIGN, (size_t)L * sizeof(int));
     seq_grow(dst, L);
     dst->rng = h.rng;
+    dst->hvalid = L; // (an MTP view's: every row taken as final, no hidden state of the target: internal.h)
 done:
     if (e == RQ_ERR_IO) rq_seq_reset(dst);
     close(fd);

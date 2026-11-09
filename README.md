@@ -70,6 +70,7 @@ CLI options (`./runq` without arguments prints them all):
 | `--mem GiB` | memory budget of the load check (below), default MemAvailable; `0` or `force`: no check. Given, prints the estimate (a `[memory]` line) |
 | `--page-cache auto\|drop\|keep` | the model file's page cache after the load; `auto` (default) drops it if the file is >= 1/4 of the RAM |
 | `-D FILE` | speculative decoding (generate and chat): a smaller draft model of the same vocabulary (e.g. Qwen3-0.6B for Qwen3-1.7B, Qwen3.5-0.8B for Qwen3.5) guesses, the model verifies; the output is exactly plain decoding's (below) |
+| `-D mtp`, `--mtp-vocab N` | the model file's own MTP block as the draft (multi-token prediction: Qwen3.8-27B's `blk.64`; a draft file named `mtp`: `-D ./mtp`); `--mtp-vocab`: its guesses among the tokens 0..N-1 and the added ones only (a part of the classifier: faster guesses), default 0 = all (below) |
 | `-G K`, `--tau T` | with `-D`: at most K guesses per pass of the model (default 3, at most 30; `-G 0`: plain decoding, the draft not loaded); adaptive length: stop guessing at the first guess whose draft top-1 probability is < T (default 0 = off, always K) |
 | `--lookup N`, `--lookup-min M` | prompt lookup (generate and chat), with or without `-D`: guess up to N tokens (at most 30) by copying what followed the latest, longest match (>= M tokens, default 2; up to 16 counted) of the last tokens earlier in the context; no model, exact as any draft; with `-D` the draft model guesses where the lookup finds no match (below) |
 | `OMP_NUM_THREADS` | threads; default nproc - nproc/8 (Apple Silicon: the performance cores) |
@@ -106,6 +107,15 @@ thinking off 16.6 / 17.2 (2.0x; code and math 19-22); 12 threads: up to 15.3 / 2
 `--spec auto` (opt-in in the CLI) chooses the source and the guess count per pass from a cost model calibrated at the
 start (TODO G7).
 Measurements: [docs/qwen38-speculative.md](docs/qwen38-speculative.md#the-27b-bring-up-s7).
+
+**The MTP drafter** (`-D mtp`, TODO S9): a file with a multi-token-prediction block (Qwen3.8-27B's `blk.64`, e.g.
+ISTA-DASLab's IQ3_S-mtp, Unsloth's Q4_K_M) guesses with it: one attention layer fed the model's own final hidden state
+and the next token, through the model's classifier (`--mtp-vocab 100000`: a part of it, 99.9% of agentic replies'
+tokens). It follows the model in lockstep (its rows over the prompt and after every pass), so no second model, no
+second 64-layer state per sequence; the output is still plain decoding's. On Qwen3.5-0.8B with its block (a test file,
+`scripts/make_mtp_08b.sh`) 42-79% of the guesses are accepted; the 27B's speed is open (S9d,
+[docs/qwen38-speculative.md](docs/qwen38-speculative.md#the-loop-todo-s9b-2026-11-08)). `runq serve` does not take it yet
+(`--draft mtp` is refused).
 
 **Prompt lookup** (`--lookup N`, no model needed): replies that copy from their context (code being edited, paths,
 tool output) are guessed from the context itself, verified in the same loop (so the output is still plain decoding's).
@@ -355,9 +365,11 @@ next to decode rows; short segments, e.g. decode rows or a speculative verify pa
 take the decode-rows worker: 4 rows of one sequence cost ~1.2-1.3x a decode step, docs/qwen38-speculative.md). On top of them sit `rq_sample` / `rq_sample_batch` (temperature, top-p, an optional
 token mask), `rq_generate` (the chat loop with per-token callbacks; built on `rq_gen_start` / `rq_gen_step`, one
 token at a time, for loops that feed the tokens themselves), `rq_generate_spec` (the same with a draft model:
-speculative decoding, the output exactly `rq_generate`'s; `rq_spec_run` is its loop alone; `rq_mtp_load` makes a qwen35
-file's MTP block a model of its own, a view sharing the target's weights and tokenizer, fed the target's final hidden
-states from `RqSegment.hidden` through its `RqSegment.h_in`: the drafter of TODO S9), `rq_tokenize`, `rq_detok_push`
+speculative decoding, the output exactly `rq_generate`'s; `rq_spec_run` is its loop alone, `rq_prefill_spec` the prompt
+with the draft following; `rq_mtp_load` makes a qwen35 file's MTP block a model of its own, a view sharing the target's
+weights and tokenizer, fed the target's final hidden states from `RqSegment.hidden` through its `RqSegment.h_in`: as the
+draft of `rq_generate_spec` it follows the target in lockstep, TODO S9; `RqSpecOpts.guess_hook` replaces the guesses in
+tests), `rq_tokenize`, `rq_detok_push`
 (incremental, UTF-8 safe) and `rq_chat_render`. Errors come back as `RQ_ERR_*` codes and messages; the
 library never prints or exits. `RqModelOpts.mem` / `.page_cache` set the load's memory check and page-cache policy
 (Memory, above); `rq_model_mem` and `rq_seq_mem` return the estimates (the server sizes its slot pool with the latter;

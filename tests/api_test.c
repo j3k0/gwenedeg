@@ -241,6 +241,7 @@ typedef struct {
     RqSeq *s;
     int n, nl, tok[GR_MAX], pos[GR_MAX];
     unsigned long long rng[GR_MAX], lh[GR_MAX];
+    int stop_at;  // on_token asks to stop at its stop_at-th token (0: never)
 } GenRec;
 
 static void gr_logits(void *u, int pos, const float *lg) {
@@ -257,7 +258,7 @@ static int gr_token(void *u, int t) {
         r->rng[r->n] = *rq_seq_rng(r->s);
         r->tok[r->n++] = t;
     }
-    return 0;
+    return r->stop_at > 0 && r->n == r->stop_at;
 }
 
 static int gr_same(const GenRec *a, const GenRec *b) {
@@ -1741,6 +1742,15 @@ static int two_main(int argc, char **argv) {
 // ---------------------------------------------------------------------------------------- api_test --spec
 // rq_generate_spec == rq_generate (header). Each run on fresh sequences: the reference with rq_generate, then
 // rq_generate_spec per draft setting
+
+// src/internal.h's hooks (the library's, linked from its objects): rq_prefill with every row's final hidden state
+// (hidden, n x dim; NULL: none) and an MTP view's h input rows (h_in; NULL: zeros); an MTP view sequence's final rows
+// (hvalid), the target's hidden state it keeps (hprev at hpos)
+int fw_rows(RqCtx *c, RqSeq *s, const int *tokens, int n, int mode, float *out, float **logits, float *hidden, const float *h_in);
+void mtp_seq_state(const RqSeq *s, int *hvalid, int *hpos, const float **hprev);
+
+static int D; // the model's dim
+
 typedef struct {
     const char *name;
     int prompt;          // sp_prompt: 0 a chat turn, thinking off; 1 thinking on; 2 raw text (code)
@@ -1750,40 +1760,102 @@ typedef struct {
     int cap, dcap;       // the target's / draft's capacity past the prompt (0: the model's; < 0: shorter than it)
     int turn2;           // a second call: both cut back 3 positions (at most to the prompt), then a user turn
     int quick;           // in --quick
+    int ck;              // turn2: 1 the cut at the prompt's end with a checkpoint of the target there (the truncation lands
+                         // exactly where the kept rows end: the MTP's first row of the second call takes zeros), 2 the
+                         // checkpoint 2 positions below it (both fed again: the MTP's h known), 3 no cut (the second
+                         // call goes on where the first ended, as a Qwen3.8 chat: the MTP's first row takes the kept h)
+    int stop_at;         // on_token stops the reply at its stop_at-th token (inside a verify pass: RQ_STOP_CALLBACK)
 } SpCase;
 
+#define SP_CALLS 2
 typedef struct {
     GenRec rec;
-    int stop[2], ngen[2], len;
+    int stop[SP_CALLS], ngen[SP_CALLS], len;
     unsigned long long rng, htok, hnext;
     RqSpecStats st;      // summed over the calls (gen: the last call's)
+    int *ctok[SP_CALLS], nctok[SP_CALLS]; // the reference's (o NULL): the sequence's tokens after each call
 } SpOut;
 
+// RqSpecOpts.guess_hook (rq_spec_run's test hook): the guesses replaced by a pattern against the plain run's tokens
+// (right: the token the target samples there; wrong: another one), the draft's own depth-0 picks recorded (with an MTP
+// view: the lockstep check compares them with the reference's)
+enum { HK_RIGHT, HK_WRONG, HK_ROTATE, HK_MIX, HK_N };
+static const char *hk_name[] = { "right", "wrong", "wrong-at-rotating-depth", "mix" };
+#define HK_PICKS 4096
+typedef struct {
+    int pattern, k, call, round;
+    const SpOut *ref;   // the plain run (its tokens per call)
+    unsigned long long rng;
+    int npick, pick_pos[HK_PICKS], pick_tok[HK_PICKS], pick_call[HK_PICKS];
+} SpHook;
+
+static int sp_hook(void *u, int pos, int depth, int guess, float p1) {
+    SpHook *h = u;
+    (void)p1;
+    if (depth == 0) {
+        h->round++;
+        if (h->npick < HK_PICKS)
+            h->pick_pos[h->npick] = pos, h->pick_tok[h->npick] = guess, h->pick_call[h->npick++] = h->call;
+    }
+    const int *rt = h->ref->ctok[h->call];
+    int n = h->ref->nctok[h->call], right = pos < n ? rt[pos] : -1, wrong = ((right >= 0 ? right : guess >= 0 ? guess : 0) + 1) % V;
+    switch (h->pattern) {
+    case HK_RIGHT: return right; // (-1 past the reply's end: no more guesses)
+    case HK_WRONG: return wrong;
+    case HK_ROTATE: return depth == h->round % h->k ? wrong : right;
+    default: {
+        h->rng ^= h->rng << 13, h->rng ^= h->rng >> 7, h->rng ^= h->rng << 17;
+        int r = (int)(h->rng >> 32) % 10;
+        return r < 4 ? right : r < 7 ? guess : r < 9 ? wrong : -1;
+    }
+    }
+}
+
+// the MTP drafter's bookkeeping (TODO S9b, mtp_lockstep): what a run's calls tell the check
+typedef struct {
+    int approx;            // the rows expected to take zeros (the first row after a cut that lands where the kept rows end)
+    int apos[SP_CALLS];    // their positions
+    int keep[SP_CALLS];    // per call but the last: the view's rows the next call keeps (its picks below them stay valid)
+    int got_approx;        // RqSpecStats.mtp_approx summed
+} SpLock;
+
 static RqModel *SD;
+static int SD_MTP; // the draft is the target's MTP view (DRAFT mtp)
 static RqTokens sp_prompt[4], sp_turn2;
 
-static int sp_run(RqCtx *c, RqCtx *dc, const SpCase *k, const RqSpecOpts *o, SpOut *out) {
-    // o NULL: rq_generate; o->k 0: the lookup alone, no draft model (dc, ds NULL)
+static int sp_lockstep(RqCtx *c, RqCtx *dc, RqSeq *s, RqSeq *ms, const SpLock *lk, const SpHook *hk, int *npicks, char *d, size_t dn);
+
+static int sp_run(RqCtx *c, RqCtx *dc, const SpCase *k, const RqSpecOpts *o, SpOut *out, int *lock, char *ld, size_t ldn) {
+    // o NULL: rq_generate; o->k 0: the lookup alone, no draft model (dc, ds NULL). lock (an MTP view as the draft): the
+    // lockstep check after the calls (sp_lockstep: 1 passed, 0 failed, -1 not run), its detail in ld
     int e, np = sp_prompt[k->prompt].n;
     RqSeq *s = rq_seq_new(M, k->cap ? np + k->cap : 0, RQ_KV_DEFAULT, &e);
     if (!s) die("rq_seq_new", e);
     RqSeq *ds = o && o->k ? rq_seq_new(SD, k->dcap ? np + k->dcap : 0, RQ_KV_DEFAULT, &e) : NULL;
     if (o && o->k && !ds) die("rq_seq_new (draft)", e);
     if (!ds) dc = NULL;
+    SpHook *hk = o && o->guess_hook ? o->hook_user : NULL;
+    SpLock lk;
+    memset(&lk, 0, sizeof(lk));
+    if (lock) *lock = -1;
     rq_seq_seed(s, k->seed);
     memset(out, 0, sizeof(*out));
     out->rec.s = s;
+    out->rec.stop_at = k->stop_at;
     RqCallbacks cb = { gr_token, gr_logits, &out->rec };
     RqTokens t = { 0 };
     rq_tokens_push(&t, sp_prompt[k->prompt].v, np);
+    if (k->ck && k->ck < 3 && (e = rq_seq_checkpoint_at(s, np - (k->ck == 2 ? 2 : 0))) != RQ_OK) die("rq_seq_checkpoint_at", e);
     for (int call = 0; call <= k->turn2; call++) {
         RqSpecStats st;
+        if (hk) hk->call = call;
         if (o) {
             e = rq_generate_spec(c, s, dc, ds, t.v, t.n, &k->cfg, k->max_new, o, &cb, &st);
             out->st.passes += st.passes, out->st.drafted += st.drafted, out->st.accepted += st.accepted;
             out->st.refed += st.refed, out->st.draft_steps += st.draft_steps;
             out->st.lookup_passes += st.lookup_passes, out->st.lookup_drafted += st.lookup_drafted;
             out->st.lookup_accepted += st.lookup_accepted;
+            out->st.mtp_rows += st.mtp_rows, out->st.mtp_approx += st.mtp_approx;
         } else {
             e = rq_generate(c, s, t.v, t.n, &k->cfg, k->max_new, &cb, &st.gen);
         }
@@ -1791,19 +1863,40 @@ static int sp_run(RqCtx *c, RqCtx *dc, const SpCase *k, const RqSpecOpts *o, SpO
         out->st.gen = st.gen;
         out->stop[call] = st.gen.stop;
         out->ngen[call] = st.gen.n_gen;
+        if (!o) { // (the reference: its tokens after the call, for the hook)
+            out->nctok[call] = rq_seq_len(s);
+            out->ctok[call] = malloc((size_t)rq_seq_len(s) * sizeof(int) + 1);
+            memcpy(out->ctok[call], rq_seq_tokens(s), (size_t)rq_seq_len(s) * sizeof(int));
+        }
         if (call < k->turn2) { // (Qwen3.5: the truncation goes back to a checkpoint: what it lost is fed again)
-            int L = rq_seq_len(s) - 3 < np ? np : rq_seq_len(s) - 3;
+            int L = k->ck == 3 ? rq_seq_len(s) : k->ck ? np : rq_seq_len(s) - 3 < np ? np : rq_seq_len(s) - 3, Lprev = rq_seq_len(s);
             t.n = 0;
             rq_tokens_push(&t, rq_seq_tokens(s), L);
             if ((e = rq_seq_truncate(s, L)) != RQ_OK) break;
-            memmove(t.v, t.v + rq_seq_len(s), (size_t)(L - rq_seq_len(s)) * sizeof(int));
-            t.n = L - rq_seq_len(s);
+            int cut = rq_seq_len(s);
+            memmove(t.v, t.v + cut, (size_t)(L - cut) * sizeof(int));
+            t.n = L - cut;
             rq_tokens_push(&t, sp_turn2.v, sp_turn2.n);
+            if (ds && SD_MTP) {
+                // the view's rows the next call keeps: its common prefix with the target's tokens then t (K); its row K
+                // takes zeros when the target does not compute K - 1 again (it resumes at K: cut == K) and the call before
+                // did not end there (K != Lprev), if row K fits (its capacity)
+                const int *mt = rq_seq_tokens(ds), *st0 = rq_seq_tokens(s);
+                int K = 0, ml = rq_seq_len(ds);
+                while (K < ml && K < cut + t.n && mt[K] == (K < cut ? st0[K] : t.v[K - cut])) K++;
+                lk.keep[call] = K;
+                if (K > 0 && K < rq_seq_capacity(ds) && cut == K && K != Lprev) lk.apos[lk.approx++] = K;
+            }
         }
     }
     out->len = rq_seq_len(s);
     out->htok = hash_f((const float *)rq_seq_tokens(s), (size_t)out->len);
     out->rng = *rq_seq_rng(s);
+    if (e == RQ_OK && ds && SD_MTP && lock) { // (before the probe decode step below: the target as the loop left it)
+        lk.got_approx = out->st.mtp_approx;
+        int np_ = 0;
+        *lock = sp_lockstep(c, dc, s, ds, &lk, hk, &np_, ld, ldn);
+    }
     float *lg;
     if (e == RQ_OK && out->len < rq_seq_capacity(s) && (e = rq_decode(c, s, 1000, &lg)) == RQ_OK)
         out->hnext = rq_logits_hash(lg, V);
@@ -1811,6 +1904,107 @@ static int sp_run(RqCtx *c, RqCtx *dc, const SpCase *k, const RqSpecOpts *o, SpO
     rq_seq_free(s);
     rq_seq_free(ds);
     return e;
+}
+
+static void sp_out_free(SpOut *o) {
+    for (int i = 0; i < SP_CALLS; i++) free(o->ctok[i]);
+}
+
+static int file_same(const char *a, const char *b) {
+    // two files byte for byte (both readable)
+    FILE *f = fopen(a, "rb"), *g = fopen(b, "rb");
+    int ok = f && g, x = 0, y = 0;
+    while (ok && (x = fgetc(f)) == (y = fgetc(g)) && x != EOF) {}
+    ok &= x == y;
+    if (f) fclose(f);
+    if (g) fclose(g);
+    return ok;
+}
+
+static int sp_lockstep(RqCtx *c, RqCtx *dc, RqSeq *s, RqSeq *ms, const SpLock *lk, const SpHook *hk, int *npicks, char *d, size_t dn) {
+    // the MTP view's sequence after the loop (rev-math M4) against a reference built from the final tokens alone: the
+    // target's hidden rows of a fresh prefill, the view's fresh prefill over them (h shifted by one, zeros at the expected
+    // positions). Its length == the target's (to its capacity), mtp_approx == expected, every row final (hvalid), the
+    // target's last hidden state kept (hpos); the KV cache bitwise (rq_seq_save of copies of the whole 16-position tiles:
+    // a cache's positions past its length hold what was written there before); a probe row at the next position on both
+    // (the loop's with its hprev) bitwise; the hook's depth-0 picks (the view's own first guess of each round) == the
+    // reference's rq_spec_pick at those rows
+    int L = rq_seq_len(s), capm = rq_seq_capacity(ms), ML = rq_seq_len(ms), hv, hp, e, ok = 1;
+    const float *hprev;
+    mtp_seq_state(ms, &hv, &hp, &hprev);
+    int want = L < capm ? L : capm;
+    char why[256] = "";
+#define LK_FAIL(...) do { if (ok) snprintf(why, sizeof(why), __VA_ARGS__); ok = 0; } while (0)
+    if (ML != want) LK_FAIL("length %d, target %d (capacity %d)", ML, L, capm);
+    if (lk->got_approx != lk->approx) LK_FAIL("mtp_approx %d, expected %d", lk->got_approx, lk->approx);
+    if (hv != ML) LK_FAIL("hvalid %d of %d rows", hv, ML);
+    if (hp != L - 1) LK_FAIL("hpos %d, the target's last position %d", hp, L - 1);
+    float *H = malloc((size_t)L * D * sizeof(float)), *hin = calloc((size_t)(want + 1) * D, sizeof(float));
+    float *out = malloc((size_t)64 * V * sizeof(float));
+    int *pick = malloc((size_t)(want + 1) * sizeof(int));
+    RqSeq *rs = rq_seq_new(M, rq_seq_capacity(s), RQ_KV_DEFAULT, &e), *rv = rq_seq_new(SD, capm, RQ_KV_DEFAULT, &e);
+    if (!H || !hin || !out || !pick || !rs || !rv) die("sp_lockstep", RQ_ERR_NOMEM);
+    e = fw_rows(c, rs, rq_seq_tokens(s), L, RQ_LOGITS_NONE, NULL, NULL, H, NULL);
+    for (int q = 1; q < want; q++) {
+        int z = 0;
+        for (int i = 0; i < lk->approx; i++) z |= lk->apos[i] == q;
+        if (!z) memcpy(hin + (size_t)q * D, H + (size_t)(q - 1) * D, (size_t)D * sizeof(float));
+    }
+    for (int q = 0; q < want && e == RQ_OK; q += 64) { // (the reference's picks: its rows' rq_spec_pick)
+        int r = want - q < 64 ? want - q : 64;
+        e = fw_rows(dc, rv, rq_seq_tokens(s) + q, r, RQ_LOGITS_ALL, out, NULL, NULL, hin + (size_t)q * D);
+        for (int i = 0; i < r && e == RQ_OK; i++) {
+            float p1;
+            pick[q + i] = rq_spec_pick(out + (size_t)i * V, V, NULL, 0, &p1);
+        }
+    }
+    if (e != RQ_OK) LK_FAIL("reference: %s (%s)", rq_strerror(e), rq_ctx_error(dc));
+    // the KV cache: copies of the whole tiles below the length (fresh sequences: zeros past them), saved, byte for byte
+    int L16 = ML / 16 * 16;
+    if (ok && L16 > 0) {
+        RqSeq *a = rq_seq_new(SD, capm, RQ_KV_DEFAULT, &e), *b = rq_seq_new(SD, capm, RQ_KV_DEFAULT, &e);
+        char pa[512], pb[512];
+        const char *tmp = getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp";
+        snprintf(pa, sizeof(pa), "%s/api_test_lock_%d_a.rqseq", tmp, (int)getpid());
+        snprintf(pb, sizeof(pb), "%s/api_test_lock_%d_b.rqseq", tmp, (int)getpid());
+        int okk = a && b && rq_seq_copy(a, ms, L16) == RQ_OK && rq_seq_copy(b, rv, L16) == RQ_OK && rq_seq_save(a, pa) == RQ_OK &&
+                  rq_seq_save(b, pb) == RQ_OK && file_same(pa, pb);
+        if (!okk) LK_FAIL("the KV cache of rows 0..%d differs from the reference's", L16 - 1);
+        remove(pa);
+        remove(pb);
+        rq_seq_free(a);
+        rq_seq_free(b);
+    }
+    // a probe row at the next position: the loop's sequence with its hprev, the reference with h_{L-1}
+    int probe = ok && ML == L && L < capm && hp == L - 1;
+    if (probe) {
+        float *lg;
+        int tok = 1000 % V;
+        unsigned long long h1 = 0, h2 = 1;
+        if (fw_rows(dc, ms, &tok, 1, RQ_LOGITS_LAST, NULL, &lg, NULL, hprev) == RQ_OK) h1 = rq_logits_hash(lg, V);
+        if (fw_rows(dc, rv, &tok, 1, RQ_LOGITS_LAST, NULL, &lg, NULL, H + (size_t)(L - 1) * D) == RQ_OK) h2 = rq_logits_hash(lg, V);
+        if (h1 != h2) LK_FAIL("the probe row at %d differs (the kept hidden state or the cache)", L);
+    }
+    // the depth-0 picks (an earlier call's: rows the next call kept)
+    int np = 0;
+    for (int i = 0; hk && i < hk->npick && ok; i++) {
+        int row = hk->pick_pos[i] - 1, cl = hk->pick_call[i];
+        if (cl < hk->call && row >= lk->keep[cl]) continue;
+        if (row >= want || hk->pick_tok[i] != pick[row])
+            LK_FAIL("the first guess at %d: %d, the reference's %d", row + 1, hk->pick_tok[i], row < want ? pick[row] : -1);
+        np++;
+    }
+    *npicks = np;
+    snprintf(d, dn, "%d rows%s%s%s", ML, lk->approx ? " (1 approximate)" : "", probe ? " + probe" : "", ok ? "" : ": ");
+    if (!ok) snprintf(d + strlen(d), dn - strlen(d), "%s", why);
+#undef LK_FAIL
+    free(H);
+    free(hin);
+    free(out);
+    free(pick);
+    rq_seq_free(rs);
+    rq_seq_free(rv);
+    return ok;
 }
 
 static int sp_same(const SpOut *a, const SpOut *b) {
@@ -1894,18 +2088,22 @@ static int spec_main(int argc, char **argv) {
         else bad = 1;
     }
     if (bad || !path[1]) {
-        fprintf(stderr, "usage: api_test --spec TARGET DRAFT [--quick] [--other MODEL_OTHER_VOCABULARY]\n");
+        fprintf(stderr, "usage: api_test --spec TARGET DRAFT|mtp [--quick] [--other MODEL_OTHER_VOCABULARY]\n");
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     rq_threads_init(0);
-    char err[512], d[2048];
-    if (!(M = rq_model_load(path[0], NULL, err, sizeof(err))) || !(SD = rq_model_load(path[1], NULL, err, sizeof(err)))) {
+    char err[512], d[4096];
+    RqMtpOpts mo = { 0, -1 };
+    SD_MTP = !strcmp(path[1], "mtp"); // (the target's own MTP block: rq_mtp_load)
+    if (!(M = rq_model_load(path[0], NULL, err, sizeof(err))) ||
+        !(SD = SD_MTP ? rq_mtp_load(M, &mo, err, sizeof(err)) : rq_model_load(path[1], NULL, err, sizeof(err)))) {
         printf("FAIL setup  %s\n", err);
         return 1;
     }
     rq_model_info(M, &I);
     V = I.vocab_size;
+    D = I.dim;
     int e;
     RqCtx *c = rq_ctx_new(M, 64, 0, &e), *dc = c ? rq_ctx_new(SD, 64, 0, &e) : NULL;
     if (!dc) die("rq_ctx_new", e);
@@ -1954,6 +2152,11 @@ static int spec_main(int argc, char **argv) {
         { "think_turn2_greedy", 1, { 0, 0.9f, NULL, 0 }, 1, 30, 0, 0, 1, 1 },
         { "text_copy_greedy", 3, { 0, 0.9f, NULL, 0 }, 1, 110, 0, 0, 0, 1 },
         { "text_copy_seeded_turn2", 3, { 0.6f, 0.9f, NULL, 20 }, 13, 70, 0, 0, 1, 0 },
+        { "think_turn2_cut_at_checkpoint", 1, { 0, 0.9f, NULL, 0 }, 1, 30, 0, 0, 1, 1, 1 },
+        { "chat_turn2_checkpoint_below_cut", 0, { 0.7f, 0.9f, NULL, 40 }, 3, 24, 0, 0, 1, 0, 2 },
+        { "chat_turn2_no_cut", 0, { 0, 0.9f, NULL, 0 }, 1, 20, 0, 0, 1, 1, 3 },
+        { "chat_callback_stop", 0, { 1.0f, 0.95f, NULL, 20 }, 9, 96, 0, 0, 0, 1, 0, 25 },
+        { "chat_seeded_end_token", 0, { 1.0f, 0.95f, NULL, 20 }, 9, 96, 0, 0, 0, 0 }, // (synth-q35-27b-mtp: <|im_end|> 41st)
     };
     // G7, auto: the cost models calibrated here (on empty sequences), and a cheap one (guesses nearly free: every pass
     // guesses, the maximum of either source)
@@ -1976,12 +2179,18 @@ static int spec_main(int argc, char **argv) {
                                 { 8, 0, 8, 0, &tfree, &dfree } };
     const int quick_opts[] = { 1, 3, 4, 6, 9 };
     const char *stop_name[] = { "end", "limit", "context", "callback" };
+    // the hook's patterns (RqSpecOpts.guess_hook) per case: with an MTP view at k 3 and k 8 with tau 0.5 (the hook overrides
+    // tau; --quick: k 3), with a draft model at k 3 (not --quick)
+    const RqSpecOpts hk_opts[] = { { 3, 0, 0, 0 }, { 8, 0.5f, 0, 0 } };
+    int nhk = SD_MTP ? (quick ? 1 : 2) : quick ? 0 : 1;
+    static SpHook hk;
     int refed = 0;
     for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
         const SpCase *k = &cases[ci];
         if (quick && !k->quick) continue;
         SpOut ref, got;
-        int ok = (e = sp_run(c, dc, k, NULL, &ref)) == RQ_OK;
+        int lock_ok = 1, nlock = 0, lock, ok = (e = sp_run(c, dc, k, NULL, &ref, NULL, NULL, 0)) == RQ_OK;
+        char ld[512] = "", lfail[600] = "";
         snprintf(d, sizeof(d), "%d%s tok, stop %s%s%s:", ref.ngen[0] + ref.ngen[1], k->turn2 ? " (2 calls)" : "",
                  stop_name[ref.stop[k->turn2] & 3], k->turn2 ? "/" : "", k->turn2 ? stop_name[ref.stop[1] & 3] : "");
         for (size_t oi = 0; oi < sizeof(opts) / sizeof(opts[0]) && ok; oi++) {
@@ -1989,7 +2198,12 @@ static int spec_main(int argc, char **argv) {
             while (qi < 5 && quick_opts[qi] != (int)oi) qi++;
             if (quick && qi == 5) continue;
             const RqSpecOpts *o = &opts[oi];
-            int okk = (e = sp_run(c, dc, k, o, &got)) == RQ_OK && sp_same(&ref, &got);
+            int okk = (e = sp_run(c, dc, k, o, &got, &lock, ld, sizeof(ld))) == RQ_OK && sp_same(&ref, &got);
+            if (lock >= 0) {
+                nlock++;
+                if (!lock && lock_ok) snprintf(lfail, sizeof(lfail), " FAILED at setting %zu: %s", oi, ld);
+                lock_ok &= lock;
+            }
             okk &= got.st.accepted <= got.st.drafted && (I.linear_layers || got.st.refed == 0);
             okk &= got.st.lookup_accepted <= got.st.lookup_drafted && got.st.lookup_drafted <= got.st.drafted &&
                    (o->lookup || got.st.lookup_passes == 0) && (o->k || got.st.lookup_drafted == got.st.drafted);
@@ -2009,7 +2223,8 @@ static int spec_main(int argc, char **argv) {
                 snprintf(d + dl, sizeof(d) - dl, " (lookup %d/%d)", got.st.lookup_accepted, got.st.lookup_drafted);
             }
             ok &= okk;
-            if (k->prompt == 3 && k->cfg.temperature == 0 && oi == 4) { // the copy, the lookup alone (4 guesses)
+            if (k->prompt == 3 && k->cfg.temperature == 0 && oi == 4 && !SD_MTP) { // the copy, the lookup alone (4 guesses;
+                // the model pairs': the synthetic MTP files' main models do not copy)
                 double tpp = (double)got.st.gen.n_gen / (got.st.passes > 0 ? got.st.passes : 1);
                 char dd[160];
                 snprintf(dd, sizeof(dd), "a verbatim copy, lookup 4 alone: %.2f tokens per pass (%d/%d guesses accepted)", tpp,
@@ -2017,6 +2232,31 @@ static int spec_main(int argc, char **argv) {
                 report(okk && tpp >= 3.0, "spec_lookup_copy", dd);
             }
         }
+        // the hook's patterns: right (every guess accepted), wrong (none), wrong at a depth rotating per round, a seeded mix
+        int npick = 0;
+        for (int hi = 0; hi < nhk && ok && e == RQ_OK; hi++)
+            for (int p = 0; p < HK_N && ok; p++) {
+                RqSpecOpts o = hk_opts[hi];
+                memset(&hk, 0, sizeof(hk));
+                hk.pattern = p, hk.k = o.k, hk.ref = &ref, hk.rng = 0x9E3779B97F4A7C15ull ^ (ci * 131 + p);
+                o.guess_hook = sp_hook;
+                o.hook_user = &hk;
+                int okk = (e = sp_run(c, dc, k, &o, &got, &lock, ld, sizeof(ld))) == RQ_OK && sp_same(&ref, &got);
+                okk &= p != HK_RIGHT || got.st.accepted == got.st.drafted;
+                okk &= p != HK_WRONG || got.st.accepted == 0;
+                okk &= got.st.accepted <= got.st.drafted && (I.linear_layers || got.st.refed == 0);
+                refed += got.st.refed;
+                if (lock >= 0) {
+                    nlock++;
+                    if (!lock && lock_ok) snprintf(lfail, sizeof(lfail), " FAILED at hook %s k%d: %s", hk_name[p], o.k, ld);
+                    lock_ok &= lock;
+                    npick += hk.npick;
+                }
+                size_t dl = strlen(d);
+                snprintf(d + dl, sizeof(d) - dl, " hook-%s k%d%s %d/%d%s", hk_name[p], o.k, o.tau > 0 ? " tau 0.5" : "",
+                         got.st.accepted, got.st.drafted, okk ? "" : " DIFFER");
+                ok &= okk;
+            }
         if (e != RQ_OK) {
             size_t dl = strlen(d);
             snprintf(d + dl, sizeof(d) - dl, " error %s (%s)", rq_strerror(e), rq_ctx_error(c));
@@ -2024,6 +2264,14 @@ static int spec_main(int argc, char **argv) {
         char name[96];
         snprintf(name, sizeof(name), "spec_%s", k->name);
         report(ok, name, d);
+        if (SD_MTP) { // (rev-math M4: the view's rows, hidden states and guesses as a fresh lockstep run over the final tokens gives them)
+            snprintf(name, sizeof(name), "spec_%s/mtp_lockstep", k->name);
+            snprintf(d, sizeof(d), "%d runs (every setting and hook): the MTP view == a fresh lockstep prefill of the final tokens "
+                     "(length, mtp_approx, hvalid, hpos, the KV cache bitwise, a probe row, %d first guesses), last: %s%s", nlock, npick,
+                     ld, lfail);
+            report(ok && nlock > 0 && lock_ok, name, d);
+        }
+        sp_out_free(&ref);
         if (ci == 0) { // k 0: rq_generate itself (no draft)
             RqSpecOpts z = { 0, 0 };
             RqSeq *s = seq_new(0);
@@ -2040,6 +2288,64 @@ static int spec_main(int argc, char **argv) {
     }
     // Qwen3.5: every rollback on a checkpoint (both sequences)
     if (I.linear_layers) report(refed == 0, "spec_rollback_exact", refed ? "positions fed again after a rollback" : "no position fed again");
+    if (SD_MTP) { // an MTP view's final rows (hvalid): rq_prefill_spec, rq_seq_common_prefix, copy, truncate, save / load, reset
+        RqTokens u = toks("The quick brown fox jumps over the lazy dog. The quick brown fox");
+        int n = u.n, hv, hp, ok = 1;
+        const float *hpv;
+        RqSeq *s = seq_new(0), *s2 = seq_new(0), *ms = rq_seq_new(SD, 0, RQ_KV_DEFAULT, &e), *m2 = rq_seq_new(SD, 0, RQ_KV_DEFAULT, &e);
+        float *l1 = NULL, *l2 = NULL, *o1 = malloc((size_t)n * V * sizeof(float)), *o2 = malloc((size_t)n * V * sizeof(float));
+        // the target's logits: rq_prefill's (all rows, the last); the view in lockstep: every row final, h_{n-2} kept
+        ok &= rq_prefill(c, s2, u.v, n - 1, RQ_LOGITS_ALL, o1, NULL) == RQ_OK &&
+              rq_prefill_spec(c, s, dc, ms, u.v, n - 1, RQ_LOGITS_ALL, o2, NULL) == RQ_OK && same(o1, o2, (size_t)(n - 1) * V);
+        mtp_seq_state(ms, &hv, &hp, &hpv);
+        ok &= rq_seq_len(ms) == n - 1 && hv == n - 1 && hp == n - 2 && rq_seq_common_prefix(ms, u.v, n) == n - 1;
+        rq_seq_reset(s);
+        rq_seq_reset(s2);
+        ok &= rq_prefill(c, s2, u.v, n, RQ_LOGITS_LAST, NULL, &l1) == RQ_OK && (memcpy(o1, l1, V * sizeof(float)), 1) &&
+              rq_prefill_spec(c, s, dc, ms, u.v, n, RQ_LOGITS_LAST, NULL, &l2) == RQ_OK && same(o1, l2, V);
+        mtp_seq_state(ms, &hv, &hp, &hpv);
+        ok &= rq_seq_len(ms) == n && hv == n && hp == n - 1; // (its n - 1 rows kept: the same tokens)
+        // a row fed outside the loop (provisional: hvalid unchanged) is not kept by the common prefix
+        ok &= rq_seq_truncate(ms, n - 1) == RQ_OK && fw_rows(dc, ms, u.v + n - 1, 1, RQ_LOGITS_NONE, NULL, NULL, NULL, NULL) == RQ_OK;
+        mtp_seq_state(ms, &hv, &hp, &hpv);
+        ok &= rq_seq_len(ms) == n && hv == n - 1 && hp == -1 && rq_seq_common_prefix(ms, u.v, n) == n - 1;
+        ok &= rq_seq_copy(m2, ms, n) == RQ_OK && (mtp_seq_state(m2, &hv, &hp, &hpv), hv == n - 1 && hp == -1);
+        ok &= rq_seq_truncate(ms, 3) == RQ_OK && (mtp_seq_state(ms, &hv, &hp, &hpv), hv == 3) && rq_seq_common_prefix(ms, u.v, n) == 3;
+        char pa[512];
+        snprintf(pa, sizeof(pa), "%s/api_test_hvalid_%d.rqseq", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", (int)getpid());
+        ok &= rq_seq_save(m2, pa) == RQ_OK && rq_seq_load(ms, pa, n) == RQ_OK && (mtp_seq_state(ms, &hv, &hp, &hpv), hv == n && hp == -1);
+        remove(pa);
+        rq_seq_reset(ms);
+        mtp_seq_state(ms, &hv, &hp, &hpv);
+        ok &= hv == 0 && hp == -1;
+        report(ok, "spec_mtp_hvalid", "rq_prefill_spec: the target's logits == rq_prefill's, the view's rows final (hvalid) with "
+               "the last hidden state kept; a row fed outside the loop not kept by rq_seq_common_prefix; copy / truncate / "
+               "save + load / reset");
+        // the MTP block of another model (a second load of the target file): refused before any pass
+        if (!quick) {
+            ok = 1;
+            RqModel *M2 = rq_model_load(path[0], NULL, err, sizeof(err));
+            RqModel *v2 = M2 ? rq_mtp_load(M2, &mo, err, sizeof(err)) : NULL;
+            RqSeq *x = v2 ? rq_seq_new(v2, 0, RQ_KV_DEFAULT, &e) : NULL;
+            RqCtx *xc = v2 ? rq_ctx_new(v2, 8, 0, &e) : NULL;
+            RqSpecOpts so = { 3, 0, 0, 0 };
+            rq_seq_reset(s);
+            ok &= x && xc && rq_generate_spec(c, s, xc, x, u.v, n, &cases[0].cfg, 4, &so, NULL, NULL) == RQ_ERR_ARG && rq_seq_len(s) == 0 &&
+                  rq_prefill_spec(c, s, xc, x, u.v, n, RQ_LOGITS_NONE, NULL, NULL) == RQ_ERR_ARG && rq_seq_len(s) == 0;
+            rq_ctx_free(xc);
+            rq_seq_free(x);
+            rq_model_free(v2);
+            rq_model_free(M2);
+            report(ok, "spec_mtp_other_model", "the MTP view of another model (a second load): RQ_ERR_ARG before any pass");
+        }
+        free(o1);
+        free(o2);
+        rq_seq_free(s);
+        rq_seq_free(s2);
+        rq_seq_free(ms);
+        rq_seq_free(m2);
+        rq_tokens_free(&u);
+    }
     // a verify row's checkpoint kept (rq_seq_checkpoint_at below the length: the server's </think> inside a verify pass),
     // the rows' dropped (rq_seq_checkpoint_rows_drop: the end of a job's speculation); a truncation there == a fresh prefill
     {
@@ -2111,12 +2417,7 @@ static int spec_main(int argc, char **argv) {
 }
 
 // ---------------------------------------------------------------------------------------- api_test --mtp
-
-// src/internal.h's fw_rows (the library's hook for the MTP drafter; linked from its objects): rq_prefill with every row's
-// final hidden state (hidden, n x dim; NULL: none) and an MTP view's h input rows (h_in; NULL: zeros)
-int fw_rows(RqCtx *c, RqSeq *s, const int *tokens, int n, int mode, float *out, float **logits, float *hidden, const float *h_in);
-
-static int D; // the model's dim
+// (fw_rows, D: above, api_test --spec)
 
 static RqSeq *mt_seq(RqModel *m) {
     int e;

@@ -335,6 +335,8 @@ void seq_kv_populate(const RqSeq *s, int n, int it);
 // view's h input rows h_in (n x dim; NULL: zeros; RQ_ERR_ARG on another model): the same logits, cache and state as
 // without them (the speculative loop's MTP drafter, spec.c; tests/api_test.c --mtp)
 int fw_rows(RqCtx *c, RqSeq *s, const int *tokens, int n, int mode, float *out, float **logits, float *hidden, const float *h_in);
+// spec.c: an MTP view sequence's hvalid, hpos and hprev (RqSeq above; tests/api_test.c --spec's mtp_lockstep)
+void mtp_seq_state(const RqSeq *s, int *hvalid, int *hpos, const float **hprev);
 
 // ------------------------------------------------------------------------------------- a sequence
 
@@ -381,6 +383,15 @@ struct RqSeq {
     struct { int pos, rows; } pend[RQ_SEQ_CK_MAX];
     CkPass ckw;         // the checkpoints the pass in progress takes (n 0: none)
     unsigned long long rng; // sampling (xorshift)
+    // an MTP view's sequence (the speculative loop's MTP drafter, spec.c): hvalid the leading rows that are final (their h
+    // input the target's hidden state at the previous position, or zeros where the loop did not have it: RqSpecStats.
+    // mtp_approx), the rows past it provisional (a guess's, fed the view's own hidden state); rq_seq_common_prefix keeps
+    // at most hvalid rows, so a provisional row is never kept as a final one. hprev (dim floats, views only): the target's
+    // hidden state at position hpos (-1: none), the next call's h for its row hpos + 1. rq_seq_truncate(n): hvalid =
+    // min(hvalid, n), hpos > n - 1 -> -1; rq_seq_copy as a truncation of the source; reset: 0, -1; a loaded view
+    // sequence (seqfile.c): hvalid = its length, hpos -1. The forward passes leave them as they are (spec.c sets them)
+    int hvalid, hpos;
+    float *hprev;
 };
 
 // bytes of a cache offset of e elements (a whole number of tiles: layers, blocks of ATT_P positions, kv_tile) in the

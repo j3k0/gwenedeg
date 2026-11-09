@@ -342,6 +342,12 @@ Server
 - Byte-level masking: the non-canonical first tokens (e.g. `S` + `IMPLE` rather than `SIM` + `PLE`) carry at most
   0.2% (0.6B) / 1.1% (1.7B) of the probability mass on the router eval set. It is small, but a trie of
   canonical token sequences would drop it.
+- The MTP drafter (TODO S9b, `src/spec.c`) follows the target in lockstep: its rows run in every round (and over every
+  prompt chunk), so only the last target pass's hidden rows are ever needed. A lazy MTP that catches up only when it
+  drafts would have to keep every position's hidden state (20 KB per position on the 27B, ~1.9 GiB at 96k); keeping
+  several passes' rows (S9e) only pays if non-MTP rounds are common. Rows fed zeros for an unknown hidden state (the
+  first row after a cut that lands where the kept rows end) count as final (`RqSeq.hvalid`): the target never
+  computes their h again, so dropping them at the next turn would only turn the rows after them into zero rows too.
 
 ## History
 

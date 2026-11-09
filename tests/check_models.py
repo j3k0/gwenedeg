@@ -585,6 +585,15 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
                 continue
             for ok, name, det in mtp_ref_run(a, model, d, texts, f"{prefix}/{tag}", *MTP_TH[tag], nd):
                 res.report(ok, name, det)
+            # the speculative loop with the trained block as the draft (TODO S9b): == plain decoding, mtp_lockstep after each
+            # case (mtp_approx as expected: 0 in one call, at most 1 per later call), the acceptance in the details
+            p = run([a.api_test, "--spec", model, "mtp", "--quick"], nd)
+            lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
+            for l in lines:
+                n, _, det = l[5:].partition("  ")
+                res.report(l.startswith("PASS "), f"{prefix}/{tag}/spec/{n.strip()}", det.strip())
+            if p.returncode not in (0, 1) or not lines:
+                res.report(False, f"{prefix}/{tag}/spec/run", f"exit status {p.returncode}: {p.stderr.decode(errors='replace')[-300:]}")
             print(f"      ({tag}: {time.time() - t0:.1f} s)")
             continue
 

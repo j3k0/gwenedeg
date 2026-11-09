@@ -54,6 +54,15 @@ Steps:
   classifier; a vocabulary subset is fine, exactness does not care which guesses). Needs the final hidden state per
   row from the verify pass (a new `rq_forward_batch` output). Measure acceptance first; keep whichever draft gives
   more tok/s (the 0.8B Q4_K_M at S7: ~6.5 ms per guess, 13.2-14.1 tok/s thinking on, 16.6-17.2 off).
+  - **Status (2026-11-08, branch `s9-mtp`, plan `PLAN-S9-mtp.md`):** S9.0, S9.0b, S9.1, S9a, S9w and **S9b done**: the
+    CLI's `-D mtp` (`--mtp-vocab N`) and the API (`rq_generate_spec` / `rq_spec_run` / `rq_prefill_spec` with the
+    target's MTP view as the draft, in lockstep; `RqSpecOpts.guess_hook` / `prior`, `RqSpecStats.mtp_rows` /
+    `mtp_approx`); output == plain decoding on every case (spec group: `spec_api/mtp_synth*`, `spec_mtp/*`, the
+    `mtp_lockstep` check after every run). On Qwen3.5-0.8B with its own block (the opt-in test file) as target and
+    draft: 64 / 64 outputs == plain, 42-79% of the guesses accepted, 2.2-3.5 tokens per pass at k 2-4, 0.87-1.24x plain's
+    tok/s on that small model (docs/qwen38-speculative.md, "The loop"). `runq serve --draft mtp` is refused until S9c. **Next: S9d** (S9d.1:
+    `scripts/s9_gate.sh`, `tests/spec_sweep.c`; S9d.2: the 27B's acceptance, gated: closed while MemAvailable is ~12 GiB
+    next to the live server), then S9c only after a go.
   - **Acceptance measured (2026-11-08, llama.cpp cf34d31 `--spec-type draft-mtp` vs `draft-simple -md` the 0.8B
     Q4_K_M; k 3, thinking on, T 0.6 / top_p 0.95 / top_k 20, 12 threads, CPU):** MTP 410 / 765 drafted tokens accepted
     (54%) vs the 0.8B 233 / 714 (33%), MTP ahead on each of the 4 prompts (38-70% vs 25-42%; LCB medium + 2 coding

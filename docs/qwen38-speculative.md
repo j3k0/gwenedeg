@@ -1687,8 +1687,9 @@ h_in: A's guesses) and the target. `B 1`: one view row without logits (B's), `ca
 | | 16k | 5.74 / 5.17 | 7.45 / 7.29 | 3.16 / 3.26 | 11.83 / 11.93 |
 | | 49k | 7.52 / 7.54 | 10.62 / 10.49 | 5.35 / 5.43 | 15.35 / 15.33 |
 
-The f16 runs are alike (wide, 1k: 4.90 / 4.51, 7.57 / 7.45, 2.37 / 2.50, 11.99 / 11.72). The decode path is never
-slower beyond the noise (+-3%), and up to ~10% faster for the guesses with the 100k subset. So the engine's "one row:
+The f16 runs are alike (wide, 1k: 4.90 / 4.51, 7.57 / 7.45, 2.37 / 2.50, 11.99 / 11.72). The decode path is not
+slower beyond the noise (+-3%) but in one small-file cell (synth-q35-ista-mtp, 1k, a full-vocabulary guess: 0.53 /
+0.61, +15%; not at 16k, nor on the wider files), and up to ~10% faster for the guesses with the 100k subset. So the engine's "one row:
 the decode path" stays with hidden states: `rq_decode_hidden` for a one-row pass of either model. Both are bitwise
 equal (`decode_hidden/*`).
 

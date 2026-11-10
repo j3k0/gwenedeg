@@ -18,6 +18,10 @@ CONTEXT=98304
 KV_DISK="./kv-cache"
 KV_DISK_MAX="10"
 
+# drafter (speculative decoding) and extra flags per config: the 0.8B draft by default
+SPEC_ARGS="-G 5 --tau 0.4 --draft $DRAFT_MODEL"
+EXTRA_ARGS=""
+
 # Saluki on port 8418
 if [ "$CONFIG" = "saluki" ]; then
   MODEL=models/Underdog-Saluki-27B-1.0-GGUF/Underdog-Saluki-27B-1.0-IQ2-mix.gguf
@@ -39,10 +43,14 @@ elif [ "$CONFIG" = "qwopus" ]; then
 elif [ "$CONFIG" = "ista-iq3s" ]; then
   # ISTA-DASLab Qwen3.8-27B GSQ-RCO IQ3_S (3.5 bpw, 12.1 GB), the file with its MTP block (blk.64, Q6_K): BF16
   # ssm_alpha / ssm_beta widened to F32 at load (TODO S9.1; logits identical to the F32-rewritten file's); the block
-  # is not loaded unless --draft mtp (TODO S9c)
+  # is not loaded unless --draft mtp (TODO S9c). The daytime server since 2026-11-10 (the nightly's RESTORE).
+  # Its own MTP block as the drafter (S9c.G, 2026-11-10: 1.14x / 1.18x the 0.8B draft at 1 client, thinking on / off;
+  # docs/qwen38-speculative.md); --repack: the IQ3_S weights as 4-bit codes (bit-identical output, ~+1.4 GiB, faster decode)
   MODEL=models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
   NAME=qwen3.8-27b-iq3s
   KV_CACHE_TYPE=q8-dot
+  SPEC_ARGS="--draft mtp -G 6 --tau 0.5"
+  EXTRA_ARGS="--repack"
 else
   echo "Usage: $0 <config>"
   echo "Config:"
@@ -70,9 +78,8 @@ mkdir -p "$KV_DISK"
 ./runq serve "$MODEL" \
   --ctx "$CONTEXT" \
   --timeout 0 \
-  -G 5 --tau 0.4 \
+  $SPEC_ARGS $EXTRA_ARGS \
   -k "$KV_CACHE_TYPE" \
-  --draft "$DRAFT_MODEL" \
   --slots $SLOTS --parallel $PARALLEL --admit "$ADMIT" \
   --kv-disk "$KV_DISK" --kv-disk-max "$KV_DISK_MAX" \
   --port "$BIND_PORT" --host "$BIND_HOST" \

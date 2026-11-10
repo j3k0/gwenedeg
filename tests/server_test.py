@@ -2320,7 +2320,10 @@ def run_all(a, t, port, ref, slow, logname):
     rep(st == 200 and d["object"] == "list" and [m["id"] for m in d["data"]] == ["test-model"], "basic/models")
     st1, d1, _ = req(port, "GET", "/v1/models/test-model")
     st2, d2, _ = req(port, "GET", "/v1/models/other")
-    rep(st1 == 200 and d1["id"] == "test-model" and st2 == 404 and d2["error"]["code"] == "model_not_found", "basic/model_by_id")
+    st3, d3, _ = req(port, "GET", "/v1/models/test")   # a prefix of the id ending at its '-'
+    st4, d4, _ = req(port, "GET", "/v1/models/tes")
+    rep(st1 == 200 and d1["id"] == "test-model" and st2 == 404 and d2["error"]["code"] == "model_not_found" and
+        st3 == 200 and d3["id"] == "test-model" and st4 == 404, "basic/model_by_id")
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
     ok = True
     for i in range(5):
@@ -2563,6 +2566,11 @@ def run_all(a, t, port, ref, slow, logname):
     err("invalid_utf8", 400, "invalid_json", raw=b'{"messages": [{"role": "user", "content": "\xff"}]}')
     err("missing_messages", 400, body={"model": "test-model"})
     err("model_other", 404, "model_not_found", body={"model": "other", "messages": U})
+    # a prefix of the id is accepted only where the id has a '-' (test-model: "test", not "tes", "test-" nor "")
+    for nm in ("tes", "test-", "", "test-modelx"):
+        err(f"model_prefix_{nm or 'empty'}", 404, "model_not_found", body={"model": nm, "messages": U, "max_tokens": 1})
+    st, d, _ = req(port, "POST", "/v1/chat/completions", {"model": "test", "messages": U, "max_tokens": 1})
+    rep(st == 200 and d.get("model") == "test", "errors/model_prefix_ok", f"{st} {str(d)[:120]}")  # (the request's name echoed)
     err("model_not_string", 400, body={"model": 3, "messages": U})
     err("empty_messages", 400, body={"messages": []})
     err("bad_role", 400, body={"messages": [{"role": "tool", "content": "x"}]})

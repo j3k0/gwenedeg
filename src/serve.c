@@ -97,6 +97,13 @@ static void send_err(App *a, HttpConn *c, HttpReq *r, int status, const char *ms
 
 // ------------------------------------------------------------------------------------- GET routes
 
+static int model_named(const char *req, size_t n, const char *id) {
+    // a request's model names this server's: its id (--name), or a prefix of it that ends where the id has a '-'
+    // (qwen3.8-27b-iq3s: also qwen3.8-27b and qwen3.8, not qwen3 nor qwen3.8-2), so a gateway's generic name reaches it
+    size_t k = strlen(id);
+    return n <= k && !memcmp(req, id, n) && (n == k || (n > 0 && id[n] == '-'));
+}
+
 static void model_obj(App *a, JBuf *b) {
     jb_cstr(b, "{\"id\": ");
     jb_strz(b, a->model_id);
@@ -106,7 +113,7 @@ static void model_obj(App *a, JBuf *b) {
 static void get_models(App *a, HttpConn *c, HttpReq *r, const char *id) {
     JBuf b = { 0 };
     if (id) {
-        if (strcmp(id, a->model_id)) {
+        if (!model_named(id, strlen(id), a->model_id)) {
             char msg[512];
             snprintf(msg, sizeof(msg), "The model '%.200s' does not exist", id);
             send_err(a, c, r, 404, msg, "model", "model_not_found");
@@ -926,10 +933,10 @@ static void post_chat(App *a, HttpConn *c, HttpReq *r) {
         send_err(a, c, r, 400, msg, NULL, "invalid_json");
         return;
     }
-    // the request's model: absent (or null) for the served one, else exactly its id (--name); render (serve_render)
-    // does not check it
+    // the request's model: absent (or null) for the served one, else its id (--name) or a prefix of it ending at a '-'
+    // (model_named); render (serve_render) does not check it
     const Js *mv = json_get(json_root(doc), "model");
-    if (mv && mv->t != JS_NULL && !json_str_eq(mv, a->model_id)) {
+    if (mv && mv->t != JS_NULL && !(mv->t == JS_STR && model_named(mv->s, (size_t)mv->n, a->model_id))) {
         char msg[512];
         int str = mv->t == JS_STR;
         if (str) snprintf(msg, sizeof(msg), "The model '%.200s' does not exist (this server's: '%.200s')", mv->s, a->model_id);

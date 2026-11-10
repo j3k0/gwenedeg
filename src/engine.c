@@ -2649,10 +2649,10 @@ static int mtp_pass(Engine *e, int nds, int rows, float **lg, double *t) {
     double took = rq_now() - t0;
     *t += took;
     if (err == RQ_OK && pred > 0) cost_learn(&e->dcost, &e->dcal, &e->dlr, pred, took);
-    if (err == RQ_OK)
+    if (err == RQ_OK) {
         for (int i = 0; i < nds; i++) // (a job that ended in this step: published, the connection thread may read its Job)
             if (!e->dsegrun[i]->done) e->dsegrun[i]->j->sp_draft_rows += g[i].n;
-    else if (e->o.verbose)
+    } else if (e->o.verbose)
         fprintf(stderr, "[engine] the MTP view's pass failed (%d rows): %s (only the speed changes)\n", rows,
                 rq_ctx_error(e->dc)[0] ? rq_ctx_error(e->dc) : rq_strerror(err));
     return err;

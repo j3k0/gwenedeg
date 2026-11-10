@@ -341,6 +341,10 @@ draft model's (its calibrated costs, prior 0.8: `rq_spec_prior`). A view row who
 and at most one row per conversation turn that restarts exactly where it diverged (the cut drops the kept state; a
 hybrid model's restart below the divergence leaves the view ahead, exact). Only the guesses get worse; the output stays
 plain decoding's. `-v`'s summary at the end: `mtp: A n passes r rows t s; B ...; steps n t s; approx n; gaps n`.
+On a Qwen3.8-27B file with its block (S9c.G, 2026-11-10: ISTA's IQ3_S-mtp, 14 threads, `--parallel 4 --admit bound`,
+against today's 0.8B Q4_K_M `-G 5 --tau 0.4`; docs/qwen38-speculative.md, "In the server (S9c)"): **`--draft mtp -G 6
+--tau 0.5`** (the vocabulary default 100000), +14% tok/s at 1 client thinking on, +18% off, +1% at 4 clients, the 32k
+warm turns 2% shorter, outputs identical.
 
 **Tests** (`tests/server_test.py --spec DRAFT|none`, in `make test`'s spec group: the Qwen3-0.6B Q8_0 + Q4_K_M pair,
 Qwen3.5-0.8B Q8_0 + Q4_K_M, the 0.8B with the lookup alone; 19 / 22 / 22 checks): every request with speculation off
@@ -355,7 +359,8 @@ drafter's checks: every reply's `mtp_approx` 0 (a restart exactly at a divergenc
 `"speculative": false` and after a constrained one, the copy paths (from a running request, from an idle slot under slot
 affinity), a cancelled stream retried, the trained block's guesses accepted, the views at rest after every step
 (`RUNQ_TEST_MTP_CHECK=1`: no `[engine] bug:` line) and every finished request's view == a fresh lockstep run
-(`RUNQ_TEST_MTP_DUMP=DIR` + `api_test --mtp-seqcheck`); `--admit-chunk --draft mtp`: the swap with the view
+(`RUNQ_TEST_MTP_DUMP=DIR` + `api_test --mtp-seqcheck`; on a 27B, `--one-server --mtp-dump-max N`: one check at a time,
+every 4th dump kept up to N, a 27B dump being ~0.8 GB); `--admit-chunk --draft mtp`: the swap with the view
 (`mtp_approx` 0 after a swap, a lookup-only request's view swapped too); `--draft mtp -G 0` == no draft.
 
 **Measured** (`scripts/bench_serve.py --only gen`, streamed 128-token greedy replies, 2 per client, `--parallel 4`, 8

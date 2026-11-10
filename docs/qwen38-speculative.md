@@ -1768,6 +1768,100 @@ $GATE --server-draft $D8 -- .venv/bin/python -I scripts/s9c_bench.py --model $S 
 G4 reads the JSON files (`startup`: the `admission bound:` terms; per request `lease_gib`; `peak` and `samples`:
 committed, VmHWM); G5's rule and records as in the plan.
 
+**S9c.G (2026-11-10, 10:20-13:30Z, a window the user opened: saluki and `runq-day` stopped by the lead, no runq server
+up).** The build: 0a32bdc (S9c + `--repack`), `./runq` == main's installed one (sha256 ee3696e3...), `--repack` off.
+Every job through `scripts/s9_gate.sh --until 13:30 --server ...` (the commands above), **`KM=6`** for both
+configurations (the gate: closed at 7, MemAvailable 22.5-23.6 GiB with saluki down; at 6 the estimate 18.09 GiB with the
+view / 18.01 with the 0.8B, cap 19.09 / 19.01, budget 19.1-19.8: open, a few jobs after a 15-60 s retry). At 6 GiB a
+G2 request leases 1.81-1.86 GiB with A and 1.87-1.93 with B, so **3 of a 4-client burst run at once** in both (`/health`:
+running 3, queued up to 3). A box with load 12-18 from other jobs (not an idle box's numbers).
+
+- **G1, correctness (== plain): passed.** `--spec mtp --quick --one-server` 13 / 13 (greedy 8 settings, seeded 4,
+  thinking 4, four at once with auto, next turn's cache, `mtp_followed`, `mtp_copy`, `mtp_cancel`, `mtp_approx` 0 on 42
+  replies, the startup line, `mtp_invariant`, **`mtp_lockstep` 8 of the 42 dumped views == a fresh lockstep run** (every 4th
+  kept: `--mtp-dump-max 8`, below), `servers at once: max 1`; 7 min 12 s, the scope's peak 16.93 / 18.09 / 19.09 GiB).
+  `--disk --draft mtp --one-server` 11 / 11 + `SKIP disk/lock` (`disk/mtp_lockstep` 3 saved pairs, `disk/mtp_approx` 0 on
+  the 4 loaded turns, the restart bitwise, `servers at once: max 1`; 3 min 46 s, peak 12.71 GiB). Startup: `draft mtp
+  (blk.64, vocab 100000; weights 0.33 GiB)`; `admission bound:` KV 37.0 KB per position, state 149.6 MiB (B: 41.4 KB /
+  168.9 MiB); `costs: target 84.7 ms + ...; draft 2.76 ms + ...` (`-G 3`, the server_test's settings).
+  - The first G1a run was killed by its scope's OOM (cap 19.09) in `spec/mtp_lockstep`: server_test ran two `api_test
+    --mtp-seqcheck` at once (each loads the 27B), and its 42 dumps (a 27B target's `.rqseq` is ~0.8 GB: 4 checkpoints +
+    the state + KV) filled `/` (25 GB, 10:24-10:38Z; deleted at 10:38). Fixed in server_test.py: `--one-server` runs
+    them one at a time, and `--mtp-dump-max N` keeps every 4th dumped job up to N (the others deleted as they appear;
+    the check still requires one dump per `mtp_approx` 0 reply).
+- **G2, short context, A B A B A B: every output hash equal**, 192 replies of the 6 jobs (16 requests x 1 and 4 clients x
+  2 modes per job; == plain via G1). A = `--draft mtp -G 6 --tau 0.5`, B = the 0.8B Q4_K_M `-G 5 --tau 0.4` (today's
+  `ista-iq3s`). Tok/s per request (predicted_n / predicted_ms), 1 client: the mean of 4 prompts x {greedy, seeded}; 4
+  clients: the aggregate tokens / the round's wall, the mean of greedy and seeded:
+
+  | job | thinking on, 1 client | on, 4 clients (greedy, seeded) | thinking off, 1 client | off, 4 clients | accepted / drafted | tokens per pass | VmHWM / scope peak (GiB) | wall |
+  |---|---|---|---|---|---|---|---|---|
+  | A1 | 16.35 | 19.68 (18.57, 20.80) | 18.50 | 20.91 | 5,449 / 7,815 (70%) | 2.24 | 17.10 / 17.13 | 12 min 38 s |
+  | B1 | 14.39 | 20.68 (18.59, 22.77) | 15.97 | 21.52 | 4,346 / 6,758 (64%) | 1.82 | 17.06 / 17.53 | 10 min 30 s |
+  | A2 | 17.11 | 21.05 (20.40, 21.70) | 18.85 | 21.93 | 5,590 / 7,733 (72%) | 2.31 | 17.05 / 17.08 | 12 min 14 s |
+  | B2 | 15.23 | 19.52 (17.23, 21.80) | 15.68 | 17.55 | 4,395 / 6,823 (64%) | 1.82 | 17.14 / 17.18 | 13 min 52 s |
+  | A3 | 15.40 | 19.26 (18.09, 20.43) | 16.41 | 18.74 | 5,598 / 7,656 (73%) | 2.31 | 17.04 / 17.07 | 13 min 30 s |
+  | B3 | 13.60 | 18.59 (16.48, 20.70) | 15.44 | 19.14 | 3,588 / 5,655 (63%) | 1.60 | 16.59 / 16.78 | 14 min 18 s |
+  | **median A** | **16.35** | **19.68** | **18.50** | 20.91 | | | | |
+  | **median B** | **14.39** | **19.52** | **15.68** | 19.14 | | | | |
+  | **A / B** | **1.136** (rule >= 1.05) | **1.009** (>= 0.97) | **1.180** (>= 0.95) | 1.092 | | | | |
+
+  - Tokens per pass: the job's tokens / its requests' passes (every pass, plain ones too). `mtp_approx` 0 on every
+    reply; `draft_rows` A ~26,000, B ~19,000-21,000 per job. What auto chose (passes plain / model / lookup): A
+    1,093-1,389 / 3,051-3,218 / 27-39, B 1,542-1,567 / 3,835-3,864 / 80-104 (B3: 3,475 / 2,596 / 195: auto chose plain
+    more often there, B's lowest job; its startup calibration: target 86.3 ms, draft 4.92 ms, vs B1 79.0 / 4.71 and B2 77.8 / 3.88;
+    A's: target 78.2-88.4 ms, the view's guess 2.73-3.04 ms).
+  - The `-v` summaries: A's `mtp: A 8,227-9,087 passes 29.6-35.6 s; B 2,228-2,314 passes 7.4-8.6 s; steps 3,087-3,190
+    708.7-783.2 s; approx 0; gaps 0`: the view's follow pass B is **1.0-1.1% of the step time**, its guesses (A) 4.2-4.5%.
+    B's draft model: 6,466-7,026 passes, 42.4-46.4 s.
+  - Against S9d.2's CLI (8 threads, 4 prompts x 256 tokens, one run): there MTP `-G 6 --tau 0.5` +16% over the 0.8B
+    thinking on and -4% off; here, in the server at 14 threads, +14% on and **+18% off** (the 0.8B's `-G 5 --tau 0.4`, and
+    the server's auto, which takes plain or the lookup where the draft does not pay).
+  - B1 started on A1's `/var/tmp/s9c-kv` (its 7 view files removed as foreign, the 0.8B caught up on the loaded
+    prefixes); from A2 on every G2 job started with the directory empty (A2 / A3 would otherwise have loaded B's targets
+    with zero-filled view rows, `mtp_approx` > 0). The optional C runs (`-G 3`) were not done (time).
+- **G4, memory:** the startup terms as planned (A: 37.0 KB per position, 149.6 MiB state; B: 41.4 / 168.9); leases
+  A 1.807 / 1.851 / 1.860 GiB, B 1.874 / 1.923 / 1.933 per request (-3.6%); the pool's peak `committed` A 5.83-5.87 GiB,
+  B 5.68-5.95; **VmHWM A 17.04-17.10, B 16.59-17.14; the scope's peak A 17.07-17.13, B 16.78-17.53** (estimate 18.09 /
+  18.01, cap 19.09 / 19.01). A's peak (max over its jobs) <= B's: 17.10 vs 17.14 (VmHWM), 17.13 vs 17.53 (scope).
+- **G3, 32k, per turn** (`--long 32768 --turns 3`, greedy, thinking on, auto; one run each; A first into an empty
+  `/var/tmp/s9c-kv`, then B): every output hash equal (8 replies). Seconds; decode tok/s in brackets:
+
+  | turn | prompt (cached) | A wall | A prefill | A decode | B wall | B prefill | B decode |
+  |---|---|---|---|---|---|---|---|
+  | 0 (cold) | 31,755 (0) / B 31,713 (42) | 886.2 | 844.9 | 41.2 (12.42) | 817.8 | 768.6 | 49.2 (10.41) |
+  | 1 | 34,299 (31,750) | 134.1 | 82.8 | 51.3 (9.60, 493 tokens) | 120.0 | 71.2 | 48.8 (10.10) |
+  | 2 | 36,934 (34,294) | 126.1 | 83.4 | 42.7 (11.99) | 129.5 | 74.2 | 55.3 (9.26) |
+  | 3 | 39,556 (36,929) | 128.2 | 85.5 | 42.7 (11.98) | 130.6 | 75.8 | 54.7 (9.35) |
+  | **2-3 (warm)** | | **254.3** | 168.9 | 85.4 | **260.1** | 150.0 | 110.0 |
+
+  - **A / B on the warm turns: 0.978** (rule <= 1.03). A decodes 28-29% faster (12.0 vs 9.3 tok/s) and prefills 12-16%
+    slower (the view follows every prompt row: B 40,865 rows 24.6 s, 0.6 ms a row at 32-40k; cold +10%, 844.9 vs 768.6 s).
+  - What auto chose: A the view on every turn (117-155 model passes, 24-52 plain, lookup 0-15; 1,222 / 1,756 guesses
+    accepted, 70%); **B never the 0.8B at 32k+** (0 model passes; lookup 32-94 passes, 157 / 347 accepted, plain
+    330-463): there B is plain + the lookup.
+  - The view's guess at 32-40k with q8-dot (risk 9.4): `mtp: A 2,227 passes 2,227 rows 13.77 s` = **6.2 ms a guess**
+    (S9w's 49k: 8.3 ms q8); B 1.9% and A 1.1% of the step time (1,274.4 s).
+  - B's turn 0 is cold as well: the disk tier gave it 42 of the saved entry's 40,067 tokens (a hybrid target resumes at
+    a kept checkpoint; the entry's are at its end, none at the 31.7k prompt's), not the plan's "only its 0.8B catches up".
+  - Memory: VmHWM A 14.77 / B 14.20 GiB, the scope's peak 14.80 / 14.35, the pool's resident 2.85 / 2.39, committed
+    3.14 / 3.37; leases A 2.87-3.14, B 3.07-3.36 GiB. A's higher resident memory here is its `-G 6` verify rows' state
+    copies (149.6 MiB each) that B's lookup (<= 3 guesses) never touched.
+  - Jobs: A 21 min 40 s (from the gate's open: 12:29:30-12:51:10Z), B 20 min 23 s (12:51:31-13:11:54Z).
+- **G5, the rule (PLAN-S9c-server.md 7):** outputs equal (G1 == plain, G2 192 and G3 8 hashes equal) yes; 1 client
+  thinking on 1.136 >= 1.05 yes; 1 client thinking off 1.180 >= 0.95 yes; 4 clients thinking on 1.009 >= 0.97 yes; the
+  32k warm turns 0.978 <= 1.03 yes; A's memory peak <= B's yes on each configuration's peak over its jobs (VmHWM 17.10
+  vs 17.14, the scope 17.13 vs 17.53 GiB, both in G2), though in G3 alone A's was higher (14.77 vs 14.20, the state
+  copies above). **Verdict: DEPLOY** (`--draft mtp -G 6 --tau 0.5`, the vocabulary default; C not run, so `-G 3` not
+  considered); the user decides (S9c.D). Small margins: 4 clients +0.9%, memory 0.04 GiB, G3 one run each, a loaded box.
+  **S9c.6 not triggered:** A is 1.136 B at 1 client (not in [B, 1.05 B)), and B's time is 1.0-1.1% of the step total
+  (< 3%).
+- **Found:** `mtp_pass` (src/engine.c, the `-v` failure line) has a dangling `else`: the `else if (verbose)` binds to the
+  inner `if (!dsegrun[i]->done)`, so a successful B pass that includes a job ending in this step prints "the MTP view's
+  pass failed (1 rows): ok" (once per finished request: 23-24 per G2 A job, 4 in G3-A), and a real failure prints
+  nothing. Logging only (`draft_rows` counted right, `approx 0; gaps 0` everywhere). Not fixed here (the measured binary
+  == the installed one); braces in S9c.D's build or before.
+
 ## Not now
 
 DFlash 2 (a 2B block-diffusion drafter: a new architecture, a 4 GB BF16 download); multi-VM splits (~10-30% over

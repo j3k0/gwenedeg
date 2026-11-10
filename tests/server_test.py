@@ -2007,6 +2007,42 @@ def run_spec_mtp(a, t, port, out, quick):
         + ("; " + "; ".join(bad[:4]) if bad else ""))
 
 
+class DumpPruner:
+    """--mtp-dump-max N: keeps every 4th dumped job (in the order they appear) up to N, deletes the others' files as soon as
+    they appear (a file being written is freed at its close)"""
+
+    def __init__(self, d, n):
+        self.d, self.n, self.seen, self.keep, self.dropped = d, n, [], set(), 0
+        self.stop = threading.Event()
+        self.th = threading.Thread(target=self.loop, daemon=True)
+        self.th.start()
+
+    def scan(self):
+        for f in sorted(os.listdir(self.d)):
+            j = f.split(".", 1)[0]
+            if j not in self.seen:
+                self.seen.append(j)
+                if (len(self.seen) - 1) % 4 == 0 and len(self.keep) < self.n:
+                    self.keep.add(j)
+                else:
+                    self.dropped += 1
+            if j not in self.keep:
+                try:
+                    os.unlink(os.path.join(self.d, f))
+                except OSError:
+                    pass
+
+    def loop(self):
+        while not self.stop.is_set():
+            self.scan()
+            self.stop.wait(0.2)
+
+    def finish(self):
+        self.stop.set()
+        self.th.join()
+        self.scan()
+
+
 def spec_mtp_after(a, t, logtext, dump):
     """--spec mtp, after the shutdown: no '[engine] bug:' line (RUNQ_TEST_MTP_CHECK: every view at rest after every step);
     the dumps (RUNQ_TEST_MTP_DUMP: the finished jobs with mtp_approx 0) one per such reply, each == a fresh lockstep run
@@ -2016,6 +2052,13 @@ def spec_mtp_after(a, t, logtext, dump):
     rep(not bugs and "runq serve: stopped" in logtext, "spec/mtp_invariant", "; ".join(bugs[:3]) or "no '[engine] bug:' line")
     pairs = sorted(f[:-len(".draft.rqseq")] for f in os.listdir(dump) if f.endswith(".draft.rqseq"))
     want = sum(1 for tm in MTP_REC if tm["speculative"]["mtp_approx"] == 0)
+    pr = getattr(a, "dump_pruner", None)
+    if pr:  # (--mtp-dump-max: the kept ones; every dumped job was seen)
+        if len(pr.seen) != want:
+            rep(False, "spec/mtp_lockstep", f"{len(pr.seen)} jobs dumped, {want} replies with mtp_approx 0")
+            shutil.rmtree(dump, ignore_errors=True)
+            return
+        want = len(pr.keep)
     api = a.api_test or os.path.join(os.path.dirname(os.path.abspath(a.runq)), "build", "api_test")
     env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
 
@@ -2023,7 +2066,8 @@ def spec_mtp_after(a, t, logtext, dump):
         q = subprocess.run([api, "--mtp-seqcheck", a.model, os.path.join(dump, p + ".rqseq"), os.path.join(dump, p + ".draft.rqseq")],
                            capture_output=True, env=env)
         return p, q.returncode == 0 and q.stdout.startswith(b"PASS "), q.stdout.decode(errors="replace").strip()[-200:]
-    with cf.ThreadPoolExecutor(max_workers=2) as ex:
+    # (--one-server: one api_test at a time; each loads the whole model, two 27B ones exceed the gate's cap: S9c.G1)
+    with cf.ThreadPoolExecutor(max_workers=1 if getattr(a, "one_server", False) else 2) as ex:
         res = list(ex.map(one, pairs))
     fails = [f"job {p}: {o}" for p, ok, o in res if not ok]
     v2 = sum(1 for _, ok, o in res if ok and "the kept state" in o)
@@ -2133,6 +2177,9 @@ def main():
                     "first, then served with --draft mtp (disk/mtp_foreign_draft)")
     ap.add_argument("--one-server", action="store_true", help="never two runq serve processes at once (the 27B: S9c.G); with "
                     "S9_GATE_MEM set, --mem S9_GATE_MEM for every server")
+    ap.add_argument("--mtp-dump-max", type=int, default=0, metavar="N", help="with --spec mtp: keep at most N dumped jobs (every 4th "
+                    "one as they are written, the rest deleted at once; spec/mtp_lockstep checks those): a 27B target's dump is "
+                    "~0.8 GB (S9c.G1)")
     a = ap.parse_args()
     a.q35_spec = False
     t = T(a)
@@ -2200,6 +2247,8 @@ def main_groups(a, t):
             return 1
         dump = tempfile.mkdtemp(prefix="runq-mtpdump-", dir=os.environ.get("RUNQ_DISK_TMP") or ("/var/tmp" if os.access("/var/tmp", os.W_OK) else None))
         env.update(RUNQ_TEST_MTP_CHECK="1", RUNQ_TEST_MTP_DUMP=dump)
+        if a.mtp_dump_max > 0:
+            a.dump_pruner = DumpPruner(dump, a.mtp_dump_max)
     srv = subprocess.Popen([a.runq, "serve", a.model] + base +
                            ((["-D", a.spec] if a.spec != "none" else ["--lookup", "4"]) + ["--spec-calibrate", "1024"] if a.spec else []),
                            stderr=log, stdout=subprocess.DEVNULL, env=env)
@@ -2250,6 +2299,8 @@ def main_groups(a, t):
     live(-1)
     logtext = open(log.name).read()
     t.report(rc == 0 and "runq serve: stopped" in logtext, "shutdown/sigterm", f"exit status {rc}")
+    if getattr(a, "dump_pruner", None):
+        a.dump_pruner.finish()
     if dump:
         spec_mtp_after(a, t, logtext, dump)
     if a.verbose:

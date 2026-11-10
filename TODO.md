@@ -64,8 +64,22 @@ Steps:
     (2026-11-09, docs/server.md), its view loaded from `--kv-disk` to the prompt's prefix and in the `--admit` terms
     since S9c.4; S9c.5 (2026-11-09) added the tools of the 27B's measurement in the server (`scripts/s9_gate.sh --server`,
     `scripts/s9c_bench.py`, `bench/s9c/`; the commands in docs/qwen38-speculative.md, "In the server (S9c)") and the
-    trained 0.8B block's whole `--spec mtp` group (`models/3.5-0.8b-mtp/server_spec/*`); next: S9c.G (the 27B in the
-    server, gated: a window with saluki down).
+    trained 0.8B block's whole `--spec mtp` group (`models/3.5-0.8b-mtp/server_spec/*`). **S9c.G done (2026-11-10,
+    10:20-13:30Z, saluki down; 0a32bdc's `./runq`, `--repack` off; `--kv-mem 6` for both, 7 closed): DEPLOY** by the
+    plan's rule (docs/qwen38-speculative.md, "In the server (S9c)"). ISTA IQ3_S-mtp, 14 threads, `ista-iq3s`'s flags;
+    A = `--draft mtp -G 6 --tau 0.5`, B = the 0.8B Q4_K_M `-G 5 --tau 0.4`:
+    - G1: `--spec mtp --quick --one-server` 13 / 13 (== plain; `mtp_approx` 0 on 42 replies; `mtp_lockstep` 8 of 42
+      dumps, `--mtp-dump-max 8`), `--disk --draft mtp --one-server` 11 / 11 + SKIP `disk/lock`; `servers at once: max 1`.
+    - G2 (A B A B A B, `--short --think 1,0`): 192 hashes equal; medians A / B: 1 client thinking on **16.35 / 14.39
+      (1.136)**, off **18.50 / 15.68 (1.180)**, 4 clients on **19.68 / 19.52 (1.009)** (3 of 4 run at once at 6 GiB);
+      70-73% vs 63-64% of the guesses accepted; the view's B 1.0-1.1% of the step time.
+    - G3 (32k, 3 turns): warm turns 2-3 **254.3 / 260.1 s (0.978)**; A decodes +28-29%, prefills +12-16% (the view
+      follows); auto never took the 0.8B at 32k+ (B = plain + lookup); the view's guess 6.2 ms at 32-40k.
+    - G4: leases A 1.81-1.86, B 1.87-1.93 GiB; VmHWM A 17.04-17.10, B 16.59-17.14 (G3: 14.77 / 14.20); the scope's
+      peak <= 17.53 GiB (estimate 18.09 / 18.01, cap 19.09 / 19.01).
+    - S9c.6 not triggered (A is 1.136 B; B's time < 3%). The setting for `ista-iq3s`: `--draft mtp -G 6 --tau 0.5`
+      (S9c.D, the user's call). Open: `mtp_pass`'s dangling `else` (a spurious `-v` "view's pass failed ... ok" line
+      per finished request, a real failure unlogged; logging only).
     **S9d.1 done (2026-11-09):** `scripts/s9_gate.sh` (the 27B gate: the estimate from metadata, the servers' `/health`
     margin and the timers that start one, a capped scope without swap, the watchdog, the bench lock) and
     `build/spec_sweep` (`make spec-sweep`: settings x S7's prompts in one process, every output checked against plain);

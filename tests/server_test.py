@@ -1290,8 +1290,10 @@ def run_admit_chunk(a, t):
     try:
         rep(bool(sd) and not swap_files() and "leftover swap file(s) removed" in open(lg).read(), "admit_chunk/restart_empties_swap",
             f"swap dir {sd}, files {swap_files()}")
-        ls = [{"messages": [{"role": "user", "content": f"Count from {k} to 5000, separated by commas."}], "temperature": 0, **LP}
-              for k in (1, 2, 3)]
+        # ("Write only the numbers.": without it Qwen3-0.6B-Q8_0.gguf answers k = 3 with a short explanation, EOS at
+        # 133 tokens, alone too; the .bin and Qwen3.5-0.8B count to the context either way)
+        ls = [{"messages": [{"role": "user", "content": f"Count from {k} to 5000, separated by commas. Write only the numbers."}],
+               "temperature": 0, **LP} for k in (1, 2, 3)]
         with cf.ThreadPoolExecutor(max_workers=3) as ex:
             fs = []
             for k, b in enumerate(ls):
@@ -1310,7 +1312,8 @@ def run_admit_chunk(a, t):
         ok &= all(r["tm"].get("paused_ms", 0) > 0 or r["tm"].get("swaps", 0) > 0 for r in rs[1:])
         nsw = sum(r["tm"].get("swaps", 0) for r in rs[1:])
         rep(ok and nsw > 0 and r0["ka"] >= 3 and "beyond the live budget" in log, "admit_chunk/liveness",
-            f"swapped out at once {mem(hp, 'swapped_out')}; finish {[r0['finish']] + [r['out'][3] for r in rs[1:]]}, the oldest first: "
+            f"swapped out at once {mem(hp, 'swapped_out')}; finish {[r0['finish']] + [r['out'][3] for r in rs[1:]]} "
+            f"(alone {[f['out'][3] if len(f['out']) > 3 else f['out'] for f in refs]}), the oldest first: "
             f"{done == sorted(done)}; paused_ms {[round(r['tm'].get('paused_ms', -1)) for r in rs]}, swaps {[r['tm'].get('swaps') for r in rs]}; "
             f"== alone: {[r0['content'] == refs[0]['out'][0]] + [r['out'] == f['out'] for r, f in zip(rs[1:], refs[1:])]}; keep-alives in a row "
             f"during a swap {r0['ka']}; warned: {'beyond the live budget' in log}")

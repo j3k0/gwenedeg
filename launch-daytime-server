@@ -1,0 +1,17 @@
+#!/bin/bash
+# The daytime server: the one place that says which runq config devbox3 serves by day.
+# Started as the systemd user unit runq-day (lcb_timebox/nightly.sh restores it after the nightly benchmark;
+# by hand: systemd-run --user --unit=runq-day --working-directory=$PWD --property=Restart=on-failure ./launch-daytime-server).
+#   ./launch-daytime-server          start it (exec launch-server with the settings below)
+#   ./launch-daytime-server --print  print "<config> <kv>" (for scripts)
+# History: saluki (q8-dot) until 2026-11-10; ista-iq3s q8-dot 2026-11-10; ista-iq3s q4-dot since 2026-11-11.
+DAY_CONFIG=ista-iq3s   # a launch-server config
+DAY_KV=q4-dot          # KV cache type ("" = the config's default)
+
+case "${1:-}" in
+  --print) echo "$DAY_CONFIG ${DAY_KV:--}"; exit 0 ;;
+  "") ;;
+  *) echo "usage: $0 [--print]" >&2; exit 2 ;;
+esac
+cd "$(dirname "$0")" || exit 1
+KV="$DAY_KV" exec ./launch-server "$DAY_CONFIG"

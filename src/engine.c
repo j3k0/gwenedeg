@@ -156,6 +156,11 @@ struct Engine {
     DiskEnt *dk;
     long long dk_bytes;
     double dk_max;
+    // the disk watch (dk_watch): the free space kept (--kv-disk-free, bytes), the room always kept for one full session (a
+    // slot's sequences at ctx: dk_open), the next check, the heartbeat's last touch, the last low-space warning; the
+    // test hooks' check period (s) and free-space file (RUNQ_TEST_KV_CHECK, RUNQ_TEST_DISKFREE: bytes)
+    double dk_res, dk_floor, dk_chk, dk_beat, dk_warn, dk_every;
+    const char *df_file;
     struct { int spill, slot, load, L, Lv; } plan; // (slots / entry id, -1: none; Lv: the saved tokens' common prefix with the prompt)
     unsigned long long dk_saves, dk_loads;
     double dk_save_s, dk_load_s;
@@ -928,7 +933,13 @@ static int real_reuse(int L, int n) { return L >= 32 || (L > 0 && 2 * L >= n); }
 // run between passes, without mu (admit plans them: dk_run), so queueing and /health never wait on the disk; the
 // running jobs do (a 6 GiB sequence: ~2.5 s to save, ~1 s to load at ~2.5 / ~6 GB/s). The files survive a
 // restart (indexed at the start; their mtime orders them). Budget: --kv-disk-max GiB (default half the free space
-// at the start, our files included), and 1 GiB of the file system kept free; the least recently used go first.
+// at the start, our files included, at least one full session), and --kv-disk-free GiB of the file system kept free
+// (default 5); the least recently used go first. Whatever the free space, the tier keeps room for one full session (a
+// slot's sequences at ctx positions: dk_floor) as long as 1 GiB stays free (DK_RESERVE).
+// The disk watch (dk_watch, every minute, by the engine thread between passes or when idle): the heartbeat (DIR/.../lock's
+// mtime, touched at the start, hourly and at shutdown); below --kv-disk-free, first the unused directories next to ours
+// are deleted (dk_purge: <16 hex digits>-<KV type> with a lock file nobody holds, no activity for 2 h: the newest mtime
+// there), the oldest first, then our least recently used files down to one session's room.
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -936,7 +947,10 @@ static int real_reuse(int L, int n) { return L >= 32 || (L > 0 && 2 * L >= n); }
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 
-#define DK_RESERVE (1024.0 * 1048576.0) // bytes of the file system kept free
+#define DK_RESERVE (1024.0 * 1048576.0) // bytes of the file system kept free, even for the one session's room
+#define DK_CHECK 60.0                   // s between disk watches
+#define DK_BEAT 3600.0                  // s between heartbeats
+#define DK_STALE 7200.0                 // s without activity: another server's directory is unused (if its lock is free)
 
 static void start_run(Engine *e, Job *j, int si, int src, int L);
 
@@ -946,7 +960,121 @@ static void dk_path(const Engine *e, int id, int draft, char *buf, size_t n) {
 
 static double dk_free(const Engine *e) {
     struct statvfs v;
+    if (e->df_file) { // (RUNQ_TEST_DISKFREE: bytes, read at each use)
+        FILE *f = fopen(e->df_file, "r");
+        double b = -1;
+        if (f) {
+            if (fscanf(f, "%lf", &b) != 1) b = -1;
+            fclose(f);
+        }
+        if (b >= 0) return b;
+    }
     return statvfs(e->dk_dir, &v) ? -1 : (double)v.f_bavail * (double)v.f_frsize;
+}
+
+static void dk_beat(Engine *e) {
+    // the heartbeat: the lock file's mtime (dk_purge: a directory whose lock is free and whose newest mtime is 2 h old)
+    char p[4096];
+    snprintf(p, sizeof(p), "%s/lock", e->dk_dir);
+    utimensat(AT_FDCWD, p, NULL, 0);
+    e->dk_beat = rq_now();
+}
+
+static double dir_scan(const char *dir, int del, double *newest) {
+    // the regular files' bytes under dir (one level of subdirectories: swap/), their newest mtime (wall clock, into
+    // *newest); del: unlinked (the lock last), the directories removed
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    double bytes = 0;
+    char p[4096];
+    struct dirent *de;
+    struct stat st;
+    while ((de = readdir(d))) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..") || (del && !strcmp(de->d_name, "lock"))) continue;
+        snprintf(p, sizeof(p), "%s/%s", dir, de->d_name);
+        if (lstat(p, &st)) continue;
+        if (S_ISDIR(st.st_mode)) {
+            bytes += dir_scan(p, del, newest);
+            if (del) rmdir(p);
+            continue;
+        }
+        bytes += (double)st.st_size;
+        if (newest && (double)st.st_mtime > *newest) *newest = (double)st.st_mtime;
+        if (del) unlink(p);
+    }
+    closedir(d);
+    if (del) {
+        snprintf(p, sizeof(p), "%s/lock", dir);
+        if (!lstat(p, &st)) bytes += (double)st.st_size;
+        unlink(p);
+        rmdir(dir);
+    }
+    return bytes;
+}
+
+static int dk_name(const char *s) {
+    // a disk tier's directory name: <16 hex digits>-<KV type>
+    for (int i = 0; i < 16; i++)
+        if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f'))) return 0;
+    return s[16] == '-' && s[17];
+}
+
+static void dk_purge(Engine *e, double want) {
+    // until want bytes are free: the unused disk tier directories next to ours removed, the oldest activity first (a lock
+    // file nobody holds, taken while they go; their newest mtime DK_STALE old; nothing else there touched)
+    const char *own = strrchr(e->dk_dir, '/');
+    own = own ? own + 1 : e->dk_dir;
+    for (int n = 0; n < 64; n++) { // (bounded: a directory that cannot be removed is not tried forever)
+        double fr = dk_free(e);
+        if (fr < 0 || fr >= want) return;
+        DIR *d = opendir(e->o.kv_disk);
+        if (!d) return;
+        char best[256] = "", p[4096];
+        double bt = 0, wall = (double)time(NULL);
+        struct dirent *de;
+        struct stat st;
+        while ((de = readdir(d))) {
+            const char *s = de->d_name;
+            if (!dk_name(s) || !strcmp(s, own) || strlen(s) >= sizeof(best)) continue;
+            snprintf(p, sizeof(p), "%s/%s/lock", e->o.kv_disk, s);
+            if (lstat(p, &st) || !S_ISREG(st.st_mode)) continue;
+            double newest = 0;
+            snprintf(p, sizeof(p), "%s/%s", e->o.kv_disk, s);
+            dir_scan(p, 0, &newest);
+            if (wall - newest < DK_STALE || (best[0] && newest >= bt)) continue;
+            int fd = open(p, O_RDONLY | O_DIRECTORY | O_CLOEXEC); // (its lock: free now?)
+            char q[4096];
+            snprintf(q, sizeof(q), "%s/lock", p);
+            int lk = fd >= 0 ? open(q, O_RDWR | O_CLOEXEC) : -1, freed = lk >= 0 && !flock(lk, LOCK_EX | LOCK_NB);
+            if (lk >= 0) close(lk);
+            if (fd >= 0) close(fd);
+            if (!freed) continue;
+            snprintf(best, sizeof(best), "%s", s);
+            bt = newest;
+        }
+        closedir(d);
+        if (!best[0]) return;
+        snprintf(p, sizeof(p), "%s/%s/lock", e->o.kv_disk, best);
+        int lk = open(p, O_RDWR | O_CLOEXEC);
+        if (lk < 0 || flock(lk, LOCK_EX | LOCK_NB)) { // (taken meanwhile: a server started there)
+            if (lk >= 0) close(lk);
+            return;
+        }
+        snprintf(p, sizeof(p), "%s/%s", e->o.kv_disk, best);
+        double b = dir_scan(p, 1, NULL);
+        close(lk);
+        fprintf(stderr, "runq serve: --kv-disk: %s removed (unused for %.1f h, %.2f GiB): %.2f GiB free, --kv-disk-free %.2f\n", p,
+                (wall - bt) / 3600.0, b / 1073741824.0, fr / 1073741824.0, e->dk_res / 1073741824.0);
+    }
+}
+
+static void dk_low(Engine *e, double fr, const char *what) {
+    // the warning that the free space is under --kv-disk-free (at most hourly)
+    double now = rq_now();
+    if (e->dk_warn > 0 && now - e->dk_warn < 3600) return;
+    e->dk_warn = now;
+    fprintf(stderr, "runq serve: --kv-disk: %.2f GiB free under %s, below --kv-disk-free %.2f GiB; %s\n", fr / 1073741824.0,
+            e->o.kv_disk, e->dk_res / 1073741824.0, what);
 }
 
 static void dk_touch(const Engine *e, DiskEnt *d) {
@@ -979,14 +1107,23 @@ static int dk_fit(Engine *e, double need, int keep_id) {
     // room for need more bytes (the budget, the file system's reserve): the least recently used entries removed (not
     // keep_id) until it fits; 0 if it cannot
     // (--admit chunk: the budget kept free beyond the reserve for the swap files, sw_open)
+    // (--kv-disk-free: the unused directories next to ours go first, dk_purge; below it, our files fit one session's room)
     double sw = e->sw_dir && e->o.kv_mem * 1073741824.0 > e->sw_bytes ? e->o.kv_mem * 1073741824.0 - e->sw_bytes : 0;
+    dk_purge(e, need + e->dk_res + sw);
     for (;;) {
         double fr = dk_free(e);
-        if (e->dk_bytes + need <= e->dk_max && (fr < 0 || fr - need >= DK_RESERVE + sw)) return 1;
+        if (e->dk_bytes + need <= e->dk_max && (fr < 0 || fr - need >= e->dk_res + sw ||
+                                                (e->dk_bytes + need <= e->dk_floor && fr - need >= DK_RESERVE + sw))) {
+            if (fr >= 0 && fr - need < e->dk_res + sw && need > 0) dk_low(e, fr, "the disk tier keeps one session's room");
+            return 1;
+        }
         int v = -1;
         for (int k = 0; k < e->ndk; k++)
             if (e->dk[k].id != keep_id && (v < 0 || e->dk[k].used < e->dk[v].used)) v = k;
-        if (v < 0) return 0;
+        if (v < 0) {
+            if (fr >= 0 && fr - need < DK_RESERVE + sw && need > 0) dk_low(e, fr, "nothing saved (not even one session's room)");
+            return 0;
+        }
         if (e->o.verbose) fprintf(stderr, "[engine] disk: entry %d removed (%d tokens, %.1f MB): room\n", e->dk[v].id, e->dk[v].f.len, e->dk[v].bytes / 1e6);
         dk_remove(e, v);
     }
@@ -1130,8 +1267,33 @@ static int dk_open(Engine *e, char *err, size_t errlen) {
     if (e->o.admit == ADMIT_CHUNK && sw_open(e, err, errlen)) return -1;
     double fr = dk_free(e);
     e->dk_max = e->o.kv_disk_max > 0 ? e->o.kv_disk_max * 1073741824.0 : fr >= 0 ? 0.5 * (fr + (double)e->dk_bytes) : 16.0 * 1073741824.0;
+    if (e->o.kv_disk_max <= 0 && e->dk_max < e->dk_floor) e->dk_max = e->dk_floor;
+    if (e->o.kv_disk_max > 0 && e->dk_max < e->dk_floor)
+        fprintf(stderr, "runq serve: --kv-disk-max %.2f GiB holds less than one full session (%.2f GiB at %d positions)\n", e->o.kv_disk_max,
+                e->dk_floor / 1073741824.0, e->o.ctx);
+    dk_beat(e);
+    e->dk_chk = rq_now() + e->dk_every;
     dk_fit(e, 0, -1);
+    fr = dk_free(e);
+    if (fr >= 0 && fr + (double)e->dk_bytes < e->dk_floor + DK_RESERVE)
+        fprintf(stderr, "runq serve: --kv-disk: %.2f GiB free under %s (our files included): less than one full session (%.2f GiB) + "
+                "%.0f GiB kept free, the disk tier saves what fits\n", (fr + (double)e->dk_bytes) / 1073741824.0, e->o.kv_disk,
+                e->dk_floor / 1073741824.0, DK_RESERVE / 1073741824.0);
     return 0;
+}
+
+static void dk_watch(Engine *e) {
+    // (the engine thread, without mu: every DK_CHECK s) the heartbeat; below --kv-disk-free, the unused directories next to
+    // ours removed, then our least recently used files down to one session's room (dk_fit)
+    double now = rq_now();
+    e->dk_chk = now + e->dk_every;
+    if (now - e->dk_beat >= DK_BEAT) dk_beat(e);
+    double fr = dk_free(e);
+    if (fr < 0 || fr >= e->dk_res) return;
+    dk_fit(e, 0, -1);
+    fr = dk_free(e);
+    if (fr >= 0 && fr < e->dk_res)
+        dk_low(e, fr, e->dk_bytes > 0 ? "the disk tier keeps one session's room at most" : "the disk tier is empty");
 }
 
 static void dk_close(Engine *e) {
@@ -3121,7 +3283,23 @@ static void *engine_main(void *arg) {
     Engine *e = arg;
     pthread_mutex_lock(&e->mu);
     for (;;) {
-        while (e->nrun == 0 && e->qn == 0 && !e->stop) pthread_cond_wait(&e->cv, &e->mu);
+        while (e->nrun == 0 && e->qn == 0 && !e->stop) {
+            if (!e->dk_dir) {
+                pthread_cond_wait(&e->cv, &e->mu);
+                continue;
+            }
+            if (rq_now() >= e->dk_chk) { // (the disk watch when idle; e->cv's clock: the wall clock, a tick only)
+                pthread_mutex_unlock(&e->mu);
+                dk_watch(e);
+                pthread_mutex_lock(&e->mu);
+                continue;
+            }
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            double w = e->dk_chk - rq_now();
+            ts.tv_sec += (time_t)(w > 0 ? w : 0) + 1;
+            pthread_cond_timedwait(&e->cv, &e->mu, &ts);
+        }
         if (e->nrun == 0 && e->qn == 0) break;
         double now = rq_now();
         int k = 0;
@@ -3186,6 +3364,7 @@ static void *engine_main(void *arg) {
         }
         reap(e);
         if (e->mtp_chk) mtp_check(e);
+        if (e->dk_dir && rq_now() >= e->dk_chk) dk_watch(e); // (between passes, as dk_run)
         pthread_mutex_lock(&e->mu);
         e->running = e->nrun;
         mem_publish(e);
@@ -3193,6 +3372,7 @@ static void *engine_main(void *arg) {
     pthread_mutex_unlock(&e->mu);
     for (int i = 0; e->dk_dir && i < e->nslot; i++) // the disk tier: what the disk has not seen yet
         if (e->slot[i].gen != e->slot[i].dk_gen && rq_seq_len(e->slot[i].seq) >= e->o.kv_disk_min) dk_spill(e, i, -1);
+    if (e->dk_dir) dk_beat(e); // (the last heartbeat: DK_STALE from the shutdown)
     if (e->dk_dir && (e->dk_saves || e->dk_loads))
         fprintf(stderr, "[engine] disk: %llu saves (%.2f s), %llu loads (%.2f s); %d entries, %.2f GiB in %s\n", e->dk_saves, e->dk_save_s,
                 e->dk_loads, e->dk_load_s, e->ndk, e->dk_bytes / 1073741824.0, e->dk_dir);
@@ -3458,6 +3638,13 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
     }
     e->tcal = e->tcost;
     e->dcal = e->dcost;
+    // the disk watch's settings (dk_open uses them): one full session = a slot's sequences at ctx positions (+ the files'
+    // tokens and headers, the MTP view's kept state)
+    e->dk_res = o->kv_disk_free * 1073741824.0 > DK_RESERVE ? o->kv_disk_free * 1073741824.0 : DK_RESERVE; // (1 GiB at least, as before)
+    e->dk_floor = (double)e->sm.total + (double)e->dsm.total + 2.0 * (4.0 * o->ctx + 3 * 4096.0);
+    const char *kc = getenv("RUNQ_TEST_KV_CHECK"), *kf = getenv("RUNQ_TEST_DISKFREE"); // (tests: the watch's period, s; the free space)
+    e->dk_every = kc && atof(kc) > 0 ? atof(kc) : DK_CHECK;
+    e->df_file = kf && *kf ? kf : NULL;
     if (o->kv_disk && *o->kv_disk && dk_open(e, err, errlen)) {
         engine_free(e);
         return NULL;
@@ -3502,8 +3689,8 @@ void engine_describe(Engine *e, char *buf, size_t n) {
              ((double)e->sm.total + e->dsm.total) * e->nslot / G, e->o.kv_mem, e->mem_src, e->o.chunk, e->o.batch);
     if (e->dk_dir) {
         size_t l = strlen(buf);
-        snprintf(buf + l, n - l, "; disk tier %s: %d saved sequence(s), %.2f of %.2f GiB, slots saved from %d tokens", e->dk_dir, e->ndk,
-                 e->dk_bytes / G, e->dk_max / G, e->o.kv_disk_min);
+        snprintf(buf + l, n - l, "; disk tier %s: %d saved sequence(s), %.2f of %.2f GiB, slots saved from %d tokens, %.2f GiB kept free "
+                 "(one session's room: %.2f GiB)", e->dk_dir, e->ndk, e->dk_bytes / G, e->dk_max / G, e->o.kv_disk_min, e->dk_res / G, e->dk_floor / G);
     }
 }
 

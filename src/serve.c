@@ -1090,6 +1090,9 @@ static void usage(void) {
             "                      (and at shutdown), loaded back when a prompt continues them (also after a restart);\n"
             "                      an SSD; one server per model and KV type (docs/server.md, \"KV cache on disk\")\n"
             "  --kv-disk-max <GiB> the disk tier's size at most, default half the free space at the start\n"
+            "  --kv-disk-free <GiB> free space kept on --kv-disk's file system, default 5: checked every minute, the unused\n"
+            "                      directories there (no server, no activity for 2 h) removed first, then the oldest saved\n"
+            "                      sequences; room for one full session is kept whatever the free space\n"
             "  --kv-disk-min <int> save a slot when at least this many of its tokens would be discarded, default 1024\n"
             "  --checkpoints <int> Qwen3.5 / 3.8: recurrent-state checkpoints per slot (the end of the system prompt, the\n"
             "                      assistant header, the turn's first reply, the reply's end), 1..32, default 4\n"
@@ -1134,7 +1137,7 @@ int serve_main(int argc, char **argv) {
     const char *draft_path = NULL, *kv_disk = NULL;
     int mtp_vocab = -1; // (--mtp-vocab; -1: RQ_MTP_VOCAB_DEFAULT if the vocabulary is larger, else all)
     int kv_disk_min = 1024, admit = ADMIT_WORST, admit_chunk = 1024, admit_yield = 0;
-    double kv_disk_max = 0, admit_margin = 1.5;
+    double kv_disk_max = 0, kv_disk_free = 5, admit_margin = 1.5;
     int spec_k = 3, lookup = -1, lookup_min = 0, spec_mode = -1, calib = 8192;
     float spec_tau = 0;
     long long maxbody = 4 << 20;
@@ -1190,6 +1193,7 @@ int serve_main(int argc, char **argv) {
         else if (!strcmp(f, "--checkpoints")) ckpts = atoi(v);
         else if (!strcmp(f, "--kv-disk")) kv_disk = v;
         else if (!strcmp(f, "--kv-disk-max")) kv_disk_max = atof(v);
+        else if (!strcmp(f, "--kv-disk-free")) kv_disk_free = atof(v);
         else if (!strcmp(f, "--kv-disk-min")) kv_disk_min = num_arg(v, 1, 1 << 30);
         else if (!strcmp(f, "--queue")) queue = atoi(v);
         else if (!strcmp(f, "--max-conns")) conns = atoi(v);
@@ -1211,7 +1215,7 @@ int serve_main(int argc, char **argv) {
         else usage();
     }
     if (port < 0 || port > 65535 || ctx < 16 || slots < 0 || slots > 1024 || parallel < 1 || parallel > 256 || kv_mem < 0 || chunk < 1 ||
-        copy_min < 0 || kv_disk_max < 0 || ckpts < 1 || ckpts > RQ_CHECKPOINTS_MAX || queue < 1 || conns < 1 || maxbody < 1024 || temp < 0 || temp > 2 || topp <= 0 || topp > 1 || topk < 0 || maxtok < 0 || batch < 1)
+        copy_min < 0 || kv_disk_max < 0 || kv_disk_free < 0 || ckpts < 1 || ckpts > RQ_CHECKPOINTS_MAX || queue < 1 || conns < 1 || maxbody < 1024 || temp < 0 || temp > 2 || topp <= 0 || topp > 1 || topk < 0 || maxtok < 0 || batch < 1)
         usage();
     if (batch > RQ_BATCH_MAX) batch = RQ_BATCH_MAX;
     int draft_mtp = draft_path && !strcmp(draft_path, "mtp"); // (a draft file named mtp: --draft ./mtp)
@@ -1307,7 +1311,7 @@ int serve_main(int argc, char **argv) {
     }
     EngineOpts eo = { path, ctx, kv, batch, chunk, parallel, slots, kv_mem, copy_min, queue, verbose, ckpts, dm, calib,
                       a.spec_mode != SPEC_OFF, a.spec_k > a.spec_lookup ? a.spec_k : a.spec_lookup, draft_mtp, mtp_vocab > 0 ? mtp_vocab : 0,
-                      kv_disk, kv_disk_max, kv_disk_min, admit, admit_margin, admit_chunk, admit_yield };
+                      kv_disk, kv_disk_max, kv_disk_free, kv_disk_min, admit, admit_margin, admit_chunk, admit_yield };
     double t0 = rq_now();
     a.eng = engine_start(m, &eo, err, sizeof(err));
     if (!a.eng) { // (the models freed: a sanitizer build's leak check at this exit)

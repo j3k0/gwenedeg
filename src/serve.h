@@ -191,9 +191,10 @@ typedef struct {
     int mtp_vocab;              // ... its vocabulary subset (RqMtpOpts.vocab; 0: all)
     // the disk tier (engine.c, "the disk tier"): saved sequences in kv_disk/<model fingerprint>-<KV type>/ (NULL: off),
     // at most kv_disk_max GiB (0: half the free space at the start, our files included), a slot saved when a job would
-    // discard >= kv_disk_min of its tokens (and at shutdown)
+    // discard >= kv_disk_min of its tokens (and at shutdown); kv_disk_free GiB of the file system kept free (the unused
+    // directories next to ours removed first; room for one full session kept whatever the free space)
     const char *kv_disk;
-    double kv_disk_max;
+    double kv_disk_max, kv_disk_free;
     int kv_disk_min;
     int admit;                  // ADMIT_*
     double admit_margin;        // GiB kept free of MemAvailable (bound, chunk: step 3's live budget)

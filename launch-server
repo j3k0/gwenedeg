@@ -17,6 +17,7 @@ CONTEXT=98304
 
 KV_DISK="./kv-cache"
 KV_DISK_MAX="10"
+KV_DISK_FREE="14"   # GiB kept free on the disk under $KV_DISK (14 GiB = 15 GB, the rule for /): unused kv-cache directories go first
 
 # drafter (speculative decoding) and extra flags per config: the 0.8B draft by default
 SPEC_ARGS="-G 5 --tau 0.4 --draft $DRAFT_MODEL"
@@ -81,7 +82,7 @@ mkdir -p "$KV_DISK"
   $SPEC_ARGS $EXTRA_ARGS \
   -k "$KV_CACHE_TYPE" \
   --slots $SLOTS --parallel $PARALLEL --admit "$ADMIT" \
-  --kv-disk "$KV_DISK" --kv-disk-max "$KV_DISK_MAX" \
+  --kv-disk "$KV_DISK" --kv-disk-max "$KV_DISK_MAX" --kv-disk-free "$KV_DISK_FREE" \
   --port "$BIND_PORT" --host "$BIND_HOST" \
   --name "$NAME"
 

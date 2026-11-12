@@ -336,6 +336,110 @@ def ref_parse(text, tools):
     return text[:i].rstrip(), calls
 
 
+def run_disk_watch(a, t):
+    """the disk watch (--kv-disk-free; RUNQ_TEST_DISKFREE: the free space from a file, RUNQ_TEST_KV_CHECK: its period): the
+    heartbeat (the lock's mtime at the start and at shutdown); above --kv-disk-free nothing removed; below it the unused
+    directory next to ours removed (its lock free, 3 h old), not a fresh one, a locked one, one without a lock file or
+    another name; our saves then fit one session's room (a warning); below the 1 GiB reserve our files removed, the
+    requests served as before"""
+    import fcntl
+    rep = t.report
+    d = tempfile.mkdtemp(prefix="runq-kvwatch-", dir=os.environ.get("RUNQ_DISK_TMP") or ("/var/tmp" if os.access("/var/tmp", os.W_OK) else None))
+    G = 1073741824
+    old = time.time() - 3 * 3600
+
+    def mk(name, lock=True, age=None):
+        p = os.path.join(d, name)
+        os.makedirs(os.path.join(p, "swap"))
+        for f in (["lock"] if lock else []) + ["1.rqseq", "swap/2.rqseq"]:
+            with open(os.path.join(p, f), "wb") as fh:
+                fh.write(b"x" * 4096)
+            if age:
+                os.utime(os.path.join(p, f), (age, age))
+        return p
+
+    stale, fresh, held = mk("aaaaaaaaaaaaaaaa-q8-dot", age=old), mk("bbbbbbbbbbbbbbbb-q8-dot"), mk("cccccccccccccccc-q8-dot", age=old)
+    nolock, other = mk("dddddddddddddddd-q8-dot", lock=False, age=old), mk("notes", age=old)
+    hf = open(os.path.join(held, "lock"), "r+")
+    fcntl.flock(hf, fcntl.LOCK_EX | fcntl.LOCK_NB)  # (another server's)
+    free = os.path.join(d, "free")
+    open(free, "w").write(str(100 * G))
+    env = dict(os.environ, OMP_NUM_THREADS=str(a.threads), RUNQ_TEST_DISKFREE=free, RUNQ_TEST_KV_CHECK="0.2")
+    log = tempfile.NamedTemporaryFile(prefix="runq-serve-watch-", suffix=".log", delete=False)
+    args = ["--port", "0", "-c", "2048", "--parallel", "1", "--slots", "1", "-v", "--kv-disk", d, "--kv-disk-min", "64",
+            "--kv-disk-free", "5"] + (["-D", a.draft] if a.draft and a.draft != "mtp" else []) + gate_mem(a)
+    t0 = time.time()
+    p = subprocess.Popen([a.runq, "serve", a.model] + args, stderr=log, stdout=subprocess.DEVNULL, env=env)
+    live(1)
+    port = None
+    for _ in range(600):
+        m = re.search(r"listening on http://127\.0\.0\.1:(\d+)", open(log.name).read())
+        if m:
+            port = int(m.group(1))
+            break
+        if p.poll() is not None:
+            break
+        time.sleep(0.05)
+    if not port:
+        live(-1) if p.poll() is not None else None
+        rep(False, "disk/watch_start", open(log.name).read()[-500:])
+        return
+    own = [x for x in os.listdir(d) if re.fullmatch(r"[0-9a-f]{16}-.+", x) and os.path.join(d, x) not in (stale, fresh, held, nolock)]
+    ownd = os.path.join(d, own[0]) if len(own) == 1 else d
+
+    def ask(msgs):
+        st, r, _ = chat(port, {"messages": msgs, "temperature": 0, "max_tokens": 8}, timeout=300)
+        return text_of(r) if st == 200 else None
+
+    def saved():
+        return sorted(f for f in os.listdir(ownd) if f.endswith(".rqseq") and not f.endswith(".draft.rqseq"))
+
+    log_lines = " ".join(f"Entry {i}: the keeper logged wind {i % 7} knots, swell {i % 5} m." for i in range(24))
+    X = [{"role": "system", "content": LONG_SYS}, {"role": "user", "content": log_lines + " Which entry had the most wind?"}]
+    Y = [{"role": "system", "content": PIRATE_SYS}, {"role": "user", "content": "Describe your ship, its crew and its last voyage. " * 8}]
+    Z = [{"role": "user", "content": "List the planets of the solar system, one per line, with a fact each. " * 3}]
+    beat0 = os.stat(os.path.join(ownd, "lock")).st_mtime
+    x, y = ask(X), ask(Y)  # (X saved: evicted)
+    time.sleep(1)
+    s1 = saved()
+    rep(len(own) == 1 and beat0 >= t0 - 2 and x and y and len(s1) >= 1 and all(os.path.isdir(q) for q in (stale, fresh, held, nolock, other)),
+        "disk/watch_above", f"our directory {own}, its heartbeat at the start ({beat0 - t0:+.1f} s), {len(s1)} file(s) saved; nothing removed "
+        "above --kv-disk-free")
+    open(free, "w").write(str(3 * G))  # (below --kv-disk-free 5, above the 1 GiB reserve)
+    time.sleep(1.5)
+    z = ask(Z)  # (Y saved: within one session's room)
+    time.sleep(0.5)
+    s2, text = saved(), open(log.name).read()
+    m = re.search(r"one session's room: ([\d.]+) GiB", text)
+    room = float(m.group(1)) * G if m else 0
+    used = sum(os.path.getsize(os.path.join(ownd, f)) for f in os.listdir(ownd) if f.endswith(".rqseq"))
+    rep(not os.path.exists(stale) and all(os.path.isdir(q) for q in (fresh, held, nolock, other)) and
+        re.search(r"--kv-disk: \S*aaaaaaaaaaaaaaaa-q8-dot removed \(unused for 3\.0 h", text) and z and set(s2) - set(s1) and
+        used <= room + 0.01 * G and "below --kv-disk-free 5.00 GiB; the disk tier keeps one session's room" in text, "disk/watch_purge",
+        f"3 GiB free: the unused directory removed ({not os.path.exists(stale)}), the fresh, locked, lock-less and other ones kept; "
+        f"our files {s1} -> {s2}: Y saved, {used / 1e6:.1f} MB within one session's room ({room / 1e6:.1f} MB)")
+    open(free, "w").write(str(G // 2))  # (below the reserve: our files go)
+    time.sleep(1.5)
+    x2 = ask(X)
+    time.sleep(0.5)
+    s3 = saved()
+    rep(s3 == [] and x2 == x, "disk/watch_trim", f"0.5 GiB free: our files {s2} -> {s3}, the requests served as before ({x2 == x})")
+    open(free, "w").write(str(100 * G))
+    time.sleep(0.2)
+    p.send_signal(signal.SIGTERM)
+    try:
+        rc = p.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        rc = "timeout"
+    live(-1)
+    beat1 = os.stat(os.path.join(ownd, "lock")).st_mtime
+    rep(rc == 0 and beat1 >= beat0 and beat1 >= time.time() - 30, "disk/watch_beat", f"exit {rc}, the heartbeat at shutdown {beat1 - time.time():+.1f} s")
+    hf.close()
+    os.unlink(log.name)
+    shutil.rmtree(d, ignore_errors=True)
+
+
 def run_disk(a, t):
     """the disk tier (--kv-disk): one slot, so that each new conversation evicts the previous one; its own servers"""
     rep = t.report
@@ -2230,6 +2334,7 @@ def main_groups(a, t):
     if a.disk:
         try:
             run_disk(a, t)
+            run_disk_watch(a, t)
         except Exception as e:
             import traceback
             t.report(False, "disk/error", f"{type(e).__name__}: {e} {traceback.format_exc()[-600:]}")

@@ -171,6 +171,15 @@ static void bench(int type, int d, int k, int nb) {
             double t = now() - t0;
             if (t < best[l]) best[l] = t;
         }
+#ifdef IQX_SCRATCH
+    { // (the two paths' outputs: bit-identical here too)
+        float *y2 = malloc(sizeof(float) * nb * d);
+        run_rows(type, y, d, xq, k, xs, c16, nb, kp);
+        run_gemm(type, y2, d, xq, k, xs, c16, nb, kp, scr, sb);
+        if (memcmp(y, y2, sizeof(float) * nb * d)) printf("FAIL %s: the tiled GEMM's output differs\n", iq_name(type));
+        free(y2);
+    }
+#endif
     double w = (double)d * k * nb / nt;
     printf("%-9s %5d x %5d nb %4d %2d thr: iq_rows %7.1f ms %.4f ns", iq_name(type), d, k, nb, nt, 1e3 * best[0], 1e9 * best[0] / w);
     if (nl > 1) printf(" | tiled %7.1f ms %.4f ns (x%.2f)", 1e3 * best[1], 1e9 * best[1] / w, best[0] / best[1]);

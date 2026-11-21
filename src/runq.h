@@ -324,7 +324,9 @@ float rq_rng_f32(unsigned long long *state);
 // ---------------------------------------------------------------------------------- compute context
 typedef struct RqCtx RqCtx;
 
+#ifndef RQ_BATCH_MAX // (-DRQ_BATCH_MAX=N: a build for measuring bigger chunks, PP-RESULTS.md)
 #define RQ_BATCH_MAX 512 // rows per batched forward pass (prefill chunk), at most
+#endif
 
 // max_batch: rows per batched pass (<= RQ_BATCH_MAX; 0 or 1: no batched buffers, prefill token by
 // token through the decode path). max_ctx: positions the attention scratch is sized for (0 = the

@@ -399,7 +399,7 @@ cell, same scripts (round 1 / round 2):
   instructions (`hw.optional.arm.FEAT_BF16` 0); the conversion does not need them (a 16-bit shift).
   (Since `59d1e34` the NEON attention covers bf16 / f16 too: fourth session.)
 - `make test` on the rebased build: 162 passed, 8 failed, the same 8 as unmodified `origin/main`
-  built on this Mac (tests that depend on the generated text; README, Known limitations).
+  built on this Mac (tests that depend on the generated text; docs/usage.md, Limitations).
 - Disturbed runs, not the reported bests: Q8_0 before, round 2, 9 threads, 1,500 tokens (prefill 373
   vs 1,154-1,159); Q8_0 after, round 2, 10 threads, 1,500 tokens (decode 60 vs 77).
 

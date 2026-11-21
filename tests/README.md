@@ -174,7 +174,7 @@ All hooks work the same on a GGUF file (tokenizer and templates from the file an
 | `gguf_logits/{en,code}`, `gguf_logits_batched/*` | logits vs HF fp32 on the GGUF Q8_0 file, same thresholds: sequential (`-b 1`) on en and code, batched (`-b 64`) on all 5 prompts, pooled metrics | `golden/logits/*.npz` |
 | `gguf_batched/*`, `gguf_threads/bitwise_b7`, `gguf_kernels/*` | GGUF (group size 32 kernels), byte-identical logits: `-b 7` / `-b 64` vs `-b 1` (en, code), OMP_NUM_THREADS 8 vs 3 (en `-b 7`), VNNI vs generic on en `-b 1` (GEMV), en `-b 7` (GEMM 6 + 1 rows), all `-b 64` (2 chunks, 6 + 4 row tiles, all-rows classifier) | sequential / other build |
 | `gguf_template/*` | the built-in chat templates (GGUF) give the same chat token ids as the .bin's `.template*` side files, `-r 0` / `-r 1`, with and without `-y`, and decode to the side file text | `.template*` files |
-| `gguf_mem/refused`, `gguf_mem/estimate`, `gguf_mem/bad_value` | the load-time memory check (README, Memory) on the GGUF Q8_0 file: `--mem 0.1` refuses it with one stderr line ("needs ~N GiB (weights ..., runtime ..., a sequence of 40960 positions: KV cache 4.38), more than the budget of 0.10 GiB (--mem): not loaded ...") and exit status 1, nothing on stdout; `--mem 64 -c 1024` prints the `[memory]` line with the KV cache of 1,024 positions (28 layers x 1,024 values x 2 x 2 bytes x 1,024 = 0.11 GiB); `--mem lots` is a usage error. That the refusal comes before any weight is read: by hand below ([Memory](#memory)) | |
+| `gguf_mem/refused`, `gguf_mem/estimate`, `gguf_mem/bad_value` | the load-time memory check ([docs/usage.md](../docs/usage.md#memory-check-at-load)) on the GGUF Q8_0 file: `--mem 0.1` refuses it with one stderr line ("needs ~N GiB (weights ..., runtime ..., a sequence of 40960 positions: KV cache 4.38), more than the budget of 0.10 GiB (--mem): not loaded ...") and exit status 1, nothing on stdout; `--mem 64 -c 1024` prints the `[memory]` line with the KV cache of 1,024 positions (28 layers x 1,024 values x 2 x 2 bytes x 1,024 = 0.11 GiB); `--mem lots` is a usage error. That the refusal comes before any weight is read: by hand below ([Memory](#memory)) | |
 | `greedy/gguf_chat`, `greedy/gguf_generate` | exact stdout of `-t 0` chat / generate on the GGUF file (same prompts as `chat`, `generate`) | `golden/greedy/gguf_*.txt` |
 | `q4_dequant/*` | Q4_K_M: 2 rows each of blk.0.attn_q, blk.3.ffn_down (Q4_K, 1024 / 3072 columns), blk.0.attn_v, blk.27.ffn_down, token_embd (Q6_K), across a 16-row block boundary, `-m dequant`: from the blocks and from the repacked layout, both bit-identical to gguf-py's `dequantize` | `golden/dequant/q4_k_m.npz` |
 | `q4_logits_batched/*` | Q4_K_M logits vs HF fp32 (-b 64, 5 prompts, pooled), loose Q4 thresholds (below) | `golden/logits/*.npz` |
@@ -330,7 +330,7 @@ ASan+UBSan build (`-O1 -g -fsanitize=address,undefined`, -b 1/7/13/64): no repor
 Multi-turn chat (`chat/*`): the conversation in the KV cache was also checked once against HF's
 `apply_chat_template` (transformers 4.53.0): identical text with `-r 1`; with `-r 0` the only
 difference is the empty `<think>\n\n</think>\n\n` that runq keeps before each earlier answer (see
-`../README.md`). Deliberate breakage (scratch builds), caught: a follow-up prefill one position too
+[docs/DEVELOPMENT.md](../docs/DEVELOPMENT.md#chat-kv-cache-and-threads-details)). Deliberate breakage (scratch builds), caught: a follow-up prefill one position too
 far (`pos0 + 1`): max |diff| 6-25 on all three cases, and the turn-2 reply forgets the name; the
 `\n` after `<|im_end|>` dropped from the history: the template-rendering check on all three.
 
@@ -507,7 +507,7 @@ TSan: 12 clients at `--parallel 8 --queue 8`, a cold burst of 8): no reports, no
 
 ## Memory
 
-The load-time estimate (README, Memory; `src/model.c`, `model_mem`) against the measured memory, with
+The load-time estimate ([docs/usage.md](../docs/usage.md#memory-check-at-load); `src/model.c`, `model_mem`) against the measured memory, with
 `build/mem_probe MODEL CTX [--cold] [--page-cache auto|drop|keep] [--mtp]` (`make mem-probe`, `tests/mem_probe.c`): it
 loads the model, then fills a sequence of CTX positions (Qwen3.5: with its checkpoints taken), and prints the estimate's
 parts, the load's peak RSS and the peak RSS with the context full; `--mtp` (TODO S9a): then the MTP view

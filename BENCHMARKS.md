@@ -186,7 +186,7 @@ the part runq could learn from.
 **Caveats**
 - One run per cell, a shared box (1-min load 0.5-6.5 over the window, from other users' jobs; the same window for both
   engines but not simultaneous): differences of a few tens of percent are noise, the 2-8x ones are not. runq's numbers
-  here are higher than the S9c ones in `docs/qwen38-speculative.md` (a busier box then).
+  here are higher than the S9c ones in `docs/notes/qwen38-speculative.md` (a busier box then).
 - ik_llama.cpp was configured by us, from its README and `--help` (flags above, tuned with `llama-bench`); its authors
   may know better settings. Its support for Qwen3.8's hybrid layers and MTP is recent, and it is a fork under heavy
   development (the build is of 2026-11-19).
@@ -199,7 +199,7 @@ the part runq could learn from.
   those depths.
 - Not measured: mainline llama.cpp, vLLM's CPU backend, other engines; a plain (no MTP, 1 client) decode of runq side by
   side with ik's (`llama-bench` tg64 gives ik's 5.4-6.0 tok/s; runq's plain decode on this file was 7.2-8.1 tok/s in
-  a loaded window of an earlier session, `docs/qwen38-speculative.md`); other CPUs (a different AVX-512 implementation or
+  a loaded window of an earlier session, `docs/notes/qwen38-speculative.md`); other CPUs (a different AVX-512 implementation or
   AVX2 would change both engines' numbers).
 
 ## Apple M1 Pro (macOS, NEON)

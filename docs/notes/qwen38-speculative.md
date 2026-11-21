@@ -13,11 +13,11 @@ calibrated cost model, the position and the batch; [below](#in-the-server-s8-and
 GiB), the long-context costs are measured ([G0 (b)](#long-context-costs-todo-g0-b-measured-2026-10-27): decode at 98k
 6.9 tok/s, a 2,560-token chunk 86 s, 16 threads, `bf16-dot`), a pi session replayed through `runq serve` up to 84k with
 a compaction ([Agent sessions](#agent-sessions-replay-and-compaction-g0-a-g5)) and a live pi session completed its
-task ([server.md](server.md#qwen38-27b-with-pi)). Open: the MTP drafter, seed-coupled drafting, the draft model at
+task ([server.md](../server.md#qwen38-27b-with-pi)). Open: the MTP drafter, seed-coupled drafting, the draft model at
 64-98k in a live session. The open steps are in
-[TODO.md](../TODO.md) (section "Qwen3.8-27B with speculative decoding"); this file holds what was verified and the
+[TODO.md](../../TODO.md) (section "Qwen3.8-27B with speculative decoding"); this file holds what was verified and the
 design decisions, so that the two cannot drift.
-The architecture is Qwen3.5's (`qwen35`, [qwen35.md](qwen35.md)).
+The architecture is Qwen3.5's (`qwen35`, [qwen35.md](../qwen35.md)).
 
 **Goal:** decode Qwen3.8-27B on the CPU at ~13-18 tok/s on the 16-vCPU dev box (plain decode: ~8, estimated), with
 Qwen3.5-0.8B as the draft model. The output is **exactly** plain decoding's: the same tokens, greedy and seeded, and
@@ -89,7 +89,7 @@ the 3.8 chat template (9,993 bytes). Tensors (row-major [rows, columns]; llama.c
 No `nextn.embed_tokens` / `nextn.shared_head_head`: the MTP block uses `token_embd` and `output`.
 `tests/make_synth_q35.py` builds this layout at a small scale (`synth-q35-27b.gguf`, dim 768, GQA 6, r = 3, the types
 per role; `-mtp`: + the MTP block; `-f32`: + F32 alpha / beta, the 3.8 template and the bos key), checked by the `q35`
-group ([tests/README.md](../tests/README.md)).
+group ([tests/README.md](../../tests/README.md)).
 
 ### Loader: the MTP block and the F32 matrices
 
@@ -202,7 +202,7 @@ Unsloth's 0.8B GGUFs drop the block): HF `Qwen/Qwen3.5-0.8B` at revision 2fc0636
   dequantized at lookup (no 5 GB fp32 table).
 - The load-time estimate (`--mem`; computed from the tensor directory before any weight is read, refused past
   MemAvailable; within 3% of the peak RSS with the context full for Qwen3-0.6B to 8B and Qwen3.5-0.8B / 4B,
-  [tests/README.md](../tests/README.md#memory)), for the 27B from its tensor directory with the same rules
+  [tests/README.md](../../tests/README.md#memory)), for the 27B from its tensor directory with the same rules
   (2026-10-27, by script; the MTP block is not counted, it is not loaded): repacked weights
   **15.3 GiB** (the 64 main layers and `output`; K-quants +1-3% repacked; `ssm_alpha` / `ssm_beta` counted as F32),
   runtime ~0.3 GiB, one sequence at the default `-c` 40,960: KV 2.5 GiB + state 150 MiB x 3: **~18.6 GiB** (~20 GB);
@@ -230,7 +230,7 @@ Unsloth's 0.8B GGUFs drop the block): HF `Qwen/Qwen3.5-0.8B` at revision 2fc0636
 - runq: `RQ_CHAT_QWEN38` (TODO S6), detected in a qwen35 file whose template has `reasoning_effort` (the 27B GGUF's
   = `tests/golden/templates/qwen3.8.jinja`, Unsloth's rewrite; Qwen's own, `qwen3.8-hf.jinja`, is detected too; it
   lacks the developer role, the merging and `high`). CLI: thinking on unless `-r 0`, `-e xhigh|high|medium|low`;
-  `runq serve`: on by default, `reasoning_effort` / `chat_template_kwargs` ([server.md](server.md)); the library:
+  `runq serve`: on by default, `reasoning_effort` / `chat_template_kwargs` ([server.md](../server.md)); the library:
   the effort in the `thinking` argument (`RQ_THINK_*`, `src/runq.h`). The CLI's history keeps each reply as
   generated, which is what the template renders: a second turn prefills only `<|im_end|>\n` + its user turn (no
   rollback to a checkpoint, unlike Qwen3.5 with thinking). `-m render` == HF's `apply_chat_template` in 40 of 45
@@ -1104,7 +1104,7 @@ L=logs/specmeas-2026-10-27; $P report --by-kind --answers $L/out_nothink.json:$L
 ## In the server (S8) and the choice by position (G7)
 
 `runq serve --draft DRAFT` (and / or `--lookup N`): speculation inside the engine's batched passes, the output exactly
-plain decoding's ([server.md](server.md#speculative-decoding-todo-s8-g7): the design, the request field, the timings,
+plain decoding's ([server.md](../server.md#speculative-decoding-todo-s8-g7): the design, the request field, the timings,
 the tests). A decoding request's segment is `[t, g1..gn]` with every row's logits next to the other requests' rows and
 prompt chunks; its rows are sampled in rounds (one row per request and round, so each RNG draws in plain decoding's
 order) through the plain path; the sequence is cut after the first row whose token is not the next guess (Qwen3.5:
@@ -1166,14 +1166,14 @@ within one guess of the measured ones; the first version (median of 3, att_x fro
 where the 4B's segments imply ~0.2, and lookup 4 instead of 2-3 at 24-32k.
 
 **Measured in the server** (`scripts/bench_serve.py`, 8 threads, 128-token greedy replies, 2 per client, the box at load
-12-18; the table: [server.md](server.md#speculative-decoding-todo-s8-g7)): one client, auto 1.2-1.35x plain (Qwen3-1.7B +
+12-18; the table: [server.md](../server.md#speculative-decoding-todo-s8-g7)): one client, auto 1.2-1.35x plain (Qwen3-1.7B +
 0.6B Q4_K_M 84 vs 62-66 tok/s on code; Qwen3.5-4B + 0.8B Q4_K_M 35-37 vs 28-31); four clients, auto within the runs'
 noise of plain (187-208 vs 190-214; 71-76 vs 75-78) where the fixed draft at k 3 loses 15-20%: the batch fills the
 weights' read that speculation would otherwise use. The 27B's own runs (the server, its draft, 32k-96k) are left (TODO G7).
 
 ## Agent sessions: replay and compaction (G0 (a), G5)
 
-The replay benchmark (`scripts/replay_sessions.py`, [server.md](server.md#agent-sessions-pi-the-replay-benchmark-checkpoints-compaction):
+The replay benchmark (`scripts/replay_sessions.py`, [server.md](../server.md#agent-sessions-pi-the-replay-benchmark-checkpoints-compaction):
 pi's recorded sessions replayed through pi's own code against `runq serve`) on the 0.8B: with this work's checkpoints
 (the system block, the header, Qwen3.5's turn start, `</think>`, the reply's end) and slot affinity, every tool turn
 prefills its new tokens only, or those plus the previous reply when it comes back tokenized differently (an empty

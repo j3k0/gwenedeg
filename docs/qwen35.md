@@ -7,7 +7,7 @@ batched decode rows) with the bitwise invariants, recurrent-state checkpoints fo
 `runq serve`, and the tests (`tests/check_models.py` group `q35` in `make test`, the file in the `models` group).
 Open: the NEON check of the recurrence, the MoE models ([TODO.md](../TODO.md)); 2B (16 / 16 heads, as 0.8B), 9B and 27B
 (2x / 3x as many value heads as key heads, as 4B) should load but are untested (Qwen3.8-27B, the same architecture
-at r = 3, is tested: [qwen38-speculative.md](qwen38-speculative.md#the-27b-bring-up-s7)).
+at r = 3, is tested: [qwen38-speculative.md](notes/qwen38-speculative.md#the-27b-bring-up-s7)).
 This file records what Qwen3.5 is, what was verified, and the design. Test model: **Qwen3.5-0.8B**: the same layer
 types as the larger Qwen3.5 / 3.6 models, with a dense FFN instead of MoE.
 
@@ -164,7 +164,7 @@ uses Q4_K / Q6_K, plus **Q5_K** for `attn_qkv` and `ssm_out` of every linear lay
 = Q4_K's fold on 5-bit values); the Q8_0 file came first. Q3_K (the **Q3_K_M** file, TODO G3) since 2026-10-27: the Q3P
 layout, Q6_K's fold on 3-bit values. Qwen3.8-27B's Q4_K_M has `ssm_alpha` / `ssm_beta` as **F32**
 matrices: accepted for those two only, applied in fp32 to the fp32 activations with a fixed summation order (TODO S6:
-[qwen38-speculative.md](qwen38-speculative.md#loader-the-mtp-block-and-the-f32-matrices)), and an MTP block after its
+[qwen38-speculative.md](notes/qwen38-speculative.md#loader-the-mtp-block-and-the-f32-matrices)), and an MTP block after its
 64 layers (`nextn_predict_layers` 1), validated but not loaded.
 
 ## Design decisions
@@ -404,7 +404,7 @@ position), max |diff| 0.2-0.3 at every distance with two 0.44s. What was checked
   6/6, max |diff| 0.16-0.41; the three paths bitwise equal, the generic build too (to 16k); max |K| 19.6, |V| 52.5;
   the fact retrieved from a 28,860-token prompt.
 - **Qwen3.8-27B** (TODO G2, 2026-10-28; `tests/check_long.py --retrieval FILE --kv bf16-dot`, 16 threads, one 27B
-  process with the box's other services stopped, load 13-21): the Q3_K_M file (the agentic one, docs/qwen38-speculative.md,
+  process with the box's other services stopped, load 13-21): the Q3_K_M file (the agentic one, docs/notes/qwen38-speculative.md,
   G3) retrieves the fact from the 88,092-token prompt, greedy reply `PLUM-7316-HERON`, with the bf16 dot-product
   attention, in 2,052 s (prefill and 24 steps). Not run: its logits against a reference at long context (the numpy
   reference on the file is checked at short context, the models group: cos 0.99983).

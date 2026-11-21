@@ -336,14 +336,14 @@ through the swap and to disk). Before the target's pass, A guesses for the reque
 (the token to feed, the kept state) gives the first guess and the view's own hidden state h', then one row per further
 guess with h' (provisional rows: B's cut to the common prefix drops them, and whatever the verify cut). Costs: B is one
 block pass per step for every request (+2-5% of a prefill's time; ~3 ms a step on the 27B at short context), A's guesses
-~6 ms each on the 27B with the 100k subset (docs/qwen38-speculative.md). The auto policy prices the view's guesses as a
+~6 ms each on the 27B with the 100k subset (docs/notes/qwen38-speculative.md). The auto policy prices the view's guesses as a
 draft model's (its calibrated costs, prior 0.8: `rq_spec_prior`). A view row whose h is unknown takes zeros, counted in
 `timings.speculative.mtp_approx`: after a failed view pass or a view lost in the swap (its rows then catch up as a gap),
 and at most one row per conversation turn that restarts exactly where it diverged (the cut drops the kept state; a
 hybrid model's restart below the divergence leaves the view ahead, exact). Only the guesses get worse; the output stays
 plain decoding's. `-v`'s summary at the end: `mtp: A n passes r rows t s; B ...; steps n t s; approx n; gaps n`.
 On a Qwen3.8-27B file with its block (S9c.G, 2026-11-10: ISTA's IQ3_S-mtp, 14 threads, `--parallel 4 --admit bound`,
-against today's 0.8B Q4_K_M `-G 5 --tau 0.4`; docs/qwen38-speculative.md, "In the server (S9c)"): **`--draft mtp -G 6
+against today's 0.8B Q4_K_M `-G 5 --tau 0.4`; docs/notes/qwen38-speculative.md, "In the server (S9c)"): **`--draft mtp -G 6
 --tau 0.5`** (the vocabulary default 100000), +14% tok/s at 1 client thinking on, +18% off, +1% at 4 clients, the 32k
 warm turns 2% shorter, outputs identical.
 
@@ -384,13 +384,13 @@ guesses, within the runs' noise of plain (4B, 3 more alternating runs at 4 clien
 online correction a noisy start-up calibration once made auto choose the draft in the full batch on the 4B (70 vs 78
 tok/s); the passes' measured times now correct the model (`[engine]` summary with `-v`: the measured / calibrated ratio).
 `"edit"` asks for a function back with changes: the replies rewrite more than they copy (the lookup's guesses are mostly
-wrong; on verbatim copies it is 2.8-3.9x, docs/qwen38-speculative.md, Prompt lookup).
+wrong; on verbatim copies it is 2.8-3.9x, docs/notes/qwen38-speculative.md, Prompt lookup).
 
 At long context (TODO G7, `build/bench_long -D`, the choice from the measured passes; the 27B extrapolated from
 synth-27b: its short-context costs + 16 x the synth's attention): the 27B with the 0.8B Q4_K_M draft (its guesses accepted at p 0.6):
 the model at k 2 up to 32k (x1.56 at 512 down to x1.23), k 1 at 64-98k (x1.17 -> x1.13; nothing for p < ~0.45), and
 with a 4-token lookup match the lookup, 4 guesses at 512 down to 2 at 98k (x2.15 -> x1.38)
-([qwen38-speculative.md](qwen38-speculative.md#in-the-server-s8-and-the-choice-by-position-g7)).
+([qwen38-speculative.md](notes/qwen38-speculative.md#in-the-server-s8-and-the-choice-by-position-g7)).
 
 ## Agent sessions (pi): the replay benchmark, checkpoints, compaction
 
@@ -464,13 +464,13 @@ ending long prefills; two slots if the memory allows them (`--kv-mem`: the summa
 session's slot, and the next request reuses the system block; with one slot it is prefilled again: ~8k tokens, ~3
 min); `--checkpoints 3` saves 150 MiB per slot on Qwen3.8 (its header, the system block and the `</think>` or the
 reply's end; Qwen3.5's turn checkpoint is not needed there). pi's compaction settings and a compaction's cost on the
-27B: [qwen38-speculative.md](qwen38-speculative.md#agent-sessions-replay-and-compaction-g0-a-g5). The configuration
+27B: [qwen38-speculative.md](notes/qwen38-speculative.md#agent-sessions-replay-and-compaction-g0-a-g5). The configuration
 measured on the 27B: next section.
 
 ## Qwen3.8-27B with pi
 
 The setup for agentic development at 96k on the 16-vCPU / 31 GB box (2026-10-28; TODO's "Agentic development";
-measurements in [qwen38-speculative.md](qwen38-speculative.md): G3, "Long-context costs", "Agent sessions"), with the
+measurements in [qwen38-speculative.md](notes/qwen38-speculative.md): G3, "Long-context costs", "Agent sessions"), with the
 box's other services stopped (~24 GiB available):
 
 ```sh

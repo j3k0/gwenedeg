@@ -109,7 +109,7 @@ chat, code, math and summary prompts: 8.7 tok/s plain; thinking on 13.2 at `-G 3
 thinking off 16.6 / 17.2 (2.0x; code and math 19-22); 12 threads: up to 15.3 / 20.6. In `runq serve` too (below).
 `--spec auto` (opt-in in the CLI) chooses the source and the guess count per pass from a cost model calibrated at the
 start (TODO G7).
-Measurements: [docs/qwen38-speculative.md](docs/qwen38-speculative.md#the-27b-bring-up-s7).
+Measurements: [docs/notes/qwen38-speculative.md](docs/notes/qwen38-speculative.md#the-27b-bring-up-s7).
 
 **The MTP drafter** (`-D mtp`, TODO S9): a file with a multi-token-prediction block (Qwen3.8-27B's `blk.64`, e.g.
 ISTA-DASLab's IQ3_S-mtp, Unsloth's Q4_K_M) guesses with it: one attention layer fed the model's own final hidden state
@@ -118,7 +118,7 @@ replies' tokens). It follows the model in lockstep (its rows over the prompt and
 no second 64-layer state per sequence; the output is still plain decoding's. On the 27B with thinking on it is ahead of
 the 0.8B draft: IQ3_S-mtp 12.8 vs 11.1 tok/s at each one's best fixed settings (`-D mtp -G 6 --tau 0.5` vs `-G 6 --tau
 0.4`; 1.6x plain), Unsloth's Q4_K_M 17.1 vs 14.1 (2.0x plain); with thinking off the two are even (TODO S9d,
-[docs/qwen38-speculative.md](docs/qwen38-speculative.md#the-27bs-acceptance-and-the-go-todo-s9d2-2026-11-09)).
+[docs/notes/qwen38-speculative.md](docs/notes/qwen38-speculative.md#the-27bs-acceptance-and-the-go-todo-s9d2-2026-11-09)).
 `runq serve --draft mtp` runs it too (TODO S9c.3: every request followed by the view, its guesses batched across
 requests; [docs/server.md](docs/server.md#speculative-decoding-todo-s8-g7)); not measured on the 27B in the server yet.
 
@@ -127,7 +127,7 @@ tool output) are guessed from the context itself, verified in the same loop (so 
 On edits that return the prompt's code, `--lookup 8` decodes 2.8-3.9x faster (Qwen3-1.7B, Qwen3.5-0.8B; the 0.6B draft
 at `-G 3`: 1.4-1.6x); with nothing to copy it is about plain speed. With `-D`, the draft guesses where the lookup
 finds nothing: `-G 3 --lookup 8 --lookup-min 4` (a longer minimum match: the draft guesses short matches better).
-On recorded agentic sessions it guesses ~1.5 tokens per pass alone (the 0.8B draft 2.4): [docs/qwen38-speculative.md](docs/qwen38-speculative.md#prompt-lookup-todo-g6-g0-c-measured-2026-10-27).
+On recorded agentic sessions it guesses ~1.5 tokens per pass alone (the 0.8B draft 2.4): [docs/notes/qwen38-speculative.md](docs/notes/qwen38-speculative.md#prompt-lookup-todo-g6-g0-c-measured-2026-10-27).
 
 ## Models
 
@@ -145,7 +145,7 @@ On recorded agentic sessions it guesses ~1.5 tokens per pass alone (the 0.8B dra
 | `3.5-0.8b-q4km` | `Qwen3.5-0.8B-Q4_K_M.gguf` (unsloth) | 533 MB | Q4_K / Q5_K / Q6_K / Q8_0 mix: decode ~1.27x the Q8_0 file (188 vs 148 tok/s), prefill ~0.88x, peak RSS 662 vs 963 MB; vs HF fp32 pooled cos 0.9946, top-1 57/62 |
 | `3.5-0.8b-q3km` | `Qwen3.5-0.8B-Q3_K_M.gguf` (unsloth) | 470 MB | Q3_K for `attn_q` / `attn_k` / `attn_gate` / `ffn_gate` / `ffn_up` (the 27B Q3_K_M file's 3-bit roles), Q4_K / Q5_K / Q6_K / Q8_0 for the rest: vs its Q4_K_M decode 211 / 209 vs 206 / 192 tok/s, prefill ~0.98x, peak RSS 601 vs 663 MB; vs HF fp32 pooled cos 0.981, top-1 54/62 (Q4_K_M 0.9946, 57/62) |
 | `3.5-4b-q8` | `Qwen3.5-4B-Q8_0.gguf` (unsloth) | 4,482 MB | Qwen3.5-4B: 32 value heads on 16 key heads in its linear layers; as fast as Qwen3-4B Q8_0, perplexity 10.59 (Qwen3-4B: 15.65) |
-| `3.8-27b-q4km` | `Qwen3.8-27B-Q4_K_M.gguf` (unsloth) | 17,107 MB | Qwen3.8-27B (thinks by default; its MTP block is not used): ~16-16.5 GB of RAM, 8.7 tok/s plain, 13-17 with `-D` Qwen3.5-0.8B ([docs/qwen38-speculative.md](docs/qwen38-speculative.md)) |
+| `3.8-27b-q4km` | `Qwen3.8-27B-Q4_K_M.gguf` (unsloth) | 17,107 MB | Qwen3.8-27B (thinks by default; its MTP block is not used): ~16-16.5 GB of RAM, 8.7 tok/s plain, 13-17 with `-D` Qwen3.5-0.8B ([docs/notes/qwen38-speculative.md](docs/notes/qwen38-speculative.md)) |
 | `3.8-27b-q3km` | `Qwen3.8-27B-Q3_K_M.gguf` (unsloth) | 13,819 MB | the same model in 3-bit (Q3_K) for its FFN gate / up, attention q / k / gate and embeddings: ~13.3 GB of RAM, the file for 96k agentic sessions with the draft (below, Agentic development); vs the Q4_K_M: top-1 = the API model's 96.5 / 94.5% (thinking off / on; Q4_K_M 98.4 / 96.9%), perplexity +2.7%, decode +17-22% at 8 threads |
 | `saluki-27b` | `Underdog-Saluki-27B-1.0-IQ2-mix.gguf` (ConwayResearch) | 7,898 MB | Qwen3.8-27B as a Q2_K / IQ1_S .. IQ4_XS mix tuned for tool calling (thinks by default; Qwen's own Qwen3.8 template): 8.4 GB of RAM, decode 13-15 tok/s at 16 threads (the fastest 27B here), prefill ~0.72x the Q3_K_M's, perplexity +18% over it ([docs/iquants.md](docs/iquants.md)) |
 | `hf`, `1.7b-hf`, `3.5-0.8b-hf`, `3.5-4b-hf` | `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-1.7B`, `Qwen/Qwen3.5-0.8B`, `Qwen/Qwen3.5-4B` (bf16 safetensors) | 1.5 / 4.1 / 1.8 / 9.3 GB | for the `.bin` export and the test goldens |
@@ -181,7 +181,7 @@ after 1,500 tokens): only 6 of its 24 layers have a KV cache, at 12 KB per token
 (Qwen3.8's template adds its reasoning instruction); 16 threads: 76 / 10.3; after 1,500 tokens 8.7 / 10.6; startup
 20 s at 8 threads (the 17 GB file read cold: its page cache is dropped after each load).
 (\*\*\*\*) 2026-10-28, `scripts/bench_models.py -t 8,16`, best of 2, load 10-19, the Q4_K_M alongside: 45 / 73 tok/s of
-prefill, 7.9 / 9.1 of decode at 8 / 16 threads; perplexity of both with `scripts/ppl.py -w 512`, docs/qwen38-speculative.md, G3.
+prefill, 7.9 / 9.1 of decode at 8 / 16 threads; perplexity of both with `scripts/ppl.py -w 512`, docs/notes/qwen38-speculative.md, G3.
 (\*\*\*\*\*) 2026-10-30, `scripts/bench_models.py -t 8,16 -r 2`, the Q3_K_M alongside (42 / 74 prefill, 9.8 / 12.3 decode
 at 8 / 16 threads; 13.3 GB); decode after 1,500 tokens 9.8 / 14.3; startup 2.3 s at 16 threads; docs/iquants.md.
 
@@ -215,7 +215,7 @@ the MoE models (`qwen3moe`, `qwen35moe`: Qwen3.5-35B-A3B and up, Qwen3.6-35B-A3B
 RoPE scaling (YaRN), and Hadamard-folded GGUFs (`prism.hadamard.*` metadata: rejected). The other dense Qwen3.5 / 3.6
 sizes should load but are untested: 2B (as many value heads as key heads, like 0.8B), 9B, 27B and Qwen3.6-27B (2x / 3x
 as many value heads, like 4B; the 27B shape is covered by synthetic test models). **Qwen3.8-27B** (Unsloth's Q4_K_M,
-docs/qwen38-speculative.md) loads its main model: the MTP block after its 64 layers (`nextn_predict_layers` 1,
+docs/notes/qwen38-speculative.md) loads its main model: the MTP block after its 64 layers (`nextn_predict_layers` 1,
 `blk.64`: an attention layer + `nextn.*`) is checked (names, shapes, types) but not read nor used yet, and its F32
 `ssm_alpha` / `ssm_beta` matrices are applied in fp32; tested on the real file (logits vs its numpy reference cos
 0.9999, top-1 62/62; the bitwise invariants; the models group's `3.8-27b-q4km`, opt-in; its Q3_K_M too, `3.8-27b-q3km`:
@@ -270,7 +270,7 @@ instruction's exact rounding was verified on Zen 4, `make bf16dp-test` checks an
 2,560-token chunk prefilled at 98k positions, 8 threads: its attention ~1.72x faster (the 27B-shaped synthetic model
 8.99 -> 5.22 s, Qwen3.5-0.8B 18.3 -> 10.7 s), verify passes of speculative decoding ~20-30% cheaper, decode ~10-15%;
 for Qwen3.8-27B that is ~200 -> ~140 s per such chunk (estimated,
-[docs/qwen38-speculative.md](docs/qwen38-speculative.md#long-context-costs-todo-g0-b-measured-2026-10-27), G4 (b)).
+[docs/notes/qwen38-speculative.md](docs/notes/qwen38-speculative.md#long-context-costs-todo-g0-b-measured-2026-10-27), G4 (b)).
 Bit-exactness is kept: the same results for any batch, chunk size, thread count and build. The price is accuracy: KL
 divergence from HF fp32 (28-45k tokens of prose and code) +0.3% on Qwen3.5-0.8B (within the noise of the default
 cache: f16 -0.7%), but +5.4% on Qwen3-0.6B and +2.9% on Qwen3-1.7B (about a bf16 cache's +3.9% / +2.8%; f16 +2.1% /
@@ -386,7 +386,7 @@ has three kinds of objects:
 The forward passes are `rq_decode` (one token), `rq_prefill` (a sequence's tokens in chunks) and
 `rq_forward_batch` (one pass over rows of several sequences, each at its own position: prefill chunks
 next to decode rows; short segments, e.g. decode rows or a speculative verify pass of a few rows of one sequence,
-take the decode-rows worker: 4 rows of one sequence cost ~1.2-1.3x a decode step, docs/qwen38-speculative.md). On top of them sit `rq_sample` / `rq_sample_batch` (temperature, top-p, an optional
+take the decode-rows worker: 4 rows of one sequence cost ~1.2-1.3x a decode step, docs/notes/qwen38-speculative.md). On top of them sit `rq_sample` / `rq_sample_batch` (temperature, top-p, an optional
 token mask), `rq_generate` (the chat loop with per-token callbacks; built on `rq_gen_start` / `rq_gen_step`, one
 token at a time, for loops that feed the tokens themselves), `rq_generate_spec` (the same with a draft model:
 speculative decoding, the output exactly `rq_generate`'s; `rq_spec_run` is its loop alone, `rq_prefill_spec` the prompt
@@ -473,7 +473,7 @@ tables of BENCHMARKS.md, ~8 min), `scripts/bench_batch.sh`, `scripts/bench_serve
 `scripts/bench_models.py`, `scripts/ppl.py` (perplexity), `scripts/spec_accept.py` (draft acceptance for
 speculative decoding), `scripts/lookup_accept.py` (prompt-lookup and draft acceptance on recorded agentic sessions),
 `scripts/bench_lookup.py` (tok/s of the lookup on code-editing prompts; all three:
-[docs/qwen38-speculative.md](docs/qwen38-speculative.md)). `scripts/fetch_mynah.sh` fetches
+[docs/notes/qwen38-speculative.md](docs/notes/qwen38-speculative.md)). `scripts/fetch_mynah.sh` fetches
 and builds mynah-slm, an optional reference engine for comparison (not part of this repository).
 
 ## Limitations

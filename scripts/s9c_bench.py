@@ -2,6 +2,10 @@
 """The server benchmark of TODO S9c (PLAN-S9c-server.md S9c.G): one `runq serve` and the requests of one configuration.
 
   scripts/s9c_bench.py --model MODEL --serve-args "ARGS" [--short [--think 1,0]] [--long L --turns T] [--label X] [--json PATH]
+  scripts/s9c_bench.py --model MODEL --server-cmd "llama-server -m {model} ... --port {port}" [--short] [--long L ...]
+                                                        (another engine's OpenAI-compatible server, e.g. ik_llama.cpp:
+                                                        {model} / {port} filled in, ready when its /health says ok;
+                                                        BENCHMARKS.md, Qwen3.8-27B vs ik_llama.cpp)
   scripts/s9c_bench.py --compare A.json B.json ...      (the output hashes of the runs: equal per request and
                                                         every request in every run, exit 0; else 1)
 
@@ -35,6 +39,7 @@ import os
 import re
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -92,17 +97,37 @@ class Server:
     """runq serve MODEL ARGS on 127.0.0.1, an ephemeral port; its log in a file; a sampler of /health and /proc/PID/status"""
 
     def __init__(self, a, logpath):
-        cmd = [a.runq, "serve", a.model] + shlex.split(a.serve_args)
-        if os.environ.get("S9_GATE_MEM"):
-            cmd += ["--mem", os.environ["S9_GATE_MEM"]]
-        cmd += ["--host", "127.0.0.1", "--port", "0", "--timeout", "0"]
+        self.ext = bool(a.server_cmd)
+        if self.ext:  # another engine's server (--server-cmd): a free port picked here, ready when /health says ok
+            so = socket.socket()
+            so.bind(("127.0.0.1", 0))
+            fport = so.getsockname()[1]
+            so.close()
+            cmd = shlex.split(a.server_cmd.format(port=fport, model=a.model))
+        else:
+            cmd = [a.runq, "serve", a.model] + shlex.split(a.serve_args)
+            if os.environ.get("S9_GATE_MEM"):
+                cmd += ["--mem", os.environ["S9_GATE_MEM"]]
+            cmd += ["--host", "127.0.0.1", "--port", "0", "--timeout", "0"]
         self.cmd, self.logpath = cmd, logpath
         self.log = open(logpath, "w")
         self.t0 = time.time()
         self.p = subprocess.Popen(cmd, stderr=self.log, stdout=subprocess.DEVNULL)
         self.port, self.samples, self.stop_at = None, [], 0
         while time.time() - self.t0 < a.start_timeout:
-            m = re.search(r"listening on http://127\.0\.0\.1:(\d+)", open(logpath).read())
+            if self.ext:
+                try:
+                    c = http.client.HTTPConnection("127.0.0.1", fport, timeout=2)
+                    c.request("GET", "/health")
+                    r = c.getresponse()
+                    ok = r.status == 200 and b"ok" in r.read()
+                    c.close()
+                except OSError:
+                    ok = False
+                if ok:
+                    self.port = fport
+                    break
+            m = None if self.ext else re.search(r"listening on http://127\.0\.0\.1:(\d+)", open(logpath).read())
             if m:
                 self.port = int(m.group(1))
                 break
@@ -300,7 +325,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--model")
     ap.add_argument("--serve-args", default="", help="runq serve's arguments (threads, draft, pool, -v, ...)")
-    ap.add_argument("--runq", default=os.path.join(ROOT, "runq"))
+    ap.add_argument("--runq", default=os.path.join(ROOT, "runq"), help="runq (its -m tokenize cuts --long's prompts, any engine)")
+    ap.add_argument("--server-cmd", default="", help="another engine's server instead of runq serve: a command line with {model} / {port}")
     ap.add_argument("--short", action="store_true")
     ap.add_argument("--think", default="1", help="1, 0 or 1,0 (thinking on / off)")
     ap.add_argument("--long", type=int, default=0, metavar="L")

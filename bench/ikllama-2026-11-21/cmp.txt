@@ -1,0 +1,2 @@
+rq_prose.bin: n 2352, scored 1023 (positions 1024..2046), PPL 9.4830, mean NLL 2.24950 +- 0.07688
+rq_code.bin: n 3145, scored 1535 (positions 1536..3070), PPL 7.1330, mean NLL 1.96473 +- 0.06666

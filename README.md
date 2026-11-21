@@ -17,7 +17,8 @@ called `runq`**, as in qwen3.c, the project it grew from. The library keeps the 
   that sequence alone. The test suite checks all of this.
 - **Fast prefill and decode**: int8 GEMM / GEMV on weights repacked at load, a tiled f16 KV cache, its
   own thread pool. On a 16-vCPU AMD EPYC Genoa VM, Qwen3-0.6B prefills ~2,000-2,700 tok/s and decodes
-  ~200-350 tok/s (below).
+  ~200-350 tok/s; Qwen3.8-27B (IQ3_S, 12 GB) serves ~19-22 tok/s per request with its MTP head, 2-3x the decode
+  speed of ik_llama.cpp on the same file at the same quality (below).
 - **Server** (`runq serve`): OpenAI chat completions with streaming and continuous batching (requests
   share each forward pass), prefix KV-cache reuse across requests, tool calls (Qwen3.5 / Qwen3.8: agent
   harnesses such as pi run their loop against it), and constrained decoding for JSON schemas with a finite
@@ -238,6 +239,23 @@ not comparable with each other:
     aggregate, 16 sequences 1,091 / 1,449 (single sequence: 326 / 366).
   - `runq serve`, 0.6B, 12 threads, 16 concurrent clients streaming 128-token replies: 1,185 (Q4_K_M) /
     1,223 (Q8_0) tok/s in aggregate, time to first token ~0.1 s.
+  - **Qwen3.8-27B against ik_llama.cpp** (2026-11-21, one window, the same IQ3_S file of 12.1 GB, 14 threads, an 8-bit K
+    / 4-bit V cache in both, MTP speculative decoding in both, the same server benchmark `scripts/s9c_bench.py`;
+    [BENCHMARKS.md](BENCHMARKS.md#qwen38-27b-iq3_s-vs-ik_llamacpp-server-workloads-2026-11-21)):
+
+    | tok/s unless noted | runq serve | ik_llama.cpp (its best configuration) |
+    |---|---|---|
+    | decode, 1 client, thinking on / off | **18.6 / 21.8** | 7.8 / 11.2 |
+    | decode, 4 clients at once (aggregate), thinking on / off | **23.4 / 26.4** | 6.6 / 8.5 (MTP needs a single slot) |
+    | decode in a 32-37k-token session | **13-16** | 2-2.4 |
+    | a pi-shaped follow-up turn (+2.5k tokens) on a 32k session, wall | **76-81 s** | 301-316 s |
+    | prefill, 0.8-2.5k-token prompts | 81-84 | **110-118** |
+    | prefill, a cold 31.8k-token prompt | 471 s | **319 s** |
+    | perplexity on the same tokens (prose / code) | 9.483 / 7.133 | 9.493 / 7.145 |
+
+    Same quality; runq decodes 2-3x faster and 6-8x faster at depth, ik_llama.cpp prefills 1.35-1.5x faster. One run
+    per cell on a shared VM; ik_llama.cpp configured and tuned by us from its documentation. Other engines (mainline
+    llama.cpp, vLLM's CPU backend) and other CPUs were not measured.
 - **Apple M1 Pro** (8 performance + 2 efficiency cores, 32 GB, macOS), 0.6B, 8 threads: prefill of 451
   tokens ~1,700 tok/s with the Q8_0 `.bin` and ~1,300 with Q4_K_M; decode ~140-155 and ~190-230 tok/s.
   Sessions vary by ~15% on that desktop.

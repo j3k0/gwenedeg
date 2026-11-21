@@ -8,6 +8,9 @@ measurements are only in [History](#history-earlier-measurements) and are labell
 (The project was called cwayn when these sessions ran; the raw logs in `bench/` have the new name and
 generic paths, nothing measured was changed.)
 
+The [Qwen3.8-27B vs ik_llama.cpp section](#qwen38-27b-iq3_s-vs-ik_llamacpp-server-workloads-2026-11-21) is a
+different model, comparison and session (2026-11-21) and is not comparable with the tables above either.
+
 The [Apple M1 Pro section](#apple-m1-pro-macos-neon) is a different machine and different sessions
 (2026-10-25, 14:56-22:30 UTC, branch `mac-m1-pro`) and is not comparable with the tables above
 (other CPU; Q4_K_M as well as Q8_0).
@@ -124,6 +127,80 @@ VNNI weights (~630 MB, ~55 ms to pack). mynah-slm reports a 0.14-0.15 s model lo
   23.6), 1 run Q4_K_M; ~65-90 s per run, so not repeated more.
 - mynah-slm decode is flat from 4 threads; its Q4_K_M (0.40 GB) is no faster than Q8_0 here, so it
   is compute-bound (~13 GB/s), not bandwidth-bound.
+
+## Qwen3.8-27B (IQ3_S) vs ik_llama.cpp, server workloads (2026-11-21)
+
+A different session, model and comparison from everything above: not comparable with the 0.6B tables. One engine
+against another on the **same GGUF file**, the same prompts, requests and measurement script, one box, one window.
+Raw per-request data, commands and logs' numbers: [bench/ikllama-2026-11-21/](bench/ikllama-2026-11-21/).
+
+| | |
+|---|---|
+| CPU | AMD EPYC Genoa (Zen 4), 16 vCPUs, 32 MB L3, 30 GB RAM (the same KVM VM as above; only the daytime runq server was stopped for the window, other services kept running: 1-min load 0.5-6.5, see Caveats) |
+| model | `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (ISTA-DASLab, 3.44 bpw, 12.1 GB, with its MTP block), thinking on and off |
+| runq | `13d55a5`, gcc 14.2.0, `runq serve --ctx 98304 --draft mtp -G 6 --tau 0.5 --repack -k q4-dot --slots 6 --parallel 4 --admit bound` (the production arguments; `--kv-disk` in a temporary directory) |
+| ik_llama.cpp | `ac8d544b` (upstream `06a141f3` of 2026-11-19 + 2 commits unrelated to this model), `-DGGML_NATIVE=ON`, Release, AVX-512 / VNNI active (checked: `HAVE_FANCY_SIMD`); `llama-server -fa on -ctk q8_0 -ctv q4_0 -rtr -ub 1024 -b 2048 -t 14 --spec-type mtp:n_max=6,p_min=0.5 --ctx-checkpoints 4 --jinja`, 1 slot (its MTP stage is removed with more than one slot) |
+| equal settings | 14 threads; KV cache 8-bit K + 4-bit V (runq `q4-dot` = ik `q8_0` K / `q4_0` V: not the same quantizer, the same bit widths; see Caveats); MTP drafting with up to 6 tokens, p_min 0.5; greedy and seeded (T 1, top-p 0.95, top-k 20, seed 42) requests; `scripts/s9c_bench.py` unchanged for both (`--server-cmd` starts ik's server) |
+| prompts | `bench/s9c/`: two LiveCodeBench-shaped prompts, two agent-shaped ones (system block + task), `max_tokens` 512; a 32k-token source file + 2 pi-shaped follow-up turns of ~2,500 new tokens |
+
+**Short requests** (tok/s per request, mean of 8 at one client; 4 clients: aggregate tokens / the round's wall time):
+
+| | runq | ik_llama.cpp, 1 slot + MTP | ik_llama.cpp, 4 slots, no MTP |
+|---|---|---|---|
+| thinking on, 1 client | **18.6** | 7.8 | 5.5 |
+| thinking on, 4 clients (greedy / seeded) | **23.1 / 23.7** | 7.1 / 6.0 (queued behind one slot) | 8.1 / 4.2 |
+| thinking off, 1 client | **21.8** | 11.2 | 5.6 |
+| thinking off, 4 clients (greedy / seeded) | **26.1 / 26.6** | 8.3 / 8.6 (queued) | 4.5 / 6.0 |
+| prefill, 0.8-2.5k-token prompts, tok/s | 81-84 | **110-118** | |
+| peak RSS (GiB) | 18.4 | 17.7 (16k context) | 14.6 |
+
+**Long context** (a 31,755-token cold prompt, then two turns adding ~2,500 tokens each; thinking on, greedy, 512 new tokens):
+
+| | runq | ik_llama.cpp (1 slot + MTP, `-c 49152`) |
+|---|---|---|
+| cold prefill (31,755 tokens) | 471 s (67 tok/s) | **319 s (100 tok/s)** |
+| decode, cold turn | **13.1 tok/s** | 2.4 tok/s |
+| decode, follow-up turns | **14.8 / 15.9 tok/s** | 1.9 / 2.0 tok/s |
+| prefill of a follow-up turn's ~2.5k new tokens | 44.2 / 46.7 s (the 31-34k cached prefix reused) | 39.6 / 41.9 s (checkpoint restored) |
+| a follow-up turn, wall | **76 / 81 s** | 316 / 301 s |
+
+**Quality, the same tokens and context** (the same file; perplexity over the second half of the first 2,048 / 3,072-token
+window, `llama-perplexity` against runq's `-m logits`, both with the 8-bit K / 4-bit V cache; the token ids of both
+engines' tokenizers are identical): prose (Beagle ch. I) runq 9.483, ik 9.493 (+0.1%); code (the 32k source's head)
+runq 7.133, ik 7.145 (+0.2%): within the +-0.07 standard error of 1,000-1,500 scored tokens, i.e. the same quality.
+(`llama-perplexity`'s printed final estimate also averages in a second window, which runq was not run on, so it is not
+the number to compare.)
+
+**ik_llama.cpp tuning, `llama-bench` on the same file** (pp2048 / tg64, tok/s): `-t 14 -ub 2048`: 148 / 6.0; `-t 16 -ub
+2048`: 160 / 4.6; `-t 14 -ub 512`: 135 / 5.9; `-rtr 0` and `-rtr 1` equal within noise on this file; decoding at a
+16k-token depth: 4.3 tok/s with a 4-bit V cache, 4.8 with 8-bit. 14 threads decode faster than 16 (other services on the
+box); `-ub 2048` helps prefill by ~8-10% and was not usable at 98k context in a 20 GB cap (see below), `-ub 1024` was used.
+
+**Reading**: on this CPU, with this model, runq decodes **1.9-2.4x** faster on short requests and **6-8x** faster at 32k
+context, serves 4 clients at once with MTP (ik: one slot with MTP, or four without), and finishes a 2.5k-token follow-up
+turn on a 32k session ~4x sooner; ik_llama.cpp prefills **1.35-1.5x** faster (cold 32k prompt 319 s vs 471 s). Quality is
+equal. Neither gap was profiled: ik's decode without MTP (`llama-bench` tg64, 5.4-6.0 tok/s) is already below runq's
+plain decode of earlier sessions, and its MTP decode drops sharply with depth (2-2.4 tok/s at 32k); its prefill is
+the part runq could learn from.
+
+**Caveats**
+- One run per cell, a shared box (1-min load 0.5-6.5 over the window, from other users' jobs; the same window for both
+  engines but not simultaneous): differences of a few tens of percent are noise, the 2-8x ones are not. runq's numbers
+  here are higher than the S9c ones in `docs/qwen38-speculative.md` (a busier box then).
+- ik_llama.cpp was configured by us, from its README and `--help` (flags above, tuned with `llama-bench`); its authors
+  may know better settings. Its support for Qwen3.8's hybrid layers and MTP is recent, and it is a fork under heavy
+  development (the build is of 2026-11-19).
+- Equal KV bit widths, not the same quantizer: runq's `q4-dot` is Hadamard-rotated per-32 8-bit K / 4-bit V with a bf16
+  dot-product attention; ik's `q8_0` / `q4_0` are ggml's types. The perplexity above says the effect on quality is
+  within noise on these texts; that is not a long-context quality test.
+- At 98,304 context ik_llama.cpp's server was OOM-killed twice in a 20 GB cap (it reserves the KV cache at the full
+  context up front, 2.65 GiB K+V here, plus a 2 GiB compute buffer at `-ub 2048` and an 8 GiB default prompt cache,
+  `-cram`); the runs above use 16k (short) and 48k (long) contexts and `-cram 512`, which do not change the speed at
+  those depths.
+- Not measured: mainline llama.cpp, vLLM's CPU backend, other engines; a plain (no MTP, 1 client) decode of runq side by
+  side with ik's (`llama-bench` tg64 gives ik's 5.4-6.0 tok/s; runq's plain decode on this file was 7.2-8.1 tok/s in
+  a loaded window of an earlier session, `docs/qwen38-speculative.md`); other CPUs (a different AVX-512 implementation or
+  AVX2 would change both engines' numbers).
 
 ## Apple M1 Pro (macOS, NEON)
 

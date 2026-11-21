@@ -14,7 +14,7 @@ and generic kernels, a request batched or alone), and a change of numerics must 
 (The use it serves: the next section, agentic development at 96k context.)
 Decode Qwen3.8-27B (`qwen35`, 64 layers, r = 3, untied, an MTP block) at ~13-18 tok/s on the dev box with
 Qwen3.5-0.8B as the draft, the output **exactly** plain decoding's (tokens, greedy and seeded, and each emitted
-token's logits bits). Facts, measurements and decisions: [docs/qwen38-speculative.md](docs/qwen38-speculative.md).
+token's logits bits). Facts, measurements and decisions: [docs/notes/qwen38-speculative.md](docs/notes/qwen38-speculative.md).
 Added rule for this section: speculative output == plain output (tokens + a hash of each emitted token's logits).
 The preparation is done (2026-10-27: the regression net `tests/compare_bins.sh REF_DIR NEW_DIR` over every model
 family incl. Qwen3.5 and the synthetic r = 2 / 3 / 27B-shaped models; two models in one process; checkpoint sets and
@@ -23,11 +23,11 @@ and `general.sampling.*`; the file's specifics: the MTP block validated and skip
 fp32, the 3.8 chat template with its reasoning effort; the verify-pass cost: small segments through the decode-rows
 worker, a 4-row segment 1.20-1.29x a decode step), and so is S1, the loop (`rq_generate_spec` / `rq_spec_run`,
 `src/spec.c`; CLI `-D` / `-G` / `--tau`; exact on Qwen3 and Qwen3.5, tested in `make test`'s `spec` group; Qwen3-1.7B
-+ 0.6B Q4_K_M: 1.15-1.5x at k 3, [docs](docs/qwen38-speculative.md#the-loop-s1)), and so is S7, the 27B bring-up
++ 0.6B Q4_K_M: 1.15-1.5x at k 3, [docs](docs/notes/qwen38-speculative.md#the-loop-s1)), and so is S7, the 27B bring-up
 (Unsloth's Q4_K_M: 16.3 GiB of RSS, the load estimate within 0.3%; logits vs its numpy reference cos 0.9999, top-1
 62/62; plain 8.7 tok/s, with the 0.8B Q4_K_M draft 13.2-14.1 tok/s thinking on, 16.6-17.2 off, 8 threads, every output
 plain decoding's; a checkpoint per verify row 2.2 ms (S3's cost); the opt-in `3.8-27b-q4km` of the `models` group;
-[docs](docs/qwen38-speculative.md#the-27b-bring-up-s7)), and so is S8, the server (2026-10-28: `runq serve --draft FILE`
+[docs](docs/notes/qwen38-speculative.md#the-27b-bring-up-s7)), and so is S8, the server (2026-10-28: `runq serve --draft FILE`
 and / or `--lookup N`, the guesses verified in the engine's batched passes, the draft's steps in its own batched passes,
 Qwen3.5's checkpoints per verify row transient next to the slot's G5 budget; outputs exactly plain decoding's,
 `server_test.py --spec` in the `spec` group; the auto policy of G7; `timings.speculative`;
@@ -60,13 +60,13 @@ Steps:
     `mtp_approx`); output == plain decoding on every case (spec group: `spec_api/mtp_synth*`, `spec_mtp/*`, the
     `mtp_lockstep` check after every run). On Qwen3.5-0.8B with its own block (the opt-in test file) as target and
     draft: 64 / 64 outputs == plain, 42-79% of the guesses accepted, 2.2-3.5 tokens per pass at k 2-4, 0.87-1.24x plain's
-    tok/s on that small model (docs/qwen38-speculative.md, "The loop"). `runq serve --draft mtp` runs since S9c.3
+    tok/s on that small model (docs/notes/qwen38-speculative.md, "The loop"). `runq serve --draft mtp` runs since S9c.3
     (2026-11-09, docs/server.md), its view loaded from `--kv-disk` to the prompt's prefix and in the `--admit` terms
     since S9c.4; S9c.5 (2026-11-09) added the tools of the 27B's measurement in the server (`scripts/s9_gate.sh --server`,
-    `scripts/s9c_bench.py`, `bench/s9c/`; the commands in docs/qwen38-speculative.md, "In the server (S9c)") and the
+    `scripts/s9c_bench.py`, `bench/s9c/`; the commands in docs/notes/qwen38-speculative.md, "In the server (S9c)") and the
     trained 0.8B block's whole `--spec mtp` group (`models/3.5-0.8b-mtp/server_spec/*`). **S9c.G done (2026-11-10,
     10:20-13:30Z, saluki down; 0a32bdc's `./runq`, `--repack` off; `--kv-mem 6` for both, 7 closed): DEPLOY** by the
-    plan's rule (docs/qwen38-speculative.md, "In the server (S9c)"). ISTA IQ3_S-mtp, 14 threads, `ista-iq3s`'s flags;
+    plan's rule (docs/notes/qwen38-speculative.md, "In the server (S9c)"). ISTA IQ3_S-mtp, 14 threads, `ista-iq3s`'s flags;
     A = `--draft mtp -G 6 --tau 0.5`, B = the 0.8B Q4_K_M `-G 5 --tau 0.4`:
     - G1: `--spec mtp --quick --one-server` 13 / 13 (== plain; `mtp_approx` 0 on 42 replies; `mtp_lockstep` 8 of 42
       dumps, `--mtp-dump-max 8`), `--disk --draft mtp --one-server` 11 / 11 + SKIP `disk/lock`; `servers at once: max 1`.
@@ -83,7 +83,7 @@ Steps:
     **S9d.1 done (2026-11-09):** `scripts/s9_gate.sh` (the 27B gate: the estimate from metadata, the servers' `/health`
     margin and the timers that start one, a capped scope without swap, the watchdog, the bench lock) and
     `build/spec_sweep` (`make spec-sweep`: settings x S7's prompts in one process, every output checked against plain);
-    the 0.8B-mtp through the gate: 80 / 80 runs == plain (docs/qwen38-speculative.md, "The 27B gate"). **S9d.2 done
+    the 0.8B-mtp through the gate: 80 / 80 runs == plain (docs/notes/qwen38-speculative.md, "The 27B gate"). **S9d.2 done
     (2026-11-09): go** (below). **Open:** S9c (the server; needs the user's OK, and for production an MTP file: the
     Saluki MTP variant below, the live Saluki IQ2-mix has no block); on the 27B `--spec auto` with the MTP (the prior
     0.8 unverified there), long contexts (S9w's costs only), Qwopus' block, llama.cpp's comparison (PLAN 8 item 6).
@@ -91,7 +91,7 @@ Steps:
     through `scripts/s9_gate.sh --until 21:30`, `build/spec_sweep FILE -c 4096 -n 256`, 8 threads, S7's 4 prompts, box
     load 5-10 from other jobs (plain 7.2-8.1 tok/s on IQ3_S-mtp, 8.4-8.6 on the Q4_K_M; a nightly dry run's 27B server
     up 07:19:56-07:20:38Z and from 07:48:00Z, between / after the jobs, overlapping none). **172 / 172 runs == plain** (164 speculative, 128 with the MTP),
-    `mtp_approx` 0. Tok/s, mean of the 4 prompts (docs/qwen38-speculative.md, "The 27B's acceptance and the go"):
+    `mtp_approx` 0. Tok/s, mean of the 4 prompts (docs/notes/qwen38-speculative.md, "The 27B's acceptance and the go"):
     | target, mode | plain | 0.8B `-G 3` | 0.8B `-G 6 --tau 0.4` | MTP `-G 3` | MTP `-G 6 --tau 0.5` |
     |---|---|---|---|---|---|
     | IQ3_S-mtp, greedy, thinking on | 7.96 | 9.95 (2.39 per pass) | 11.12 | 12.39 (3.01) | **12.85** (+16%) |
@@ -148,7 +148,7 @@ Steps:
     MTP follows every chunk, +1.9% at short context, +5.0% at 98k, +4.3% for a cold 96k prefill. Memory: no 0.8B
     weights nor its 708.7 MiB draft sequence per slot, against one attention layer's KV (4 KiB per position) per slot.
     k and tau swept at S9d.2 (above: `-G 6 --tau 0.5` the best fixed setting, +4% over `-G 3`). Tables:
-    docs/qwen38-speculative.md, "The MTP drafter (S9)".
+    docs/notes/qwen38-speculative.md, "The MTP drafter (S9)".
   - **Test files:** `models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (ISTA-DASLab, 12.1 GB, sha256
     58fd8267...; downloaded). Its `blk.64` (15 tensors: attn q/k/v/output, ffn gate/up/down, `nextn.eh_proj` all Q6_K;
     norms incl. `nextn.enorm` / `hnorm` / `shared_head_norm` F32) is a full block with its own FFN. Its trunk's
@@ -184,7 +184,7 @@ reasoning omitted, tool results cut to 2,000 characters: no prefix to reuse) and
 the summary + the last `keepRecentTokens`. Every item keeps the project's rules (bitwise paths; speculative == plain).
 
 Where it stands (measured 2026-10-28 on the 27B: G3's gate, G0's replay and long-context costs, G2's retrieval, all done; the setup and its numbers in docs/server.md, "Qwen3.8-27B
-with pi"; the measurements in docs/qwen38-speculative.md, "Q3_K_M: the quality gate", "Long-context costs", "Agent
+with pi"; the measurements in docs/notes/qwen38-speculative.md, "Q3_K_M: the quality gate", "Long-context costs", "Agent
 sessions"):
 - **Memory: fits.** The agentic file is the **Q3_K_M** (G3's gate: top-1 = the API model's 96.5 / 94.5% thinking off /
   on against the Q4_K_M's 98.4 / 96.9%, perplexity +2.7%, KL 0.029 from the Q4_K_M on pi sessions' replies): runq's
@@ -206,7 +206,7 @@ Goal, against the measurements: a 96k session with the draft fits with >= 2 GiB 
 plus the last reply (met: 46 of 52 tool turns exact, none beyond).
 
 - [ ] **G3 leftovers: memory beyond the Q3_K_M.** (The quality gate is done: the Q3_K_M is the agentic file, the
-  Q4_K_M the reference and the choice where it fits; docs/qwen38-speculative.md, G3.) The ~2 GiB to spare are thin on a
+  Q4_K_M the reference and the choice where it fits; docs/notes/qwen38-speculative.md, G3.) The ~2 GiB to spare are thin on a
   shared box, and the Q4_K_M at 96k with its draft needs ~3 GiB more:
   - The 8-bit / 4-bit KV cache is in (`-k q8`, `q4` = 8-bit K + 4-bit V, `q4k4`, each also `-dot`; docs/kv-quant.md):
     K and V Hadamard-rotated (instead of per-tile scales: the scales stay per position, so no path dependence),
@@ -223,12 +223,12 @@ plus the last reply (met: 46 of 52 tool turns exact, none beyond).
   - The checkpoint budget: 150 MiB each for the 27B; `--checkpoints 3` is enough for Qwen3.8 (the header, the system
     block, the reply's end).
 - [ ] **G4 leftovers: prefill attention against a long cache.** (a) and (b) are in (`082511f`, `-k bf16-dot` as an
-  option; docs/qwen38-speculative.md, "G4", "G4 (b)"). On the 27B (G0's run, the Q3_K_M): the 2,560-token chunk at 98k
+  option; docs/notes/qwen38-speculative.md, "G4", "G4 (b)"). On the 27B (G0's run, the Q3_K_M): the 2,560-token chunk at 98k
   123 -> 86 s at 16 threads, 208 -> 148 s at 8 (1.41-1.43x the whole chunk); G2's retrieval at 88k passes with it. Left
   for the goal's ~1 min: the matmul part (38 of the 86 s at 16 threads; the Q3_K kernels' prefill is ~6% slower than
   the Q4_K_M's), an fp32-free softmax (a change of definition), and the KL at 64k-98k positions (the long group's golden
   keeps 576 ids per position). Not the default: `bf16-dot` stays opt-in (docs: the setting for the 27B's sessions).
-- [ ] **G5 leftovers: re-prefill and compaction.** G5 is done (docs/server.md and docs/qwen38-speculative.md,
+- [ ] **G5 leftovers: re-prefill and compaction.** G5 is done (docs/server.md and docs/notes/qwen38-speculative.md,
   "Agent sessions"). Measured on the 27B (Q3_K_M, 16 threads): every tool turn prefills its new tokens, or those plus
   the previous reply's last few; a compaction at 84k with `keepRecentTokens` 8,000 costs ~12.4 min. Left: (a) the reply's
   own tokens for its span of the next prompt when the text matches (no re-prefill after a non-canonical sampled token
@@ -249,12 +249,12 @@ plus the last reply (met: 46 of 52 tool turns exact, none beyond).
   common prefix with the file (today a load replaces the slot's sequence; the margin rule keeps it from reading much
   for little). (d) The 8-bit KV cache (G3) halves the files and the I/O.
 - [ ] **G6 leftovers: prompt lookup.** Prompt-lookup drafting is in (`--lookup N [--lookup-min M]`, with or without
-  `-D`; exact; docs/qwen38-speculative.md, "Prompt lookup": ~1.5 tokens per pass on agentic replies, 2.8-3.9x on edits
+  `-D`; exact; docs/notes/qwen38-speculative.md, "Prompt lookup": ~1.5 tokens per pass on agentic replies, 2.8-3.9x on edits
   that return the prompt's code; in the server and chosen per pass since S8 / G7; on the 27B's replay 47% of its guesses
   accepted at 21-81k). Left: tool schemas whose old / new text are plain string parameters (pi's `edits` array is
   JSON-escaped, so multi-line old text does not match the raw file text in the context: a pi-side change or a custom
   edit tool).
-- [ ] **G7 leftovers: speculation at long context.** In (2026-10-28, docs/qwen38-speculative.md, "In the server (S8)
+- [ ] **G7 leftovers: speculation at long context.** In (2026-10-28, docs/notes/qwen38-speculative.md, "In the server (S8)
   and the choice by position (G7)"): `runq serve --spec auto` and `runq --spec auto`. On the 27B (Q3_K_M, `bf16-dot`, 16
   threads): `bench_long -D`'s choice from the measured passes, the model k 3 up to 32k (x1.38-1.49), k 1 at 64-98k
   (x1.24 / x1.17), a 4-token lookup match 3 guesses (x1.47-2.10); in the server the replay's probes (256 tokens) at
@@ -445,7 +445,7 @@ Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M (Qwen3.8-27B Q4_K_M, the same
 ## Benchmarks and docs
 
 - [ ] **A fresh BENCHMARKS.md session.** It is still the 2026-10-25 session (`d76e4cc`, before the Q4_K_M kernels,
-  the thread pool, the f16 KV cache, batched decode and the server); later numbers are in the README and
+  the thread pool, the f16 KV cache, batched decode and the server); later numbers are in BENCHMARKS.md (the all-models table) and
   [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Rerun `scripts/bench_all.sh`, `scripts/bench_models.py`,
   `scripts/bench_batch.sh` and `scripts/bench_serve.py` with one binary in one session, against qwen3.c and
   mynah-slm as before, and update its text.
@@ -467,4 +467,4 @@ Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M (Qwen3.8-27B Q4_K_M, the same
   verifies nothing, so still check the sha256 before linking), else plain curl + sha256sum into the gwenedeg cache
   dir; the same logic as a `scripts/fetch.sh` (no Python needed). Done when a bare set name resolves in every
   location, `hf`-downloaded files are found and used without copying, `runq models` prints the table, and the docs
-  (`README.md`, `scripts/download_models.py --list`) agree.
+  (`docs/models.md`, `scripts/download_models.py --list`) agree.

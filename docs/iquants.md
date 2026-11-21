@@ -160,7 +160,7 @@ alongside (best of 2, load 10-17):
 | Qwen3.8-27B Q3_K_M | 12.4 GiB | 13.3 GB | 42 / 74 | 9.8 / 10.2 | 12.3 / 12.6 | 9.0 s | 10.069 |
 | Qwen3.8-27B Q4_K_M | 15.3 GiB | 15.9 GB | 45 / 73 | 7.9 | 9.1 | | 9.800 |
 
-(Perplexity: `scripts/ppl.py bench/ppl_beagle_ch1.txt -w 512` with .venv-hf5, the 27B rows from README.md's table.) So:
+(Perplexity: `scripts/ppl.py bench/ppl_beagle_ch1.txt -w 512` with .venv-hf5, the 27B rows from the all-models table, now in BENCHMARKS.md; it was in the README.) So:
 ~37% less RAM than the Q3_K_M and the fastest 27B decode here at 16 threads; at 8 threads it is compute-bound (the
 codebook decode) and as fast as the Q3_K_M; prefill is ~0.72x the Q3_K_M's (the K-quants have a tuned GEMM: a follow-up,
 TODO.md); perplexity +18% over the Q3_K_M (the model card's own numbers: tool calling kept, competition math 82-85% of

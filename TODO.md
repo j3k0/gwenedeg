@@ -395,10 +395,10 @@ Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M (Qwen3.8-27B Q4_K_M, the same
 
 - [x] **Q2_K and the i-quants** (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS; 2026-10-30): Underdog Saluki
   27B 1.0 (`saluki-27b`, 7.9 GB) and the Unsloth "UD" files made of them load and run; [docs/iquants.md](docs/iquants.md).
-- [ ] **i-quant prefill**: a tiled GEMM for the types of `src/iquants.h` (each group is decoded once per 8 activation rows
-  today, `iq_rows`; no tiles, no small-batch kernels): Saluki prefills at ~0.72x the 27B Q3_K_M's tok/s (30 / 54 vs
-  42 / 74 at 8 / 16 threads). Decode the 16-row block's codes once into a scratch tile (as `kq_unpack_tile`) and run
-  more activation rows per pass; maybe 32-row tiles sharing the activation broadcasts.
+- [x] **i-quant prefill** (2026-11-21, branch `pp-tiled-iq`; docs/iquants.md "Batched rows", PP-RESULTS.md): a tiled GEMM
+  for Q2_K and the i-quants on AVX-512 (`iqx_gemm_item`: the 32-row tile decoded once per claim, a 2-block x 6-row
+  register tile on u8 codes), bit-identical; 17408 x 5120 at 512 rows, 8 threads: 1.43-2.11x per type (IQ3_S 2.11x).
+  Open: the 27B end to end (`scripts/pp_window.sh` in a measurement window); NEON (still `iq_rows`, 32 rows per pass).
 - [x] **`--repack`** (2026-11-09; docs/iquants.md, `--repack: 4-bit codes`): IQ3_S / IQ3_XXS stored as 4-bit codes at load,
   bit-identical; `--repack[=LIST]`, `--no-repack`, `--repack-info` (CLI, `runq serve`, `spec_sweep`). ISTA 27B, 8 threads:
   `--repack=IQ3_S` +0.74 GiB, decode 1.15x, 4-row pass 1.14x; all +1.37 GiB, 1.25x / 1.19x; 16 threads ~1.05x / 1.15x.

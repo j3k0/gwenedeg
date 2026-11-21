@@ -58,8 +58,42 @@ IQ2_XXS 0.066 -> 0.023, IQ2_XS 0.067 -> 0.028, IQ2_S 0.068 -> 0.034, IQ3_XXS 0.0
 IQ1_S / IQ1_M (codes) 0.061 / 0.067 -> 0.017 / 0.020; Q2_K 0.014, IQ4_XS 0.013 (no codebook). Saluki's decode went
 6.7 -> 10.2 -> 12.7 -> 14-15 tok/s at 16 threads over these steps.
 
-Batched rows (prefill, verify passes, batched decode) take the same kernel with up to 8 activation rows per pass over a
-decoded group (`iq_rows`; not the K-quants' tiled GEMM nor their small-batch kernels).
+Batched rows: verify passes, batched decode and prefill phases of fewer than `IQX_MIN` = 24 rows take the same kernel
+with up to 8 activation rows per pass over a decoded group (`iq_rows`). Prefill phases of 24 rows or more take the tiled
+GEMM (`iqx_gemm_item`, AVX-512, 2026-11-21), shaped as the K-quants' (`kq512_gemm_item`): a work item is (32-row tile,
+chunk of activation rows), a tile's chunks are claimed together, and the tile is decoded once per claim into the
+thread's scratch (`iqx_unpack_tile`: per 16-row block and group the 8 steps of biased codes v + B as u8, S0 / S1 as
+int32, D as fp32; the decode is `iq512_group`'s, so VBMI and gathers give the same bytes), then a register tile of 2
+blocks x 6 activation rows (two-scale types 5, Q2_K 4) runs vpdpbusd on the u8 codes, each activation broadcast shared by
+32 weight rows. The arithmetic is `iq_dot`'s: per (row, group) T_h exact, I = S0 T0 + S1 T1 in int32 (one-scale types:
+one chain over both halves from -B (X0 + X1), then one vpmulld: the same int32), `val + (D * xs) * (float) I`, each
+fp32 operation rounded, in group order (Q2_K: its codes stored times their scale, S v <= 45 fits u8, so the chain gives
+I directly; its mins term M0 X0 + M1 X1 by one vpdpwssd on int16 pairs). Bit-identical to `iq_rows` and `iq_dot`:
+`make iq-gemm-test` (every type and --repack's codes, 1 .. 77 rows, K to 17408, both decodes) and the q35 group's
+batch / thread / generic checks on synth-q35-iq.
+
+Micro-benchmark (`build/iq_gemm_test -b all 512`: 17408 x 5120, i.e. the 27B's ffn_gate / ffn_up, 38-49 MB of weights
+per matrix (DRAM-resident), 512 activation rows, 8 threads, best of 5; ns per weight and row = wall time x threads /
+(rows x weights); Zen 4 VM, load 3-4):
+
+| type | iq_rows | tiled | |
+|---|---|---|---|
+| IQ3_S | 0.0082 | 0.0039 | 2.11x |
+| IQ3_XXS | 0.0074 | 0.0039 | 1.92x |
+| IQ4_XS | 0.0056 | 0.0039 | 1.43x |
+| IQ3_S / IQ3_XXS --repack codes | 0.0061 / 0.0056 | 0.0038 / 0.0039 | 1.58x / 1.46x |
+| IQ2_XXS / IQ1_S | 0.0072 / 0.0063 | 0.0041 / 0.0039 | 1.74x / 1.63x |
+| IQ2_XS / IQ2_S / IQ1_M | 0.0077 / 0.0084 / 0.0067 | 0.0048 / 0.0048 / 0.0046 | 1.61x / 1.74x / 1.45x |
+| Q2_K | 0.0075 | 0.0047 | 1.60x |
+
+The one-scale types run at ~60% of the core's vpdpbusd peak (measured 440 GMAC/s per core); without the per-32 fp32
+fold (a diagnostic build, wrong results) they would take 0.0031 ns: the fold the bit-identity rule fixes costs ~25%, the
+rest is loads and the tile decode. Two-scale types pay a second vpmulld per group. 5120 x 17408 (ffn_down): IQ3_S
+0.0044, IQ4_XS 0.0044 (2.02x / 1.37x). Crossover with `iq_rows`: ~16-24 rows (IQ3_S 1.20x at 16, IQ2_S / IQ4_XS 0.94-0.96x
+at 16, 1.03-1.06x at 24): `IQX_MIN`. Rows per chunk 256 .. 2048: the same ns per weight and row within noise. With the
+tiled GEMM, `--repack` no longer changes prefill (both layouts decode to the same tile); it still speeds up decode.
+The scratch is 2 x (k / 32) x 832 bytes per thread (766 KB / 905 KB at k = 17408 for the one-scale / Q2_K tiles; the
+K-quant tile 766 KB), allocated as before.
 
 ## NEON
 
@@ -188,7 +222,7 @@ the full model's). A 64-token greedy decode at 16 threads measured 14.2-15.1 tok
 
 ## Not done (TODO.md)
 
-- Prefill: a tiled GEMM for these types (decode once per tile, more activation rows per pass), ~0.72x the Q3_K_M today.
+- Prefill on the 27B end to end with the tiled GEMM (above): `scripts/pp_window.sh` (a measurement window; PP-RESULTS.md).
 - NEON: faster GEMV (IQ3_S's index bit 8; TODO.md), a prefill GEMM; gcc on AArch64 Linux untested.
 - IQ4_NL (blocks of 32), TQ1_0 / TQ2_0, and the community MTP variant of Saluki (`Kujira/Underdog-Saluki-27B-1.0-MTP-GGUF`:
   an MTP block for speculative decoding; runq validates but does not run MTP blocks yet, TODO S9).

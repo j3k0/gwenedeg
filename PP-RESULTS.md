@@ -196,11 +196,18 @@ Q2_K 3%, IQ2_XXS 1.4%, IQ1_M 0.3%), time ∝ share x ns from the table:
 - Manual: `synth-q35-iq` logits sha256 identical for `-b 1`, `-b 64`, `-b 512`, generic `-b 512`, `--repack -b 333`,
   and 3 threads `-b 100`. `scripts/pp_window.sh`'s dry run (below) also printed identical sha256 for base vs new.
 
-**Not run:** the default `make test` groups that need `models/Qwen3-0.6B-q8.bin` (tokenizer, logits, batched, threads,
-kernels, greedy, chat, gguf, q4, kv, api, server, synth, spec). The worktree has no `models/`, the task only cleared
-the Qwen3.5-0.8B files, and the full suite starts ~25 processes (12-16 GB). These groups do not reach the changed code:
-it is gated on `iq_type()` / `RUNQ_IQX`, except the scratch size, which the q35 group's K-quant checks cover. Run
-`make test` once before merging.
+**Full suite after the rebase onto main `fbe8c51`** (2026-11-21, `models` symlinked read-only to the main tree's; `make`
+capped at `-j4`, `nice -n 10`, `OMP_NUM_THREADS=8`, `GWENEDEG_TEST_PROCS=1`; peak summed RSS of the suite's processes
+3.8 GB, load 3-8):
+- `make test` (all default groups): **1858 passed, 3 failed**, 53 min. The 3 failures are `spec_server/mtp_admit/admit/strict_fifo`
+  (queue_ms 65-80, the check wants > 200), `spec_server/mtp_disk/disk/watch_above` and `.../watch_purge`. **They predate
+  this branch:** `tests/server_test.py` on main's own build (`fbe8c51`, built in a temp dir) fails the same three checks with
+  the same messages, run alone (`--admit --draft mtp`, `--disk --draft mtp --foreign-draft ...`; load 6-7). Not
+  investigated further; they look timing / environment dependent (a busy box, the live server next to them).
+- `make test-models` (the files present: Qwen3.5-0.8B Q8_0 / Q4_K_M / mtp): 170 passed, 0 failed, 3.3 min.
+- `tests/run_tests.sh --long-context`: 36 passed, 0 failed, 11 min.
+- `build/iq_repack_test`, `build/iq_gemm_test`, `build/bf16dp_test`, `build/bf16dp_test-emu`: ok; AVX-512 and generic
+  builds both built.
 
 ## Needs a measurement window
 

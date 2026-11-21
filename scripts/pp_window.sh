@@ -14,7 +14,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 M="${1:-/opt/projects/tools/gwenedeg/models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf}"
-BASE="${2:-eaf34f6}"
+BASE="${2:-$(git -C "$ROOT" merge-base HEAD main)}"  # (the branch point: base and new differ by this branch only)
 REPS="${REPS:-2}"
 JOBS="${JOBS:-8}"
 TH="${TH:-8 14 16}"   # thread counts of step 2

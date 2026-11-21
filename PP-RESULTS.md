@@ -215,10 +215,10 @@ One command, from the worktree, with the live server stopped (≈ 13 GB free RAM
 
 ```sh
 cd /opt/projects/tools/gwenedeg-pp && scripts/pp_window.sh
-# = scripts/pp_window.sh /opt/projects/tools/gwenedeg/models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf eaf34f6
+# = scripts/pp_window.sh /opt/projects/tools/gwenedeg/models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf fbe8c51
 ```
 
-- **What it does.** It builds base (`eaf34f6`) and this tree in a temp dir (plain, `-DRUNQ_PROFILE`,
+- **What it does.** It builds base (the branch point with main, `fbe8c51`) and this tree in a temp dir (plain, `-DRUNQ_PROFILE`,
   `-DRQ_BATCH_MAX=2048`; `-j8`), then:
   1. **Bit-identity on the 27B.** sha256 of `-m logits` on a ~300-token prompt: base `-b 512`, new `-b 512`, `-b 1`,
      `-b 77` at 3 threads, and `--repack`. All must be equal.

@@ -112,7 +112,7 @@ chat templates and what is not supported (MoE, images, RoPE scaling, other GGUF 
 
 [docs/README.md](docs/README.md) is the index.
 
-## Platforms and limitations
+## Limitations
 
 - Linux (gcc) is the main platform. macOS on Apple Silicon (Apple clang) builds and runs with the NEON kernels (tested on macOS only; the
   tests that compare generated text with goldens recorded on x86 need an arm64 baseline: [docs/usage.md](docs/usage.md#limitations)). The

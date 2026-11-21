@@ -356,6 +356,14 @@ def iq_synth_run(a, sd, tmp, texts):
         out.append((p.returncode == 0 and nok > 0, "q35/iq_repack_test",
                     f"{nok} cases bit-identical (iq_rows VBMI / gather / codes, iq_dot, iq_packed_row)" if p.returncode == 0
                     else "; ".join(l for l in lines if l.startswith("FAIL"))[:300] or f"exit {p.returncode}"))
+    kt = os.path.join(ROOT, "build", "iq_gemm_test")  # (the tiled prefill GEMM vs iq_rows and iq_dot, random blocks; AVX-512)
+    if os.path.exists(kt):
+        p = run([kt], 4)
+        lines = p.stdout.decode(errors="replace").splitlines()
+        nok = sum(l.startswith("ok ") for l in lines)
+        out.append((p.returncode == 0 and nok > 0, "q35/iq_gemm_test",
+                    f"{nok} cases bit-identical (iqx_gemm_item, iq_rows, iq_dot; every type, 1 .. 77 rows)" if p.returncode == 0
+                    else "; ".join(l for l in lines if l.startswith("FAIL"))[:300] or f"exit {p.returncode}"))
     model = os.path.join(sd, "synth-q35-iq.gguf")
     if not os.path.exists(model):
         return out

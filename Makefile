@@ -29,7 +29,7 @@ HDR = $(wildcard src/*.h)
 Q8  = models/Qwen3-0.6B-q8.bin
 B   = build
 
-.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test iq-neon-test iq-repack-test api-test tools-test bench-batch bench-verify long-ctx bench-long bench-mtp spec-sweep teacher-force mem-probe bf16dp-test FORCE
+.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test iq-neon-test iq-repack-test iq-gemm-test api-test tools-test bench-batch bench-verify long-ctx bench-long bench-mtp spec-sweep teacher-force mem-probe bf16dp-test FORCE
 
 all: runq
 
@@ -164,6 +164,14 @@ iq-neon-test: tests/kernels/iq_neon_test.c src/kernels_neon.h src/iquants.h src/
 # bit-identical (tests/kernels/iq_repack_test -b [k]: single-thread ns per weight, base vs repacked)
 iq-repack-test: tests/kernels/iq_repack_test.c src/kernels_avx512.h src/iquants.h src/iq_grids.h src/kquants.h
 	$(CC) $(CFLAGS) $< -o tests/kernels/iq_repack_test && tests/kernels/iq_repack_test
+
+# the prefill GEMM of Q2_K and the i-quants (iquants.h: iqx_gemm_item) vs iq_rows and iq_dot, AVX-512 build, on random
+# blocks: bit-identical (tests/kernels/iq_gemm_test -b [TYPES [NB [D [K]]]]: the micro-benchmark, OMP_NUM_THREADS threads)
+$(B)/iq_gemm_test: tests/kernels/iq_gemm_test.c src/kernels_avx512.h src/iquants.h src/iq_grids.h src/kquants.h
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $< -o $@
+iq-gemm-test: $(B)/iq_gemm_test
+	$(B)/iq_gemm_test
 
 generic: runq-generic
 

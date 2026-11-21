@@ -676,7 +676,7 @@ RqCtx *rq_ctx_new(const RqModel *mc, int nb_max, int max_ctx, int *err) {
             if (!c->bq_xf || !c->bh_xf || !c->bq_c16 || !c->bh_c16) goto fail;
 #ifdef RUNQ_KQX
             int kmax = p->hidden_dim > xs ? p->hidden_dim : xs;
-            c->kq_scr_bytes = (KQX_SCRATCH(kmax) + 63) / 64 * 64;
+            c->kq_scr_bytes = (GEMM_SCRATCH(kmax) + 63) / 64 * 64;
             c->kq_scr = aligned_alloc(64, c->kq_scr_bytes * c->nt);
             if (!c->kq_scr) goto fail;
 #endif
@@ -1148,6 +1148,10 @@ static void gemm_plan(const RqCtx *c, Gemm *g, int nj, const MatJob *job, Quanti
 #ifdef RUNQ_KQX
         g->tiled[j] = job[j].w->kp != NULL && !iq_type(job[j].w->type); // (Q2_K, i-quants: blocks over all rows, iq_rows)
 #endif
+#ifdef RUNQ_IQX
+        if (job[j].w->kp && iq_type(job[j].w->type) && nb >= IQX_MIN)
+            g->tiled[j] = 1; // (Q2_K, i-quants, AVX-512: their tiled GEMM from IQX_MIN rows, iqx_gemm_item)
+#endif
 #ifdef RUNQ_Q8X
         g->tiled[j] |= job[j].w->p != NULL;
 #endif
@@ -1201,6 +1205,12 @@ NO_FP_CONTRACT static void gemm_item(const Gemm *g, int it, uint8_t *scr, const 
 #if defined RUNQ_Q8X || defined RUNQ_KQX
     if (g->tiled[j]) {
         int t = i / g->nchunk, ch = i % g->nchunk;
+#ifdef RUNQ_IQX
+        if (w->kp && iq_type(w->type)) {
+            iqx_gemm_item(jb->out, jb->ldo, w->kp, w->type, jb->d, t, ch, g->nbi, x->q, x->s, ldx, nb, k, g->c16, scr, last);
+            return;
+        }
+#endif
 #ifdef RUNQ_KQX
         if (w->kp) {
             kqx_gemm_item(jb->out, jb->ldo, w->kp, w->type, jb->d, t, ch, g->nbi, x->q, x->s, ldx, nb, k, g->xf, g->c16, scr, last);

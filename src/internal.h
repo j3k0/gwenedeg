@@ -41,6 +41,13 @@
 #include "iquants.h"
 // phase synchronization and the parallel region of a decode step / prefill chunk
 #include "threads.h"
+// the per-thread GEMM scratch bytes for k columns: a K-quant tile (KQX_SCRATCH), AVX-512: or a Q2_K / i-quant tile
+// (IQX_SCRATCH), the larger
+#ifdef RUNQ_IQX
+#define GEMM_SCRATCH(k) (IQX_SCRATCH(k) > KQX_SCRATCH(k) ? IQX_SCRATCH(k) : KQX_SCRATCH(k))
+#elif defined RUNQ_KQX
+#define GEMM_SCRATCH(k) KQX_SCRATCH(k)
+#endif
 
 // Activation quantization group size of the loaded model (64 .bin, 32 GGUF): a process-wide
 // setting of the kernels, read in their loops (a parameter would change the -Ofast code generation

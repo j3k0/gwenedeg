@@ -665,7 +665,7 @@ static size_t ctx_mem(const RqModel *m, int nb, int max_ctx, int nt) {
         n += (size_t)nb * row + (size_t)nt * (att_scores_floats(vr, att_nb) + vr * att_nb * ATT_PSTRIDE(hd)) * sizeof(float);
 #ifdef RUNQ_KQX
         size_t kmax = hid > xs ? hid : xs;
-        if (m->kq) n += (size_t)nt * ((KQX_SCRATCH(kmax) + 63) / 64 * 64);
+        if (m->kq) n += (size_t)nt * ((GEMM_SCRATCH(kmax) + 63) / 64 * 64);
 #endif
     }
     return n;

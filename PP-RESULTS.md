@@ -57,7 +57,7 @@ types, dim 768, 8 layers; 1,500 tokens, `-b 512`, 8 threads, load 3.2): GEMM pha
 The model is small, so its weights sit in L2/L3. That flatters the old kernel; the 27B's share needs the window
 (step 3 of the script).
 
-**Peak**: a hand-written loop of 16 independent vpdpbusd measures **440 GMAC/s per core** (`/var/tmp/pp-scripts/peak2.c`).
+**Peak**: a hand-written loop of 16 independent vpdpbusd measures **440 GMAC/s per core** (`bench/pp-tiled-iq/vpdpbusd_peak.c`).
 
 ## 2. Cheap wins in `iq512_blk` / `iq_rows`: nothing kept
 
@@ -132,7 +132,7 @@ Other measurements at load 3-5:
   `--repack` still speeds up decode.
 
 **Small-model prefill** (`synth-q35-iq.gguf`, ~1,500-token prompt, `-b 512`, 8 threads, best of 7 alternating runs,
-`/var/tmp/pp-scripts/pf.sh`):
+`bench/pp-tiled-iq/prefill_ab.sh`):
 
 | | base (`eaf34f6`) | tiled | |
 |---|---|---|---|

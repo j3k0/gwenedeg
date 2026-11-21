@@ -98,7 +98,7 @@ thinking, 87 on code at temperature 1, against 70-78 plain (1.15-1.5x; 45-80% of
 guesses the same but its step is slower (5.6 vs 4.2 ms). Qwen3.5 targets and drafts work too (rolled back through
 state checkpoints). **Qwen3.8-27B Q4_K_M** with Qwen3.5-0.8B Q4_K_M as the draft, 8 threads, 256 tokens, the mean of
 chat, code, math and summary prompts: 8.7 tok/s plain; thinking on 13.2 at `-G 3`, 14.1 at `-G 6 --tau 0.4` (1.6x),
-thinking off 16.6 / 17.2 (2.0x; code and math 19-22); 12 threads: up to 15.3 / 20.6. In `runq serve` too (below).
+thinking off 16.6 / 17.2 (2.0x; code and math 19-22); 12 threads: up to 15.3 / 20.6. In `runq serve` too ([server.md](server.md#speculative-decoding-todo-s8-g7)).
 `--spec auto` (opt-in in the CLI) chooses the source and the guess count per pass from a cost model calibrated at the
 start (TODO G7).
 Measurements: [docs/notes/qwen38-speculative.md](notes/qwen38-speculative.md#the-27b-bring-up-s7).

@@ -1,5 +1,33 @@
 # Qwen3.8-27B with speculative decoding: facts and design
 
+> **Lab notebook, not a manual.** This file is the dated record of how speculative decoding and the 27B were brought
+> up, written step by step between 2026-10-27 and 2026-11-10 (steps S1-S9, G0-G7 of [TODO.md](../../TODO.md)). Every
+> measurement says when, on what and how; they were taken on the shared 16-vCPU AMD EPYC Genoa VM of
+> [BENCHMARKS.md](../../BENCHMARKS.md), mostly at load 5-20 from other jobs, so read the noise notes next to each
+> table. Sections are not rewritten when later work changes the picture: the "Status" paragraph below is the
+> **2026-10-27** one (written before the MTP drafter and the server's S9c work) and is kept as it was. For using
+> the features, read [usage.md](../usage.md) (CLI), [server.md](../server.md) (`runq serve`) and
+> [models.md](../models.md); for the numbers that are current, [BENCHMARKS.md](../../BENCHMARKS.md).
+>
+> **What is in it, in order**
+> - *The model and its file* (2026-10-27): the Qwen3.8-27B hyperparameters, GGUF layout, the loader's handling of the
+>   MTP block (`blk.64`) and of the F32 `ssm_alpha` / `ssm_beta` matrices, memory and the chat template.
+> - *Speculation, exact by construction* (S1, S2, 2026-10-27): the loop, why the output equals plain decoding's, the
+>   draft's acceptance (1.15-1.5x on Qwen3-1.7B + 0.6B; the 27B with the Qwen3.5-0.8B draft 8.7 tok/s plain, 13-17
+>   with the draft at 8 threads, the bring-up S7) and the cost of a verify pass.
+> - *The 27B at 96k for agentic work* (G0-G7, 2026-10-27 / 28): long-context costs of attention and the `bf16-dot`
+>   cache, prompt lookup, the Q3_K_M quality gate, replayed pi sessions and compaction, the server's choice of
+>   guess source by position.
+> - *The MTP drafter* (S9, 2026-11-08 to 2026-11-10): the model's own block as the draft: costs, the lockstep loop,
+>   acceptance on the real 27B (IQ3_S-mtp, Unsloth's Q4_K_M), and the gated server run (S9c.G), which decided to
+>   deploy `--draft mtp -G 6 --tau 0.5` for the IQ3_S-mtp file.
+> - *Not now*: directions rejected or postponed.
+>
+> **Superseded since the text was written** (the code and [usage.md](../usage.md) are current): the "Open: the MTP
+> drafter" in the Status below (done: S9); "IQ / UD types maybe later" in Decisions 4 and Not now (the i-quant mixes
+> load since [iquants.md](../iquants.md)); "its MTP block is not used" wherever it appears (it is, with `-D mtp` /
+> `--draft mtp`).
+
 Status (2026-10-27): **the 27B runs, with the 0.8B draft, exactly.** In: the speculative loop (S1: `rq_generate_spec`
 in `src/spec.c`, the CLI's `-D` / `-G` / `--tau`, exact on Qwen3 and Qwen3.5 targets and drafts,
 [below](#the-loop-s1)); the verify pass through the decode-rows worker (S2); the file's specifics (the MTP block, F32

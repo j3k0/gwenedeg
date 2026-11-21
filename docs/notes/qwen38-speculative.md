@@ -56,7 +56,7 @@ the same logits bits for every emitted token. Later: the 27B's own MTP layer as 
 - Dense hybrid (`qwen35`), 64 layers: 48 Gated DeltaNet + 16 gated full attention (every 4th). dim 5120, FFN 17,408.
 - Attention: 24 query heads, 4 KV heads (GQA 6), head size 256, RoPE on 64 dims (theta 1e7).
 - DeltaNet: 16 key heads and **48 value heads** of 128 (r = 3; r = 2 is done and tested on Qwen3.5-4B, r = 3 on a
-  synthetic model, qwen35.md design 8), conv kernel 4.
+  synthetic model, docs/qwen35.md design 8), conv kernel 4.
 - Vocabulary 248,320, **untied** (`token_embd` Q4_K, `output` Q6_K). The same tokenizer as Qwen3.5-0.8B: the 0.8B
   re-tokenized every non-thinking 27B answer of the measurement below to the API's ids.
 - **An MTP layer in the file:** `block_count` = 65 and `nextn_predict_layers` = 1. `blk.64` is a full-attention

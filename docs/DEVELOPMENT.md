@@ -1,5 +1,10 @@
 # Gwenedeg: developer notes
 
+For contributors. Parts of this file are history: "Benchmark notes (per step)" and "History" record measurements and
+commits of the development steps (dated, from the shared dev box), not the current state; "Design notes and rejected
+experiments" keeps measured alternatives that were not adopted. Current usage is in [usage.md](usage.md), the library in
+[library.md](library.md).
+
 Details moved out of the [README](../README.md) when the project (then called cwayn) was prepared for
 publication: what changed relative to qwen3.c, the 0.6B file comparison, chat / KV cache / thread details,
 benchmark notes, the platform test status, and design notes with the experiments that were measured and not
@@ -50,7 +55,7 @@ printf 'My name is Ada.\nWhat is my name?\n' | ./runq models/Qwen3-0.6B-q8.bin -
 
 - Each turn prefills only what is new: the `<|im_end|>` that ended the previous answer, `\n`, and
   the next user turn of Qwen3's chat template (`<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n`,
-  plus `<think>\n\n</think>\n\n` with `-r 0`; the 2507 models' variants: README, Chat templates). The `[timing]` line per
+  plus `<think>\n\n</think>\n\n` with `-r 0`; the 2507 models' variants: [usage.md](usage.md#chat-templates-and-thinking)). The `[timing]` line per
   turn counts those new tokens.
 - Thinking (`-r 1`): as in Qwen3's template, earlier answers stay in the history without their
   `<think>...</think>` block: at the next turn the cache is cut back to where the answer started and
@@ -75,7 +80,7 @@ within the noise); bf16 is a bit further (+2.6%: |K| reaches ~500, and bf16 keep
 f16's 11) and prefills long prompts ~3% faster. All three pass the same logits thresholds; the attention
 arithmetic is fp32 on the exactly converted values (Step 7b). `-k bf16-dot` / `f16-dot` (TODO G4 (b), opt-in): the
 same caches with the bf16 dot-product attention (`vdpbf16ps`: ~1.7x the attention at long context, KL about a bf16
-cache's on Qwen3, within f16's noise on Qwen3.5; README, "Long context"; docs/notes/qwen38-speculative.md, "G4 (b)").
+cache's on Qwen3, within f16's noise on Qwen3.5; [usage.md](usage.md#kv-cache-types); docs/notes/qwen38-speculative.md, "G4 (b)").
 
 Threads: without `OMP_NUM_THREADS`, runq uses nproc - nproc/8 threads (Apple Silicon with efficiency
 cores: the performance cores, see the M1 Pro notes under Benchmarks; 14 on the 16-vCPU dev box).
@@ -91,7 +96,7 @@ conversation goes.
 
 ## Layout and changes from qwen3.c
 
-- `src/*.c`: our engine (library + CLI, see the README's Architecture), from qwen3.c's `runq.c` (MIT, see `LICENSE`).
+- `src/*.c`: our engine (library + CLI, see [library.md](library.md)), from qwen3.c's `runq.c` (MIT, see `LICENSE`).
   Changes so far:
   `-n <int>` max new tokens, plus a `[timing]` line on stderr (prefill and decode tok/s);
   no classifier matmul for prompt tokens whose logits are unused;
@@ -202,8 +207,9 @@ vs the f32 cache +8-10% / +17-22% / +23-29% after 451 / 1,500 / 3,000-token prom
 
 ## Platform notes and test status
 
-- Q8_0 (.bin or GGUF) and Q3_K_M / Q4_K_M / Q5_K_M GGUF (any mix of Q8_0 / Q3_K / Q4_K / Q5_K / Q6_K matrices). Other GGUF types
-  (F16, IQ*, Q4_0, ...) are rejected with a clean error. Without AVX-512 VNNI (or `make generic`)
+- Q8_0 (.bin or GGUF) and Q3_K_M / Q4_K_M / Q5_K_M GGUF (any mix of Q8_0 / Q3_K / Q4_K / Q5_K / Q6_K matrices; written
+  before the i-quant mixes, which load since the Saluki work: [iquants.md](iquants.md)). Other GGUF types
+  (F16, Q4_0, ...) are rejected with a clean error. Without AVX-512 VNNI (or `make generic`)
   every format runs on the generic C kernels, with the same results; for Q4_K_M they are ~10x
   slower in prefill and ~3-4x in decode than the AVX-512 ones. On AArch64 (with `sdot`) every
   format and the attention have NEON kernels (same results; on an M1 Pro vs generic: Q4_K_M 7-8.5x
@@ -224,9 +230,40 @@ vs the f32 cache +8-10% / +17-22% / +23-29% after 451 / 1,500 / 3,000-token prom
   The goldens need an arm64 re-baseline (`--update-greedy` into a separate file).
 - GGUF: Qwen3 (`general.architecture` qwen3: the dense models, any RoPE theta without scaling, RMSNorm eps 1e-6)
   with the gpt2 / qwen2 tokenizer only; `tokenizer.chat_template` (Jinja) is not interpreted: Qwen3's templates are
-  built in, the variant (hybrid / Instruct-2507 / Thinking-2507) is detected from it (README, Chat templates).
+  built in, the variant (hybrid / Instruct-2507 / Thinking-2507) is detected from it ([usage.md](usage.md#chat-templates-and-thinking)).
 - The Step 11 fixes (RoPE theta, rmsnorm, the untied embedding) are shared C code, but untested on the Mac (NEON,
   clang): its goldens need a re-run.
+
+## Testing and benchmark scripts
+
+Moved here from the README's Testing section (2026-11-21); the check counts and times are those of the day they were measured (the 16-vCPU dev box, shared), [tests/README.md](../tests/README.md) has the current ones.
+
+```sh
+scripts/download_models.py                # default sets: hf (HF bf16), q4km, q8gguf
+scripts/setup_venv.sh && scripts/export_q8.sh   # .venv (CPU torch) and models/Qwen3-0.6B-q8.bin
+make test                                 # the regression suite
+make test-models                          # optional: every downloaded bigger model (minutes)
+```
+
+`make test` runs 481 checks in ~28-36 s on the 16-vCPU VM, 644 with the Qwen3.5-0.8B Q8_0 file
+(`scripts/download_models.py 3.5-0.8b-q8`; also the source of two synthetic Qwen3.5 models with more value heads
+than key heads), 686 with its Q4_K_M file too (`3.5-0.8b-q4km`; ~70-80 s), 27 more with its Q3_K_M file (`3.5-0.8b-q3km`). It needs numpy (from `.venv` or the system `python3`) and the 0.6B
+`.bin`; the GGUF groups are skipped if their files are missing. It covers:
+tokenizer ids against HF; logits against HF fp32 (cosine, top-1 / top-5); batched against sequential,
+thread-count and generic-against-SIMD bit-identity; Q4_K_M, Q5_K, Q3_K, Q2_K and i-quant dequantization against gguf-py; the KV cache
+types; greedy-output goldens; chat-template rendering against HF's `apply_chat_template`; the library
+API; speculative decoding against plain decoding (tokens and logits bits; in the server, request by request); the server over HTTP; synthetic GGUF models with the bigger models' shapes; and Qwen3.5-0.8B (its tokenizer,
+logits against HF fp32, the same invariants, chats that roll back to a state checkpoint) and synthetic Qwen3.5 models
+with the 4B / 27B head layout (one of them in all nine i-quant / Q2_K types, as Underdog Saluki 27B). Golden references
+come from HF transformers and are committed under `tests/golden/`. See [tests/README.md](../tests/README.md).
+
+Benchmarks: `make bench` (decode, thread sweep), `make bench-prefill`, `scripts/bench_all.sh` (the runq
+tables of BENCHMARKS.md, ~8 min), `scripts/bench_batch.sh`, `scripts/bench_serve.py`,
+`scripts/bench_models.py`, `scripts/ppl.py` (perplexity), `scripts/spec_accept.py` (draft acceptance for
+speculative decoding), `scripts/lookup_accept.py` (prompt-lookup and draft acceptance on recorded agentic sessions),
+`scripts/bench_lookup.py` (tok/s of the lookup on code-editing prompts; all three:
+[docs/notes/qwen38-speculative.md](notes/qwen38-speculative.md)). `scripts/fetch_mynah.sh` fetches
+and builds mynah-slm, an optional reference engine for comparison (not part of this repository).
 
 ## CI with Dagger (`dagger check`)
 

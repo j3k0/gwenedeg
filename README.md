@@ -14,8 +14,9 @@ i-quants IQ1_S .. IQ4_XS) directly, weights, tokenizer and hyperparameters from 
   (against Hugging Face transformers goldens as well: [tests/README.md](tests/README.md)).
 - **i-quant kernels for AVX-512.** Q2_K and all of IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS, on
   weights repacked at load, with an optional lossless 4-bit repacking of IQ3 weights (`--repack`). Underdog Saluki 27B
-  (a 7.9 GB Qwen3.8-27B mix of these types) runs in 8.4 GB of RAM. I-quant prefill is ~0.72x the K-quants' on AVX-512
-  (measured, [docs/iquants.md](docs/iquants.md)).
+  (a 7.9 GB Qwen3.8-27B mix of these types) runs in 8.4 GB of RAM. Prefill runs a tiled GEMM that decodes each weight
+  tile once per chunk: on Qwen3.8-27B IQ3_S, 14 threads, 1.24x faster than before it, bit-identical
+  ([BENCHMARKS.md](BENCHMARKS.md#qwen38-27b-iq3_s-prefill-with-the-i-quant-tiled-gemm-2026-11-21), [docs/iquants.md](docs/iquants.md)).
 - **Speculative decoding that does not change the output.** A draft model of the same vocabulary, the model's own MTP
   block (multi-token prediction: Qwen3.8-27B's `blk.64`), or a prompt lookup guesses; the model verifies the guesses in
   one batched pass. The output is exactly plain decoding's, greedy or seeded, whatever the draft. In `runq serve` the
@@ -56,7 +57,8 @@ other workloads (run-to-run noise ±15-30%).
 
 Same quality (the perplexities differ by 0.1-0.2%, within the standard error). Per cell, runq decodes 1.9-2.4x faster at
 one client, 3.1-4.0x at four clients (against ik's single MTP slot) and 5.5-8x faster in the 32k session; ik_llama.cpp
-prefills 1.35-1.5x faster. One run per cell on a shared VM; ik_llama.cpp was configured and tuned by us from its
+prefilled 1.35-1.5x faster (runq's prefill has since become 1.24x faster on this file at 14 threads with the i-quant
+tiled GEMM, the next section of BENCHMARKS.md; the comparison was not re-run). One run per cell on a shared VM; ik_llama.cpp was configured and tuned by us from its
 documentation, and its authors may know better settings; the KV caches have equal bit widths but are not the same
 quantizer. Other engines (mainline llama.cpp, vLLM's CPU backend) and other CPUs were not measured.
 

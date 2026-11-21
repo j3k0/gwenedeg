@@ -1,0 +1,53 @@
+[repack] IQ3_S (144), IQ3_XXS (78) as 4-bit codes: +1.37 GiB, weights 12.23 GiB
+[repack] IQ3_S (144), IQ3_XXS (78) as 4-bit codes: +1.37 GiB, weights 12.23 GiB
+
+[timing] prompt: 2521 tok in 50.663 s (49.8 tok/s) | generated: 1 tok in 0.090 s (11.1 tok/s)
+[repack] IQ3_S (144), IQ3_XXS (78) as 4-bit codes: +1.37 GiB, weights 12.23 GiB
+
+[timing] prompt: 2521 tok in 37.449 s (67.3 tok/s) | generated: 1 tok in 0.096 s (10.4 tok/s)
+[repack] IQ3_S (144), IQ3_XXS (78) as 4-bit codes: +1.37 GiB, weights 12.23 GiB
+
+[timing] prompt: 2521 tok in 51.180 s (49.3 tok/s) | generated: 1 tok in 0.096 s (10.4 tok/s)
+[repack] IQ3_S (144), IQ3_XXS (78) as 4-bit codes: +1.37 GiB, weights 12.23 GiB
+
+[timing] prompt: 2521 tok in 38.046 s (66.3 tok/s) | generated: 1 tok in 0.102 s (9.8 tok/s)
+[repack] IQ3_S (144), IQ3_XXS (78) as 4-bit codes: +1.37 GiB, weights 12.23 GiB
+
+[timing] prompt: 2521 tok in 30.241 s (83.4 tok/s) | generated: 1 tok in 0.084 s (11.9 tok/s)
+[repack] IQ3_S (144), IQ3_XXS (78) as 4-bit codes: +1.37 GiB, weights 12.23 GiB
+
+[timing] prompt: 2521 tok in 24.926 s (101.1 tok/s) | generated: 1 tok in 0.071 s (14.0 tok/s)
+[repack] IQ3_S (144), IQ3_XXS (78) as 4-bit codes: +1.37 GiB, weights 12.23 GiB
+
+[timing] prompt: 2521 tok in 30.992 s (81.3 tok/s) | generated: 1 tok in 0.081 s (12.4 tok/s)
+[repack] IQ3_S (144), IQ3_XXS (78) as 4-bit codes: +1.37 GiB, weights 12.23 GiB
+
+[timing] prompt: 2521 tok in 24.397 s (103.3 tok/s) | generated: 1 tok in 0.074 s (13.6 tok/s)
+[repack] IQ3_S (144), IQ3_XXS (78) as 4-bit codes: +1.37 GiB, weights 12.23 GiB
+
+[timing] prompt: 2521 tok in 29.135 s (86.5 tok/s) | generated: 1 tok in 0.078 s (12.8 tok/s)
+[repack] IQ3_S (144), IQ3_XXS (78) as 4-bit codes: +1.37 GiB, weights 12.23 GiB
+
+[timing] prompt: 2521 tok in 23.072 s (109.3 tok/s) | generated: 1 tok in 0.099 s (10.1 tok/s)
+[repack] IQ3_S (144), IQ3_XXS (78) as 4-bit codes: +1.37 GiB, weights 12.23 GiB
+
+[timing] prompt: 2521 tok in 31.765 s (79.4 tok/s) | generated: 1 tok in 0.071 s (14.1 tok/s)
+[repack] IQ3_S (144), IQ3_XXS (78) as 4-bit codes: +1.37 GiB, weights 12.23 GiB
+
+[timing] prompt: 2521 tok in 23.414 s (107.7 tok/s) | generated: 1 tok in 0.081 s (12.4 tok/s)
+
+[timing] prompt: 2521 tok in 24.883 s (101.3 tok/s) | generated: 1 tok in 0.083 s (12.0 tok/s)
+
+[timing] prompt: 2521 tok in 37.151 s (67.9 tok/s) | generated: 1 tok in 0.078 s (12.8 tok/s)
+[repack] IQ3_S (144), IQ3_XXS (78) as 4-bit codes: +1.37 GiB, weights 12.23 GiB
+
+[timing] prompt: 4113 tok in 41.182 s (99.9 tok/s) | generated: 1 tok in 0.086 s (11.6 tok/s)
+[repack] IQ3_S (144), IQ3_XXS (78) as 4-bit codes: +1.37 GiB, weights 12.23 GiB
+
+[timing] prompt: 4113 tok in 39.599 s (103.9 tok/s) | generated: 1 tok in 0.066 s (15.1 tok/s)
+[repack] IQ3_S (144), IQ3_XXS (78) as 4-bit codes: +1.37 GiB, weights 12.23 GiB
+
+[timing] prompt: 4113 tok in 41.082 s (100.1 tok/s) | generated: 1 tok in 0.077 s (13.0 tok/s)
+[repack] IQ3_S (144), IQ3_XXS (78) as 4-bit codes: +1.37 GiB, weights 12.23 GiB
+
+[timing] prompt: 4113 tok in 43.101 s (95.4 tok/s) | generated: 1 tok in 0.061 s (16.3 tok/s)

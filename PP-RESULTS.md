@@ -7,8 +7,12 @@ integers, same fp32 fold, same order). On the 27B-shaped micro-benchmark (17408 
 i-quant GEMM got **1.43-2.11x faster per type**: IQ3_S 2.09-2.11x, IQ3_XXS 1.92-2.00x, IQ4_XS 1.43-1.48x, and
 --repack's codes 1.43-1.58x. All one-scale types now take ~0.0040 ns per weight and row. Weighted by the ISTA 27B's
 type mix, that is **~1.5x on the i-quant GEMM with production `--repack`** (1.8x without it). The synthetic i-quant model
-prefills 6.8-7.3k -> 8.7-9.3k tok/s (**+27-29%**, 1,500 tokens, 8 threads). End-to-end numbers on the 27B need a
-measurement window: one command, `scripts/pp_window.sh` (below).
+prefills 6.8-7.3k -> 8.7-9.3k tok/s (**+27-29%**, 1,500 tokens, 8 threads).
+
+**On the 27B** (the measurement window, 2026-11-21 16:51-17:09Z, section below): logits **bit-identical** (base == new,
+`-b 1` / `77` / `512`, 3 / 14 threads, `--repack` on / off); prefill of a 2,521-token prompt with production `--repack`
+**81-83 -> 101-103 tok/s at 14 threads (1.24x)**, 1.35x at 8 threads, 1.26x at 16; without `--repack` 1.49x at 14
+threads (67.9 -> 101.3: `--repack` no longer matters for prefill).
 
 Commits on `pp-tiled-iq`, on top of `eaf34f6` (not pushed, not merged):
 
@@ -209,7 +213,56 @@ capped at `-j4`, `nice -n 10`, `OMP_NUM_THREADS=8`, `GWENEDEG_TEST_PROCS=1`; pea
 - `build/iq_repack_test`, `build/iq_gemm_test`, `build/bf16dp_test`, `build/bf16dp_test-emu`: ok; AVX-512 and generic
   builds both built.
 
-## Needs a measurement window
+## The 27B window (2026-11-21, 16:51-17:09Z)
+
+`scripts/pp_window.sh` (base = `fbe8c51`, main at the branch point; new = `c601176`), the live server stopped, nothing
+else of ours running; the box's other services kept running (1-min load 4.8-7.9 before the runs, 10-16 during them,
+mostly our own 8-16 threads). ISTA `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf`, `[repack] IQ3_S (144), IQ3_XXS (78) as 4-bit
+codes: +1.37 GiB, weights 12.23 GiB`. Raw log: [bench/pp-window-2026-11-21/](bench/pp-window-2026-11-21/).
+
+**1. Bit-identity** (`-m logits`, ~300-token prompt): base `-b 512`, new `-b 512`, new `-b 1` (token by token), new
+`-b 77` at 3 threads, new `--repack -b 512`: all `ff19abe701acd1e1`.
+
+**2. Prefill**, 2,521-token prompt, `-b 512`, chat mode, tok/s of the `[timing]` line (2 runs each, alternating):
+
+| threads | base | new | speed-up (best vs best) |
+|---|---|---|---|
+| 8, `--repack` | 49.8 / 49.3 | 67.3 / 66.3 | 1.35x |
+| 14, `--repack` (production) | 83.4 / 81.3 | 101.1 / 103.3 | **1.24x** |
+| 16, `--repack` | 86.5 / 79.4 | 109.3 / 107.7 | 1.26x |
+| 14, no `--repack` | 67.9 | 101.3 | 1.49x |
+
+**3. Phase split** (`RUNQ_PROFILE`, 14 threads, `--repack`, the same prompt; s):
+
+| phase | base | new | |
+|---|---|---|---|
+| gemm w1+w3 | 13.64 | 9.55 | 1.43x |
+| gemm qkv (qkv, z, alpha, beta / q, k, v) | 6.55 | 5.42 | 1.21x |
+| gemm w2 (ffn_down, k = 17408) | 6.44 | 5.27 | 1.22x |
+| gemm wo / ssm_out | 2.26 | 1.72 | 1.31x |
+| all GEMM phases | 28.89 (92.7%) | 21.97 (90.4%) | 1.32x |
+| attention, delta-net (prep, recurrence, out), norms, SwiGLU | 2.29 | 2.33 | (unchanged) |
+| total | 31.18 (80.9 tok/s) | 24.30 (103.8 tok/s) | 1.28x |
+
+So at 2.5k tokens the 27B's prefill is ~90% GEMM even after the change (the recurrence 2.5-3.3%, attention 2-3%): the
+estimate's g was ~0.8 for the i-quant part (92.7% minus the K-quant / Q8_0 matrices' share), and the GEMM phases gained 1.32x where the micro-benchmark predicted ~1.5x.
+Not explained by this window; likely causes, unmeasured: 14 threads vs the micro-benchmark's 8 (the per-thread speed-up
+shrinks as the weights' DRAM traffic and the tile decode compete; 8 threads end to end gained 1.35x), the K-quant /
+Q8_0 / F32 matrices inside the same phases (Q4_K 10%, Q6_K 1.6% of the weights, alpha / beta), and ffn_down's k = 17408
+(the micro-benchmark's weakest shape, plus a 766 KB tile next to the activations in a 1 MB L2). Worth a `perf` look at
+14 threads (a future window).
+
+**4. `-b`** (4,113 tokens, 14 threads, `--repack`, an `RQ_BATCH_MAX=2048` build): 256 / 512 / 1024 / 2048 = 99.9 /
+**103.9** / 100.1 / 95.4 tok/s. 512 stays the best; no reason to raise the cap.
+
+**Against ik_llama.cpp** (BENCHMARKS.md, same file and box, 2026-11-21; not the same harness): its server prefilled the
+0.8-2.5k-token prompts at 110-118 tok/s where runq's server did 81-84, which is base's CLI number here at 14 threads;
+with the change runq's CLI does 101-103. If the server follows the CLI as before, the short-prompt gap goes from
+1.35-1.45x to ~1.1x; `llama-bench` pp2048 (`-ub 512` 135, `-ub 2048` 148 tok/s) stays 1.3-1.45x ahead. The 32k cold
+prefill (471 vs 319 s) was not re-measured: there attention is a larger share and the gain will be smaller. Both are
+server measurements for a later window (`scripts/s9c_bench.py` as in `bench/ikllama-2026-11-21/`).
+
+## Needs a measurement window (done 2026-11-21: the section above)
 
 One command, from the worktree, with the live server stopped (≈ 13 GB free RAM needed):
 

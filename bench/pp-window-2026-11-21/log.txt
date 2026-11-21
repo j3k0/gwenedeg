@@ -1,0 +1,64 @@
+== 2026-11-21T16:51:19+00:00 model /opt/projects/tools/gwenedeg/models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf, base fbe8c51ef3a1cfae19d1e22de6362240eac98e05, new c601176
+== 1. bit-identity (-m logits, ~300 tokens; load 4.76 6.51 7.90)
+base -b 512          ff19abe701acd1e1
+new  -b 512          ff19abe701acd1e1
+new  -b 1            ff19abe701acd1e1
+new  -b 77, 3 thr    ff19abe701acd1e1
+new  --repack -b 512 ff19abe701acd1e1
+== 2. prefill, ~2,500 tokens, -b 512, best of 2 (load 9.96 7.94 8.29)
+  8 thr base --repack: 2521 tok 50.663 s 49.8 tok/s
+  8 thr new  --repack: 2521 tok 37.449 s 67.3 tok/s
+  8 thr base --repack: 2521 tok 51.180 s 49.3 tok/s
+  8 thr new  --repack: 2521 tok 38.046 s 66.3 tok/s
+  14 thr base --repack: 2521 tok 30.241 s 83.4 tok/s
+  14 thr new  --repack: 2521 tok 24.926 s 101.1 tok/s
+  14 thr base --repack: 2521 tok 30.992 s 81.3 tok/s
+  14 thr new  --repack: 2521 tok 24.397 s 103.3 tok/s
+  16 thr base --repack: 2521 tok 29.135 s 86.5 tok/s
+  16 thr new  --repack: 2521 tok 23.072 s 109.3 tok/s
+  16 thr base --repack: 2521 tok 31.765 s 79.4 tok/s
+  16 thr new  --repack: 2521 tok 23.414 s 107.7 tok/s
+  14 thr new, no --repack: 2521 tok 24.883 s 101.3 tok/s
+  14 thr base, no --repack: 2521 tok 37.151 s 67.9 tok/s
+  (load 15.66 13.81 10.93)
+== 3. phase split, 14 threads, --repack, ~2,500 tokens (load 15.66 13.81 10.93)
+-- base
+[timing] prompt: 2521 tok in 31.176 s (80.9 tok/s) | generated: 1 tok in 0.073 s (13.7 tok/s)
+[profile] forward_batch total 31.175 s
+[profile]   norm+quant+resid      0.209 s    0.7%
+[profile]   gemm qkv              6.551 s   21.0%
+[profile]   qk-norm+rope+kv       0.027 s    0.1%
+[profile]   attention+quant       0.675 s    2.2%
+[profile]   gemm wo               2.258 s    7.2%
+[profile]   gemm w1+w3           13.644 s   43.8%
+[profile]   swiglu+quant          0.263 s    0.8%
+[profile]   gemm w2               6.440 s   20.7%
+[profile]   classifier            0.004 s    0.0%
+[profile]   rows qkv+att          0.000 s    0.0%
+[profile]   rows w1+w3+swiglu     0.000 s    0.0%
+[profile]   dn prep (conv, l2norm)    0.228 s    0.7%
+[profile]   dn recurrence         0.789 s    2.5%
+[profile]   dn out+quant          0.088 s    0.3%
+-- new
+[timing] prompt: 2521 tok in 24.298 s (103.8 tok/s) | generated: 1 tok in 0.081 s (12.4 tok/s)
+[profile] forward_batch total 24.296 s
+[profile]   norm+quant+resid      0.200 s    0.8%
+[profile]   gemm qkv              5.424 s   22.3%
+[profile]   qk-norm+rope+kv       0.027 s    0.1%
+[profile]   attention+quant       0.709 s    2.9%
+[profile]   gemm wo               1.724 s    7.1%
+[profile]   gemm w1+w3            9.549 s   39.3%
+[profile]   swiglu+quant          0.279 s    1.1%
+[profile]   gemm w2               5.269 s   21.7%
+[profile]   classifier            0.003 s    0.0%
+[profile]   rows qkv+att          0.000 s    0.0%
+[profile]   rows w1+w3+swiglu     0.000 s    0.0%
+[profile]   dn prep (conv, l2norm)    0.220 s    0.9%
+[profile]   dn recurrence         0.803 s    3.3%
+[profile]   dn out+quant          0.091 s    0.4%
+== 4. -b, ~4,100 tokens, 14 threads, --repack, the RQ_BATCH_MAX=2048 build (load 15.60 14.23 11.29)
+  -b 256: 4113 tok 41.182 s 99.9 tok/s
+  -b 512: 4113 tok 39.599 s 103.9 tok/s
+  -b 1024: 4113 tok 41.082 s 100.1 tok/s
+  -b 2048: 4113 tok 43.101 s 95.4 tok/s
+== done 2026-11-21T17:09:22+00:00 (load 12.40 14.01 11.81); /opt/projects/tools/gwenedeg-pp/bench/pp-window-2026-11-21

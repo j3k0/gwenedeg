@@ -222,7 +222,8 @@ the full model's). A 64-token greedy decode at 16 threads measured 14.2-15.1 tok
 
 ## Not done (TODO.md)
 
-- Prefill on the 27B end to end with the tiled GEMM (above): `scripts/pp_window.sh` (a measurement window; PP-RESULTS.md).
+- The tiled GEMM on the ISTA 27B (2026-11-21, BENCHMARKS.md): bit-identical, prefill 1.24x at 14 threads with `--repack`
+  (81-83 -> 101-103 tok/s), its GEMM phases 1.32x where the micro-benchmark predicts ~1.5x: not explained yet.
 - NEON: faster GEMV (IQ3_S's index bit 8; TODO.md), a prefill GEMM; gcc on AArch64 Linux untested.
 - IQ4_NL (blocks of 32), TQ1_0 / TQ2_0, and the community MTP variant of Saluki (`Kujira/Underdog-Saluki-27B-1.0-MTP-GGUF`:
   an MTP block for speculative decoding; runq validates but does not run MTP blocks yet, TODO S9).

@@ -11,6 +11,9 @@ generic paths, nothing measured was changed.)
 The [Qwen3.8-27B vs ik_llama.cpp section](#qwen38-27b-iq3_s-vs-ik_llamacpp-server-workloads-2026-11-21) is a
 different model, comparison and session (2026-11-21) and is not comparable with the tables above either.
 
+The [i-quant tiled GEMM section](#qwen38-27b-iq3_s-prefill-with-the-i-quant-tiled-gemm-2026-11-21) is a
+before / after of one change on that model (2026-11-21, a later window), not comparable with the 0.6B tables either.
+
 The [all-models table](#all-model-files-on-the-epyc-vm-2026-10-26-to-2026-10-30) and the [batched-decode
 table](#batched-decode-aggregate-toks-step-10a-2026-10-26) are from other days on the same VM (dated in each) and are not
 comparable with the tables above either.
@@ -206,6 +209,45 @@ the part runq could learn from.
   side with ik's (`llama-bench` tg64 gives ik's 5.4-6.0 tok/s; runq's plain decode on this file was 7.2-8.1 tok/s in
   a loaded window of an earlier session, `docs/notes/qwen38-speculative.md`); other CPUs (a different AVX-512 implementation or
   AVX2 would change both engines' numbers).
+
+## Qwen3.8-27B (IQ3_S) prefill with the i-quant tiled GEMM (2026-11-21)
+
+One change measured before / after on the same file as the section above: the prefill GEMM for Q2_K and the i-quants
+(branch `pp-tiled-iq`; docs/iquants.md, "Batched rows"; the work and its micro-benchmarks: PP-RESULTS.md). Raw log:
+[bench/pp-window-2026-11-21/](bench/pp-window-2026-11-21/), produced by `scripts/pp_window.sh`.
+
+| | |
+|---|---|
+| CPU | the same AMD EPYC Genoa VM (16 vCPUs, 32 MB L3, 30 GB RAM); window 16:51-17:09Z, the live runq server stopped, other services running (1-min load 4.8-7.9 before the runs, 10-16 during them, mostly the runs' own threads) |
+| model | `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` with `--repack` (IQ3_S, IQ3_XXS as 4-bit codes: weights 12.23 GiB), as in production |
+| builds | base `fbe8c51` (main) and new `c601176` (main + the tiled GEMM), gcc 14.2.0, `-Ofast -march=native` |
+| workload | the CLI, chat mode, a 2,521-token prompt (the bench paragraph repeated), `-b 512`, `-n 1`, tok/s of the `[timing]` line, 2 runs per cell alternating base / new |
+
+**Prefill tok/s** (2 runs; best vs best):
+
+| threads | base | new | |
+|---|---|---|---|
+| 8 | 49.8 / 49.3 | 67.3 / 66.3 | 1.35x |
+| **14** (production) | 83.4 / 81.3 | **101.1 / 103.3** | **1.24x** |
+| 16 | 86.5 / 79.4 | 109.3 / 107.7 | 1.26x |
+| 14, without `--repack` | 67.9 | 101.3 | 1.49x |
+
+- **Exactness:** the logits of a ~300-token prompt are bit-identical, base `-b 512` == new `-b 512` == `-b 1` ==
+  `-b 77` at 3 threads == `--repack` (sha256 `ff19abe701acd1e1...`).
+- **Where the time goes** (`-DRUNQ_PROFILE`, 14 threads): the GEMM phases are 92.7% of the base prefill and 90.4% of the
+  new one; they gained 1.32x (w1+w3 1.43x, wo 1.31x, w2 1.22x, qkv 1.21x). Attention, the delta-net recurrence and the
+  norms are ~7% at this length, unchanged.
+- **Chunk size:** `-b` 256 / 512 / 1024 / 2048 (4,113 tokens, 14 threads): 99.9 / 103.9 / 100.1 / 95.4 tok/s.
+- **Reading:** at 14 threads runq's short-prompt prefill moves from ik_llama.cpp's 0.7x to ~0.9x on this file (CLI
+  numbers here vs the server numbers of the section above, 110-118 tok/s; not the same harness, so an estimate).
+  `--repack` no longer changes prefill; it still speeds up decode.
+
+**Caveats**
+- Two runs per cell on a shared box: base's runs spread 2-9%, so the speed-ups are good to about ±5%.
+- The CLI, not the server: the server workloads above (short prompts, the 32k cold prefill) were not re-run. At 32k the
+  attention share is larger and the gain smaller.
+- The GEMM phases gained 1.32x where the 8-thread micro-benchmark predicts ~1.5x for this type mix; not yet explained
+  (PP-RESULTS.md lists the likely causes).
 
 ## All model files on the EPYC VM (2026-10-26 to 2026-10-30)
 

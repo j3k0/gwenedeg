@@ -18,8 +18,9 @@ subset classifier of TODO.md, such a call would cost little more than the prefil
 ## Shared (paged) KV cache between slots
 
 A shared prompt prefix (e.g. a judge's rubric) is copied into each request's slot today (`rq_seq_copy`: 253
-positions in 0.6-1.6 ms), and the slot pool is fixed (`--slots` x `-c`, bounded by `--kv-mem`; no paging, no
-preemption). Copying is cheap in time, so sharing would gain memory: 115 KB per position for the 28-layer models,
+positions in 0.6-1.6 ms), and the slot pool is fixed (`--slots` x `-c`, bounded by `--kv-mem`; no paging; since this was written
+`--admit bound` / `chunk` admit requests on leases and `chunk` can swap a request out to disk, [docs/memory-admission.md](docs/memory-admission.md),
+but blocks are still not shared between slots). Copying is cheap in time, so sharing would gain memory: 115 KB per position for the 28-layer models,
 147 KB for the 36-layer ones (f16). The cache is already laid out in blocks of 256 positions, so a natural design
 is reference-counted, copy-on-write blocks with per-sequence block tables. That would allow more concurrent
 requests for the same memory, and preemption (a slot swapped out under memory pressure). The attention reads the
@@ -28,7 +29,8 @@ attention path (AVX-512, NEON and generic).
 
 ## Scheduling: request priorities
 
-Admission is FIFO, up to `--parallel` running requests. A priority (or separate limits) could let short
+Admission is FIFO, up to `--parallel` running requests (`--admit chunk --admit-yield N` adds a round-robin of the running
+places, [docs/memory-admission.md](docs/memory-admission.md); there is still no priority). A priority (or separate limits) could let short
 interactive calls, such as router classifications, pass long generations, and could decide which request yields
 its slot when memory runs out (with the previous idea). Related effect: in a cold burst, all requests deferred
 behind a shared prefix finish in the same pass, so the median latency rises (~300 -> ~400 ms for 16 at once)

@@ -1,6 +1,6 @@
 /* runq: Qwen3 (and Qwen3.5-0.8B) inference on the CPU, as a library (the engine of the runq CLI, src/cli.c).
  *
- * Three kinds of objects (README.md, Architecture):
+ * Three kinds of objects (docs/library.md):
  *   RqModel  the model: hyperparameters, weights (repacked for the kernels at load), tokenizer, chat
  *            templates. Loaded once, read-only afterwards: any number of sequences and compute
  *            contexts may use it. Several models can be loaded at once (a draft and a target model;
@@ -88,7 +88,7 @@ RqModel *rq_model_load(const char *path, const RqModelOpts *opts, char *err, siz
 void rq_model_free(RqModel *m);
 
 // The MTP (multi-token prediction) block of a loaded qwen35 model (nextn_predict_layers 1: blk.<n_layers>, e.g.
-// Qwen3.8-27B's blk.64) as a model of its own, for the speculative loop's guesses (TODO S9, docs/qwen38-speculative.md):
+// Qwen3.8-27B's blk.64) as a model of its own, for the speculative loop's guesses (TODO S9, docs/notes/qwen38-speculative.md):
 // one gated full-attention layer whose input row is eh_proj([enorm(embedding) | hnorm(h)]), h = the target's final
 // hidden state at the previous position (RqSegment.hidden of the target's pass, given as the view's RqSegment.h_in),
 // and whose output goes through shared_head_norm and the target's classifier: row q (token x_q, h_{q-1}) predicts
@@ -146,7 +146,7 @@ typedef struct {
 } RqModelInfo;
 void rq_model_info(const RqModel *m, RqModelInfo *info);
 
-// Memory estimates, in bytes (README.md, Memory). rq_model_load computes them from the tensor directory before
+// Memory estimates, in bytes (docs/usage.md, "Memory check at load"). rq_model_load computes them from the tensor directory before
 // reading any weight, and checks total against the budget (RqModelOpts.mem); a model loaded without weights
 // has none (RQ_ERR_STATE)
 typedef struct {
@@ -561,7 +561,7 @@ int rq_gen_step(RqGen *g, RqCtx *c, int pos, float *logits);
 unsigned long long rq_logits_hash(const float *logits, int n);
 
 // ---------------------------------------------------------------------------- speculative decoding
-// rq_generate with a draft model (src/spec.c, docs/qwen38-speculative.md): the draft guesses up to k tokens greedily,
+// rq_generate with a draft model (src/spec.c, docs/notes/qwen38-speculative.md): the draft guesses up to k tokens greedily,
 // the target verifies [last, d1..dk] in one pass (RQ_LOGITS_ALL) and steps through the rows with rq_gen_step while
 // the sampled token equals the guess; the first mismatch's sample (or the bonus token after k accepted guesses) is
 // the next token; both sequences are cut back to what was accepted. The output is rq_generate's exactly, for any

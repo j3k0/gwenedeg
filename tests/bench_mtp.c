@@ -1,4 +1,4 @@
-/* MTP drafter costs (the library API, src/runq.h; TODO S9w, docs/qwen38-speculative.md "The MTP drafter (S9)"): what a
+/* MTP drafter costs (the library API, src/runq.h; TODO S9w, docs/notes/qwen38-speculative.md "The MTP drafter (S9)"): what a
  * guess of a model's MTP block (rq_mtp_load: a view of one attention layer + the target's classifier) costs at a
  * context of L positions, on a file with the target's full width (tests/make_synth_wide.py: Qwen3.8-27B's dimensions,
  * a short trunk, its real MTP block and classifier sizes), without the 27B. The sequences are filled with synthetic KV

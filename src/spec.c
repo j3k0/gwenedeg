@@ -1,4 +1,4 @@
-/* Speculative decoding (TODO S1, docs/qwen38-speculative.md): a small draft model guesses the next tokens
+/* Speculative decoding (TODO S1, docs/notes/qwen38-speculative.md): a small draft model guesses the next tokens
  * greedily, the target model checks them in one batched pass, and the output is exactly plain decoding's.
  *
  * One round, the target sequence at length P, t its last sampled token (not fed yet):
@@ -220,7 +220,7 @@ static void ck_slots(RqSeq *s, int n) {
 }
 
 // ------------------------------------------------------------------------------------------- the MTP drafter
-// (TODO S9; runq.h, docs/qwen38-speculative.md "The MTP drafter (S9)") The draft is the target's MTP view (rq_mtp_load):
+// (TODO S9; runq.h, docs/notes/qwen38-speculative.md "The MTP drafter (S9)") The draft is the target's MTP view (rq_mtp_load):
 // its row q, (x_q, h_{q-1}), predicts x_{q+1}, h_{q-1} = the target's final hidden state at q - 1, which exists only
 // during the target's pass that computes it. So the view follows the target in lockstep, from the hidden rows of the
 // target's last pass only (H: positions h0 .. h0 + hn - 1) and the one kept with its sequence (hprev at hpos):
@@ -795,7 +795,7 @@ double rq_spec_expect(double p, int n) {
 }
 
 double rq_lookup_prior(int len) {
-    // per guess, the chance that a lookup guess is accepted after a match of len tokens (docs/qwen38-speculative.md,
+    // per guess, the chance that a lookup guess is accepted after a match of len tokens (docs/notes/qwen38-speculative.md,
     // Prompt lookup: pi's sessions teacher-forced, the accepted run after a match of 2 / 4 / 8 / >= 16 tokens was ~1.0 /
     // 2.8 / 5.9 / 15.6 tokens: a geometric run with p ~0.5 / 0.74 / 0.85 / 0.94)
     static const double p[] = { 0, 0.3, 0.45, 0.6, 0.72, 0.75, 0.8, 0.8, 0.85, 0.85, 0.85, 0.85, 0.9, 0.9, 0.9, 0.9, 0.94 };

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tok/s of plain decoding, the model draft, the prompt lookup and both combined (TODO G6, docs/qwen38-speculative.md,
+"""tok/s of plain decoding, the model draft, the prompt lookup and both combined (TODO G6, docs/notes/qwen38-speculative.md,
 "Prompt lookup") on code-editing prompts (the reply rewrites code of the prompt with a change) and one chat prompt
 (little to copy): `runq -m chat -t 0 -n N` per prompt and setting, the settings rotated within each rep, the generated
 tok/s and the speculative counters parsed from stderr; every speculative run's stdout checked against plain's.

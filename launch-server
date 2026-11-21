@@ -46,7 +46,7 @@ elif [ "$CONFIG" = "ista-iq3s" ]; then
   # ssm_alpha / ssm_beta widened to F32 at load (TODO S9.1; logits identical to the F32-rewritten file's); the block
   # is not loaded unless --draft mtp (TODO S9c). The daytime server since 2026-11-10 (the nightly's RESTORE).
   # Its own MTP block as the drafter (S9c.G, 2026-11-10: 1.14x / 1.18x the 0.8B draft at 1 client, thinking on / off;
-  # docs/qwen38-speculative.md); --repack: the IQ3_S weights as 4-bit codes (bit-identical output, ~+1.4 GiB, faster decode)
+  # docs/notes/qwen38-speculative.md); --repack: the IQ3_S weights as 4-bit codes (bit-identical output, ~+1.4 GiB, faster decode)
   MODEL=models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
   NAME=qwen3.8-27b-iq3s
   KV_CACHE_TYPE=q8-dot

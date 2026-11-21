@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prompt-lookup draft acceptance on agentic transcripts (TODO G0 (c), G6; docs/qwen38-speculative.md, "Prompt
+"""Prompt-lookup draft acceptance on agentic transcripts (TODO G0 (c), G6; docs/notes/qwen38-speculative.md, "Prompt
 lookup"): teacher-forced, would an n-gram lookup in the context (the prompt + the reply so far) have guessed the
 next tokens, alone and combined with a draft model?
 
@@ -558,7 +558,7 @@ def simulate(D, cost, lk=None, mk=None, tau=None, kinds_of=None):
     return acc
 
 
-COSTS = {  # the 27B Q4_K_M + the 0.8B Q4_K_M draft (docs/qwen38-speculative.md): a short context and ~98k positions
+COSTS = {  # the 27B Q4_K_M + the 0.8B Q4_K_M draft (docs/notes/qwen38-speculative.md): a short context and ~98k positions
     "short": {"step": 120.0, "draft": 5.1, "verify": [1.0, 1.14, 1.16, 1.25, 1.41, 1.62, 1.83, 2.15, 2.52]},
     "long": {"step": 207.0, "draft": 19.0, "verify": [1.0, 1.41, 1.785, 2.16, 2.63, 3.10, 3.57, 4.04, 4.51]},
 }

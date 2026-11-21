@@ -414,7 +414,7 @@ FAMILY = [
     # HF golden is tests/ref_qwen35.py on the HF bf16 weights (make_model_ref.py --hf: transformers' fp32 forward needs
     # ~17 GB), which matches transformers on 0.8B and on tiny models with nv = 2 / 3 nk (docs/qwen35.md)
     ("3.5-4b-q8", "Qwen3.5-4B-GGUF/Qwen3.5-4B-Q8_0.gguf", "qwen3.5", [("3.5-4b-hf", "q8_hf"), ("3.5-4b-q8", "ref")]),
-    # Qwen3.8-27B Q4_K_M (docs/qwen38-speculative.md: 64 layers + an MTP block (validated, not loaded), r = 3, GQA 6,
+    # Qwen3.8-27B Q4_K_M (docs/notes/qwen38-speculative.md: 64 layers + an MTP block (validated, not loaded), r = 3, GQA 6,
     # untied, F32 ssm_alpha / ssm_beta, Qwen3.8's template: thinking on by default). ~16.3 GiB of RSS: run only when
     # MemAvailable allows it (BIG); its golden is tests/ref_qwen35.py on the file (make_model_ref.py: 214 s, ~2 GB)
     ("3.8-27b-q4km", "Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf", "qwen3.8", [("3.8-27b-q4km", "ref")]),
@@ -429,7 +429,7 @@ FAMILY = [
     # (IQ_MINI). Measured vs the golden: cos mean 0.99994-0.99998, min 0.99989, top-1 62/62 (the int8 activations only);
     # the entry takes ~12 min (8 threads), most of it the generic build's kernels runs
     ("saluki-27b", "Underdog-Saluki-27B-1.0-GGUF/Underdog-Saluki-27B-1.0-IQ2-mix.gguf", "qwen3.8", [("saluki-27b", "ref")]),
-    # Qwen3.5-0.8B with its MTP block kept (scripts/make_mtp_08b.sh, TODO S9.0b; docs/qwen38-speculative.md): the MTP
+    # Qwen3.5-0.8B with its MTP block kept (scripts/make_mtp_08b.sh, TODO S9.0b; docs/notes/qwen38-speculative.md): the MTP
     # drafter's checks only (MTP_ONLY: the block vs tests/ref_qwen35.py's mtp_forward, its teacher-forced top-1, the CLI's
     # loop, runq serve --draft mtp: tests/server_test.py --spec mtp whole; its main model is the Q8_0 file's but 7 ssm_a
     # ulps, covered by 3.5-0.8b-q8)
@@ -731,7 +731,7 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
                            f"{len(dg[0])} batched passes (batched decode rows, ...): AVX-512 == generic" + (f"; differ: {diff}" if diff else ""))
         if a.api_test and tag in BIG:
             # (its batched decode of up to 17 sequences, each with its recurrent state and checkpoints, would need
-            # ~22.4 GiB of RSS on the 27B: run by hand, docs/qwen38-speculative.md)
+            # ~22.4 GiB of RSS on the 27B: run by hand, docs/notes/qwen38-speculative.md)
             print(f"      {tag}: api_test skipped (memory)")
         elif a.api_test and not lean:
             p = run([a.api_test, model], nd)

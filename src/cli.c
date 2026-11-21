@@ -15,7 +15,7 @@
 #include "json.h" // (-m render: the messages as JSON)
 
 static int max_new_tokens = 0; // -n: stop after this many generated tokens, 0 = unlimited
-#define SPEC_K_DEFAULT 3       // -G with -D (the best fixed k for Qwen3-1.7B + 0.6B: docs/qwen38-speculative.md)
+#define SPEC_K_DEFAULT 3       // -G with -D (the best fixed k for Qwen3-1.7B + 0.6B: docs/notes/qwen38-speculative.md)
 
 // speculative decoding (-D draft.gguf, -G k, --tau; --lookup N, --lookup-min L): the draft model, its context and
 // sequence (m NULL: no draft model), the options (o.k 0 and o.lookup 0: plain decoding); -D mtp: m is the model's MTP

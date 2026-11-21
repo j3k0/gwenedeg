@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Draft acceptance for speculative decoding (docs/qwen38-speculative.md, "Draft acceptance"): the target's answers
+"""Draft acceptance for speculative decoding (docs/notes/qwen38-speculative.md, "Draft acceptance"): the target's answers
 from an OpenAI-compatible API, teacher-forced through a draft GGUF with runq, and the loop simulated on the result.
 
   gen      query the target model (temperature 0 or seeded sampling) for answers to the built-in prompts; saves the
@@ -27,7 +27,7 @@ a cross-check of the built-in rendering against the model's own template). Logit
 The cost model (report): tok/s = tokens per pass / pass time, pass time = step_ms x verify(n) + draft_ms x (n + 1)
 for n drafted tokens (verify(0) = 1: a plain step); verify(n) is the cost of a pass of n + 1 rows of one sequence
 relative to one decode step (--verify, k = 1..8; default: TODO S2's measurement on Qwen3-8B Q4_K_M, the 27B's
-proxy, docs/qwen38-speculative.md "Verify-pass cost"; the guess before it: 1.03,1.12,1.20,1.35,1.47,1.60,1.75,1.90). With --tau the teacher-forced
+proxy, docs/notes/qwen38-speculative.md "Verify-pass cost"; the guess before it: 1.03,1.12,1.20,1.35,1.47,1.60,1.75,1.90). With --tau the teacher-forced
 probabilities are exact up to the first wrong guess; after it they only decide how many wasted guesses are paid for.
 """
 import argparse

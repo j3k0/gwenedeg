@@ -21,7 +21,7 @@ CPPFLAGS += -D_FILE_OFFSET_BITS=64
 LDLIBS  += -lm -lpthread
 
 # the library modules (runq.h) and the CLI; each module is its own translation unit, all numeric code
-# of the forward passes is in forward.c (README.md, Architecture)
+# of the forward passes is in forward.c (docs/library.md)
 LIB = model gguf forward tokenizer sampler chat threads spec seqfile
 # runq serve (an OpenAI-compatible HTTP server; serve.h): linked into the runq binary, not part of the library
 SRV = json constrain http engine serve tools

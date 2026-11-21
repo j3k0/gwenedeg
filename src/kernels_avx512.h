@@ -1440,7 +1440,7 @@ static void att512_kv(int kvt, int nv, const float *const *q, float *const *out,
  * bf16 dot-product attention (the sequence's KV type RQ_KV_BF16_DOT / RQ_KV_F16_DOT, runq --attn bf16; TODO G4 (b)):
  * the two products of the attention as vdpbf16ps does them, on q, K, the softmax weights and V rounded to bf16, so
  * twice the dot-product rate of the fp32 FMAs (Zen 4: one vdpbf16ps per cycle per core, 64 FLOP). Opt-in: it is less
- * accurate than the fp32 attention (README, docs/qwen38-speculative.md "G4"). A sequence's every path (prefill,
+ * accurate than the fp32 attention (docs/usage.md "KV cache types", docs/notes/qwen38-speculative.md "G4"). A sequence's every path (prefill,
  * decode, verify, batched decode) uses its type, so the invariants (batched == sequential, threads, builds) hold.
  * Definition, per query vector and kv head, as the fp32 attention above except:
  *   bf16(x) = f32_bf16_daz(x) = vcvtneps2bf16: round to nearest even, a denormal input flushed to a zero of its sign;

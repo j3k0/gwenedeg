@@ -17,7 +17,7 @@ bad-q35-nv.gguf, bad-q35-hadamard.gguf, bad-q35-nextn.gguf (< 1 KB): metadata on
   (Hadamard-folded weights), resp. nextn_predict_layers = block_count: runq must reject them while reading the
   configuration.
 
-The 27B's layout at a small scale (if the 0.8B Q4_K_M file is there, --src-q4; docs/qwen38-speculative.md, file layout):
+The 27B's layout at a small scale (if the 0.8B Q4_K_M file is there, --src-q4; docs/notes/qwen38-speculative.md, file layout):
 synth-q35-27b.gguf (330 MB): 8 layers (linear 0, 1, 2, 4, 5, 6, attention 3, 7: every 4th), dim 768 (not a power of
   two; 27B 5120), FFN 2560 (27B 17408), attention 12 / 2 heads of 256 (GQA 6, as 24 / 4), DeltaNet 4 key / 12 value
   heads of 128 (r = 3, as 16 / 48), an untied Q4_K token_embd and a Q6_K output, the 27B's types per role: attn_q / k /
@@ -50,7 +50,7 @@ synth-q35-27b-mtpbad.gguf (TODO S9a): synth-q35-27b-mtp.gguf + an optional MTP t
   blk.8.nextn.shared_head_head.weight (16 zero Q8_0 rows: only its presence matters), which rq_mtp_load refuses (the
   main model loads as before). Built last, from synth-q35-27b-mtp.gguf, without random numbers.
 synth-q35-ista-mtp.gguf (~220 MB; TODO S9c.1): ISTA-DASLab's Qwen3.8-27B GSQ-RCO IQ3_S-mtp file's types at the small
-  scale (docs/qwen38-speculative.md; the target of runq serve --draft mtp): synth-q35-27b-mtp.gguf's tensors and order
+  scale (docs/notes/qwen38-speculative.md; the target of runq serve --draft mtp): synth-q35-27b-mtp.gguf's tensors and order
   with synth-q35-iq.gguf's trunk matrices (Q2_K and the i-quants; ISTA's trunk is an i-quant mix with some Q4_K, which
   synth-q35-27b covers), an IQ2_S token_embd (synth-q35-27b-mtp's Q4_K one requantized), a Q4_K classifier (the bytes
   of that Q4_K token_embd: real super-blocks, as if tied), BF16 ssm_alpha / ssm_beta (the Q8_0 rows rounded, as

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """A full-width synthetic Qwen3.8-27B file for timing the MTP drafter without loading the 27B (TODO S9w; build/bench_mtp,
-docs/qwen38-speculative.md "The MTP drafter (S9)"; numpy only). Not part of the default suite.
+docs/notes/qwen38-speculative.md "The MTP drafter (S9)"; numpy only). Not part of the default suite.
 
 build/synth-wide/synth-q38-wide-cls4.gguf (~2.7 GB) or -cls6.gguf (~3.0 GB): the 27B's hyper-parameters, read from the
 IQ3_S-mtp file's header (metadata only, no tensor data: dim 5120, FFN 17408, 24 / 4 heads of 256, DeltaNet 16 key / 48

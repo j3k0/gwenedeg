@@ -101,7 +101,7 @@ chat, code, math and summary prompts: 8.7 tok/s plain; thinking on 13.2 at `-G 3
 thinking off 16.6 / 17.2 (2.0x; code and math 19-22); 12 threads: up to 15.3 / 20.6. In `runq serve` too (below).
 `--spec auto` (opt-in in the CLI) chooses the source and the guess count per pass from a cost model calibrated at the
 start (TODO G7).
-Measurements: [docs/qwen38-speculative.md](qwen38-speculative.md#the-27b-bring-up-s7).
+Measurements: [docs/notes/qwen38-speculative.md](notes/qwen38-speculative.md#the-27b-bring-up-s7).
 
 **The MTP drafter** (`-D mtp`, TODO S9): a file with a multi-token-prediction block (Qwen3.8-27B's `blk.64`, e.g.
 ISTA-DASLab's IQ3_S-mtp, Unsloth's Q4_K_M) guesses with it: one attention layer fed the model's own final hidden state
@@ -110,7 +110,7 @@ replies' tokens). It follows the model in lockstep (its rows over the prompt and
 no second 64-layer state per sequence; the output is still plain decoding's. On the 27B with thinking on it is ahead of
 the 0.8B draft: IQ3_S-mtp 12.8 vs 11.1 tok/s at each one's best fixed settings (`-D mtp -G 6 --tau 0.5` vs `-G 6 --tau
 0.4`; 1.6x plain), Unsloth's Q4_K_M 17.1 vs 14.1 (2.0x plain); with thinking off the two are even (TODO S9d,
-[docs/qwen38-speculative.md](qwen38-speculative.md#the-27bs-acceptance-and-the-go-todo-s9d2-2026-11-09)).
+[docs/notes/qwen38-speculative.md](notes/qwen38-speculative.md#the-27bs-acceptance-and-the-go-todo-s9d2-2026-11-09)).
 `runq serve --draft mtp` runs it too (TODO S9c.3: every request followed by the view, its guesses batched across
 requests; [docs/server.md](server.md#speculative-decoding-todo-s8-g7)). Measured on the 27B in the server (S9c.G,
 2026-11-10, ISTA's IQ3_S-mtp, 14 threads, `--parallel 4 --admit bound`, against the 0.8B draft at `-G 5 --tau 0.4`):
@@ -122,7 +122,7 @@ tool output) are guessed from the context itself, verified in the same loop (so 
 On edits that return the prompt's code, `--lookup 8` decodes 2.8-3.9x faster (Qwen3-1.7B, Qwen3.5-0.8B; the 0.6B draft
 at `-G 3`: 1.4-1.6x); with nothing to copy it is about plain speed. With `-D`, the draft guesses where the lookup
 finds nothing: `-G 3 --lookup 8 --lookup-min 4` (a longer minimum match: the draft guesses short matches better).
-On recorded agentic sessions it guesses ~1.5 tokens per pass alone (the 0.8B draft 2.4): [docs/qwen38-speculative.md](qwen38-speculative.md#prompt-lookup-todo-g6-g0-c-measured-2026-10-27).
+On recorded agentic sessions it guesses ~1.5 tokens per pass alone (the 0.8B draft 2.4): [docs/notes/qwen38-speculative.md](notes/qwen38-speculative.md#prompt-lookup-todo-g6-g0-c-measured-2026-10-27).
 
 ## KV cache types
 
@@ -144,7 +144,7 @@ instruction's exact rounding was verified on Zen 4, `make bf16dp-test` checks an
 2,560-token chunk prefilled at 98k positions, 8 threads: its attention ~1.72x faster (the 27B-shaped synthetic model
 8.99 -> 5.22 s, Qwen3.5-0.8B 18.3 -> 10.7 s), verify passes of speculative decoding ~20-30% cheaper, decode ~10-15%;
 for Qwen3.8-27B that is ~200 -> ~140 s per such chunk (estimated,
-[docs/qwen38-speculative.md](qwen38-speculative.md#long-context-costs-todo-g0-b-measured-2026-10-27), G4 (b)).
+[docs/notes/qwen38-speculative.md](notes/qwen38-speculative.md#long-context-costs-todo-g0-b-measured-2026-10-27), G4 (b)).
 Bit-exactness is kept: the same results for any batch, chunk size, thread count and build. The price is accuracy: KL
 divergence from HF fp32 (28-45k tokens of prose and code) +0.3% on Qwen3.5-0.8B (within the noise of the default
 cache: f16 -0.7%), but +5.4% on Qwen3-0.6B and +2.9% on Qwen3-1.7B (about a bf16 cache's +3.9% / +2.8%; f16 +2.1% /

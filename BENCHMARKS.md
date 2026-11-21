@@ -11,6 +11,10 @@ generic paths, nothing measured was changed.)
 The [Qwen3.8-27B vs ik_llama.cpp section](#qwen38-27b-iq3_s-vs-ik_llamacpp-server-workloads-2026-11-21) is a
 different model, comparison and session (2026-11-21) and is not comparable with the tables above either.
 
+The [all-models table](#all-model-files-on-the-epyc-vm-2026-10-26-to-2026-10-30) and the [batched-decode
+table](#batched-decode-aggregate-toks-step-10a-2026-10-26) are from other days on the same VM (dated in each) and are not
+comparable with the tables above either.
+
 The [Apple M1 Pro section](#apple-m1-pro-macos-neon) is a different machine and different sessions
 (2026-10-25, 14:56-22:30 UTC, branch `mac-m1-pro`) and is not comparable with the tables above
 (other CPU; Q4_K_M as well as Q8_0).
@@ -88,7 +92,7 @@ Decode runs at ~100-115 GB/s effective from 4 threads up, i.e. memory-bound; the
 bandwidth test (one streaming loop, `bench/bw.c`) under-reads this machine at 4-8 threads (it gave
 87-100 GB/s at 8 threads in earlier sessions, 60-73 today), so treat its column as a noisy lower
 bound, not a roofline. At 3,000 tokens of context the fp32 KV cache (0.70 GB) is read more than the
-weights, so decode speed halves: a 16-bit KV cache was the next decode lever (done afterwards: f16 is the default now, see the README).
+weights, so decode speed halves: a 16-bit KV cache was the next decode lever (done afterwards: f16 is the default now, see [docs/usage.md](docs/usage.md#kv-cache-types)).
 
 **Startup** (`-c 4096 -t 0 -n 1 -i "Why is the sky blue?"`, page cache warm, process start to exit
 after the first generated token):
@@ -176,8 +180,9 @@ the number to compare.)
 16k-token depth: 4.3 tok/s with a 4-bit V cache, 4.8 with 8-bit. 14 threads decode faster than 16 (other services on the
 box); `-ub 2048` helps prefill by ~8-10% and was not usable at 98k context in a 20 GB cap (see below), `-ub 1024` was used.
 
-**Reading**: on this CPU, with this model, runq decodes **1.9-2.4x** faster on short requests and **6-8x** faster at 32k
-context, serves 4 clients at once with MTP (ik: one slot with MTP, or four without), and finishes a 2.5k-token follow-up
+**Reading**: on this CPU, with this model, runq decodes **1.9-2.4x** faster on short requests at one client (3.1-4.0x with 4
+clients, against ik's one slot) and **5.5-8x** faster at 32k context (13.1 / 2.4 on the cold turn, 14.8 / 1.9 and 15.9 /
+2.0 on the follow-ups), serves 4 clients at once with MTP (ik: one slot with MTP, or four without), and finishes a 2.5k-token follow-up
 turn on a 32k session ~4x sooner; ik_llama.cpp prefills **1.35-1.5x** faster (cold 32k prompt 319 s vs 471 s). Quality is
 equal. Neither gap was profiled: ik's decode without MTP (`llama-bench` tg64, 5.4-6.0 tok/s) is already below runq's
 plain decode of earlier sessions, and its MTP decode drops sharply with depth (2-2.4 tok/s at 32k); its prefill is
@@ -201,6 +206,74 @@ the part runq could learn from.
   side with ik's (`llama-bench` tg64 gives ik's 5.4-6.0 tok/s; runq's plain decode on this file was 7.2-8.1 tok/s in
   a loaded window of an earlier session, `docs/notes/qwen38-speculative.md`); other CPUs (a different AVX-512 implementation or
   AVX2 would change both engines' numbers).
+
+## All model files on the EPYC VM (2026-10-26 to 2026-10-30)
+
+A different set of sessions from the Results above (other days, other loads: not comparable with the 2026-10-25 tables;
+this is the table the README carried until the documentation was reorganised on 2026-11-21, moved here unchanged except
+for the document paths in the footnotes). Same VM as Setup. Where a footnote gives another date, that cell is from it.
+
+Measured on the 16-vCPU AMD EPYC Genoa VM of Setup (shared, noisy: best of 2, interleaved, 2026-10-26; prefill of
+451 tokens, decode of 128 tokens after a short prompt, perplexity on the 4,142-token
+`bench/ppl_beagle_ch1.txt`):
+
+| file | peak RSS (1,500 tok, `-c 4096`) | prefill, 8 / 12 threads | decode, 8 / 12 threads | 8 sequences batched, 8 / 12 | perplexity |
+|---|---|---|---|---|---|
+| Qwen3-0.6B Q8_0 | 0.93 GB | 1,813 / 2,287 tok/s | 207 / 165 | 814 / 910 | 27.60 (HF fp32 27.57) |
+| Qwen3-0.6B Q4_K_M | 0.67 GB | 1,721 / 2,338 | 278 / 373 | 1,005 / 1,096 | 28.95 |
+| Qwen3-1.7B Q8_0 | 2.1 GB | 790 / 1,013 | 78 / 78 | 381 / 458 | 18.90 (HF 18.84) |
+| Qwen3-1.7B Q4_K_M | 1.4 GB | 680 / 943 | 101 / 112 | 466 / 529 | 19.09 |
+| Qwen3-4B Q8_0 | 4.7 GB | 313 / 412 | 29 / 31 | 157 / 201 | 15.65 |
+| Qwen3-4B Q4_K_M | 2.8 GB | 276 / 385 | 47 / 51 | 177 / 226 | 16.26 |
+| Qwen3-4B-Instruct-2507 Q4_K_M | 2.8 GB | 284 / 401 | 56 / 56 | 173 / 237 | 11.86 |
+| Qwen3-4B-Thinking-2507 Q4_K_M | 2.8 GB | 280 / 375 | 51 / 58 | 179 / 233 | 13.61 |
+| Qwen3-8B Q4_K_M | 4.9 GB | 158 / 219 | 30 / 30 | 91 / 119 | 11.53 |
+| Qwen3.5-0.8B Q8_0 (\*) | 0.96 GB | 1,506 / 2,039 | 141 / 182 | | 18.86 (512-token windows: 22.729, HF 22.728) |
+| Qwen3.5-4B Q8_0 (\*\*) | 4.8 GB | 308 / 443 | 31 / 30 | | 10.59 (512-token windows: 12.645) |
+| Qwen3.8-27B Q4_K_M (\*\*\*) | 15.9 GB | 45 / 65 | 8.5 / 10.0 | | 9.800 (512-token windows) |
+| Qwen3.8-27B Q3_K_M (\*\*\*\*) | 13.0 GB | 42 / 68 (16 threads) | 9.6 / 9.8 (16 threads) | | 10.069 (512-token windows) |
+| Underdog Saluki 27B IQ2-mix (\*\*\*\*\*) | 8.45 GB | 30 / 54 (16 threads) | 9.9 / 13.3 (16 threads) | | 11.841 (512-token windows) |
+
+(\*) Another session: prefill 2026-10-27 (`scripts/bench_models.py`, 451 tokens; Qwen3-0.6B Q8_0 alongside: 1,832 /
+2,511), decode 2026-10-26 (0.6B alongside: 209 / 230). Its decode barely slows down with the context (160 / 174 tok/s
+after 1,500 tokens): only 6 of its 24 layers have a KV cache, at 12 KB per token. Prefill is ~0.8x the 0.6B's (it was
+~0.64x before the linear attention's recurrence was blocked and tuned, docs/qwen35.md, Performance).
+(\*\*) 2026-10-27, `scripts/bench_models.py -r 3`, load 13-15 (with the run's own threads); Qwen3-4B Q8_0 alongside:
+314 / 440 and 31 / 31, the same within noise (after 1,500 tokens 26 / 32 vs 32 / 32).
+(\*\*\*) 2026-10-27, `scripts/bench_models.py`, best of 2, load 9-14 (with the run's own threads); prefill of 488 tokens
+(Qwen3.8's template adds its reasoning instruction); 16 threads: 76 / 10.3; after 1,500 tokens 8.7 / 10.6; startup
+20 s at 8 threads (the 17 GB file read cold: its page cache is dropped after each load).
+(\*\*\*\*) 2026-10-28, `scripts/bench_models.py -t 8,16`, best of 2, load 10-19, the Q4_K_M alongside: 45 / 73 tok/s of
+prefill, 7.9 / 9.1 of decode at 8 / 16 threads; perplexity of both with `scripts/ppl.py -w 512`, docs/notes/qwen38-speculative.md, G3.
+(\*\*\*\*\*) 2026-10-30, `scripts/bench_models.py -t 8,16 -r 2`, the Q3_K_M alongside (42 / 74 prefill, 9.8 / 12.3 decode
+at 8 / 16 threads; 13.3 GB); decode after 1,500 tokens 9.8 / 14.3; startup 2.3 s at 16 threads; docs/iquants.md.
+
+Decode is memory-bound and moves with the machine's load (8B ranged 12-30 tok/s); startup takes 0.1-0.2 s
+up to 1.7B, ~0.5 s for 4B and ~1 s for 8B. Q4_K_M is the better trade at 4B / 8B (decode ~1.6x Q8_0 at
+~60% of the RAM). Q8_0 is the more accurate one: at 0.6B, Q4_K_M has ~25x the logits error and answers
+"Sydney" for the capital of Australia.
+
+## Batched decode, aggregate tok/s (Step 10a, 2026-10-26)
+
+From the development log of Step 10a (full tables: `git show b3e48a3:TODO.md`), quoted for the README's former
+"batched decode" line. Aggregate tok/s of N sequences decoded in one batched pass, 50 positions per sequence, best of 4
+interleaved rounds per binary (2026-10-26, load 6-12), same VM; "before" = the binary before Step 10a, "now" = after it
+(commit `302e0b2`); the "decode" column is one sequence through `rq_decode`:
+
+| | decode | N=1 | N=2 | N=4 | N=8 | N=16 |
+|---|---|---|---|---|---|---|
+| Q4_K_M 8 threads, before | 315 | 186 | 330 | 526 | 758 | 942 |
+| Q4_K_M 8 threads, now | 326 | 311 | 515 | 813 | **1,003** (3.1x decode) | 1,091 |
+| Q4_K_M 12 threads, before | 345 | 215 | 378 | 619 | 897 | 1,164 |
+| Q4_K_M 12 threads, now | 366 | 332 | 552 | 965 | **1,214** (3.3x) | 1,449 |
+| Q8_0 GGUF 8 threads, before | 207 | 212 | 372 | 627 | 931 | 1,105 |
+| Q8_0 GGUF 8 threads, now | 210 | 216 | 340 | 647 | **976** (4.6x) | 1,146 |
+| Q8_0 GGUF 12 threads, before | 195 | 180 | 371 | 690 | 978 | 1,343 |
+| Q8_0 GGUF 12 threads, now | 223 | 252 | 403 | 705 | **1,107** (5.0x) | 1,446 |
+
+(Qwen3-0.6B. The Q8_0 cells where "now" is lower than "before" are within the run-to-run noise of +-15-30% on this box.
+The server's end-to-end throughput with concurrent clients is in [docs/server.md](docs/server.md): 0.6B Q4_K_M, 12
+threads, 16 clients streaming 128-token replies, 1,185 tok/s in aggregate.)
 
 ## Apple M1 Pro (macOS, NEON)
 

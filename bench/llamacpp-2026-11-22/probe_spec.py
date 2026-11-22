@@ -3,7 +3,8 @@
 256 new tokens; prints decode tok/s and the draft counters. usage: probe_spec.py OUT.md"""
 import http.client, json, subprocess, sys, time
 
-R = "/opt/projects/tools/gwenedeg-llama"
+import os
+R = os.environ.get("GWENEDEG", ".")  # the repo checkout
 M = R + "/models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"
 L = "llama.cpp/build/bin/llama-server"
 BASE = f"{L} -m {M} -c 98304 -np 1 -t 14 -fa on -ctk q8_0 -ctv q4_0 -ub 512 -b 2048 -lm none --no-repack --ctx-checkpoints 4 -cram 512 --jinja --host 127.0.0.1 --port 18733"

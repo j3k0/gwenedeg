@@ -27,7 +27,7 @@ worker, a 4-row segment 1.20-1.29x a decode step), and so is S1, the loop (`rq_g
 (Unsloth's Q4_K_M: 16.3 GiB of RSS, the load estimate within 0.3%; logits vs its numpy reference cos 0.9999, top-1
 62/62; plain 8.7 tok/s, with the 0.8B Q4_K_M draft 13.2-14.1 tok/s thinking on, 16.6-17.2 off, 8 threads, every output
 plain decoding's; a checkpoint per verify row 2.2 ms (S3's cost); the opt-in `3.8-27b-q4km` of the `models` group;
-[docs](docs/notes/qwen38-speculative.md#the-27b-bring-up-s7)), and so is S8, the server (2026-10-28: `runq serve --draft FILE`
+[docs](docs/notes/qwen38-speculative.md#the-27b-bring-up-s7)), and so is S8, the server (2026-10-28: `gwenedeg serve --draft FILE`
 and / or `--lookup N`, the guesses verified in the engine's batched passes, the draft's steps in its own batched passes,
 Qwen3.5's checkpoints per verify row transient next to the slot's G5 budget; outputs exactly plain decoding's,
 `server_test.py --spec` in the `spec` group; the auto policy of G7; `timings.speculative`;
@@ -60,12 +60,12 @@ Steps:
     `mtp_approx`); output == plain decoding on every case (spec group: `spec_api/mtp_synth*`, `spec_mtp/*`, the
     `mtp_lockstep` check after every run). On Qwen3.5-0.8B with its own block (the opt-in test file) as target and
     draft: 64 / 64 outputs == plain, 42-79% of the guesses accepted, 2.2-3.5 tokens per pass at k 2-4, 0.87-1.24x plain's
-    tok/s on that small model (docs/notes/qwen38-speculative.md, "The loop"). `runq serve --draft mtp` runs since S9c.3
+    tok/s on that small model (docs/notes/qwen38-speculative.md, "The loop"). `gwenedeg serve --draft mtp` runs since S9c.3
     (2026-11-09, docs/server.md), its view loaded from `--kv-disk` to the prompt's prefix and in the `--admit` terms
     since S9c.4; S9c.5 (2026-11-09) added the tools of the 27B's measurement in the server (`scripts/s9_gate.sh --server`,
     `scripts/s9c_bench.py`, `bench/s9c/`; the commands in docs/notes/qwen38-speculative.md, "In the server (S9c)") and the
     trained 0.8B block's whole `--spec mtp` group (`models/3.5-0.8b-mtp/server_spec/*`). **S9c.G done (2026-11-10,
-    10:20-13:30Z, saluki down; 0a32bdc's `./runq`, `--repack` off; `--kv-mem 6` for both, 7 closed): DEPLOY** by the
+    10:20-13:30Z, saluki down; 0a32bdc's `./gwenedeg`, `--repack` off; `--kv-mem 6` for both, 7 closed): DEPLOY** by the
     plan's rule (docs/notes/qwen38-speculative.md, "In the server (S9c)"). ISTA IQ3_S-mtp, 14 threads, `ista-iq3s`'s flags;
     A = `--draft mtp -G 6 --tau 0.5`, B = the 0.8B Q4_K_M `-G 5 --tau 0.4`:
     - G1: `--spec mtp --quick --one-server` 13 / 13 (== plain; `mtp_approx` 0 on 42 replies; `mtp_lockstep` 8 of 42
@@ -87,7 +87,7 @@ Steps:
     (2026-11-09): go** (below). **Open:** S9c (the server; needs the user's OK, and for production an MTP file: the
     Saluki MTP variant below, the live Saluki IQ2-mix has no block); on the 27B `--spec auto` with the MTP (the prior
     0.8 unverified there), long contexts (S9w's costs only), Qwopus' block, llama.cpp's comparison (PLAN 8 item 6).
-  - **S9d.2, the 27B's acceptance (2026-11-09, a window the user opened: saluki stopped, no runq server up):** every job
+  - **S9d.2, the 27B's acceptance (2026-11-09, a window the user opened: saluki stopped, no gwenedeg server up):** every job
     through `scripts/s9_gate.sh --until 21:30`, `build/spec_sweep FILE -c 4096 -n 256`, 8 threads, S7's 4 prompts, box
     load 5-10 from other jobs (plain 7.2-8.1 tok/s on IQ3_S-mtp, 8.4-8.6 on the Q4_K_M; a nightly dry run's 27B server
     up 07:19:56-07:20:38Z and from 07:48:00Z, between / after the jobs, overlapping none). **172 / 172 runs == plain** (164 speculative, 128 with the MTP),
@@ -126,7 +126,7 @@ Steps:
       -S "$S" -S "$S --mtp-vocab 65536" -S "$S --mtp-vocab 100000" -S "$S --mtp-vocab 151643" -S "mtp -G 3 --mtp-vocab 100000"
     scripts/s9_gate.sh --until 21:30 -- build/spec_sweep $G-IQ3_S-mtp.gguf -c 4096 -n 256 -r 1,0 -t 1 -p 0.95 -K 20 -s 42 -D $D8 \
       -S "draft -G 6 --tau 0.4" -S "mtp -G 6 --tau 0.5 --mtp-vocab 100000" -S "mtp -G 3 --mtp-vocab 100000"
-    for f in IQ3_S IQ3_S-f32ssm IQ3_S-mtp; do scripts/s9_gate.sh --until 21:30 -- ./runq $G-$f.gguf -m logits -c 512 \
+    for f in IQ3_S IQ3_S-f32ssm IQ3_S-mtp; do scripts/s9_gate.sh --until 21:30 -- ./gwenedeg $G-$f.gguf -m logits -c 512 \
       -i "The capital of Australia is" -o /var/tmp/s9d2/$f.bin; done   # then cmp
     scripts/s9_gate.sh --until 21:30 -- build/spec_sweep models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf -c 4096 -n 256 -r 1 \
       -D $D8 -S plain -S "draft -G 3" -S "draft -G 6 --tau 0.4" -S "mtp -G 3" -S "mtp -G 3 --mtp-vocab 100000" \
@@ -136,7 +136,7 @@ Steps:
     Q4_K_M; k 3, thinking on, T 0.6 / top_p 0.95 / top_k 20, 12 threads, CPU):** MTP 410 / 765 drafted tokens accepted
     (54%) vs the 0.8B 233 / 714 (33%), MTP ahead on each of the 4 prompts (38-70% vs 25-42%; LCB medium + 2 coding
     prompts, 96-192 tokens). Small sample; details `/home/jeko/JC/lcb_timebox/mtp/results.md`. llama.cpp's speed there
-    is no guide (plain 3.5 tok/s vs runq's 11 on the same IQ3_S; its verify batch costs ~k steps, so no draft helped).
+    is no guide (plain 3.5 tok/s vs gwenedeg's 11 on the same IQ3_S; its verify batch costs ~k steps, so no draft helped).
     Published, GPU: Qwopus3.8-27B-Flash-V2 card 80.7% (MTP) vs 66.1% base; Qwen3.5-27B n 1/2/3 -> 49/66/74%.
   - **Expected here (costs measured at S9w, 2026-11-08, on full-width synthetic files, 8 threads; the acceptance:
     S9d.2 above, p 0.81 at k 3 full, the go line's 0.79 met):** a guess (a one-row MTP pass) costs ~9 ms with the full vocabulary and ~5.7 ms with
@@ -164,7 +164,7 @@ Steps:
   draw u_j (known from a copy of the target's RNG: `rq_seq_rng` + `rq_rng_f32`) and the same settings, instead of its
   argmax: more accepted guesses (up to sum min(p, q)), output unchanged. Measure first with the API's `top_logprobs`
   = 20 (`scripts/spec_accept.py gen --top-logprobs 20`). Top-k is in the sampler (`rq_sample`'s exact order,
-  `src/runq.h`). The guess is `draft_pick` in `src/spec.c` (S1: argmax; at temperature 1, k 3, the 1.7B accepted 64%
+  `src/gwenedeg.h`). The guess is `draft_pick` in `src/spec.c` (S1: argmax; at temperature 1, k 3, the 1.7B accepted 64%
   of the 0.6B's guesses against 77% greedy).
 
 RAM for the 27B runs (decided 2026-10-27): the parcolab, billing and triominos-server containers are stopped
@@ -176,7 +176,7 @@ draft (G3, next section). Keep other jobs small while a 27B run is going.
 ## Agentic development at 96k context (pi), on Qwen3.8-27B
 
 The use the 27B work is for: an agent harness such as pi (`openai-completions` provider: streamed chat completions
-with tools, `reasoning_effort` / `chat_template_kwargs`, usage in the stream) driving `runq serve` with Qwen3.8-27B
+with tools, `reasoning_effort` / `chat_template_kwargs`, usage in the stream) driving `gwenedeg serve` with Qwen3.8-27B
 and its draft. A context window of **96k tokens** is the minimum. A session grows by **2-3k tokens per turn** (tool
 results, file contents) followed by a reply (reasoning, then a tool call or a code edit). When the context nears
 the window, pi compacts: it summarizes the old messages in a separate request (the conversation serialized as text,
@@ -187,7 +187,7 @@ Where it stands (measured 2026-10-28 on the 27B: G3's gate, G0's replay and long
 with pi"; the measurements in docs/notes/qwen38-speculative.md, "Q3_K_M: the quality gate", "Long-context costs", "Agent
 sessions"):
 - **Memory: fits.** The agentic file is the **Q3_K_M** (G3's gate: top-1 = the API model's 96.5 / 94.5% thinking off /
-  on against the Q4_K_M's 98.4 / 96.9%, perplexity +2.7%, KL 0.029 from the Q4_K_M on pi sessions' replies): runq's
+  on against the Q4_K_M's 98.4 / 96.9%, perplexity +2.7%, KL 0.029 from the Q4_K_M on pi sessions' replies): Gwenedeg's
   estimate at `-c 98304` with 3 checkpoints 19.45 GiB + the 0.8B draft at that context 2.03 + the verify rows'
   checkpoints 0.66: ~22.1 GiB of ~24 available. The Q4_K_M: ~25.1 GiB with the draft (no), ~23.0 without it (~1 GiB
   to spare).
@@ -212,7 +212,7 @@ plus the last reply (met: 46 of 52 tool turns exact, none beyond).
     K and V Hadamard-rotated (instead of per-tile scales: the scales stay per position, so no path dependence),
     per-32-dim bf16 scales; the Q4_K_M at 98k 22.37 -> 19.56 GiB with `q8-dot`; KL on Qwen3.5-0.8B: `q8` +5% (the
     16-bit types' range), `q4` ~6x, `q4k4` ~7x; Qwen3 cannot take 4-bit K. Left: (a) G2's retrieval at ~84k on the
-    27B with `q8-dot` / `q4k4-dot`, and the KL between its f16 and quantized caches (runq vs runq); (b) a fused kernel
+    27B with `q8-dot` / `q4k4-dot`, and the KL between its f16 and quantized caches (gwenedeg vs gwenedeg); (b) a fused kernel
     (each block is dequantized into scratch first: at decode as many instructions as the attention's; int8 K against
     a quantized q with VNNI, the scales per ATT_DC chunk, V's folded into the softmax weights); decode at 64k on
     Saluki is only ~5-20% faster today; (c) NEON's own conversion (it runs the generic C one).
@@ -255,7 +255,7 @@ plus the last reply (met: 46 of 52 tool turns exact, none beyond).
   JSON-escaped, so multi-line old text does not match the raw file text in the context: a pi-side change or a custom
   edit tool).
 - [ ] **G7 leftovers: speculation at long context.** In (2026-10-28, docs/notes/qwen38-speculative.md, "In the server (S8)
-  and the choice by position (G7)"): `runq serve --spec auto` and `runq --spec auto`. On the 27B (Q3_K_M, `bf16-dot`, 16
+  and the choice by position (G7)"): `gwenedeg serve --spec auto` and `gwenedeg --spec auto`. On the 27B (Q3_K_M, `bf16-dot`, 16
   threads): `bench_long -D`'s choice from the measured passes, the model k 3 up to 32k (x1.38-1.49), k 1 at 64-98k
   (x1.24 / x1.17), a 4-token lookup match 3 guesses (x1.47-2.10); in the server the replay's probes (256 tokens) at
   21-81k used the lookup only (805 / 1,699 accepted, 8.1-13.9 tok/s), a live session at 2-3k the draft (15-23 tok/s).
@@ -298,7 +298,7 @@ plus the last reply (met: 46 of 52 tool turns exact, none beyond).
   already fail the greedy goldens, because the non-kernel float code is vectorized at another width (they pass the
   logits, batched and thread tests).
 - [ ] **Windows.** The code paths inherited from qwen3.c (`src/win.c`, the OpenMP region instead of the pool) are
-  untested (no Windows toolchain was available), and `runq serve` is a stub there. A MinGW or MSVC build, plus the
+  untested (no Windows toolchain was available), and `gwenedeg serve` is a stub there. A MinGW or MSVC build, plus the
   tests that need no server.
 
 ## Performance
@@ -324,7 +324,7 @@ plus the last reply (met: 46 of 52 tool turns exact, none beyond).
   4,096-position blocks: 1.69 vs 1.62-1.64 s). The arithmetic, including the combine order of `att_combine`, must
   stay as it is.
 
-## Server (`runq serve`)
+## Server (`gwenedeg serve`)
 
 - [ ] **Memory admission: the measurements and the default.** `--admit bound` / `chunk` (+ `--admit-yield`) are in
   (2026-11-07, [docs/memory-admission.md](docs/memory-admission.md): the `admit` / `admit_chunk` groups on the 0.6B and
@@ -377,14 +377,14 @@ Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M (Qwen3.8-27B Q4_K_M, the same
 - [ ] **NEON check of the recurrence.** The blocked recurrence (`dn_prep` / `dn_rec` / `dn_out`, docs/qwen35.md) is
   plain C vectorized along v (no AVX-512 specifics; `DN_UNROLL` is `_Pragma("clang loop unroll(full)")` for clang),
   so it should be bit-identical to the generic build on arm64 too, and as fast as the new layouts allow; untested
-  (the q35 group's AVX-512 vs generic checks, `tests/check_models.py`, on the Mac; then `-DRUNQ_PROFILE` for the
+  (the q35 group's AVX-512 vs generic checks, `tests/check_models.py`, on the Mac; then `-DGWENEDEG_PROFILE` for the
   split). Speed left: `dn_prep` scales poorly past 8 threads and `dn_rec` is ~2x its hot-cache cost (docs/qwen35.md).
 - [ ] **MoE** (not now: the Qwen3.8-27B section first) (`qwen35moe`: Qwen3.5 / 3.6-35B-A3B and up; images are out of scope for this project, ideas:
   [IDEAS.md](IDEAS.md#images-qwen35-vision)).
   - Qwen3.6-35B-A3B and a tiny test model: router `ffn_gate_inp` (F32), experts
     `ffn_{gate,up,down}_exps` (3-D tensors), a shared expert `ffn_*_shexp` with its sigmoid gate
     `ffn_gate_inp_shexp`; softmax, top-8, always renormalized (as `qwen3moe`, which has no shared expert). The 35B's
-    Q4_K_M file is 22 GB: runq copies and repacks all weights into RAM today, so the experts (19.5 GB) would be read
+    Q4_K_M file is 22 GB: gwenedeg copies and repacks all weights into RAM today, so the experts (19.5 GB) would be read
     in place from the mmap'd file (`ffn_down_exps` is Q5_K, supported now). Estimate: ~2.6 GB read per token, 30-40 tok/s
     with everything cached, a few tok/s on the 30 GB dev box. Reference: a numpy forward that dequantizes only the
     routed experts (HF's 67 GB bf16 is out of reach). Its linear layers have 16 key / 32 value heads, as 4B (done).
@@ -404,7 +404,7 @@ Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M (Qwen3.8-27B Q4_K_M, the same
   (`bench/llamacpp-2026-11-22/`: short prompts 0.79-0.95x of ik, the cold 32k prompt 391 s, mainline llama.cpp added);
   NEON (still `iq_rows`, 32 rows per pass).
 - [x] **`--repack`** (2026-11-09; docs/iquants.md, `--repack: 4-bit codes`): IQ3_S / IQ3_XXS stored as 4-bit codes at load,
-  bit-identical; `--repack[=LIST]`, `--no-repack`, `--repack-info` (CLI, `runq serve`, `spec_sweep`). ISTA 27B, 8 threads:
+  bit-identical; `--repack[=LIST]`, `--no-repack`, `--repack-info` (CLI, `gwenedeg serve`, `spec_sweep`). ISTA 27B, 8 threads:
   `--repack=IQ3_S` +0.74 GiB, decode 1.15x, 4-row pass 1.14x; all +1.37 GiB, 1.25x / 1.19x; 16 threads ~1.05x / 1.15x.
 - [ ] **`--repack`, open:** (a) tok/s end to end on the 27B under `scripts/s9_gate.sh` (`build/spec_sweep $G --repack[=IQ3_S]`,
   plain and `-S "mtp -G 3"`, 8 and 16 threads; the gate was closed on 2026-11-09 evening: lcb-bench, the saluki server
@@ -460,15 +460,15 @@ Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M (Qwen3.8-27B Q4_K_M, the same
   `scripts/download_models.py` reads; the binaries read neither). Proposal, XDG rather than a `~/.gwenedeg/` of our
   own: the cache dir is `${HF_HOME:-${XDG_CACHE_HOME:-~/.cache}/huggingface}/hub` (HF's own, see below) and
   `${XDG_CACHE_HOME:-~/.cache}/gwenedeg/models` second, with `$GWENEDEG_MODELS` overriding both for set
-  resolutions; a bare set name on the command line (`runq qwen3.5-0.8b-q8 -i hi`) resolves as: a path, a file in
+  resolutions; a bare set name on the command line (`gwenedeg qwen3.5-0.8b-q8 -i hi`) resolves as: a path, a file in
   `$GWENEDEG_MODELS`, then `./models`, then the cache dirs in order. In the HF cache, a set finds its file in
   `models--<org>--<repo>/snapshots/<rev>/<file>` under any revision (verify the content: the LFS symlink points to
   `../blobs/<sha256>`, whose name is the hash; else hash it against the pinned one), so anything the user already
   pulled with `hf download` is used as-is, offline and without re-verification of blobs named by their hash.
-  `runq models` lists what is there (sets found in each location, files, sizes, and what each needs to download).
+  `gwenedeg models` lists what is there (sets found in each location, files, sizes, and what each needs to download).
   Fetching stays out of the binaries (no TLS in them): `scripts/download_models.py` keeps the pinned sets and uses
   the `hf` CLI when available (`hf download <repo> <file> --revision <sha>`, resumable, writes the HF cache; it
   verifies nothing, so still check the sha256 before linking), else plain curl + sha256sum into the gwenedeg cache
   dir; the same logic as a `scripts/fetch.sh` (no Python needed). Done when a bare set name resolves in every
-  location, `hf`-downloaded files are found and used without copying, `runq models` prints the table, and the docs
+  location, `hf`-downloaded files are found and used without copying, `gwenedeg models` prints the table, and the docs
   (`docs/models.md`, `scripts/download_models.py --list`) agree.

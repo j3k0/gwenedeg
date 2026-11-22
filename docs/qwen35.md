@@ -4,7 +4,7 @@ Status (2026-10-27): **Qwen3.5-0.8B Q8_0 and Unsloth's Q4_K_M, and Qwen3.5-4B Q8
 `general.architecture == qwen35`; 4B since Step 14: more value heads than key heads, design 8 below): loader, the
 `qwen35` pre-tokenizer, the chat template variant, the hybrid forward pass in every path (decode, batched prefill,
 batched decode rows) with the bitwise invariants, recurrent-state checkpoints for truncate / copy, the CLI chat and
-`runq serve`, and the tests (`tests/check_models.py` group `q35` in `make test`, the file in the `models` group).
+`gwenedeg serve`, and the tests (`tests/check_models.py` group `q35` in `make test`, the file in the `models` group).
 Open: the NEON check of the recurrence, the MoE models ([TODO.md](../TODO.md)); 2B (16 / 16 heads, as 0.8B), 9B and 27B
 (2x / 3x as many value heads as key heads, as 4B) should load but are untested (Qwen3.8-27B, the same architecture
 at r = 3, is tested: [qwen38-speculative.md](notes/qwen38-speculative.md#the-27b-bring-up-s7)).
@@ -15,8 +15,8 @@ Results (2026-10-26, 16-vCPU dev box):
 
 - Logits vs HF transformers 5.21 fp32 (`tests/golden/models/3.5-0.8b-hf`, en / code / chat / long2, 62 positions):
   cos mean 0.9996-0.9998 per prompt, min 0.9986, top-1 62/62, pooled 0.99976; vs the Q8_0 file's dequantized-weights
-  reference (`3.5-0.8b-q8`): pooled 0.99986. Perplexity on `bench/ppl_beagle_ch1.txt`, 512-token windows: runq Q8_0
-  22.729, HF fp32 22.728 (full text: runq 18.86; HF's reference kernels ran out of memory there).
+  reference (`3.5-0.8b-q8`): pooled 0.99986. Perplexity on `bench/ppl_beagle_ch1.txt`, 512-token windows: gwenedeg Q8_0
+  22.729, HF fp32 22.728 (full text: gwenedeg 18.86; HF's reference kernels ran out of memory there).
 - Bit-identical: `-b 1 / 7 / 64 / 512`, 8 vs 3 threads, AVX-512 vs generic, KV f16 / bf16 / f32, a batched decode
   row vs the sequence alone (`api_test`), a CLI chat that rolls back to a checkpoint vs a single-shot run.
 - Speed (8 / 12 threads, `scripts/bench_models.py`, 2026-10-27, load 3-6 from another agent): prefill of 451 / 1,500
@@ -24,7 +24,7 @@ Results (2026-10-26, 16-vCPU dev box):
   0.82x / 1.05x at 8 threads, 0.81x / 1.03x at 12; before the blocked recurrence 1,170 / 1,127 and 1,568 / 1,590),
   decode 162 / 174 tok/s (0.6B: 180 / 219; 141 / 182 in the quiet session of 2026-10-26, 0.6B 209 / 230), after a
   1,500-token prompt 142 / 160 (0.6B: 161 / 194: the 6-layer KV cache barely slows it down); peak RSS 964 MB (1,500 +
-  128 tokens, `-c 4096`), startup 0.1 s. The recurrence takes ~17% of prefill (`-DRUNQ_PROFILE`): see Performance
+  128 tokens, `-c 4096`), startup 0.1 s. The recurrence takes ~17% of prefill (`-DGWENEDEG_PROFILE`): see Performance
   below.
 - Tokenizer: `tests/golden/tokenizer_qwen35.json` (90 cases, 23 of them pre-tokenized differently from Qwen3's
   regex) and `fuzz_tokenizer.py` (5,000 random strings + the repo's text, 1.4 M tokens): equal to HF.
@@ -35,7 +35,7 @@ interleaved with the Q8_0 file):
 - Logits vs HF fp32 (`3.5-0.8b-hf`, 62 positions): cos means 0.9924 / 0.9959 / 0.9958 / 0.9925 (chat, code, en, long2),
   min 0.9677, position 0 0.9855-0.9957, pooled 0.9946, top-1 57/62. That is the 4-bit weights' own error (Qwen3-0.6B
   Q4_K_M: pooled 0.984, top-1 68/84; its Q8_0: 0.9994): vs the file's dequantized-weights reference (`3.5-0.8b-q4km`,
-  `make_model_ref.py`) runq is at pooled cos 0.99986, every position's cos >= 0.9996 except chat's (0.9990), top-1 62/62,
+  `make_model_ref.py`) gwenedeg is at pooled cos 0.99986, every position's cos >= 0.9996 except chat's (0.9990), top-1 62/62,
   the same distance as the Q8_0 file from its reference (0.99986). So the int8 activations and kernels add nothing
   visible; the rest is quantization.
 - Bit-identical, as the Q8_0 file: `-b 1 / 7 / 64 / 512`, 8 vs 3 threads, AVX-512 vs generic (`-b 1 / 7 / 64`; the
@@ -57,7 +57,7 @@ Q3_K_M (Unsloth, 470 MB; Q3_K support added 2026-10-27, TODO G3: the 27B's Q3_K_
   Q6_K the tied `token_embd`; Q8_0 `ssm_alpha` / `ssm_beta`.
 - Logits vs HF fp32 (`3.5-0.8b-hf`, 62 positions): cos means 0.9701 / 0.9864 / 0.9815 / 0.9822 (chat, code, en, long2),
   min 0.8577 (chat), position 0 0.9379-0.9918, pooled 0.98089, top-1 54/62: ~3.5x the Q4_K_M file's 1 - cos (0.9946,
-  57/62). All of it is the 3-bit weights': vs the file's dequantized-weights reference (`3.5-0.8b-q3km`) runq is at
+  57/62). All of it is the 3-bit weights': vs the file's dequantized-weights reference (`3.5-0.8b-q3km`) gwenedeg is at
   pooled cos 0.99984, top-1 62/62 (the Q4_K_M file: 0.99986). Greedy chat answers as the Q4_K_M file does.
 - Bit-identical: `-m dequant` of all 78 Q3_K tensors (236,544 rows, from the blocks and from the repacked layout) ==
   gguf-py; `-b 1 / 7 / 64 / 512`, 8 vs 3 threads, AVX-512 vs generic (`-b 1 / 7 / 64`, `api_test --digest-small`), a
@@ -82,7 +82,7 @@ Qwen3.5-4B Q8_0 (Unsloth, 4.48 GB; Step 14, 2026-10-27):
   Canberra (the capital of the Commonwealth of" -- the model's own answer: the same 24 tokens from a greedy decode of
   the HF-weights reference (the closest call, token 20, by a margin of 0.03).
 - Bit-identical: `-b 1 / 7 / 64 / 512`, 8 vs 3 threads, AVX-512 vs generic (`-b 1 / 7 / 64`, and the batched passes of
-  `api_test --digest-small`), `api_test` 25/25 (batched decode rows == alone, checkpoints); `runq serve`'s greedy reply ==
+  `api_test --digest-small`), `api_test` 25/25 (batched decode rows == alone, checkpoints); `gwenedeg serve`'s greedy reply ==
   the CLI's. (`tests/run_tests.sh --models --model-tags 3.5-4b-q8`: 36 checks, ~100 s.)
 - Speed (`scripts/bench_models.py -t 8,12 -r 3`, load 13-15 incl. the run's own threads; prefill of 448 / 1,492 tokens,
   decode short / after 1,500 tokens, tok/s): 8 threads 308 / 298, 30.6 / 26.4; 12 threads 443 / 421, 29.5 / 31.9.
@@ -147,7 +147,7 @@ Per linear layer: `attn_qkv` (1024 -> 6144), `attn_gate` (W_z, -> 2048), `ssm_al
 
 Value transforms by llama.cpp's converter, checked bit-exactly (`maxabs 0`) on layer 0 / 3:
 - The norms are stored as `1 + w`: `attn_norm`, `post_attention_norm`, `output_norm`, `attn_q_norm`,
-  `attn_k_norm`. HF's `Qwen3_5RMSNorm` computes `x * (1 + w)`, so runq's `x * w` on the stored weight is
+  `attn_k_norm`. HF's `Qwen3_5RMSNorm` computes `x * (1 + w)`, so Gwenedeg's `x * w` on the stored weight is
   right as it is. `ssm_norm` has no `+ 1` in either.
 - `ssm_a = -exp(A_log)` (1e-7 rounding).
 - With 16 = 16 heads (0.8B, 2B), there is no head reordering. With `num_v_heads` = r x `num_k_heads` (4B, 9B: r = 2;
@@ -158,7 +158,7 @@ Value transforms by llama.cpp's converter, checked bit-exactly (`maxabs 0`) on l
   layers 0 / 1 / 4 / 28, whole tensors: max |GGUF - HF| under the tiled permutation 0 (F32 tensors) to 2e-3 (Q8_0
   rounding), under the identity 0.17-48. Design 8.
 
-Tensor types: the Unsloth **Q8_0** file is Q8_0 + F32 only, so runq's kernels cover it. The Unsloth **Q4_K_M**
+Tensor types: the Unsloth **Q8_0** file is Q8_0 + F32 only, so Gwenedeg's kernels cover it. The Unsloth **Q4_K_M**
 uses Q4_K / Q6_K, plus **Q5_K** for `attn_qkv` and `ssm_out` of every linear layer (36 tensors), and Q8_0 for
 `ssm_alpha` / `ssm_beta`. Q5_K is supported since Step 13 (`src/kquants.h`: the Q5P layout, and the Q5_K arithmetic
 = Q4_K's fold on 5-bit values); the Q8_0 file came first. Q3_K (the **Q3_K_M** file, TODO G3) since 2026-10-27: the Q3P
@@ -171,7 +171,7 @@ matrices: accepted for those two only, applied in fp32 to the fp32 activations w
 
 **1. Exact recurrence everywhere; no chunked prefill.** HF and llama.cpp prefill with the chunked
 (WY / UT-transform) form of the delta rule, and decode with the recurrence. In fp32 these round differently.
-runq's rule is that batched and sequential logits are bit-identical, so prefill runs the same per-token
+Gwenedeg's rule is that batched and sequential logits are bit-identical, so prefill runs the same per-token
 recurrence as decode. It is cheap: per token and layer, the recurrence costs 16 heads x 128 x 128 x ~8 flops,
 ~2 MFLOP, so 38 MFLOP over 18 layers. The matmuls cost ~1.5 GFLOP per token, which makes the recurrence ~2.5%.
 (That estimate was wrong in practice: the recurrence is memory-bound, see Performance.) Implemented in
@@ -305,10 +305,10 @@ How the mapping was verified, end to end: tiny random-init `qwen3_5` models (tra
 key heads with 4 resp. 6 value heads, the matrices snapped to the Q8_0 grid so that the conversion is exact),
 converted by llama.cpp's `convert_hf_to_gguf.py` (master 7aca0d2, 2026-10-26; `--no-mtp --outtype q8_0`). Against
 transformers' fp32 logits (its torch fallback of the chunked delta rule): `ref_qwen35.py` on the HF weights (h // r)
-max |diff| 4-9e-5, on the GGUF (h % nk) 4e-5-1e-4, on the GGUF with h // r cos means 0.91-0.95; runq on the GGUF cos >=
+max |diff| 4-9e-5, on the GGUF (h % nk) 4e-5-1e-4, on the GGUF with h // r cos means 0.91-0.95; Gwenedeg on the GGUF cos >=
 0.9991 at every position (means 0.99986-0.99993), top-1 100%. (Too big to commit: the 248k-token embedding; and the
 converter and transformers 5.x are not test dependencies.) In `make test`: two synthetic models cut out of the 0.8B
-file with 4 / 8 and 2 / 6 heads (`tests/make_synth_q35.py`), runq vs `ref_qwen35.py` on them and the bitwise
+file with 4 / 8 and 2 / 6 heads (`tests/make_synth_q35.py`), gwenedeg vs `ref_qwen35.py` on them and the bitwise
 invariants; scratch builds with HF's mapping in `dn_rec`, or with the q / k conv redone by every value head, fail it.
 
 ## Performance
@@ -318,7 +318,7 @@ classifier is a third of it: 248,320 x 1,024), a lower long-context slowdown, pr
 ~2.5% recurrence. Measured: decode as estimated (141 vs 209 tok/s at 8 threads; 160 vs 182 after 1,500 tokens).
 
 Prefill was ~0.64x the 0.6B's instead of ~0.8x (451 tokens, 8 threads): the recurrence took ~48% of it
-(`-DRUNQ_PROFILE`, 1,492-token prompt, -b 512: 0.62-0.69 s of 1.29-1.43 s at 8 threads, 0.42 of 0.89 at 16).
+(`-DGWENEDEG_PROFILE`, 1,492-token prompt, -b 512: 0.62-0.69 s of 1.29-1.43 s at 8 threads, 0.42 of 0.89 at 16).
 `dn_head` alone (one thread, a micro-benchmark) took ~5 us per token and head, ~4 of them in two passes over the
 64 KB state (read and write each): bound by the cache bandwidth, not by the flops; in prefill ~12 us per token and
 head at 8 threads, with only 16 work items per segment. Done (the design above): v blocks of 32 columns,
@@ -350,26 +350,26 @@ per-head copy written by `dn_prep` could help).
 ## Long context (TODO G2, 2026-10-27)
 
 Nothing else in the tests goes past ~2,000 positions. The `long` group (`tests/run_tests.sh --long-context`,
-`tests/check_long.py`, opt-in) checks runq at up to 98,304 positions against `tests/ref_qwen35.py` on the file's
+`tests/check_long.py`, opt-in) checks gwenedeg at up to 98,304 positions against `tests/ref_qwen35.py` on the file's
 dequantized weights, through `build/long_ctx` (`tests/long_ctx.c`, the library API: the CLI's hooks take neither a
 400 KB prompt nor 98k rows of logits).
 
 - **The text:** 18 files of this repository at the fixed commit `5d93873` (`git show`: README, docs, `src/*.c`,
-  `tests/check.py`, the Beagle chapter, interleaved prose / C / Python, no repeat), tokenized by runq: 244,198
+  `tests/check.py`, the Beagle chapter, interleaved prose / C / Python, no repeat), tokenized by gwenedeg: 244,198
   tokens, the first 98,304 used (sha256 of the ids in the golden).
 - **The reference:** `ref_qwen35.forward_long` (`tests/make_long_ref.py`): the same numpy fp32 forward, rows in
   chunks of 2,048 (the DeltaNet state and the conv inputs carried across chunks), full attention per layer as all
   rows' K / V first, then the queries in blocks of 128 with an exact softmax over every key up to the block's last
-  position (no split, no combine: the opposite of runq's per-256-position partial results), the last layer on the
+  position (no split, no combine: the opposite of Gwenedeg's per-256-position partial results), the last layer on the
   sampled rows only, the logits on the full vocabulary. `--check-short` compares it with `forward` (700 tokens, `rc`
   256): max |diff| 2.5e-5. Cost on the 0.8B at 98,304 tokens: **1,813 s** at 8 BLAS threads (load ~10-25; ~31 s per
   DeltaNet layer, its token-by-token recurrence, ~150-240 s per attention layer), ~1-2 GB. The golden
   (`tests/golden/long/3.5-0.8b-q8.npz`, 35 KB): per position the top 64 ids / logits and a fixed subset of 512 ids.
 
-Runtime of runq for the same rows (`long_ctx -V`, 8 threads, load ~10): 524 s (the prefill up to each position plus
+Runtime of gwenedeg for the same rows (`long_ctx -V`, 8 threads, load ~10): 524 s (the prefill up to each position plus
 the two extra paths at each).
 
-**Qwen3.5-0.8B Q8_0 vs the reference** (full vocabulary; KL = KL(ref || runq) of the softmax):
+**Qwen3.5-0.8B Q8_0 vs the reference** (full vocabulary; KL = KL(ref || gwenedeg) of the softmax):
 
 | position | 1,023 | 4,095 | 8,191 | 16,383 | 24,575 | 32,767 | 40,959 | 49,151 | 57,343 | 65,535 | 73,727 | 81,919 | 90,111 | 98,303 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -386,10 +386,10 @@ position), max |diff| 0.2-0.3 at every distance with two 0.44s. What was checked
   14 positions: the last row of a 64-row prefill chunk == a 4-row verify segment (the decode-rows worker, its
   attention items per (row block, kv head)) == a decode step (`rq_decode`: each kv head's 384 blocks split over the
   threads, combined by the last item).
-- **RoPE at large positions** (theta 1e7, 64 of 256 dims): runq's frequencies `expf((float)ln(theta) * -j / 32)`
+- **RoPE at large positions** (theta 1e7, 64 of 256 dims): Gwenedeg's frequencies `expf((float)ln(theta) * -j / 32)`
   carry the fp32 rounding of ln(1e7) (relative error up to 6.7e-7, HF's `1 / theta ** (2j / 64)` 7e-8), but the
   angle's error is that of the fp32 product `pos * freq` in both: at 98,303 max 2.6e-3 rad from the exact angle for
-  runq and for HF (runq - HF 2.0e-3), at 262,143 6.1e-3 for both (cos error 3.2e-3 / 2.4e-3). Not worth a change
+  gwenedeg and for HF (gwenedeg - HF 2.0e-3), at 262,143 6.1e-3 for both (cos error 3.2e-3 / 2.4e-3). Not worth a change
   (a double-precision angle would beat HF's own computation and change every model's bits).
 - **The f16 cache's range:** max |K| 22.3, |V| 37.2 over the 98k tokens (the reference's, per attention layer: K
   12.4-22.3, V 5.7-37.2): far from f16's 65,504, and f16's relative step (2^-11) is the precision the short tests
@@ -398,7 +398,7 @@ position), max |diff| 0.2-0.3 at every distance with two 0.44s. What was checked
   of the corpus, the corpus up to 88,000 tokens, then the question in a chat turn (thinking off): an 88,092-token
   prompt; the 0.8B's greedy reply is `PLUM-7316-HERON` (prefill + 24 decode steps at ~88k: 602 s at 8 threads,
   load ~25).
-- **Qwen3.5-4B Q8_0** (32 value heads on 16 key heads) on the first 32,768 tokens (runq at 98k would need ~7.7 GB:
+- **Qwen3.5-4B Q8_0** (32 value heads on 16 key heads) on the first 32,768 tokens (gwenedeg at 98k would need ~7.7 GB:
   more than this run's share of the box; reference 1,233 s at 8 BLAS threads, `golden/long/3.5-4b-q8.npz`): cos over
   the golden's ids 0.99998 / 0.99993 / 0.99997 / 0.99996 / 0.99990 / 0.99990 at 1k / 4k / 8k / 16k / 24k / 32k, top-1
   6/6, max |diff| 0.16-0.41; the three paths bitwise equal, the generic build too (to 16k); max |K| 19.6, |V| 52.5;
@@ -422,7 +422,7 @@ tests/run_tests.sh --models --model-tags 3.5-4b-q8                     # the 4B'
 .venv/bin/python tests/make_chat_golden.py                        # golden/chat_render.json (incl. qwen3.5)
 .venv/bin/python tests/fuzz_tokenizer.py --model models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf --hf-dir models/Qwen3.5-0.8B
 .venv-hf5/bin/python scripts/ppl.py bench/ppl_beagle_ch1.txt --hf --hf-dir models/Qwen3.5-0.8B --no-full \
-    --runq-model models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf
+    --gwenedeg-model models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf
 .venv-hf5/bin/python tests/make_model_ref.py 3.5-0.8b-q4km models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf
 python3 tests/make_dequant_golden.py --q5                         # golden/dequant/q5_k.npz (needs gguf)
 tests/run_tests.sh --only q35                                     # the q35 group alone (~45 s, ~85 s with the Q4_K_M file)

@@ -1,4 +1,4 @@
-# `runq serve`: the OpenAI-compatible server
+# `gwenedeg serve`: the OpenAI-compatible server
 
 For operators and API clients: the reference for [Gwenedeg](../README.md)'s server: flags, endpoints, behaviour, the LiteLLM
 router setup and measurements (on the 16-vCPU AMD EPYC Genoa VM of [BENCHMARKS.md](../BENCHMARKS.md),
@@ -13,7 +13,7 @@ An OpenAI-compatible HTTP server in the same binary (POSIX sockets; on Windows i
 available). One model per process, bound to 127.0.0.1 by default, no auth unless `--api-key`:
 
 ```sh
-./runq serve models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf             # http://127.0.0.1:8080/v1
+./gwenedeg serve models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf             # http://127.0.0.1:8080/v1
 curl -s localhost:8080/v1/chat/completions -d '{"messages": [{"role": "user", "content": "Hi!"}], "max_tokens": 32}'
 ```
 
@@ -33,12 +33,12 @@ curl -s localhost:8080/v1/chat/completions -d '{"messages": [{"role": "user", "c
 | `--checkpoints N` | 4 | Qwen3.5 / 3.8: copies of the recurrent state a slot keeps (1..32; ~19 MiB each for the 0.8B, ~150 MiB for the 27B), where an agent's next requests leave the cache (below, Prefix reuse); counted in the slot's size and in the load check |
 | `--mem GiB` | MemAvailable | the load check ([usage.md](usage.md#memory-check-at-load)): refuse to load if the weights, the runtime and one sequence of `-c` positions do not fit; `0` or `force`: no check |
 | `--page-cache auto\|drop\|keep` | auto | the model file's page cache after the load (auto: dropped if the file is >= 1/4 of the RAM) |
-| `--repack[=LIST]`, `--no-repack` | off | the IQ3_S / IQ3_XXS weights as 4-bit codes ([usage.md](usage.md#command-line-options), [iquants.md](iquants.md#--repack-4-bit-codes); `runq MODEL --repack-info` measures the choice): bit-identical output, more RAM (counted in the load check) |
+| `--repack[=LIST]`, `--no-repack` | off | the IQ3_S / IQ3_XXS weights as 4-bit codes ([usage.md](usage.md#command-line-options), [iquants.md](iquants.md#--repack-4-bit-codes); `gwenedeg MODEL --repack-info` measures the choice): bit-identical output, more RAM (counted in the load check) |
 | `-b N`, `--chunk N` | 512, 64 | prompt tokens per forward pass when no request is decoding / while others decode |
 | `--prefix-copy N` | 32 | copy a cached prompt prefix into a new request's slot if that saves N tokens (a running request's; an idle slot's that would otherwise be cut, slot affinity below; 0: never) |
 | `--kv-disk DIR` | off | the KV cache's disk tier ([kv-disk.md](kv-disk.md)): a slot's sequence is saved to `DIR` when a request would discard its tokens (and at shutdown), and loaded back when a prompt continues it, also after a restart; an SSD |
 | `--kv-disk-max GiB` | half the free space at the start (at least one full session) | the disk tier's files at most (the least recently used removed first); 1 GiB of the file system is always left free |
-| `--kv-disk-free GiB` | 5 | free space kept on the disk tier's file system. Checked every minute (the engine thread, between passes or when idle) and before each save; below it, first the **unused directories** next to the server's own under `--kv-disk` are deleted, the oldest first (a `<16 hex digits>-<KV type>` directory with a `lock` file no server holds and no activity for 2 h: the newest mtime of its files; every server touches its `lock` file at the start, hourly and at shutdown, the heartbeat), then the server's own least recently used files. Whatever the free space, the tier keeps **room for one full session** (a slot's sequences at `--ctx`: the startup line's `one session's room`, e.g. ~3.3 GiB for the 27B at 98k with `q4-dot` and MTP, ~4.6 GiB with `q8-dot` and the 0.8B draft) as long as 1 GiB stays free; a warning, at most hourly, when the free space is below it (`runq serve: --kv-disk: X GiB free under DIR, below --kv-disk-free ...`), one line per directory deleted (`runq serve: --kv-disk: DIR removed (unused for N h, X GiB) ...`). Nothing else under `--kv-disk` is touched; a running server (also an older build: its `lock`) never loses its directory |
+| `--kv-disk-free GiB` | 5 | free space kept on the disk tier's file system. Checked every minute (the engine thread, between passes or when idle) and before each save; below it, first the **unused directories** next to the server's own under `--kv-disk` are deleted, the oldest first (a `<16 hex digits>-<KV type>` directory with a `lock` file no server holds and no activity for 2 h: the newest mtime of its files; every server touches its `lock` file at the start, hourly and at shutdown, the heartbeat), then the server's own least recently used files. Whatever the free space, the tier keeps **room for one full session** (a slot's sequences at `--ctx`: the startup line's `one session's room`, e.g. ~3.3 GiB for the 27B at 98k with `q4-dot` and MTP, ~4.6 GiB with `q8-dot` and the 0.8B draft) as long as 1 GiB stays free; a warning, at most hourly, when the free space is below it (`gwenedeg serve: --kv-disk: X GiB free under DIR, below --kv-disk-free ...`), one line per directory deleted (`gwenedeg serve: --kv-disk: DIR removed (unused for N h, X GiB) ...`). Nothing else under `--kv-disk` is touched; a running server (also an older build: its `lock`) never loses its directory |
 | `--kv-disk-min N` | 1024 | save a slot when a request would discard at least N of its tokens (it holds at least N) |
 | `-k` | f16 | KV cache type (as for the CLI): `q8-dot` / `q4-dot` / `q4k4-dot` shrink the pool's slots (and the draft's) to 0.53 / 0.41 / 0.28 of f16's KV ([kv-quant.md](kv-quant.md)) |
 | `--queue N` | 64 | requests waiting beyond the free running places at most (more: 503, `Retry-After: 1`) |
@@ -79,7 +79,7 @@ fed after the prompt in passes of several rows, then the reply ends as on the en
 `{"mode", "k", "tau", "lookup", "lookup_min"}`; the fields not given are the server's). `usage` counts
 prompt, completion and cached prompt tokens (`prompt_tokens_details.cached_tokens`); responses (and the stream's
 usage chunk) also carry llama.cpp's `timings` (`prompt_n`: tokens prefilled, `prompt_ms`, `predicted_n` /
-`predicted_ms`, `cache_n`) and runq's: `slot`, `slot_tokens` (its length when the request took it), `common_tokens`
+`predicted_ms`, `cache_n`) and Gwenedeg's: `slot`, `slot_tokens` (its length when the request took it), `common_tokens`
 (its common prefix with the prompt: below `slot_tokens`, the history was sent differently from what was generated;
 above `cache_n`, the recurrent state rolled back to a checkpoint), `copied`, `queue_ms`, with `--admit bound` / `chunk`
 `mem_wait_ms` (the part of `queue_ms` spent at the head of the queue waiting for memory) and `lease_gib` (the request's
@@ -90,7 +90,7 @@ has `code: context_length_exceeded`), 401, 404, 405, 411 (chunked uploads), 413,
 down), 504. Not supported: tools with Qwen3's templates (400), `tool_choice` required / a named function, the legacy
 `functions`, images, `n > 1`, `json_object`, penalties (ignored).
 
-- **Conversation**: rendered with Qwen3's template (the model's variant: [usage.md](usage.md#chat-templates-and-thinking)) in the CLI chat's form (`runq -m chat`), so a greedy
+- **Conversation**: rendered with Qwen3's template (the model's variant: [usage.md](usage.md#chat-templates-and-thinking)) in the CLI chat's form (`gwenedeg -m chat`), so a greedy
   request gives the same text as the CLI for the same messages (tested bitwise, also with a seed: the RNG
   draws as the CLI's chat does for a first turn). Earlier assistant messages lose their `<think>` block.
 - **Qwen3.8** (its template, detected by `reasoning_effort` in it): thinking is **on** by default with the effort
@@ -101,7 +101,7 @@ down), 504. Not supported: tools with Qwen3's templates (400), `tool_choice` req
   assistant messages keep their reasoning, as the template renders them by default: `"<think>\n" reasoning
   "\n</think>\n\n" content`, the reasoning from the message's `reasoning_content` (a string; then neither may
   contain `</think>`), else from its content split at its last `</think>` (none: an empty think block). Tested
-  (`q35/synth-q35-27b-f32/server38/*`): each request's prompt == `runq -m render` of its messages, the greedy reply
+  (`q35/synth-q35-27b-f32/server38/*`): each request's prompt == `gwenedeg -m render` of its messages, the greedy reply
   == the CLI's.
 - **Tool calls** (`src/tools.c`; the Qwen3.5 and Qwen3.8 templates; Qwen3's older variants use another format and get a
   400). A request with `tools` (OpenAI's function tools), a `tool` message or an assistant message with `tool_calls` is
@@ -185,7 +185,7 @@ down), 504. Not supported: tools with Qwen3's templates (400), `tool_choice` req
   shared, so a short prompt does not wait for a long one), then the sampling of every row with each
   request's settings and token mask. Requests join at the next step (FIFO, at most `--parallel`) and leave
   when done; a request's output does not depend on what it is batched with (each has its own sequence and
-  RNG; tested against `runq -m chat` and against the same request alone). Connections have their own
+  RNG; tested against `gwenedeg -m chat` and against the same request alone). Connections have their own
   threads, so `/health` and queueing never wait on a forward pass. A client that disconnects cancels its
   request at the next step (the others continue). SIGINT / SIGTERM: stop accepting, reject the queue
   (503), let the running requests finish (up to 10 s), exit.
@@ -201,7 +201,7 @@ down), 504. Not supported: tools with Qwen3's templates (400), `tool_choice` req
 As the judge of LiteLLM's complexity router (`auto_router/complexity_router`, `classifier_type: llm`,
 LiteLLM 1.105): LiteLLM sends the rubric as the system message, `\nClassify this message:\n<prompt>` as the
 user message, and `response_format` = its `TierClassification` model's JSON schema (an inline enum of the
-four tiers); runq answers `{"tier": "..."}`. The judge needs no thinking and `temperature: 0`:
+four tiers); Gwenedeg answers `{"tier": "..."}`. The judge needs no thinking and `temperature: 0`:
 
 ```yaml
 model_list:
@@ -212,19 +212,19 @@ model_list:
         classifier_type: llm
         classifier_context_window_size: 0     # judge the current message only (shorter prompts)
         classifier_llm_config:
-          model: runq-judge
+          model: gwenedeg-judge
           timeout_ms: 10000                    # default 3000; a timeout opens a 30 s circuit breaker
         tiers: { SIMPLE: small-model, MEDIUM: small-model, COMPLEX: big-model, REASONING: big-model }
-  - model_name: runq-judge
+  - model_name: gwenedeg-judge
     litellm_params:
-      model: openai/runq                       # openai/<the server's --name>
+      model: openai/gwenedeg                       # openai/<the server's --name>
       api_base: http://127.0.0.1:8080/v1
       api_key: none
       temperature: 0
 ```
 
 `LITELLM_VENV=/path/to/venv scripts/litellm_e2e.sh` runs this chain with a scratch LiteLLM proxy from a venv
-with LiteLLM's proxy installed (tested with 1.105.0; runq as the judge and as the tier models; a second pass sends the same prompts concurrently). Judge latency on the 16-vCPU VM (8 threads,
+with LiteLLM's proxy installed (tested with 1.105.0; Gwenedeg as the judge and as the tier models; a second pass sends the same prompts concurrently). Judge latency on the 16-vCPU VM (8 threads,
 Q8_0 GGUF): ~180 ms for the first request (the 265-token prompt), then 15-27 ms (the rubric cached). Quality (`scripts/eval_router.py`, 80 labeled
 prompts, `scripts/router_eval.jsonl`, written for this project; Step 9): Qwen3-0.6B is a weak judge, 51-71% depending on rubric and quantization (it
 almost never says REASONING); Qwen3-1.7B Q8_0 79-88% at ~55 ms per classification; Qwen3-4B Q4_K_M
@@ -233,7 +233,7 @@ Q4_K_M 88-92% at ~130 ms, Qwen3-8B Q4_K_M 92% at ~260 ms.
 
 ## Speculative decoding (TODO S8, G7)
 
-`runq serve MODEL --draft DRAFT` (or `--lookup N` alone): the decoding requests' next tokens are guessed (by the draft
+`gwenedeg serve MODEL --draft DRAFT` (or `--lookup N` alone): the decoding requests' next tokens are guessed (by the draft
 model, or copied from the context by the prompt lookup) and verified in the same batched passes as the other requests'
 rows; every output is exactly plain decoding's: the tokens, seeded sampling (each request's RNG draws as plain decoding's),
 logprobs (the verify rows' logits are bitwise the decode steps'), streaming, stop strings, `max_tokens`, the end of the
@@ -253,7 +253,7 @@ budget (a prompt, a spell of lookup or plain steps), while the model is in use. 
 verify keeps that row's checkpoint as the reasoning's end); the draft mirrors the slot's planned checkpoints. Not for
 constrained (`json_schema`) or `force_reply` requests (plain).
 
-**The cost model** (G7, `RqPassCost` in `src/runq.h`): a pass of R rows costs `t_w f(R) + att S1 + att_x S2` (t_w: a
+**The cost model** (G7, `RqPassCost` in `src/gwenedeg.h`): a pass of R rows costs `t_w f(R) + att S1 + att_x S2` (t_w: a
 decode step's weights part; f(R): its growth with the rows, f(1) = 1; att: per position of context for the first row of
 a segment; att_x: per position for each further row, which shares the first one's read of the KV cache), for the target
 and for the draft, calibrated at the start (`--spec-calibrate`, the fastest of 5 runs per configuration) or estimated
@@ -315,8 +315,8 @@ against a server on the same file without `--draft` (run first, stopped first: o
 drafter's checks: every reply's `mtp_approx` 0 (a restart exactly at a divergence: at most 1), the next turn after a
 `"speculative": false` and after a constrained one, the copy paths (from a running request, from an idle slot under slot
 affinity), a cancelled stream retried, the trained block's guesses accepted, the views at rest after every step
-(`RUNQ_TEST_MTP_CHECK=1`: no `[engine] bug:` line) and every finished request's view == a fresh lockstep run
-(`RUNQ_TEST_MTP_DUMP=DIR` + `api_test --mtp-seqcheck`; on a 27B, `--one-server --mtp-dump-max N`: one check at a time,
+(`GWENEDEG_TEST_MTP_CHECK=1`: no `[engine] bug:` line) and every finished request's view == a fresh lockstep run
+(`GWENEDEG_TEST_MTP_DUMP=DIR` + `api_test --mtp-seqcheck`; on a 27B, `--one-server --mtp-dump-max N`: one check at a time,
 every 4th dump kept up to N, a 27B dump being ~0.8 GB); `--admit-chunk --draft mtp`: the swap with the view
 (`mtp_approx` 0 after a swap, a lookup-only request's view swapped too); `--draft mtp -G 0` == no draft.
 
@@ -352,7 +352,7 @@ with a 4-token lookup match the lookup, 4 guesses at 512 down to 2 at 98k (x2.15
 
 **The tool** (TODO G0 (a)): `scripts/replay_sessions.py --model GGUF --ctx N --session FILE | --pick N` replays pi's
 recorded sessions (`~/.pi/agent/sessions/*/*.jsonl`: read locally, never copied; the results are numbers only, under
-`/var/tmp/runq-replay`) against a fresh `runq serve`, request by request, as pi sends them: `scripts/replay_pi.mjs` runs
+`/var/tmp/gwenedeg-replay`) against a fresh `gwenedeg serve`, request by request, as pi sends them: `scripts/replay_pi.mjs` runs
 pi's own code from its install (pi-coding-agent's session context and `convertToLlm`, pi-ai's `openai-completions`
 provider: the same request body, the same SSE parsing into pi's assistant message), with the provider entry above and
 the server's context as the model's window, so pi's compaction triggers where it would (`shouldCompact`,
@@ -397,7 +397,7 @@ include a 71k-token re-prefill after pi added a tool, below.)
   template's text (tested == HF's ids); reusing the generated tokens for that span would make a request's output
   depend on what was cached (TODO, G5). The `</think>` checkpoint bounds case (2) to the content and calls when the
   difference is after the reasoning (`tools/ckpt_think`). Not seen: reasoning or content re-serialized differently
-  (`reasoning_content` round-trips: pi sends back what it got, joined with `\n`; runq trims as the template does),
+  (`reasoning_content` round-trips: pi sends back what it got, joined with `\n`; Gwenedeg trims as the template does),
   tool-call arguments formatted differently (the template renders the parsed values, not pi's JSON text).
 - **Qwen3.5's template drops a turn's reasoning at the next user query** (Qwen3.8 keeps it): that request leaves the
   cache at the turn's first reply. Before: no checkpoint below it but the header's, so back to 0; after: the turn's
@@ -414,7 +414,7 @@ include a 71k-token re-prefill after pi added a tool, below.)
   opens the system block).
 - **An aborted reply** (pi drops it from the history): back to that reply's header.
 
-**For the 27B agent setup**: `runq serve ... --timeout 0` (a compaction's next request prefills for ~16-19 min on the
+**For the 27B agent setup**: `gwenedeg serve ... --timeout 0` (a compaction's next request prefills for ~16-19 min on the
 27B at 8 threads, past the default 600 s); the SSE keep-alive comments keep pi's `httpIdleTimeoutMs` (300 s) from
 ending long prefills; two slots if the memory allows them (`--kv-mem`: the summary request then does not take the
 session's slot, and the next request reuses the system block; with one slot it is prefilled again: ~8k tokens, ~3
@@ -430,12 +430,12 @@ measurements in [qwen38-speculative.md](notes/qwen38-speculative.md): G3, "Long-
 box's other services stopped (~24 GiB available):
 
 ```sh
-OMP_NUM_THREADS=16 runq serve models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q3_K_M.gguf -c 98304 -k bf16-dot \
+OMP_NUM_THREADS=16 gwenedeg serve models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q3_K_M.gguf -c 98304 -k bf16-dot \
     --draft models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf --slots 1 --parallel 1 --checkpoints 3 \
     --spec-calibrate 32768 --timeout 0 --name qwen3.8-27b --port 18080
 ```
 
-- **The file: Q3_K_M** (`scripts/download_models.py 3.8-27b-q3km`). At `-c 98304` runq's estimate is 19.45 GiB (weights
+- **The file: Q3_K_M** (`scripts/download_models.py 3.8-27b-q3km`). At `-c 98304` Gwenedeg's estimate is 19.45 GiB (weights
   12.40, a 96k sequence: KV 6.0 + the recurrent state and 3 checkpoints), + the draft at that context (2.03 GiB: its
   sequence 1.23) and 0.66 GiB for the verify rows' checkpoints: ~22.1 GiB, ~2 GiB to spare. The Q4_K_M needs ~25 GiB
   there (it fits at 96k only without the draft and with ~1 GiB to spare, or with the draft up to ~64k). The price:
@@ -464,13 +464,13 @@ OMP_NUM_THREADS=16 runq serve models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q3_K_M.gguf -c
 **pi** (1.4.0; a temporary agent directory, `PI_CODING_AGENT_DIR=DIR`, so `~/.pi` is untouched): `DIR/models.json`
 
 ```json
-{"providers": {"runq": {"baseUrl": "http://127.0.0.1:18080/v1", "api": "openai-completions", "apiKey": "none",
+{"providers": {"gwenedeg": {"baseUrl": "http://127.0.0.1:18080/v1", "api": "openai-completions", "apiKey": "none",
   "compat": {"supportsDeveloperRole": false, "supportsReasoningEffort": true, "supportsStore": false, "maxTokensField": "max_tokens"},
-  "models": [{"id": "qwen3.8-27b", "name": "Qwen3.8-27B (runq)", "reasoning": true, "input": ["text"],
+  "models": [{"id": "qwen3.8-27b", "name": "Qwen3.8-27B (gwenedeg)", "reasoning": true, "input": ["text"],
               "contextWindow": 98304, "maxTokens": 16384, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}}]}}}
 ```
 
-and `DIR/settings.json` `{"defaultProvider": "runq", "defaultModel": "qwen3.8-27b", "defaultThinkingLevel": "medium",
+and `DIR/settings.json` `{"defaultProvider": "gwenedeg", "defaultModel": "qwen3.8-27b", "defaultThinkingLevel": "medium",
 "compaction": {"enabled": true, "reserveTokens": 16384, "keepRecentTokens": 8000}}`: `keepRecentTokens` 8,000 instead
 of pi's 20,000 makes a compaction's next request ~12k tokens shorter (~4-7 min less on the 27B); `reserveTokens` 16,384
 (pi's default) compacts at ~82k. `maxTokens` matters for speculation: the server follows a request with the draft only

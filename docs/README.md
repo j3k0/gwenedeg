@@ -5,7 +5,7 @@ start. This index lists everything else, by who it is for. The kind says how to 
 the code as it is; a **design** explains why and records what was measured while deciding; **history** is a dated record
 that is not rewritten when the code moves on.
 
-## Using runq
+## Using gwenedeg
 
 | document | kind | contents |
 |---|---|---|
@@ -17,7 +17,7 @@ that is not rewritten when the code moves on.
 
 | document | kind | contents |
 |---|---|---|
-| [server.md](server.md) | reference | `runq serve`: flags, endpoints and request fields, tool calls, prefix reuse, constrained decoding, speculation, agent sessions with pi, the Qwen3.8-27B setup, LiteLLM judge, limitations |
+| [server.md](server.md) | reference | `gwenedeg serve`: flags, endpoints and request fields, tool calls, prefix reuse, constrained decoding, speculation, agent sessions with pi, the Qwen3.8-27B setup, LiteLLM judge, limitations |
 | [memory-admission.md](memory-admission.md) | design + reference | `--admit worst / bound / chunk`: leases, the live budget, parking, swapping to disk, yielding; options, tests; the measurements still open |
 | [kv-disk.md](kv-disk.md) | reference | the KV cache's disk tier (`--kv-disk`): what is saved and when, file layout and locking, the MTP view's files, measured save and load times |
 
@@ -25,7 +25,7 @@ that is not rewritten when the code moves on.
 
 | document | kind | contents |
 |---|---|---|
-| [library.md](library.md) | reference | the C API (`src/runq.h`): models, sequences, contexts, the forward passes; the source file map |
+| [library.md](library.md) | reference | the C API (`src/gwenedeg.h`): models, sequences, contexts, the forward passes; the source file map |
 | [iquants.md](iquants.md) | design + reference | Q2_K and the i-quants: formats, arithmetic, AVX-512 and NEON kernels, `--repack`, measurements, what is not done |
 | [kv-quant.md](kv-quant.md) | design + reference | the 8-bit and 4-bit KV caches: definition, quality (KL vs HF), speed |
 | [qwen35.md](qwen35.md) | design | Qwen3.5's architecture and GGUF layout, design decisions, performance, long context |
@@ -48,6 +48,6 @@ that is not rewritten when the code moves on.
   that name different sessions.
 - Claims of speed against another engine exist for one case only: Qwen3.8-27B IQ3_S against mainline llama.cpp and
   ik_llama.cpp on one VM
-  ([BENCHMARKS.md](../BENCHMARKS.md#qwen38-27b-iq3_s-runq-vs-llamacpp-vs-ik_llamacpp-server-workloads-2026-11-22)).
+  ([BENCHMARKS.md](../BENCHMARKS.md#qwen38-27b-iq3_s-gwenedeg-vs-llamacpp-vs-ik_llamacpp-server-workloads-2026-11-22)).
 - "Step N", "S9c", "G7" and similar labels are the development steps of [TODO.md](../TODO.md) and the History table of
   [DEVELOPMENT.md](DEVELOPMENT.md#history); the old development log is in git: `git show b3e48a3:TODO.md`.

@@ -7,7 +7,7 @@ swapping out to disk as the guaranteed fallback. Steps 1-3 are written so that s
 the renewal and the swap. Each section's "As built" says where the code departs from the plan.
 
 What exists:
-- **Library** (runq.h, src/forward.c): `RqSeq.hwm`, `rq_seq_release`, `rq_seq_resident`, `rq_seq_kv_bytes`.
+- **Library** (gwenedeg.h, src/forward.c): `RqSeq.hwm`, `rq_seq_release`, `rq_seq_resident`, `rq_seq_kv_bytes`.
 - **`--admit worst`** (the default): today's pool, unchanged but for the calibration's release.
 - **`--admit bound`** (steps 1-3): leases of prompt + `max_tokens`, `committed` within `--kv-mem`, the LRU reclaim of
   idle slots (saved first with `--kv-disk`), strict FIFO waits, the live budget (MemAvailable - `--admit-margin` -
@@ -185,7 +185,7 @@ That needs `vm.overcommit_memory` 0 or 1 (this box: 0). Under 2 the `mmap` fails
 
 ## Step 2: giving memory back
 
-**New library calls** (runq.h, src/forward.c):
+**New library calls** (gwenedeg.h, src/forward.c):
 
 ```c
 // gives back the memory of the KV blocks wholly past max(keep, len) (madvise MADV_DONTNEED; they read as zeros
@@ -266,7 +266,7 @@ As built (engine.c, `mem_admit`, `mem_avail`, `mem_publish`):
 - Between two readings of /proc/meminfo, what the slots touched (or gave back) since the last one is taken out of (put
   back into) it: `MemAvailable ~ read + res(at the read) - res(now)`, so a pass's new pages are not counted twice (in
   the stale reading and no longer in `promised`).
-- `RUNQ_TEST_MEMAVAILABLE=FILE` (tests only) is read at each use, as is (no cache, no adjustment); a file that cannot
+- `GWENEDEG_TEST_MEMAVAILABLE=FILE` (tests only) is read at each use, as is (no cache, no adjustment); a file that cannot
   be read means no live budget.
 - The warning (`MemAvailable - margin` below `promised` while jobs run) is checked at every engine step, at most once a
   minute in the log; `/health`'s `mem` is a snapshot the engine thread publishes under `mu` at each step (it never
@@ -442,13 +442,13 @@ As built (engine.c, "the swap": `mem_swap_out`, `mem_swap_in`, `sw_out`, `sw_in`
 - **Prefill:** a job can be swapped out between two passes of its prefill (the file holds the positions prefilled so
   far; `-v` adds `prefilling: N of M prompt tokens`); it continues the prefill after the swap-in (the chunking does not
   change the logits). A job not prefilled at all has no file (its RNG is kept in the `Run`).
-- `RUNQ_TEST_SWAP_DELAY=s` (tests only): a sleep in each swap-out, so that a swap lasts (the SSE check).
-  `RUNQ_TEST_SWAP_FAIL=FILE` (tests only): read at each swap; `draft-save` / `draft-load` in it make the draft's save /
+- `GWENEDEG_TEST_SWAP_DELAY=s` (tests only): a sleep in each swap-out, so that a swap lasts (the SSE check).
+  `GWENEDEG_TEST_SWAP_FAIL=FILE` (tests only): read at each swap; `draft-save` / `draft-load` in it make the draft's save /
   load fail (logged: `[engine] job N: the draft's sequence could not be swapped out ...` / `... back in ...`).
 
 ### The rest of the job's life
 
-- **Streaming:** the SSE keep-alive (`: keep-alive` every 15 s, `RUNQ_SSE_KEEPALIVE`) already covers pauses and
+- **Streaming:** the SSE keep-alive (`: keep-alive` every 15 s, `GWENEDEG_SSE_KEEPALIVE`) already covers pauses and
   swaps (the connection thread waits on its job, 0.1 s at a time, never on the engine); non-streaming clients just wait
   longer.
 - **`--timeout`:** the deadline counts the paused and swapped-out time, as it counts the queue's today.
@@ -540,7 +540,7 @@ As built (engine.c, `mem_yield`, `mem_resume`, in `mem_renewals`; `--admit-yield
     first and the conversation's next request loads them back (`cached` > 0).
   - nothing running: a job that needs everything is admitted after reclaiming every idle slot.
   - RssAnon of the server never exceeds weights + runtime + `committed` + a page per range.
-- **Live budget:** a test hook, `RUNQ_TEST_MEMAVAILABLE=FILE` (bytes, read at each admission instead of
+- **Live budget:** a test hook, `GWENEDEG_TEST_MEMAVAILABLE=FILE` (bytes, read at each admission instead of
   /proc/meminfo): lowering it makes new jobs wait (and with `chunk`, renewals swap), raising it lets them in.
 - **server_test, group `admit-chunk`** (`--admit chunk --admit-chunk 16 --kv-disk`, a `--kv-mem` where the replies'
   growth does not fit together):
@@ -554,11 +554,11 @@ As built (engine.c, `mem_yield`, `mem_resume`, in `mem_renewals`; `--admit-yield
   - SSE: keep-alive comments arrive during a swap.
   - as built, also: a swap-out that fails (a 500 for that request only); a swap mid-prefill (`-c 4096 --chunk 8`, a
     ~2,400-token prompt swapped out by the oldest's block and continued after the swap-in); the draft's save, then its
-    load, made to fail (`RUNQ_TEST_SWAP_FAIL`): the draft reset, the outputs unchanged; `--admit-yield` (above).
+    load, made to fail (`GWENEDEG_TEST_SWAP_FAIL`): the draft reset, the outputs unchanged; `--admit-yield` (above).
 - **With the MTP view** (TODO S9c.3 / S9c.4; tests/check_spec.py, the spec group, on the ISTA-shaped synthetic file):
   `spec_server/mtp_admit/*` (`server_test.py --admit --draft mtp`: the budgets from the startup line as above, so the
   view's terms enter by themselves; `admit/mtp_terms`: the leases' KV per position == the target's + the view's, the
-  state == the target's; no `[engine] bug:` line under `RUNQ_TEST_MTP_CHECK`) and `spec_server/mtp_admit_chunk/*` (the
+  state == the target's; no `[engine] bug:` line under `GWENEDEG_TEST_MTP_CHECK`) and `spec_server/mtp_admit_chunk/*` (the
   view swapped with every job, its kept state in the version 2 file).
 - `--admit worst` (the default): every existing group unchanged.
 

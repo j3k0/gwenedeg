@@ -8,7 +8,7 @@ sequence's logits never depend on the path, the thread count or what it is batch
 
 ## A classification endpoint that returns label probabilities
 
-`runq serve` already answers a constrained classification in one prefill: forced tokens are never decoded, and the
+`gwenedeg serve` already answers a constrained classification in one prefill: forced tokens are never decoded, and the
 decision step's masked softmax gives the probability of each label (`scripts/eval_router.py` sums it per label).
 An endpoint could return that distribution directly, without generated text, e.g. a request with a prompt and a
 list of choices, answering with per-choice probabilities. LiteLLM's auto-router docs describe one such protocol

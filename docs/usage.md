@@ -1,6 +1,6 @@
-# Using runq: command line, memory, speculative decoding, KV cache types
+# Using gwenedeg: command line, memory, speculative decoding, KV cache types
 
-For users of the `runq` binary. The server has its own reference, [server.md](server.md); the models and their
+For users of the `gwenedeg` binary. The server has its own reference, [server.md](server.md); the models and their
 files are in [models.md](models.md); the C library is in [library.md](library.md). The tables here come from the
 README as it was before the documentation was reorganised (2026-11-21); every measurement keeps its date and setup.
 
@@ -10,14 +10,14 @@ Requirements: `make` and gcc (Linux) or Xcode's command-line tools (macOS). Pyth
 library only) runs the model download script.
 
 ```sh
-make                                      # -> ./runq   (make generic: ./runq-generic, make debug: ./runq-debug)
+make                                      # -> ./gwenedeg   (make generic: ./gwenedeg-generic, make debug: ./gwenedeg-debug)
 scripts/download_models.py q8gguf         # models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf (639 MB), pinned + checksummed
 G=models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf
 
-./runq $G -c 4096                         # interactive chat: one message per line, empty line / EOF ends
-./runq $G -c 4096 -t 0 -n 200 -i "Why is the sky blue?"     # one turn, greedy, at most 200 tokens
-./runq $G -c 4096 -r 1                    # with thinking (Qwen3's reasoning mode)
-./runq serve $G                           # OpenAI-compatible server on http://127.0.0.1:8080/v1
+./gwenedeg $G -c 4096                         # interactive chat: one message per line, empty line / EOF ends
+./gwenedeg $G -c 4096 -t 0 -n 200 -i "Why is the sky blue?"     # one turn, greedy, at most 200 tokens
+./gwenedeg $G -c 4096 -r 1                    # with thinking (Qwen3's reasoning mode)
+./gwenedeg serve $G                           # OpenAI-compatible server on http://127.0.0.1:8080/v1
 
 curl -s localhost:8080/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "Hi!"}], "max_tokens": 32}'
@@ -29,7 +29,7 @@ pinned Hugging Face revision.
 
 ## Command line options
 
-CLI options (`./runq` without arguments prints them all):
+CLI options (`./gwenedeg` without arguments prints them all):
 
 | option | |
 |---|---|
@@ -57,7 +57,7 @@ CLI options (`./runq` without arguments prints them all):
 
 Before reading any weight, the loader estimates what the run needs from the file's tensor directory:
 the repacked weights, the runtime (tokenizer, metadata, a compute context of 512 rows) and one sequence of `-c`
-positions (its whole KV cache, and for Qwen3.5 the recurrent state with its 2 checkpoints; `runq serve`: its
+positions (its whole KV cache, and for Qwen3.5 the recurrent state with its 2 checkpoints; `gwenedeg serve`: its
 `--checkpoints`, default 4). It refuses the file
 with a one-line message and exit status 1 when that exceeds MemAvailable (Linux, the host's: a cgroup limit is not read; no check elsewhere
 unless `--mem` gives a budget): a smaller `-c` lowers it, `--mem 0` loads anyway. The estimate is within 3% of the peak RSS
@@ -98,7 +98,7 @@ thinking, 87 on code at temperature 1, against 70-78 plain (1.15-1.5x; 45-80% of
 guesses the same but its step is slower (5.6 vs 4.2 ms). Qwen3.5 targets and drafts work too (rolled back through
 state checkpoints). **Qwen3.8-27B Q4_K_M** with Qwen3.5-0.8B Q4_K_M as the draft, 8 threads, 256 tokens, the mean of
 chat, code, math and summary prompts: 8.7 tok/s plain; thinking on 13.2 at `-G 3`, 14.1 at `-G 6 --tau 0.4` (1.6x),
-thinking off 16.6 / 17.2 (2.0x; code and math 19-22); 12 threads: up to 15.3 / 20.6. In `runq serve` too ([server.md](server.md#speculative-decoding-todo-s8-g7)).
+thinking off 16.6 / 17.2 (2.0x; code and math 19-22); 12 threads: up to 15.3 / 20.6. In `gwenedeg serve` too ([server.md](server.md#speculative-decoding-todo-s8-g7)).
 `--spec auto` (opt-in in the CLI) chooses the source and the guess count per pass from a cost model calibrated at the
 start (TODO G7).
 Measurements: [docs/notes/qwen38-speculative.md](notes/qwen38-speculative.md#the-27b-bring-up-s7).
@@ -111,7 +111,7 @@ no second 64-layer state per sequence; the output is still plain decoding's. On 
 the 0.8B draft: IQ3_S-mtp 12.8 vs 11.1 tok/s at each one's best fixed settings (`-D mtp -G 6 --tau 0.5` vs `-G 6 --tau
 0.4`; 1.6x plain), Unsloth's Q4_K_M 17.1 vs 14.1 (2.0x plain); with thinking off the two are even (TODO S9d,
 [docs/notes/qwen38-speculative.md](notes/qwen38-speculative.md#the-27bs-acceptance-and-the-go-todo-s9d2-2026-11-09)).
-`runq serve --draft mtp` runs it too (TODO S9c.3: every request followed by the view, its guesses batched across
+`gwenedeg serve --draft mtp` runs it too (TODO S9c.3: every request followed by the view, its guesses batched across
 requests; [docs/server.md](server.md#speculative-decoding-todo-s8-g7)). Measured on the 27B in the server (S9c.G,
 2026-11-10, ISTA's IQ3_S-mtp, 14 threads, `--parallel 4 --admit bound`, against the 0.8B draft at `-G 5 --tau 0.4`):
 `--draft mtp -G 6 --tau 0.5` +14% tok/s at one client with thinking on, +18% with it off, +1% at 4 clients, outputs
@@ -126,7 +126,7 @@ On recorded agentic sessions it guesses ~1.5 tokens per pass alone (the 0.8B dra
 
 ## KV cache types
 
-`-k TYPE` (the CLI and `runq serve`). Every type is bit-exact across batches, threads and builds; they differ in memory,
+`-k TYPE` (the CLI and `gwenedeg serve`). Every type is bit-exact across batches, threads and builds; they differ in memory,
 speed and distance from the fp32 model:
 
 | `-k` | KV cache | memory per position | notes |
@@ -137,7 +137,7 @@ speed and distance from the fp32 model:
 | `bf16-dot`, `f16-dot` | bf16 / f16 | as `bf16` / `f16` | the attention's dot products as `vdpbf16ps` (below); opt-in |
 | `q8`, `q4`, `q4k4` (each also as `-dot`) | Walsh-Hadamard rotated, 8-bit / 8-bit K + 4-bit V / 4-bit K + V, per 32 dims | 0.53 / 0.41 / 0.28 of `f16`'s | `q4k4`: Qwen3.5 / 3.8 only; [kv-quant.md](kv-quant.md) |
 
-**Long context: `-k bf16-dot`** (opt-in; `runq serve -k bf16-dot` too). The attention's two dot products as the
+**Long context: `-k bf16-dot`** (opt-in; `gwenedeg serve -k bf16-dot` too). The attention's two dot products as the
 `vdpbf16ps` instruction computes them, on q, K, the softmax weights and V rounded to bf16: twice the dot-product rate
 on CPUs with AVX512_BF16 (AMD Zen 4, Intel Sapphire Rapids; elsewhere the same results at the fp32 rate; the
 instruction's exact rounding was verified on Zen 4, `make bf16dp-test` checks another CPU). On the EPYC VM, a
@@ -175,7 +175,7 @@ on Qwen3.5 but unusable on Qwen3 (4-bit K: top-1 50%). Decode at 64k on Saluki ~
   goldens recorded on x86 fail (8 of them), because the compilers round some Q8_0 sums differently.
   Everything else passes there, but the goldens need an arm64 baseline, and the Qwen3 1.7B-8B fixes have
   not been re-run on the Mac yet (docs/DEVELOPMENT.md).
-- `runq serve`: no TLS, no images, `n` = 1, no `json_object` or free-form string constraints; tool calls only
+- `gwenedeg serve`: no TLS, no images, `n` = 1, no `json_object` or free-form string constraints; tool calls only
   with the Qwen3.5 / Qwen3.8 templates (not Qwen3's), `tool_choice` auto / none only; the KV memory is a fixed
   pool of slots (no paging).
 - CPU only; the CLI and the server run one model per process, and its draft model for speculative decoding (the library

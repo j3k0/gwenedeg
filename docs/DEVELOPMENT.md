@@ -14,7 +14,7 @@ kept. "Step N" refers to the development log ([History](#history)); open work is
 
 ## Qwen3-0.6B: which file to use
 
-The GGUF file is all runq needs: weights, hyperparameters, tokenizer (from its metadata) and the
+The GGUF file is all gwenedeg needs: weights, hyperparameters, tokenizer (from its metadata) and the
 chat templates (built in). The Q4_K_M GGUF (`scripts/download_models.py q4km`, 397 MB) works the same
 way. Which file to use (measured 2026-10-25 on the 16-vCPU dev box, Steps 6a, 6b-1, 6b-2, 7a, 7b):
 
@@ -37,7 +37,7 @@ way. Which file to use (measured 2026-10-25 on the 16-vCPU dev box, Steps 6a, 6b
   reference engine, mynah-slm: +4.7%), e.g. it answers "Sydney" for the capital of Australia.
 
 GGUF vs .bin: both Q8_0. The GGUF has 32-weight groups with fp16 scales (fp32 once loaded,
-exactly), the .bin 64-weight groups with fp32 scales; runq quantizes the activations to int8 in
+exactly), the .bin 64-weight groups with fp32 scales; Gwenedeg quantizes the activations to int8 in
 groups of the same size. The GGUF is closer to HF: perplexity +0.19% vs +0.85% over fp32, logits
 pooled 1-cos 6.1e-4 vs 9.0e-4 (Step 6a). Prefill is ~4-8% slower (twice as many
 float folds in the GEMM), decode ~5% (the packed weights are ~6% larger: fp32 scales per 32).
@@ -50,7 +50,7 @@ Piped input works the same way (each line echoed after the `> ` prompt), e.g. wi
 deterministic transcript:
 
 ```sh
-printf 'My name is Ada.\nWhat is my name?\n' | ./runq models/Qwen3-0.6B-q8.bin -c 4096 -t 0
+printf 'My name is Ada.\nWhat is my name?\n' | ./gwenedeg models/Qwen3-0.6B-q8.bin -c 4096 -t 0
 ```
 
 - Each turn prefills only what is new: the `<|im_end|>` that ended the previous answer, `\n`, and
@@ -82,7 +82,7 @@ arithmetic is fp32 on the exactly converted values (Step 7b). `-k bf16-dot` / `f
 same caches with the bf16 dot-product attention (`vdpbf16ps`: ~1.7x the attention at long context, KL about a bf16
 cache's on Qwen3, within f16's noise on Qwen3.5; [usage.md](usage.md#kv-cache-types); docs/notes/qwen38-speculative.md, "G4 (b)").
 
-Threads: without `OMP_NUM_THREADS`, runq uses nproc - nproc/8 threads (Apple Silicon with efficiency
+Threads: without `OMP_NUM_THREADS`, gwenedeg uses nproc - nproc/8 threads (Apple Silicon with efficiency
 cores: the performance cores, see the M1 Pro notes under Benchmarks; 14 on the 16-vCPU dev box).
 Decode is memory-bound: 12-14 threads saturate the bandwidth there (~190-210 tok/s Q8_0 GGUF,
 ~280-350 Q4_K_M), 8 give ~90% of it; prefill scales to 14 (~2,580 tok/s at 439 tokens vs ~2,400 at 12).
@@ -104,7 +104,7 @@ conversation goes.
   `forward_batch()`, bit-identical to the token-by-token path;
   AVX-512 VNNI kernels for the GEMM (prefill) and GEMV (decode) on weights repacked at load,
   and an AVX-512 attention (shared by decode and prefill) on a tiled KV cache
-  (`src/kernels_avx512.h`, compile-time selection; `-DRUNQ_GENERIC` / `make generic` or a CPU
+  (`src/kernels_avx512.h`, compile-time selection; `-DGWENEDEG_GENERIC` / `make generic` or a CPU
   without AVX-512 gives the generic C kernels, bit-identical results);
   NEON kernels for Q8_0, Q3_K .. Q6_K and the attention (f32 / bf16 / f16 KV cache) on AArch64 with
   the dot product extension (`src/kernels_neon.h`; tested on macOS only), bit-identical to the generic ones
@@ -129,7 +129,7 @@ conversation goes.
   token embedding rows dequantized at lookup from the Q8_0 table (upstream kept a 622 MB float
   copy) and the weight repacking done from `pread` in one parallel loop: startup ~0.5 -> ~0.06 s,
   peak RSS 1.36 -> ~0.63-0.74 GB;
-  test hooks `-m tokenize`, `-m logits -o <file>` and `RUNQ_CHAT_DUMP` (see `tests/README.md`);
+  test hooks `-m tokenize`, `-m logits -o <file>` and `GWENEDEG_CHAT_DUMP` (see `tests/README.md`);
   GGUF Q8_0 loading (format detected by magic): a bounds-checked GGUF v2/v3 reader (every
   count, length and offset validated; corrupt files give a clean error), the hyperparameters from
   the `qwen3.*` metadata, the tensors by llama.cpp name, the Q8_0 blocks (group 32, fp16 scales)
@@ -144,10 +144,10 @@ conversation goes.
   (bit-identical to gguf-py), test hook `-m dequant`;
   the library API (Step 8: model / sequence / compute context, multi-sequence batched passes, errors
   returned instead of `exit()`, no printing in the library), split into modules;
-  `runq serve` (Step 9): an OpenAI-compatible HTTP server with prefix KV reuse and constrained decoding
+  `gwenedeg serve` (Step 9): an OpenAI-compatible HTTP server with prefix KV reuse and constrained decoding
   for finite JSON schemas (a hand-written HTTP/1.1 server and JSON parser / writer, no dependencies);
   batched decode of several sequences (Step 10a): small-batch AVX-512 kernels, a decode-rows worker,
-  batched sampling, bit-identical to decoding each sequence alone; continuous batching in `runq serve`
+  batched sampling, bit-identical to decoding each sequence alone; continuous batching in `gwenedeg serve`
   (Step 10b).
 - `src/kquants.h`: the Q3_K / Q4_K / Q5_K / Q6_K block formats, their dequantization, the repacked layouts (Q3P,
   Q4P, Q5P, Q6P) and the generic kernels; the arithmetic of a K-quant matmul output is defined there.
@@ -157,7 +157,7 @@ conversation goes.
   attention (`vdpbf16ps`; its definition, the bf16-dot V layout; its C twin is in forward.c, `tests/bf16dp_test.c` checks it
   against the instruction).
 - `src/threads.h`: the thread pool and the phase synchronization (design and measurements in its
-  header comment; OpenMP's parallel region instead with `-DRUNQ_NO_POOL` and on Windows).
+  header comment; OpenMP's parallel region instead with `-DGWENEDEG_NO_POOL` and on Windows).
 - `src/unicode_tables.h`: \p{L}/\p{N}/\s ranges for the pre-tokenizer, generated by
   `tools/gen_unicode_tables.py` (Python's unicodedata, Unicode 15.1).
 - `src/unicode_nfc.h`: NFC tables (combining classes, decompositions, compositions, quick check),
@@ -184,8 +184,8 @@ Full tables, methodology and baselines: [BENCHMARKS.md](../BENCHMARKS.md) (one s
 | 12 (the default then; 14 since Step 7a) | 2,758 / 1,976 / 1,531 tok/s | 170 |
 
 Same session: upstream qwen3.c decodes at 101 / 106 tok/s (8 / 12 threads) with ~99 tok/s token-by-token
-prefill; mynah-slm at ~34 (Q8_0 and Q4_K_M). Perplexity vs HF fp32: runq Q8_0 +0.8%, Q4_K_M +4.7%
-(mynah-slm); runq on the Q8_0 GGUF +0.19% (Step 6a, measured later), on the Q4_K_M GGUF
+prefill; mynah-slm at ~34 (Q8_0 and Q4_K_M). Perplexity vs HF fp32: gwenedeg Q8_0 +0.8%, Q4_K_M +4.7%
+(mynah-slm); Gwenedeg on the Q8_0 GGUF +0.19% (Step 6a, measured later), on the Q4_K_M GGUF
 +4.9% (Step 6b-1). Q4_K_M with the AVX-512 kernels (Step 6b-2, not in BENCHMARKS.md yet): see the
 table under "Qwen3-0.6B: which file to use" above. Step 7a (threading, not in BENCHMARKS.md yet; same box, later
 session, interleaved with the Step 6b-2 binary, best / median of 8): decode Q8_0 GGUF 8 / 12 / 16 threads
@@ -194,7 +194,7 @@ within ~5% at 8-14 threads, no collapse at 16. Step 7b (KV cache, not in BENCHMA
 interleaved with the Step 7a binary, best of 5, load 8-13), Q8_0 GGUF / Q4_K_M, f16 cache: decode after a
 3,000-token prompt 8 threads 90 -> 128 / 103 -> 158 tok/s, 12 threads 114 -> 147 / 120 -> 180; after 1,500
 tokens 8 threads 130 -> 164 / 153 -> 220; prefill 450 / 1,500 / 3,000 tokens within -0..+7%.
-`scripts/bench_all.sh` reruns the runq tables (~8 min).
+`scripts/bench_all.sh` reruns the gwenedeg tables (~8 min).
 
 Apple M1 Pro (8 P + 2 E cores, branch `mac-m1-pro`, 8 threads = the default there (the performance
 cores), separate sessions, BENCHMARKS.md "Apple M1 Pro"), prefill at 451 / 1,500 tokens and decode
@@ -257,7 +257,7 @@ logits against HF fp32, the same invariants, chats that roll back to a state che
 with the 4B / 27B head layout (one of them in all nine i-quant / Q2_K types, as Underdog Saluki 27B). Golden references
 come from HF transformers and are committed under `tests/golden/`. See [tests/README.md](../tests/README.md).
 
-Benchmarks: `make bench` (decode, thread sweep), `make bench-prefill`, `scripts/bench_all.sh` (the runq
+Benchmarks: `make bench` (decode, thread sweep), `make bench-prefill`, `scripts/bench_all.sh` (the gwenedeg
 tables of BENCHMARKS.md, ~8 min), `scripts/bench_batch.sh`, `scripts/bench_serve.py`,
 `scripts/bench_models.py`, `scripts/ppl.py` (perplexity), `scripts/spec_accept.py` (draft acceptance for
 speculative decoding), `scripts/lookup_accept.py` (prompt-lookup and draft acceptance on recorded agentic sessions),
@@ -402,9 +402,9 @@ lists open work only; the full log is in git: `git show b3e48a3:TODO.md`. The st
 | 5 | NFC normalizer matching HF tokenizers | `271f2e7` |
 | 6a, 6b-1, 6b-2 | GGUF Q8_0 loading; Q4_K_M (layouts, arithmetic, generic kernels); AVX-512 K-quant kernels | `b4180af`, `ca07a0c`, `546033a` |
 | 7a, 7b | phase synchronization on a thread pool, attention blocks of 256; 16-bit KV cache (f16 default) | `779b99f`, `fed707e`, `52928cf`, `989f712` |
-| 8 | modules and the library API (`src/runq.h`) | `dfed67f`, `1f8bf3b` |
-| 9 | `runq serve` (OpenAI API, prefix reuse, constrained decoding) | `69078ea` |
-| 10a, 10b | batched decode of several sequences; continuous batching in `runq serve` | `302e0b2`, `38b71d9` |
+| 8 | modules and the library API (`src/gwenedeg.h`) | `dfed67f`, `1f8bf3b` |
+| 9 | `gwenedeg serve` (OpenAI API, prefix reuse, constrained decoding) | `69078ea` |
+| 10a, 10b | batched decode of several sequences; continuous batching in `gwenedeg serve` | `302e0b2`, `38b71d9` |
 | 11 | the other Qwen3 dense models (1.7B-8B, 2507), fixes and tests | `fb2b9fb`, `6e1f251` |
 | 12 | Qwen3.5-0.8B: Gated DeltaNet + gated attention, recurrent-state checkpoints ([qwen35.md](qwen35.md)) | `99dfa79`, `8d3be20` |
 | 12b | Qwen3.5's recurrence in blocks of 32 v columns: prefill 0.64x -> 0.82x of Qwen3-0.6B's | `902b66b` |

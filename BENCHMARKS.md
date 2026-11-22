@@ -1,17 +1,18 @@
 # Gwenedeg benchmarks
 
-Qwen3-0.6B on the CPU: Gwenedeg's `runq` (Q8_0, AVX-512 VNNI, batched prefill) vs upstream qwen3.c and
+Qwen3-0.6B on the CPU: Gwenedeg (Q8_0, AVX-512 VNNI, batched prefill) vs upstream qwen3.c and
 mynah-slm, plus perplexity. All numbers in the Results, Comparison and Quality sections are from
 **one session, 2026-10-25 04:08-05:05 UTC, commit `d76e4cc`**, same machine and conditions. Raw
 output of every run: [bench/results-2026-10-25.txt](bench/results-2026-10-25.txt). Earlier
 measurements are only in [History](#history-earlier-measurements) and are labelled there.
 (The project was called cwayn when these sessions ran; the raw logs in `bench/` have the new name and
-generic paths, nothing measured was changed.)
+generic paths, nothing measured was changed.) The binary was called `runq` until 2026-11-22 (after qwen3.c's
+`runq.c`, where it started); older raw data and logs use that name, and the commands below use `gwenedeg`.
 
-The [Qwen3.8-27B: runq vs llama.cpp vs ik_llama.cpp section](#qwen38-27b-iq3_s-runq-vs-llamacpp-vs-ik_llamacpp-server-workloads-2026-11-22)
+The [Qwen3.8-27B: Gwenedeg vs llama.cpp vs ik_llama.cpp section](#qwen38-27b-iq3_s-gwenedeg-vs-llamacpp-vs-ik_llamacpp-server-workloads-2026-11-22)
 is a different model, comparison and session (2026-11-22) and is not comparable with the tables above either. The
 [Qwen3.8-27B vs ik_llama.cpp section](#qwen38-27b-iq3_s-vs-ik_llamacpp-server-workloads-2026-11-21) is the same model
-a day earlier, before the i-quant tiled GEMM: its runq numbers are superseded by the 2026-11-22 ones.
+a day earlier, before the i-quant tiled GEMM: its gwenedeg numbers are superseded by the 2026-11-22 ones.
 
 The [i-quant tiled GEMM section](#qwen38-27b-iq3_s-prefill-with-the-i-quant-tiled-gemm-2026-11-21) is a
 before / after of one change on that model (2026-11-21, a later window), not comparable with the 0.6B tables either;
@@ -33,19 +34,19 @@ The [Apple M1 Pro section](#apple-m1-pro-macos-neon) is a different machine and 
 | sharing | the VM runs other users' services; 1-min load 2-6 before each block, up to ~19 during some (see Methodology) |
 | memory read bandwidth, this session | 1 / 4 / 8 / 12 threads: 33-35 / 49-71 / 60-73 / 86-115 GB/s (min-max of 3-4 runs at the start and end; `bench/bw.c`) |
 | compiler | gcc 14.2.0 (Debian 14.2.0-19), `-Ofast -fopenmp -march=native -D_FILE_OFFSET_BITS=64 -lm` (`make`) |
-| runq | `d76e4cc` (`src/runq.c` + `src/kernels_avx512.h`); defaults: `-b 512`, threads min(12, nproc - nproc/4) = 12 |
+| gwenedeg | `d76e4cc` (`src/runq.c` + `src/kernels_avx512.h`); defaults: `-b 512`, threads min(12, nproc - nproc/4) = 12 |
 | qwen3.c | upstream engine = `src/runq.c` at `87e08aa` (upstream `55643ff` + only the `-n` / `[timing]` patch), same flags |
 | mynah-slm | `cde1599` (`scripts/fetch_mynah.sh`, its own Makefile) |
 | HF reference | transformers 4.53.0 / torch 2.7.0, fp32, eager attention (`.venv`) |
 
 | model file | bytes | used by |
 |---|---|---|
-| `models/Qwen3-0.6B-q8.bin` (Q8_0, group 64, tied classifier; `scripts/export_q8.sh`) | 633,495,808 | runq, qwen3.c |
+| `models/Qwen3-0.6B-q8.bin` (Q8_0, group 64, tied classifier; `scripts/export_q8.sh`) | 633,495,808 | gwenedeg, qwen3.c |
 | `models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (unsloth @ `50968a4`, group 32) | 639,447,744 | mynah-slm |
 | `models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf` (unsloth @ `50968a4`, imatrix) | 396,705,472 | mynah-slm |
 | `models/Qwen3-0.6B/model.safetensors` (bf16, `Qwen/Qwen3-0.6B` @ `c1899de`) | 1,503,300,328 | HF reference (run in fp32) |
 
-## Results: runq
+## Results: gwenedeg
 
 **Prefill tok/s** vs prompt length and threads (`-b 512`, chat, greedy):
 
@@ -105,17 +106,17 @@ after the first generated token):
 
 | | wall | peak RSS |
 |---|---|---|
-| runq, 12 threads (default), 5 runs | 0.75-0.80 s (prefill of the 18-token prompt 12-28 ms) | 1,361 MB |
-| runq, 8 threads, 3 runs | 0.76-0.78 s | 1,361 MB |
-| runq without `-c` (40,960 context) | 0.79 s | 1,361 MB |
-| runq `-m tokenize` (no weights) | 0.025 s | 11 MB |
+| gwenedeg, 12 threads (default), 5 runs | 0.75-0.80 s (prefill of the 18-token prompt 12-28 ms) | 1,361 MB |
+| gwenedeg, 8 threads, 3 runs | 0.76-0.78 s | 1,361 MB |
+| gwenedeg without `-c` (40,960 context) | 0.79 s | 1,361 MB |
+| gwenedeg `-m tokenize` (no weights) | 0.025 s | 11 MB |
 
 Startup is dominated by page faults: the dequantized fp32 embedding table (~620 MB) and the repacked
 VNNI weights (~630 MB, ~55 ms to pack). mynah-slm reports a 0.14-0.15 s model load (mmap'd GGUF).
 
 ## Comparison (same session)
 
-| | qwen3.c (upstream) Q8_0 | mynah-slm Q8_0 | mynah-slm Q4_K_M | **runq** Q8_0 |
+| | qwen3.c (upstream) Q8_0 | mynah-slm Q8_0 | mynah-slm Q4_K_M | **gwenedeg** Q8_0 |
 |---|---|---|---|---|
 | decode, 1 thread | 21.4 | | | 46.6 |
 | decode, 4 threads | 70.9 | 33.8 | 28.4 | 138.3 |
@@ -124,13 +125,13 @@ VNNI weights (~630 MB, ~55 ms to pack). mynah-slm reports a 0.14-0.15 s model lo
 | prefill, short bench prompt (~33 tokens), 8 threads | 98.7 | 57.5 | 47.4 | 1,564 |
 | prefill, short bench prompt, 12 threads | 80.4 | 53.8 | 45.0 | 1,934 |
 | prefill, 1,500 tokens, 8 threads | not run (see below) | 23.6 | 21.5 | 1,570 |
-| token-by-token reference: runq `-b 1`, 1,500 tokens, 8 threads | | | | 192 |
+| token-by-token reference: gwenedeg `-b 1`, 1,500 tokens, 8 threads | | | | 192 |
 
-- Decode: `scripts/bench_qwen3c.sh` (`RUNQ=` for qwen3.c) and `scripts/bench_mynah.sh`, same prompt
+- Decode: `scripts/bench_qwen3c.sh` (`GWENEDEG_BIN=` for qwen3.c) and `scripts/bench_mynah.sh`, same prompt
   text, greedy, 256 new tokens, best of 3. Prefill is the short prompt of the same runs.
 - qwen3.c's tokenizer is quadratic (minutes for a 450-token prompt, outside its timing but
   impractical), so it was only run with the short prompt. Its prefill is token by token with the
-  classifier on every token; runq `-b 1` is runq's own token-by-token path (VNNI GEMV + AVX-512
+  classifier on every token; gwenedeg `-b 1` is Gwenedeg's own token-by-token path (VNNI GEMV + AVX-512
   attention), labelled as such, not qwen3.c.
 - mynah-slm 1,500 tokens: `mynah-slm run -p "$(scripts/bench_prefill.sh -P 1500)" --ctx 4096 -n 16
   -t 8 --temp 0 --think off --no-stream` (1,500 prompt tokens in its count too), 2 runs Q8_0 (17.2,
@@ -138,27 +139,27 @@ VNNI weights (~630 MB, ~55 ms to pack). mynah-slm reports a 0.14-0.15 s model lo
 - mynah-slm decode is flat from 4 threads; its Q4_K_M (0.40 GB) is no faster than Q8_0 here, so it
   is compute-bound (~13 GB/s), not bandwidth-bound.
 
-## Qwen3.8-27B (IQ3_S): runq vs llama.cpp vs ik_llama.cpp, server workloads (2026-11-22)
+## Qwen3.8-27B (IQ3_S): Gwenedeg vs llama.cpp vs ik_llama.cpp, server workloads (2026-11-22)
 
-The same model, prompts and harness as the section below, a different day: mainline **llama.cpp** added, **runq
+The same model, prompts and harness as the section below, a different day: mainline **llama.cpp** added, **gwenedeg
 re-measured at current main** (the numbers below were of `13d55a5`, before the i-quant tiled GEMM), and ik_llama.cpp's
 `--short` and `--long` re-run with the same commands so all three columns come from one day. Raw data, commands and
 tuning: [bench/llamacpp-2026-11-22/](bench/llamacpp-2026-11-22/).
 
 | | |
 |---|---|
-| CPU | AMD EPYC Genoa (Zen 4), 16 vCPUs, 32 MB L3, 30 GB RAM, AVX-512 VNNI / VBMI / BF16 (the same KVM VM as below; only the daytime runq server stopped for the day, other services running: 1-min load 1-20, see Caveats) |
+| CPU | AMD EPYC Genoa (Zen 4), 16 vCPUs, 32 MB L3, 30 GB RAM, AVX-512 VNNI / VBMI / BF16 (the same KVM VM as below; only the daytime gwenedeg server stopped for the day, other services running: 1-min load 1-20, see Caveats) |
 | model | `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (3.44 bpw, 12.1 GB, with its MTP block), thinking on and off |
-| runq | `50ba538` (main + the i-quant tiled GEMM), gcc 14.2.0; `runq serve --ctx 98304 --draft mtp -G 6 --tau 0.5 --repack -k q4-dot --slots 6 --parallel 4 --admit bound`, 14 threads, `--kv-disk` in a temporary directory (the production arguments) |
+| gwenedeg | `50ba538` (main + the i-quant tiled GEMM), gcc 14.2.0; `gwenedeg serve --ctx 98304 --draft mtp -G 6 --tau 0.5 --repack -k q4-dot --slots 6 --parallel 4 --admit bound`, 14 threads, `--kv-disk` in a temporary directory (the production arguments) |
 | llama.cpp | `225a5345bbb0` (master of 2026-11-22 03:25Z), Release, `-DGGML_NATIVE=ON`, gcc 14.2.0 (`-march=native`; `ggml_cpu_has_avx512 / _vnni / _vbmi / _bf16` all 1); `llama-server -t 14 -fa on -ctk q8_0 -ctv q4_0 -ub 512 -b 2048 -lm none --no-repack --ctx-checkpoints 4 -cram 512 --jinja`, `-np 1` / `-np 4` at `-c 98304`, 14 threads; every run repeated with `-ctk f16 -ctv f16` (the same flags and context otherwise; `--long` at `-c 49152`), which is faster for mainline everywhere. Tuned with `llama-bench` (threads, ubatch, repacking, mmap) and a server draft-length probe: [tune.md](bench/llamacpp-2026-11-22/tune.md) |
 | ik_llama.cpp | `ac8d544b` (2026-11-19), the build and commands of the section below: `llama-server -fa on -ctk q8_0 -ctv q4_0 -rtr -ub 1024 -b 2048 -t 14 --spec-type mtp:n_max=6,p_min=0.5 --ctx-checkpoints 4 --jinja -cram 512`, `-c 16384` (`--short`) / `-c 49152` (`--long`), 1 slot + MTP |
-| equal settings | 14 threads; KV cache 8-bit K + 4-bit V (runq `q4-dot` = mainline / ik `q8_0` K / `q4_0` V: equal bit widths, not the same quantizer), and mainline also with an f16 cache, its faster configuration; greedy and seeded (T 1, top-p 0.95, top-k 20, seed 42); `scripts/s9c_bench.py` unchanged, `--server-cmd` for the other engines; 22 GB memory cap, no swap, one model process at a time, the bench lock held |
-| speculative decoding | runq: MTP, up to 6 guesses, tau 0.5. Mainline runs this file's MTP block (`--spec-type draft-mtp`, also with several slots; the drafts are accepted), but every draft length of 1-6 decoded **slower** than no drafting on this CPU, so its runs below have **no MTP**; ik: MTP as before |
+| equal settings | 14 threads; KV cache 8-bit K + 4-bit V (gwenedeg `q4-dot` = mainline / ik `q8_0` K / `q4_0` V: equal bit widths, not the same quantizer), and mainline also with an f16 cache, its faster configuration; greedy and seeded (T 1, top-p 0.95, top-k 20, seed 42); `scripts/s9c_bench.py` unchanged, `--server-cmd` for the other engines; 22 GB memory cap, no swap, one model process at a time, the bench lock held |
+| speculative decoding | gwenedeg: MTP, up to 6 guesses, tau 0.5. Mainline runs this file's MTP block (`--spec-type draft-mtp`, also with several slots; the drafts are accepted), but every draft length of 1-6 decoded **slower** than no drafting on this CPU, so its runs below have **no MTP**; ik: MTP as before |
 | prompts | as below: `bench/s9c/`, two LiveCodeBench-shaped prompts and two agent-shaped ones, `max_tokens` 512; a 31,755-token cold prompt + 2 follow-up turns of ~2,500 new tokens |
 
 **Short requests** (tok/s per request, mean of 8 at one client; 4 clients: aggregate tokens / the round's wall time):
 
-| | runq | llama.cpp, 1 slot, q8_0 / q4_0 | llama.cpp, 4 slots, q8_0 / q4_0 | llama.cpp, 1 slot, f16 | llama.cpp, 4 slots, f16 | ik_llama.cpp, 1 slot + MTP |
+| | gwenedeg | llama.cpp, 1 slot, q8_0 / q4_0 | llama.cpp, 4 slots, q8_0 / q4_0 | llama.cpp, 1 slot, f16 | llama.cpp, 4 slots, f16 | ik_llama.cpp, 1 slot + MTP |
 |---|---|---|---|---|---|---|
 | thinking on, 1 client | **17.5** | 3.5 | 4.4 | 5.2 | 4.7 | 9.6 |
 | thinking on, 4 clients (greedy / seeded) | **23.0 / 23.0** | 2.7 / 2.7 (queued behind one slot) | 4.7 / 4.2 | 4.2 / 4.0 (queued) | 4.7 / 5.7 | 8.0 / 6.6 (queued) |
@@ -174,12 +175,12 @@ on 5.2; off 4.86 / 4.88 with 1 / 4 slots) and for the short prefill; f16 with 4 
 **Long context** (the 31,755-token cold prompt, then two turns adding ~2,500 tokens each; thinking on, greedy, 512 new
 tokens):
 
-| | runq | llama.cpp, q8_0 / q4_0 cache | llama.cpp, f16 / f16 cache (`-c 49152`) | ik_llama.cpp, q8_0 / q4_0 |
+| | gwenedeg | llama.cpp, q8_0 / q4_0 cache | llama.cpp, f16 / f16 cache (`-c 49152`) | ik_llama.cpp, q8_0 / q4_0 |
 |---|---|---|---|---|
 | cold prefill (31,755 tokens) | 391 s (81 tok/s) | 5,057 s (6.3 tok/s) | 682 s (47 tok/s) | **309 s (103 tok/s)** |
 | decode, cold turn | **14.0 tok/s** | 1.56 | 3.83 | 2.54 |
 | decode, follow-up turns | **14.8 / 14.5 tok/s** | 1.52 / 1.46 | 3.81 / 3.88 | 2.05 / 2.16 |
-| prefill of a follow-up turn's ~2.5k new tokens | 37.4 / 39.4 s (the 31-34k cached prefix reused) | 924 / 1,006 s (a checkpoint restored: the same `cache_n` as runq) | 83.9 / 91.5 s | **35.0 / 36.0 s** (checkpoint restored) |
+| prefill of a follow-up turn's ~2.5k new tokens | 37.4 / 39.4 s (the 31-34k cached prefix reused) | 924 / 1,006 s (a checkpoint restored: the same `cache_n` as gwenedeg) | 83.9 / 91.5 s | **35.0 / 36.0 s** (checkpoint restored) |
 | a follow-up turn, wall | **72 / 75 s** | 1,261 / 1,357 s | 218 / 224 s | 285 / 273 s |
 | peak RSS (GiB) | 16.0 (98k context) | 14.4 (98k) | 15.0 (49k) | 17.7 (49k) |
 
@@ -189,21 +190,21 @@ q4_0 14.3 / 3.40, q8_0 / q8_0 17.6 / 3.25, f16 / f16 62.7 / 4.48 tok/s; [depth.m
 configuration for this session, and the one the long-context ratios below use.
 
 **Quality, the same tokens and context** (the first-chunk perplexity of the 2026-11-21 protocol, 8-bit K / 4-bit V in
-all three): prose runq 9.483, mainline 9.480, ik 9.493 (2026-11-21); code runq 7.133, mainline 7.141, ik 7.145:
-mainline within 0.03-0.11% of runq, ik within 0.1-0.2% — the same quality.
+all three): prose gwenedeg 9.483, mainline 9.480, ik 9.493 (2026-11-21); code gwenedeg 7.133, mainline 7.141, ik 7.145:
+mainline within 0.03-0.11% of gwenedeg, ik within 0.1-0.2% — the same quality.
 
 **`llama-bench` micro line** (pp512 / tg128, 14 threads, q8_0 K / q4_0 V, no drafting; 06:10-06:13Z): mainline 68.5 /
-4.86, ik 124.2 / 5.13. runq's equivalent is its CLI on a 524-token prompt, 128 new tokens, plain decoding (`--repack`,
+4.86, ik 124.2 / 5.13. Gwenedeg's equivalent is its CLI on a 524-token prompt, 128 new tokens, plain decoding (`--repack`,
 `q4-dot`, 2 runs): **107-110 / 13.8-15.1**.
 
-**Reading** (against mainline's best measured configuration per row, f16 cache throughout): runq decodes **3.4-4.4x**
+**Reading** (against mainline's best measured configuration per row, f16 cache throughout): Gwenedeg decodes **3.4-4.4x**
 faster than mainline on short requests at one client and **4.1-5.7x** with 4 clients (against its 4 slots), **3.7-3.9x**
 faster at 32-37k context, and prefills short prompts **1.3-1.5x** faster per identical request and the cold 32k prompt
 **1.7x** faster; a follow-up turn on the 32k session finishes 3.0x sooner. Against mainline with the equal-bit-width
 q8_0 / q4_0 cache the factors are 4.0-8.1x (short decode), 1.8-2.4x (short prefill), 12.9x (cold 32k) and 17-18x
 (a follow-up turn). Against ik_llama.cpp,
-runs of the same day: runq decodes 1.8-1.9x faster at one client, 2.6-3.6x with 4 clients, 5.5-7.2x at 32k context,
-and a follow-up turn finishes 3.7-4.0x sooner; **ik prefills faster**, less so than before the tiled GEMM: runq's
+runs of the same day: Gwenedeg decodes 1.8-1.9x faster at one client, 2.6-3.6x with 4 clients, 5.5-7.2x at 32k context,
+and a follow-up turn finishes 3.7-4.0x sooner; **ik prefills faster**, less so than before the tiled GEMM: Gwenedeg's
 short-prompt prefill is **0.79-0.95x** of ik's per identical request (101-111 vs 117-125 tok/s; about 0.7x, 81-84 vs
 110-118, on 2026-11-21), its cold 32k prefill **0.79x** (391 s vs 309 s; 471 vs 319 s on 2026-11-21), a follow-up
 turn's 2.5k tokens 0.91-0.94x (37-39 s vs 35-36 s). Quality is equal.
@@ -211,16 +212,16 @@ turn's 2.5k tokens 0.91-0.94x (37-39 s vs 35-36 s). Quality is equal.
 **Caveats**
 - One run per cell, a shared VM (1-min load 1-20 over the day, other users' jobs; each run's start / end load in
   `bench/llamacpp-2026-11-22/runs.log`, the minute-by-minute log in `loadavg.txt`): differences of a few tens of
-  percent are noise, the 3-9x ones are not. runq's short decode today (17.5 / 21.2) is 6% below its 2026-11-21 number
+  percent are noise, the 3-9x ones are not. Gwenedeg's short decode today (17.5 / 21.2) is 6% below its 2026-11-21 number
   (18.6 / 21.8), its short prefill up 1.24x, its cold 32k prefill down 17% (471 s to 391 s). ik's re-run moved by
   similar amounts (short decode 7.8 / 11.2 to 9.6 / 11.3, cold 32k 319 s to 309 s).
-- runq's `--long` ran with `--turns 3` (one more follow-up than the others, 74 s wall, in its JSON); turns 0-2 are
+- Gwenedeg's `--long` ran with `--turns 3` (one more follow-up than the others, 74 s wall, in its JSON); turns 0-2 are
   compared.
 - llama.cpp and ik_llama.cpp were configured by us from their docs and tuned with `llama-bench`; their authors may know
   better settings. Mainline's MTP slowdown is measured, not explained (a k+1-token verification pass costs about as
   much as k+1 single-token passes here); its quantized-cache slowdown at depth shows in `llama-bench` alone.
-- Equal KV bit widths, not the same quantizer, between runq and ik and mainline's q8_0 / q4_0 columns; mainline's f16
-  columns (its best) hold 2.6x runq's KV bits. Mainline's quality was measured with q8_0 / q4_0 only (f16 can only be
+- Equal KV bit widths, not the same quantizer, between gwenedeg and ik and mainline's q8_0 / q4_0 columns; mainline's f16
+  columns (its best) hold 2.6x Gwenedeg's KV bits. Mainline's quality was measured with q8_0 / q4_0 only (f16 can only be
   as good or better).
 - Mainline is not slower for lack of context: its short-request servers ran at 98,304 positions with the full model,
   with either cache (peak RSS 14.7-19.0 GiB). ik could not (its OOMs of 2026-11-21); its 16k / 48k contexts do not
@@ -235,16 +236,16 @@ Raw per-request data, commands and logs' numbers: [bench/ikllama-2026-11-21/](be
 
 | | |
 |---|---|
-| CPU | AMD EPYC Genoa (Zen 4), 16 vCPUs, 32 MB L3, 30 GB RAM (the same KVM VM as above; only the daytime runq server was stopped for the window, other services kept running: 1-min load 0.5-6.5, see Caveats) |
+| CPU | AMD EPYC Genoa (Zen 4), 16 vCPUs, 32 MB L3, 30 GB RAM (the same KVM VM as above; only the daytime gwenedeg server was stopped for the window, other services kept running: 1-min load 0.5-6.5, see Caveats) |
 | model | `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (ISTA-DASLab, 3.44 bpw, 12.1 GB, with its MTP block), thinking on and off |
-| runq | `13d55a5`, gcc 14.2.0, `runq serve --ctx 98304 --draft mtp -G 6 --tau 0.5 --repack -k q4-dot --slots 6 --parallel 4 --admit bound` (the production arguments; `--kv-disk` in a temporary directory) |
+| gwenedeg | `13d55a5`, gcc 14.2.0, `gwenedeg serve --ctx 98304 --draft mtp -G 6 --tau 0.5 --repack -k q4-dot --slots 6 --parallel 4 --admit bound` (the production arguments; `--kv-disk` in a temporary directory) |
 | ik_llama.cpp | `ac8d544b` (upstream `06a141f3` of 2026-11-19 + 2 commits unrelated to this model), `-DGGML_NATIVE=ON`, Release, AVX-512 / VNNI active (checked: `HAVE_FANCY_SIMD`); `llama-server -fa on -ctk q8_0 -ctv q4_0 -rtr -ub 1024 -b 2048 -t 14 --spec-type mtp:n_max=6,p_min=0.5 --ctx-checkpoints 4 --jinja`, 1 slot (its MTP stage is removed with more than one slot) |
-| equal settings | 14 threads; KV cache 8-bit K + 4-bit V (runq `q4-dot` = ik `q8_0` K / `q4_0` V: not the same quantizer, the same bit widths; see Caveats); MTP drafting with up to 6 tokens, p_min 0.5; greedy and seeded (T 1, top-p 0.95, top-k 20, seed 42) requests; `scripts/s9c_bench.py` unchanged for both (`--server-cmd` starts ik's server) |
+| equal settings | 14 threads; KV cache 8-bit K + 4-bit V (gwenedeg `q4-dot` = ik `q8_0` K / `q4_0` V: not the same quantizer, the same bit widths; see Caveats); MTP drafting with up to 6 tokens, p_min 0.5; greedy and seeded (T 1, top-p 0.95, top-k 20, seed 42) requests; `scripts/s9c_bench.py` unchanged for both (`--server-cmd` starts ik's server) |
 | prompts | `bench/s9c/`: two LiveCodeBench-shaped prompts, two agent-shaped ones (system block + task), `max_tokens` 512; a 32k-token source file + 2 pi-shaped follow-up turns of ~2,500 new tokens |
 
 **Short requests** (tok/s per request, mean of 8 at one client; 4 clients: aggregate tokens / the round's wall time):
 
-| | runq | ik_llama.cpp, 1 slot + MTP | ik_llama.cpp, 4 slots, no MTP |
+| | gwenedeg | ik_llama.cpp, 1 slot + MTP | ik_llama.cpp, 4 slots, no MTP |
 |---|---|---|---|
 | thinking on, 1 client | **18.6** | 7.8 | 5.5 |
 | thinking on, 4 clients (greedy / seeded) | **23.1 / 23.7** | 7.1 / 6.0 (queued behind one slot) | 8.1 / 4.2 |
@@ -255,7 +256,7 @@ Raw per-request data, commands and logs' numbers: [bench/ikllama-2026-11-21/](be
 
 **Long context** (a 31,755-token cold prompt, then two turns adding ~2,500 tokens each; thinking on, greedy, 512 new tokens):
 
-| | runq | ik_llama.cpp (1 slot + MTP, `-c 49152`) |
+| | gwenedeg | ik_llama.cpp (1 slot + MTP, `-c 49152`) |
 |---|---|---|
 | cold prefill (31,755 tokens) | 471 s (67 tok/s) | **319 s (100 tok/s)** |
 | decode, cold turn | **13.1 tok/s** | 2.4 tok/s |
@@ -264,10 +265,10 @@ Raw per-request data, commands and logs' numbers: [bench/ikllama-2026-11-21/](be
 | a follow-up turn, wall | **76 / 81 s** | 316 / 301 s |
 
 **Quality, the same tokens and context** (the same file; perplexity over the second half of the first 2,048 / 3,072-token
-window, `llama-perplexity` against runq's `-m logits`, both with the 8-bit K / 4-bit V cache; the token ids of both
-engines' tokenizers are identical): prose (Beagle ch. I) runq 9.483, ik 9.493 (+0.1%); code (the 32k source's head)
-runq 7.133, ik 7.145 (+0.2%): within the +-0.07 standard error of 1,000-1,500 scored tokens, i.e. the same quality.
-(`llama-perplexity`'s printed final estimate also averages in a second window, which runq was not run on, so it is not
+window, `llama-perplexity` against Gwenedeg's `-m logits`, both with the 8-bit K / 4-bit V cache; the token ids of both
+engines' tokenizers are identical): prose (Beagle ch. I) gwenedeg 9.483, ik 9.493 (+0.1%); code (the 32k source's head)
+gwenedeg 7.133, ik 7.145 (+0.2%): within the +-0.07 standard error of 1,000-1,500 scored tokens, i.e. the same quality.
+(`llama-perplexity`'s printed final estimate also averages in a second window, which gwenedeg was not run on, so it is not
 the number to compare.)
 
 **ik_llama.cpp tuning, `llama-bench` on the same file** (pp2048 / tg64, tok/s): `-t 14 -ub 2048`: 148 / 6.0; `-t 16 -ub
@@ -275,35 +276,35 @@ the number to compare.)
 16k-token depth: 4.3 tok/s with a 4-bit V cache, 4.8 with 8-bit. 14 threads decode faster than 16 (other services on the
 box); `-ub 2048` helps prefill by ~8-10% and was not usable at 98k context in a 20 GB cap (see below), `-ub 1024` was used.
 
-**Reading**: on this CPU, with this model, runq decodes **1.9-2.4x** faster on short requests at one client (3.1-4.0x with 4
+**Reading**: on this CPU, with this model, gwenedeg decodes **1.9-2.4x** faster on short requests at one client (3.1-4.0x with 4
 clients, against ik's one slot) and **5.5-8x** faster at 32k context (13.1 / 2.4 on the cold turn, 14.8 / 1.9 and 15.9 /
 2.0 on the follow-ups), serves 4 clients at once with MTP (ik: one slot with MTP, or four without), and finishes a 2.5k-token follow-up
 turn on a 32k session ~4x sooner; ik_llama.cpp prefills **1.35-1.5x** faster (cold 32k prompt 319 s vs 471 s). Quality is
-equal. Neither gap was profiled: ik's decode without MTP (`llama-bench` tg64, 5.4-6.0 tok/s) is already below runq's
+equal. Neither gap was profiled: ik's decode without MTP (`llama-bench` tg64, 5.4-6.0 tok/s) is already below Gwenedeg's
 plain decode of earlier sessions, and its MTP decode drops sharply with depth (2-2.4 tok/s at 32k); its prefill is
-the part runq could learn from.
+the part gwenedeg could learn from.
 
-Superseded for runq: [the 2026-11-22 section](#qwen38-27b-iq3_s-runq-vs-llamacpp-vs-ik_llamacpp-server-workloads-2026-11-22)
-re-ran runq at current main (with the tiled GEMM: short-prompt prefill 101-111 tok/s here to 81-84 below), re-ran this
+Superseded for gwenedeg: [the 2026-11-22 section](#qwen38-27b-iq3_s-gwenedeg-vs-llamacpp-vs-ik_llamacpp-server-workloads-2026-11-22)
+re-ran gwenedeg at current main (with the tiled GEMM: short-prompt prefill 101-111 tok/s here to 81-84 below), re-ran this
 section's ik commands the same day, and added mainline llama.cpp. This section stays for ik's setup, its OOMs at 98k
 context and the session-to-session spread.
 
 **Caveats**
 - One run per cell, a shared box (1-min load 0.5-6.5 over the window, from other users' jobs; the same window for both
-  engines but not simultaneous): differences of a few tens of percent are noise, the 2-8x ones are not. runq's numbers
+  engines but not simultaneous): differences of a few tens of percent are noise, the 2-8x ones are not. Gwenedeg's numbers
   here are higher than the S9c ones in `docs/notes/qwen38-speculative.md` (a busier box then).
 - ik_llama.cpp was configured by us, from its README and `--help` (flags above, tuned with `llama-bench`); its authors
   may know better settings. Its support for Qwen3.8's hybrid layers and MTP is recent, and it is a fork under heavy
   development (the build is of 2026-11-19).
-- Equal KV bit widths, not the same quantizer: runq's `q4-dot` is Hadamard-rotated per-32 8-bit K / 4-bit V with a bf16
+- Equal KV bit widths, not the same quantizer: Gwenedeg's `q4-dot` is Hadamard-rotated per-32 8-bit K / 4-bit V with a bf16
   dot-product attention; ik's `q8_0` / `q4_0` are ggml's types. The perplexity above says the effect on quality is
   within noise on these texts; that is not a long-context quality test.
 - At 98,304 context ik_llama.cpp's server was OOM-killed twice in a 20 GB cap (it reserves the KV cache at the full
   context up front, 2.65 GiB K+V here, plus a 2 GiB compute buffer at `-ub 2048` and an 8 GiB default prompt cache,
   `-cram`); the runs above use 16k (short) and 48k (long) contexts and `-cram 512`, which do not change the speed at
   those depths.
-- Not measured: mainline llama.cpp, vLLM's CPU backend, other engines; a plain (no MTP, 1 client) decode of runq side by
-  side with ik's (`llama-bench` tg64 gives ik's 5.4-6.0 tok/s; runq's plain decode on this file was 7.2-8.1 tok/s in
+- Not measured: mainline llama.cpp, vLLM's CPU backend, other engines; a plain (no MTP, 1 client) decode of gwenedeg side by
+  side with ik's (`llama-bench` tg64 gives ik's 5.4-6.0 tok/s; Gwenedeg's plain decode on this file was 7.2-8.1 tok/s in
   a loaded window of an earlier session, `docs/notes/qwen38-speculative.md`); other CPUs (a different AVX-512 implementation or
   AVX2 would change both engines' numbers).
 
@@ -315,7 +316,7 @@ One change measured before / after on the same file as the section above: the pr
 
 | | |
 |---|---|
-| CPU | the same AMD EPYC Genoa VM (16 vCPUs, 32 MB L3, 30 GB RAM); window 16:51-17:09Z, the live runq server stopped, other services running (1-min load 4.8-7.9 before the runs, 10-16 during them, mostly the runs' own threads) |
+| CPU | the same AMD EPYC Genoa VM (16 vCPUs, 32 MB L3, 30 GB RAM); window 16:51-17:09Z, the live gwenedeg server stopped, other services running (1-min load 4.8-7.9 before the runs, 10-16 during them, mostly the runs' own threads) |
 | model | `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` with `--repack` (IQ3_S, IQ3_XXS as 4-bit codes: weights 12.23 GiB), as in production |
 | builds | base `fbe8c51` (main) and new `c601176` (main + the tiled GEMM), gcc 14.2.0, `-Ofast -march=native` |
 | workload | the CLI, chat mode, a 2,521-token prompt (the bench paragraph repeated), `-b 512`, `-n 1`, tok/s of the `[timing]` line, 2 runs per cell alternating base / new |
@@ -331,11 +332,11 @@ One change measured before / after on the same file as the section above: the pr
 
 - **Exactness:** the logits of a ~300-token prompt are bit-identical, base `-b 512` == new `-b 512` == `-b 1` ==
   `-b 77` at 3 threads == `--repack` (sha256 `ff19abe701acd1e1...`).
-- **Where the time goes** (`-DRUNQ_PROFILE`, 14 threads): the GEMM phases are 92.7% of the base prefill and 90.4% of the
+- **Where the time goes** (`-DGWENEDEG_PROFILE`, 14 threads): the GEMM phases are 92.7% of the base prefill and 90.4% of the
   new one; they gained 1.32x (w1+w3 1.43x, wo 1.31x, w2 1.22x, qkv 1.21x). Attention, the delta-net recurrence and the
   norms are ~7% at this length, unchanged.
 - **Chunk size:** `-b` 256 / 512 / 1024 / 2048 (4,113 tokens, 14 threads): 99.9 / 103.9 / 100.1 / 95.4 tok/s.
-- **Reading:** at 14 threads runq's short-prompt prefill moves from ik_llama.cpp's 0.7x to ~0.9x on this file (CLI
+- **Reading:** at 14 threads Gwenedeg's short-prompt prefill moves from ik_llama.cpp's 0.7x to ~0.9x on this file (CLI
   numbers here vs the server numbers of the section above, 110-118 tok/s; not the same harness, so an estimate; the
   next day's server re-run gives 0.79-0.95x).
   `--repack` no longer changes prefill; it still speeds up decode.
@@ -343,7 +344,7 @@ One change measured before / after on the same file as the section above: the pr
 **Caveats**
 - Two runs per cell on a shared box: base's runs spread 2-9%, so the speed-ups are good to about ±5%.
 - The CLI, not the server. The server workloads were re-run the next day ([the 2026-11-22
-  section](#qwen38-27b-iq3_s-runq-vs-llamacpp-vs-ik_llamacpp-server-workloads-2026-11-22)): short-prompt prefill
+  section](#qwen38-27b-iq3_s-gwenedeg-vs-llamacpp-vs-ik_llamacpp-server-workloads-2026-11-22)): short-prompt prefill
   101-111 tok/s against ik's 117-125 (0.79-0.95x per request), the cold 32k prompt 391 s against ik's 319 s below. At
   32k the attention share is larger and the gain smaller.
 - The GEMM phases gained 1.32x where the 8-thread micro-benchmark predicts ~1.5x for this type mix; not yet explained
@@ -419,7 +420,7 @@ threads, 16 clients streaming 128-token replies, 1,185 tok/s in aggregate.)
 
 ## Apple M1 Pro (macOS, NEON)
 
-Experimental port, branch `mac-m1-pro`: `runq` built with Apple clang (`make`), NEON `sdot` kernels
+Experimental port, branch `mac-m1-pro`: `gwenedeg` built with Apple clang (`make`), NEON `sdot` kernels
 for the Q4_K / Q6_K matrices, the attention (all KV cache types) and Q8_0, all in `src/kernels_neon.h`.
 Four sessions on 2026-10-25: Q4_K_M 14:56-15:05 UTC
 ([bench/results-mac-m1-pro-2026-10-25.txt](bench/results-mac-m1-pro-2026-10-25.txt)); Q8_0 with
@@ -436,7 +437,7 @@ the KV cache types after the rebase onto Step 7b's f16 default and the NEON 16-b
 | sharing | a desktop in use (iTerm, browser, ...): 1-min load before / after the runs 3 / 9.6 (first session), 6.4 / 8.7 (second), 4.3 / 11.1 (third), 10.6 / 12.8 (fourth: right after a test run, Spotlight indexing); the "after" values include the benchmark's own threads |
 | compiler | Apple clang 21.0.0, `-O3 -ffast-math -ffp-contract=on -mcpu=native` (`make`; no OpenMP, the pthread pool) |
 | models | `Qwen3-0.6B-Q4_K_M.gguf` (unsloth @ `50968a4`, 396,705,472 bytes); `Qwen3-0.6B-q8.bin` (633,495,808 bytes, group 64); greedy, `-b 512`, `-c 4096` |
-| runq | first session `bb69e5f`; second `a2ab409` + the Q8_0 kernels, committed unchanged as `14169f4` (both on base `92fe41f`); third `33069be` (on `10211a3`); fourth `59d1e34` (on `989f712`). The branch has been rebased since each of them (last onto `caf833e`, Step 7b complete), so these commits are no longer on it; the Mac's clone keeps them as tags `mac-m1-pro-pre-step7a` = `f4b8a68`, `mac-m1-pro-on-10211a3` = `2b152b6`, `mac-m1-pro-on-989f712` = `83e133c`. The fourth session's code is `95ccbb7` on the current branch |
+| gwenedeg | first session `bb69e5f`; second `a2ab409` + the Q8_0 kernels, committed unchanged as `14169f4` (both on base `92fe41f`); third `33069be` (on `10211a3`); fourth `59d1e34` (on `989f712`). The branch has been rebased since each of them (last onto `caf833e`, Step 7b complete), so these commits are no longer on it; the Mac's clone keeps them as tags `mac-m1-pro-pre-step7a` = `f4b8a68`, `mac-m1-pro-on-10211a3` = `2b152b6`, `mac-m1-pro-on-989f712` = `83e133c`. The fourth session's code is `95ccbb7` on the current branch |
 
 ### Q4_K_M (first session)
 
@@ -461,7 +462,7 @@ chat-mode prompts of 451 and 1,500 tokens):
 - Run-to-run spread, 8 threads: 1-2% (prefill 451), 1% (decode); one 1,500-token run was disturbed
   (278 vs 959-968 tok/s) and is not the reported best. The decode column of `bench_prefill.sh` (15
   tokens) is lower than the 256-token one (164 vs 190 at 8 threads): different prompt and length.
-- Where the time goes (one profiled run, 8 threads, `-DRUNQ_PROFILE`, 1,500 tokens): GEMMs ~55%,
+- Where the time goes (one profiled run, 8 threads, `-DGWENEDEG_PROFILE`, 1,500 tokens): GEMMs ~55%,
   attention ~36%. The GEMMs run at ~47% of the `sdot` peak, limited by the exact float fold per group
   (6 rounded operations per 8 `sdot`s), and register-tile shapes (1x6 to 4x3) changed them by less
   than 4%. Decode falls from 190 to ~100 tok/s at 1,500 tokens: the fp32 KV cache then adds about
@@ -626,7 +627,7 @@ Prefill, tok/s (the short prompt is ~25 tokens: left out):
 Text: Charles Darwin, *The Voyage of the Beagle*, start of Chapter I (Project Gutenberg #944,
 public domain), committed as [bench/ppl_beagle_ch1.txt](bench/ppl_beagle_ch1.txt): lines 129-770 of
 `pg944.txt` (2025-04-28 update, sha256 `e13d5717...`), CR removed, the first 19 paragraphs (until >=
-4,000 tokens), 17,077 bytes, **4,142 tokens** (HF tokenizer; runq's and mynah-slm's tokenizations
+4,000 tokens), 17,077 bytes, **4,142 tokens** (HF tokenizer; Gwenedeg's and mynah-slm's tokenizations
 are identical, checked for every window). sha256 `6ac0515c1da2cfff...`.
 
 Protocols, both teacher-forced on raw text (no template; Qwen3 has no BOS), PPL = exp(mean NLL):
@@ -635,19 +636,19 @@ Protocols, both teacher-forced on raw text (no template; Qwen3 has no BOS), PPL 
 - **win512**: 8 non-overlapping windows of 512 tokens (last 46 tokens dropped), each from position
   0, 511 predictions each (4,088).
 
-Command: `.venv/bin/python -I scripts/ppl.py bench/ppl_beagle_ch1.txt -t 8` (HF fp32, runq `-m
+Command: `.venv/bin/python -I scripts/ppl.py bench/ppl_beagle_ch1.txt -t 8` (HF fp32, gwenedeg `-m
 logits`, mynah-slm `ppl` per window file; ~10 min, mostly mynah-slm).
 
 | engine | weights | PPL full | vs HF | PPL win512 | vs HF | NLL full (nats) |
 |---|---|---|---|---|---|---|
 | HF transformers fp32 | bf16 -> fp32 | **27.571** | | **31.984** | | 3.31677 |
 | mynah-slm | Q8_0 GGUF (group 32, fp32 activations) | 27.580 | +0.03% | 32.039 | +0.17% | 3.31709 |
-| runq | Q8_0 (group 64, int8 activations) | 27.805 | +0.85% | 32.206 | +0.69% | 3.32522 |
+| gwenedeg | Q8_0 (group 64, int8 activations) | 27.805 | +0.85% | 32.206 | +0.69% | 3.32522 |
 | mynah-slm | Q4_K_M GGUF | 28.864 | **+4.7%** | 34.185 | **+6.9%** | 3.36258 |
 
 - Q4_K_M costs ~5-7% perplexity over fp32 (+0.046 nats per token on the full text), 5-10x the loss
-  of runq's Q8_0 and far more than mynah-slm's Q8_0, and it is not faster on this CPU (Comparison).
-- runq's Q8_0 is ~0.7-0.8% behind mynah-slm's Q8_0: runq also quantizes the activations to int8
+  of Gwenedeg's Q8_0 and far more than mynah-slm's Q8_0, and it is not faster on this CPU (Comparison).
+- Gwenedeg's Q8_0 is ~0.7-0.8% behind mynah-slm's Q8_0: Gwenedeg also quantizes the activations to int8
   per 64-group (the VNNI path, as in upstream qwen3.c) and uses 64- instead of 32-weight groups.
   mynah-slm's own int8-activation mode (`--fast`, not available in `ppl`) is documented at ~1.4%.
 - Windowed PPL is higher (less context per prediction); the ranking is the same in both protocols.
@@ -670,12 +671,12 @@ logits`, mynah-slm `ppl` per window file; ~10 min, mostly mynah-slm).
 
 ## Methodology
 
-- **[timing] line** (runq and the qwen3.c build): `prompt: N tok in X s` = prefill, from after
+- **[timing] line** (gwenedeg and the qwen3.c build): `prompt: N tok in X s` = prefill, from after
   tokenization to the logits of the last prompt token and the first sampled token (time to first
   token without load and tokenization); `generated: M tok` = the following M decode steps. mynah-slm
   prints its own `prefill` / `decode` tok/s.
 - Greedy (`-t 0`), chat mode (template, no thinking), `-c 4096`, page cache warm (the scripts `cat`
-  the model first). **Best of 3** per cell unless noted; this session ran every runq speed table
+  the model first). **Best of 3** per cell unless noted; this session ran every gwenedeg speed table
   twice (main pass + `scripts/bench_all.sh`), decode 3x, and the tables show the best of all runs
   of the same configuration (6-12 runs per cell; the -b 512 / 1,500 / 8-thread cell appears in both
   prefill tables). Every run is in the raw file.
@@ -688,15 +689,15 @@ logits`, mynah-slm `ppl` per window file; ~10 min, mostly mynah-slm).
 ```sh
 cat /proc/loadavg
 for t in 1 4 8 12; do OMP_NUM_THREADS=$t ./bw 1024; done      # gcc -O2 -fopenmp -march=native bench/bw.c -o bw
-scripts/bench_all.sh                                          # all runq tables below, ~8 min, or:
+scripts/bench_all.sh                                          # all gwenedeg tables below, ~8 min, or:
 ALL=1 scripts/bench_prefill.sh -l "450 1500 3000" -b 512 -t "1 4 8 12" -r 3   # prefill grid
 ALL=1 scripts/bench_prefill.sh -l 1500 -b "1 64 128 256 512" -t 8 -r 3        # chunk sweep
 ALL=1 REPS=3 scripts/bench_qwen3c.sh models/Qwen3-0.6B-q8.bin 1 4 8 12 16     # decode
-OMP_NUM_THREADS=8 ./runq models/Qwen3-0.6B-q8.bin -c 4096 -t 0 -n 256 -i "$(scripts/bench_prefill.sh -P 3000)"  # decode at 3,000
+OMP_NUM_THREADS=8 ./gwenedeg models/Qwen3-0.6B-q8.bin -c 4096 -t 0 -n 256 -i "$(scripts/bench_prefill.sh -P 3000)"  # decode at 3,000
 # baselines
 git show 87e08aa:src/runq.c > /tmp/q/runq.c
-gcc -Ofast -fopenmp -march=native -D_FILE_OFFSET_BITS=64 /tmp/q/runq.c -lm -o /tmp/q/runq-upstream
-ALL=1 REPS=3 RUNQ=/tmp/q/runq-upstream scripts/bench_qwen3c.sh models/Qwen3-0.6B-q8.bin 1 4 8 12
+gcc -Ofast -fopenmp -march=native -D_FILE_OFFSET_BITS=64 /tmp/q/runq.c -lm -o /tmp/q/qwen3c
+ALL=1 REPS=3 GWENEDEG_BIN=/tmp/q/qwen3c scripts/bench_qwen3c.sh models/Qwen3-0.6B-q8.bin 1 4 8 12
 scripts/fetch_mynah.sh
 ALL=1 REPS=3 scripts/bench_mynah.sh models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf 4 8 12   # and -Q4_K_M
 # quality

@@ -1,6 +1,6 @@
-# The KV cache on disk (`runq serve --kv-disk DIR`)
+# The KV cache on disk (`gwenedeg serve --kv-disk DIR`)
 
-For operators of `runq serve`. This is the section of [server.md](server.md) that described the disk tier, moved here
+For operators of `gwenedeg serve`. This is the section of [server.md](server.md) that described the disk tier, moved here
 unchanged (2026-11-21) except for its first sentence and the pointer to the command it refers to; the flags (`--kv-disk`, `--kv-disk-max`, `--kv-disk-free`,
 `--kv-disk-min`) stay in [server.md](server.md)'s flag table. The disk is also where `--admit chunk` swaps requests out
 ([memory-admission.md](memory-admission.md)). Measurements are dated 2026-10-31 on the dev box's virtual SSD.
@@ -29,7 +29,7 @@ view goes to the prompt's common prefix with the saved tokens (TODO S9c.4), not 
 hybrid target restarts at a checkpoint below it, and the view's rows above wait for the prefill (their h was the
 target's); the whole file, its kept state too. A draft file that does not check out against the server's drafter
 (another draft model's, e.g. after switching to `--draft mtp`; another KV type; other tokens) is removed at the
-start, logged (`runq serve: --kv-disk: DIR/N.draft.rqseq: not the draft's (...), removed`), its target file kept: such
+start, logged (`gwenedeg serve: --kv-disk: DIR/N.draft.rqseq: not the draft's (...), removed`), its target file kept: such
 a conversation's view then follows the loaded prefix as a gap (zeros for h, counted in `mtp_approx`; outputs exact). Every
 other file is version 1, byte for byte as before (tested against 915894a's: `seqfile/v1_same`, and `server_test.py
 --disk-compat`: one directory served by an older build, this one and the older one again, nothing removed); a

@@ -51,7 +51,7 @@ loaded; the 27B was never touched. Temp files are in `/var/tmp`, which is disk; 
 (`/r` = `--repack`'s 4-bit codes.) The codebook decode costs up to +48% over IQ4_XS, which has no codebook. That fits
 the report's finding: each weight block is decoded again for every 8 activation rows.
 
-**Phase split** (`-DRUNQ_PROFILE`, `synth-q35-iq.gguf`: the test suite's 27B-shaped synthetic model with all nine
+**Phase split** (`-DGWENEDEG_PROFILE`, `synth-q35-iq.gguf`: the test suite's 27B-shaped synthetic model with all nine
 types, dim 768, 8 layers; 1,500 tokens, `-b 512`, 8 threads, load 3.2): GEMM phases 68%:
 - qkv 23%, w1+w3 22%, w2 13%, wo 10%
 - attention 12%
@@ -81,7 +81,7 @@ The model is small, so its weights sit in L2/L3. That flatters the old kernel; t
 Design (docs/iquants.md, "Batched rows", has the full text):
 
 - **Work items.** `gemm_plan` marks Q2_K / i-quant jobs tiled when the phase has at least `IQX_MIN` = 24 rows (AVX-512
-  only, `RUNQ_IQX`). Items are (32-row tile, chunk of `q8p_nb` rows), as for the K-quants. `iqx_gemm_item` decodes the
+  only, `GWENEDEG_IQX`). Items are (32-row tile, chunk of `q8p_nb` rows), as for the K-quants. `iqx_gemm_item` decodes the
   tile once per claim (`*last`).
 - **Scratch layout**, 704 bytes per (16-row block, group of 32): 8 x 64 u8 codes v + B, S0 and S1 as int32, D as fp32.
   `iqx_unpack_tile` produces the u8 codes by calling `iq512_group`, the same decode `iq_rows` uses, so the VBMI and
@@ -194,7 +194,7 @@ Q2_K 3%, IQ2_XXS 1.4%, IQ1_M 0.3%), time ∝ share x ns from the table:
     - `-b 7` / `-b 64` / `-b 512` vs `-b 1`;
     - 4 vs 3 threads;
     - AVX-512 vs generic;
-    - `RUNQ_IQ_GATHER=1`, `--repack`, `--repack=IQ3_S` vs default;
+    - `GWENEDEG_IQ_GATHER=1`, `--repack`, `--repack=IQ3_S` vs default;
     - the MTP paths and api_test;
     - and the 0.8B Q8_0 / Q4_K_M batched / thread / kernel checks (the K-quant path: `GEMM_SCRATCH`).
 - Manual: `synth-q35-iq` logits sha256 identical for `-b 1`, `-b 64`, `-b 512`, generic `-b 512`, `--repack -b 333`,
@@ -232,7 +232,7 @@ codes: +1.37 GiB, weights 12.23 GiB`. Raw log: [bench/pp-window-2026-11-21/](ben
 | 16, `--repack` | 86.5 / 79.4 | 109.3 / 107.7 | 1.26x |
 | 14, no `--repack` | 67.9 | 101.3 | 1.49x |
 
-**3. Phase split** (`RUNQ_PROFILE`, 14 threads, `--repack`, the same prompt; s):
+**3. Phase split** (`GWENEDEG_PROFILE`, 14 threads, `--repack`, the same prompt; s):
 
 | phase | base | new | |
 |---|---|---|---|
@@ -256,13 +256,13 @@ Q8_0 / F32 matrices inside the same phases (Q4_K 10%, Q6_K 1.6% of the weights, 
 **103.9** / 100.1 / 95.4 tok/s. 512 stays the best; no reason to raise the cap.
 
 **Against ik_llama.cpp** (BENCHMARKS.md, same file and box, 2026-11-21; not the same harness): its server prefilled the
-0.8-2.5k-token prompts at 110-118 tok/s where runq's server did 81-84, which is base's CLI number here at 14 threads;
-with the change runq's CLI does 101-103. If the server follows the CLI as before, the short-prompt gap goes from
+0.8-2.5k-token prompts at 110-118 tok/s where Gwenedeg's server did 81-84, which is base's CLI number here at 14 threads;
+with the change Gwenedeg's CLI does 101-103. If the server follows the CLI as before, the short-prompt gap goes from
 1.35-1.45x to ~1.1x; `llama-bench` pp2048 (`-ub 512` 135, `-ub 2048` 148 tok/s) stays 1.3-1.45x ahead. The 32k cold
 prefill (471 vs 319 s) was not re-measured: there attention is a larger share and the gain will be smaller. Both are
 server measurements for a later window (`scripts/s9c_bench.py` as in `bench/ikllama-2026-11-21/`).
 
-**Measured 2026-11-22** (BENCHMARKS.md, the runq vs llama.cpp vs ik_llama.cpp section): the server's short prompts now
+**Measured 2026-11-22** (BENCHMARKS.md, the gwenedeg vs llama.cpp vs ik_llama.cpp section): the server's short prompts now
 prefill at 101-111 tok/s against ik's 117-125 (0.79-0.95x per identical request), the cold 32k prompt in 391 s against
 ik's 309 s the same day (0.79x). The short-prompt estimate above was about right; at 32k the gap is ~1.27x.
 
@@ -275,17 +275,17 @@ cd /opt/projects/tools/gwenedeg-pp && scripts/pp_window.sh
 # = scripts/pp_window.sh /opt/projects/tools/gwenedeg/models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf fbe8c51
 ```
 
-- **What it does.** It builds base (the branch point with main, `fbe8c51`) and this tree in a temp dir (plain, `-DRUNQ_PROFILE`,
+- **What it does.** It builds base (the branch point with main, `fbe8c51`) and this tree in a temp dir (plain, `-DGWENEDEG_PROFILE`,
   `-DRQ_BATCH_MAX=2048`; `-j8`), then:
   1. **Bit-identity on the 27B.** sha256 of `-m logits` on a ~300-token prompt: base `-b 512`, new `-b 512`, `-b 1`,
      `-b 77` at 3 threads, and `--repack`. All must be equal.
   2. **Prefill tok/s**, base vs new, ~2,500 tokens, `-b 512 --repack`, at 8 / 14 / 16 threads, best of 2. Also 14
      threads without `--repack`.
-  3. **Phase split** (`RUNQ_PROFILE`), base vs new, 14 threads: gives g above and what remains (recurrence,
+  3. **Phase split** (`GWENEDEG_PROFILE`), base vs new, 14 threads: gives g above and what remains (recurrence,
      attention, norms).
   4. **`-b` 256 / 512 / 1024 / 2048**, ~4,100 tokens, 14 threads.
 - **Cost.** Expected duration ~20-25 min: each 27B run is a ~5-10 s load plus 20-45 s of prefill; step 1's `-b 1` run
-  is ~40 s. Peak RSS ~12.5-13.5 GB, one runq at a time.
+  is ~40 s. Peak RSS ~12.5-13.5 GB, one gwenedeg at a time.
 - **Output.** Results go to `bench/pp-window-DATE/log.txt` (stderr in `stderr.txt`).
 - **Options.** Env `TH` (step 2's thread counts), `TP` (threads of the other steps, default 14), `REPS`, `JOBS`,
   `SKIP="1 4"`.
@@ -293,9 +293,9 @@ cd /opt/projects/tools/gwenedeg-pp && scripts/pp_window.sh
   (`175bded2dd8e714e`); prefill 6,713 -> 8,354 tok/s with `--repack`, 6,248 -> 8,503 without.
 
 **Follow-up, optional (~10 min):** the server workload of BENCHMARKS.md's 27B section, with the new binary, to compare
-the "prefill, 0.8-2.5k-token prompts" row (runq 81-84 vs ik 110-118 tok/s) and the 32k cold prefill (471 s vs 319 s).
-Command: `scripts/s9c_bench.py` exactly as in `bench/ikllama-2026-11-21/` with `--runq` pointing at this tree's
-`runq`; the long-context case takes ~10 min, and at 98k ctx the peak RSS is ~18.4 GB.
+the "prefill, 0.8-2.5k-token prompts" row (gwenedeg 81-84 vs ik 110-118 tok/s) and the 32k cold prefill (471 s vs 319 s).
+Command: `scripts/s9c_bench.py` exactly as in `bench/ikllama-2026-11-21/` with `--gwenedeg` pointing at this tree's
+`gwenedeg`; the long-context case takes ~10 min, and at 98k ctx the peak RSS is ~18.4 GB.
 
 ## Not done, and why
 

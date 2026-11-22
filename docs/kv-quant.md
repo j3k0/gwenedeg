@@ -1,6 +1,6 @@
 # 8-bit and 4-bit KV cache (`-k q8`, `q4`, `q4k4`; TODO G3)
 
-`-k` (runq, `runq serve`, `rq_seq_new`'s kv_type) takes three quantized cache types, each with the fp32 attention or,
+`-k` (gwenedeg, `gwenedeg serve`, `rq_seq_new`'s kv_type) takes three quantized cache types, each with the fp32 attention or,
 as `-dot`, the bf16 dot-product attention of `bf16-dot`:
 
 | `-k` | K | V | bytes / value (with scales) | KV at 98,304 positions, Qwen3.8-27B | for |
@@ -40,7 +40,7 @@ What this keeps:
 
 ## Quality
 
-KL divergence of runq's next-token distributions from the model's HF checkpoint in fp32, teacher-forced on prose and
+KL divergence of Gwenedeg's next-token distributions from the model's HF checkpoint in fp32, teacher-forced on prose and
 code (`scripts/kl_kv.py`; the Q8_0 GGUF, so the baseline f32 / f16 is the weights' own error).
 
 **Qwen3-0.6B** (attention in all 28 layers; 3 pieces, 10,338 tokens, 2026-10-31):
@@ -91,7 +91,7 @@ groups nor an asymmetric grid save it; V tolerates 4 bits in both. Hence `q4` ke
 
 Not measured on the 27B itself (no HF checkpoint of Qwen3.8-27B here): Qwen3.5-0.8B, the same architecture with the same
 1-in-4 attention layers and head_dim 256, is the proxy for Saluki and the Qwen3.8-27B files. A check on the 27B: KL
-between its f16 and quantized caches (runq vs runq, `scripts/kl_quant.py`'s method with two `-k` instead of two files).
+between its f16 and quantized caches (gwenedeg vs gwenedeg, `scripts/kl_quant.py`'s method with two `-k` instead of two files).
 
 **The rotation** (Qwen3-0.6B, `q8` without it, 2 pieces): KL 0.0222 / 0.0174 vs 0.0043 / 0.0034 rotated: ~5x. K's
 outlier dims (|K| up to ~500 in a few dims, TODO G3) otherwise set their group's scale; the rotation spreads them over
@@ -128,11 +128,11 @@ conversion are left (TODO G3).
 
 ```sh
 # Qwen3.8-27B Q4_K_M at 98k: the loader's estimate 19.56 GiB (f16: 22.37) + the draft (its KV shrinks alike)
-OMP_NUM_THREADS=16 runq serve models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf -c 98304 -k q8-dot \
+OMP_NUM_THREADS=16 gwenedeg serve models/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf -c 98304 -k q8-dot \
     --draft models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf --slots 1 --parallel 1 --checkpoints 3 \
     --spec-calibrate 32768 --timeout 0 --name qwen3.8-27b --port 18080
 # Saluki at 98k, speed first: 10.37 GiB (f16: 14.69) + the draft
-OMP_NUM_THREADS=16 runq serve models/Underdog-Saluki-27B-1.0-GGUF/Underdog-Saluki-27B-1.0-IQ2-mix.gguf -c 98304 -k q4k4-dot \
+OMP_NUM_THREADS=16 gwenedeg serve models/Underdog-Saluki-27B-1.0-GGUF/Underdog-Saluki-27B-1.0-IQ2-mix.gguf -c 98304 -k q4k4-dot \
     --draft models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf --slots 1 --parallel 1 --checkpoints 3 \
     --spec-calibrate 32768 --timeout 0 --name saluki-27b --port 18080
 ```

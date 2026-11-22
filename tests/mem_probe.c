@@ -18,7 +18,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include "../src/runq.h"
+#include "../src/gwenedeg.h"
 
 static double status_mib(const char *key) {
     FILE *f = fopen("/proc/self/status", "r");

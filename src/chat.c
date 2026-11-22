@@ -1,5 +1,5 @@
 /* Chat template rendering (Qwen3's ChatML, as the CLI's multi-turn chat keeps the conversation in the
- * KV cache) and the generation loop (rq_generate). Only the public API underneath (runq.h), except
+ * KV cache) and the generation loop (rq_generate). Only the public API underneath (gwenedeg.h), except
  * the model's templates.
  *
  * The conversation as token pieces (models/Qwen3-0.6B/tokenizer_config.json; the exporter's .template*
@@ -16,7 +16,7 @@
  * earlier assistant turns (it drops their reasoning). Text pieces are encoded separately; they are
  * separated by added tokens (<|im_start|>, <|im_end|>), so this is the same as encoding the whole
  * rendered string.
- * Variants (runq.h, RQ_CHAT_*): Instruct-2507 has no think block (G is empty in both modes, thinking is
+ * Variants (gwenedeg.h, RQ_CHAT_*): Instruct-2507 has no think block (G is empty in both modes, thinking is
  * treated as off everywhere: replies stay verbatim in the history, as its template renders them);
  * Thinking-2507's P_i ends with "<think>\n" with thinking on (G = "<think>\n\n</think>\n\n" with it off,
  * not in its template), history as the hybrid's, except that an answered turn's P_i loses the "<think>\n"

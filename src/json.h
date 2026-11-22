@@ -1,4 +1,4 @@
-/* A small JSON parser (DOM, arena-allocated) and writer, for runq serve (src/serve.c).
+/* A small JSON parser (DOM, arena-allocated) and writer, for gwenedeg serve (src/serve.c).
  *
  * Parser: RFC 8259 JSON (no comments, NaN / Infinity, trailing commas or single quotes), UTF-8 input;
  * \uXXXX escapes incl. surrogate pairs (a lone surrogate becomes U+FFFD); raw control characters in
@@ -9,8 +9,8 @@
  * (bytes that are not part of a well-formed character, surrogates, overlongs) with U+FFFD, so the
  * output is always valid JSON in valid UTF-8 whatever the model generated.
  */
-#ifndef RUNQ_JSON_H
-#define RUNQ_JSON_H
+#ifndef GWENEDEG_JSON_H
+#define GWENEDEG_JSON_H
 
 #include <stddef.h>
 

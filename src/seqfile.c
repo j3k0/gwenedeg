@@ -1,5 +1,5 @@
-/* Sequences on disk (runq.h: rq_seq_save, rq_seq_file_info, rq_seq_file_keep, rq_seq_load): a KV cache tier for
- * runq serve --kv-disk (engine.c). Its own translation unit: _GNU_SOURCE (O_DIRECT) stays out of forward.c, whose
+/* Sequences on disk (gwenedeg.h: rq_seq_save, rq_seq_file_info, rq_seq_file_keep, rq_seq_load): a KV cache tier for
+ * gwenedeg serve --kv-disk (engine.c). Its own translation unit: _GNU_SOURCE (O_DIRECT) stays out of forward.c, whose
  * code generation the exact arithmetic depends on. */
 #if defined __linux__ && !defined _GNU_SOURCE
 #define _GNU_SOURCE // (O_DIRECT, posix_fallocate, posix_fadvise)
@@ -19,7 +19,7 @@
 // pool, one item per (attention layer, K / V) and per state section (a deep queue for an SSD: ~1.4 GB/s written,
 // up to ~7 GB/s read on the dev box). Not on Windows (RQ_ERR_STATE).
 // Version 2 (TODO S9c.2): an MTP view's sequence that keeps the target's hidden state at its last row (RqSeq.hpos ==
-// len - 1: runq serve's view at rest) adds it, so that a loaded or swapped-in view goes on exactly: SeqFileExt after
+// len - 1: gwenedeg serve's view at rest) adds it, so that a loaded or swapped-in view goes on exactly: SeqFileExt after
 // the header in its page, the state (dim floats) at off_h = version 1's file_bytes, padded to SF_ALIGN, all of it under
 // the hash. Every other sequence is written as version 1, byte for byte as before (a reader of version 1 only refuses a
 // version 2 file: RQ_ERR_MISMATCH)

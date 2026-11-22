@@ -1,4 +1,4 @@
-"""Gwenedeg CI: build runq and run the regression suite in containers, cached by content.
+"""Gwenedeg CI: build gwenedeg and run the regression suite in containers, cached by content.
 
     dagger check                  # every check (build, test), in parallel; cached results return at once
     dagger check -l               # list them
@@ -46,7 +46,7 @@ MODEL_FILES = [
 ]
 MODELS_IGNORE = ["*"] + [f"!{f}" for f in MODEL_FILES]
 
-BINARIES = ["runq", "runq-generic", "api-test", "tools-test", "build/bf16dp_test", "build/bf16dp_test-emu"]
+BINARIES = ["gwenedeg", "gwenedeg-generic", "api-test", "tools-test", "build/bf16dp_test", "build/bf16dp_test-emu"]
 
 
 def _host_cpu() -> str:
@@ -91,12 +91,12 @@ class Gwenedeg:
                     "gcc libc6-dev make python3 python3-numpy >/dev/null && rm -rf /var/lib/apt/lists/*",
                 ]
             )
-            .with_env_variable("RUNQ_HOST_CPU", _host_cpu())
+            .with_env_variable("GWENEDEG_HOST_CPU", _host_cpu())
         )
 
     @function
     def builder(self) -> dagger.Container:
-        """The toolchain with the sources built: runq, runq-generic, the API / tools / bf16 tests."""
+        """The toolchain with the sources built: gwenedeg, gwenedeg-generic, the API / tools / bf16 tests."""
         return (
             self.toolchain()
             .with_directory("/src", self.source)
@@ -109,7 +109,7 @@ class Gwenedeg:
     async def build(self) -> dagger.Directory:
         """Compile everything make test needs (fails fast on a compile error, before the suite)."""
         b = self.builder()
-        out = dag.directory().with_file("runq", b.file("runq")).with_file("runq-generic", b.file("runq-generic"))
+        out = dag.directory().with_file("gwenedeg", b.file("gwenedeg")).with_file("gwenedeg-generic", b.file("gwenedeg-generic"))
         return out.with_directory("build", b.directory("build"), include=["api_test*", "tools_test", "bf16dp_test*"])
 
     @function

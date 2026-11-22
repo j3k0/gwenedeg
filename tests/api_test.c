@@ -1,4 +1,4 @@
-/* Tests of the library API (src/runq.h), run by `make test` (tests/check.py, group api) on each model:
+/* Tests of the library API (src/gwenedeg.h), run by `make test` (tests/check.py, group api) on each model:
  *   tests/api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv] [--kv-type TYPE]
  * Prints PASS / FAIL lines, exit status 1 if any failed. The forward-pass checks are bitwise: a
  * sequence's logits must not depend on what else the context ran in between or batched with it
@@ -49,14 +49,14 @@
  * same for any thread count, build and --quick). --quick: fewer variants (the generic build). TODO S9c.1:
  * decode_hidden/{target,view}: rq_decode_hidden == a one-row rq_forward_batch with hidden (h_in on the view) == the
  * decode path, logits and hidden bitwise, also without logits; mtp_follow/*: the view followed by a caller that batches
- * its rows (runq serve): rq_mtp_hin's h rule and count (hin_rule), rq_mtp_final / rq_mtp_keep / rq_mtp_kept
+ * its rows (gwenedeg serve): rq_mtp_hin's h rule and count (hin_rule), rq_mtp_final / rq_mtp_keep / rq_mtp_kept
  * (final_keep: also a kept state past the view's end at its capacity), and --mtp-seqcheck's comparison on a saved
  * lockstep pair (seqcheck: passes, with the kept state saved; the view fed zeros for h: fails). TODO S9c.2: seqfile/*:
  * the view's kept state on disk (mtp_h: saved with it as version 2, restored by a whole load only; without it, or kept
  * before the last row: version 1), a corrupted state or extension and a file cut before the state refused
  * (mtp_h_corrupt)
  *   tests/api_test --mtp-seqcheck MODEL TARGET.rqseq VIEW.rqseq
- * A saved target sequence and its MTP view's (runq serve's RUNQ_TEST_MTP_DUMP) against a fresh lockstep run over the
+ * A saved target sequence and its MTP view's (gwenedeg serve's GWENEDEG_TEST_MTP_DUMP) against a fresh lockstep run over the
  * target file's tokens (S9b's mtp_lockstep on files): the target's hidden rows of a fresh prefill, the view's prefill
  * over them shifted by one; the view's length and tokens == the target's, its KV cache bitwise over the whole
  * 16-position tiles; a view file with the kept state (version 2): the state == the target's last hidden row bitwise, a
@@ -66,9 +66,9 @@
  * (their error codes, the length and the kept state). Built into 915894a's api_test too (tests/make_seqfile_v1ref.sh),
  * for tests/check_models.py's seqfile/v1_same (version 1 files byte for byte 915894a's) and seqfile/v2_on_v1_reader
  *   tests/api_test --mtp-dump MODEL TEXTFILE OUT.bin [-b N] [--vocab N]
- * The MTP view's logits teacher-forced on TEXTFILE's tokens (raw text, as runq -m logits): the target's prefill with
+ * The MTP view's logits teacher-forced on TEXTFILE's tokens (raw text, as gwenedeg -m logits): the target's prefill with
  * hidden rows, then the view's over the same tokens with h shifted by one (row 0: zeros), every row's logits, in
- * runq -m logits' format (int32 n, vocab, ids[n], float32 logits[n][vocab]); -b: the chunk (1: the decode path),
+ * gwenedeg -m logits' format (int32 n, vocab, ids[n], float32 logits[n][vocab]); -b: the chunk (1: the decode path),
  * --vocab: RqMtpOpts.vocab. For tests/check_models.py's mtp_ref (vs tests/ref_qwen35.py mtp_forward) and mtp_top1 */
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,7 +78,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #endif
-#include "../src/runq.h"
+#include "../src/gwenedeg.h"
 
 static int failed = 0;
 
@@ -384,7 +384,7 @@ static int sample_main(int argc, char **argv) {
 }
 
 // seqfile-out: begin (tests/make_seqfile_v1ref.sh copies this block into 915894a's api_test.c: its API only, plus
-// rq_mtp_keep where runq.h has it)
+// rq_mtp_keep where gwenedeg.h has it)
 static int sfo_rows(RqCtx *c, RqSeq *s, const int *t, int n, int dim, float *H, const float *hin) {
     // t on s in passes of 64 rows: their hidden rows into H, their h inputs from hin (each NULL: none)
     int e = RQ_OK;
@@ -1350,7 +1350,7 @@ static void batch_tests(RqCtx *c, RqTokens A, RqTokens B, RqTokens C, const floa
     // few attention items, so the long rows' attention is split over its blocks, in the prefill path the single
     // row's); each row == its sequence decoded token by token, and with a checkpoint per row (rq_seq_checkpoint_rows) each row's state is reachable by
     // rq_seq_truncate and continues exactly. On the default context (batch_decode_worker: segments of at most
-    // bd_seg rows) and on one made with RUNQ_BD=64,2,8,1 (the prefill path for any segment of more than one row, as
+    // bd_seg rows) and on one made with GWENEDEG_BD=64,2,8,1 (the prefill path for any segment of more than one row, as
     // before TODO S2). DIGEST lines: batch_verify (a), _long (b), _mixed (c), _mixed_long (d); + _prefill
     {
         static const int vp[3] = { 20, 250, 252 }, vr[3] = { 4, 9, 6 };
@@ -1358,10 +1358,10 @@ static void batch_tests(RqCtx *c, RqTokens A, RqTokens B, RqTokens C, const floa
         int vt[3][VF_MAX + 1], tok2[2], e1;
         uint64_t vh[3][VF_MAX + 1];
         RqSeq *vs[3] = { seq_new(0), seq_new(0), seq_new(0) };
-        char *old = getenv("RUNQ_BD") ? strdup(getenv("RUNQ_BD")) : NULL;
-        setenv("RUNQ_BD", "64,2,8,1", 1);
+        char *old = getenv("GWENEDEG_BD") ? strdup(getenv("GWENEDEG_BD")) : NULL;
+        setenv("GWENEDEG_BD", "64,2,8,1", 1);
         RqCtx *cp = rq_ctx_new(M, rq_ctx_max_batch(c), 0, &e1), *cv[2] = { c, cp };
-        if (old) setenv("RUNQ_BD", old, 1); else unsetenv("RUNQ_BD");
+        if (old) setenv("GWENEDEG_BD", old, 1); else unsetenv("GWENEDEG_BD");
         free(old);
         if (!cp) die("rq_ctx_new", e1);
         for (int q = 0; q < 3; q++) {
@@ -2782,7 +2782,7 @@ static int mt_dec(RqModel *m, RqCtx *c1, RqCtx *c64, const int *t, int n, const 
 
 static int mt_hin(RqModel *view, RqCtx *v64, RqSeq *s, const int *t, int n, const float *hR, const float *Hs, const uint64_t *vlhR,
                   char *d, size_t dn) {
-    // rq_mtp_hin's rule (runq.h): row q's h from H (positions h0 ..), else the kept one, else zeros (row 0: exact), the
+    // rq_mtp_hin's rule (gwenedeg.h): row q's h from H (positions h0 ..), else the kept one, else zeros (row 0: exact), the
     // count of the zero rows; hR: the target's hidden rows of t (n x D), Hs: them shifted by one (row 0 zeros)
     RqSeq *vs = mt_seq(view);
     float *hin = malloc((size_t)16 * D * sizeof(float)), *z = calloc((size_t)16 * D, sizeof(float)), *lg = NULL;
@@ -2865,7 +2865,7 @@ static int mt_keep(RqModel *view, RqCtx *v64, RqSeq *s, const int *t, int n, con
 }
 
 static int mt_seqcheck(RqModel *m, RqModel *view, const char *tp, const char *vp, char *d, size_t dn) {
-    // a saved target / MTP view pair (runq serve's RUNQ_TEST_MTP_DUMP) against a fresh lockstep run over the target
+    // a saved target / MTP view pair (gwenedeg serve's GWENEDEG_TEST_MTP_DUMP) against a fresh lockstep run over the target
     // file's tokens: the target's hidden rows of a fresh prefill (its KV type), the view's prefill over them shifted by one
     // (row 0 zeros; the file's KV type). The view's length == the target's, its tokens the target's, its KV cache == the
     // reference's bitwise over the whole 16-position tiles (copies with the kept state cleared, rq_seq_save, byte for byte);
@@ -3152,7 +3152,7 @@ static int mtp_main(int argc, char **argv) {
     // decode_hidden (TODO S9c.1): rq_decode_hidden == a one-row rq_forward_batch with hidden (and h_in on the view)
     report(mt_dec(M, c1, c64, T.v, n, NULL, quick ? n - 12 : n / 2, lhR, hR, d, sizeof(d)), "decode_hidden/target", d);
     report(mt_dec(view, v1, v64, T.v, n, Hs, quick ? n - 12 : n / 2, vlhR, vhR, d, sizeof(d)), "decode_hidden/view", d);
-    // mtp_follow (TODO S9c.1): the view followed by a caller (runq serve): the h rule, the final rows, the kept state;
+    // mtp_follow (TODO S9c.1): the view followed by a caller (gwenedeg serve): the h rule, the final rows, the kept state;
     // a saved pair against a fresh lockstep run (--mtp-seqcheck's)
     report(mt_hin(view, v64, s, T.v, n, hR, Hs, vlhR, d, sizeof(d)), "mtp_follow/hin_rule", d);
     report(mt_keep(view, v64, s, T.v, n, hR, Hs, d, sizeof(d)), "mtp_follow/final_keep", d);

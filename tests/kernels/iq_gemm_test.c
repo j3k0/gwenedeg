@@ -18,7 +18,7 @@
 #include "../../src/kernels_avx512.h"
 #include "../../src/iquants.h"
 
-#ifndef RUNQ_IQX
+#ifndef GWENEDEG_IQX
 #error "needs the AVX-512 VNNI build"
 #endif
 int rq_iq_gather = 0;
@@ -112,7 +112,7 @@ static int test(int type, int d, int k, int nb) {
         for (int b = 0; b < nb; b += KQ_NC)
             iq_dot(type, y[0] + (size_t)b * d + rb * KQ_ROWS, d, kp + (size_t)rb * nsb * iq_sb_bytes(type), k,
                    nb - b < KQ_NC ? nb - b : KQ_NC, xq + (size_t)b * k, k, xs + (size_t)b * k / 32, k / 32);
-    for (int g = 0; g < 2; g++) { // the VBMI and the gather decodes (RUNQ_IQ_GATHER)
+    for (int g = 0; g < 2; g++) { // the VBMI and the gather decodes (GWENEDEG_IQ_GATHER)
         rq_iq_gather = g;
         memset(y[1], 0xff, sizeof(float) * nb * d);
         run_rows(type, y[1], d, xq, k, xs, c16, nb, kp);

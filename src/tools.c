@@ -1,4 +1,4 @@
-/* runq serve: tool calls (OpenAI `tools`) for the Qwen3.5 and Qwen3.8 chat templates (serve.h).
+/* gwenedeg serve: tool calls (OpenAI `tools`) for the Qwen3.5 and Qwen3.8 chat templates (serve.h).
  *
  * Rendering (tools_render): the conversation exactly as the templates render it with tools, `tool` messages and
  * earlier assistant `tool_calls` (models/Qwen3.5-0.8B/chat_template.jinja = tests/golden/templates/qwen3.5.jinja;
@@ -18,7 +18,7 @@
  * value V is the string itself, else tojson (Qwen3.8), or for Qwen3.5 Python's str() of a scalar (True, None, 1.5)
  * and tojson of an object / array. Arguments given as a JSON string (OpenAI's form) are parsed first, as vLLM does.
  * R / C (reasoning, content): Qwen3.5 from reasoning_content, else content split at "</think>" as its template does;
- * Qwen3.8 as runq's Qwen3.8 rendering (src/chat.c: reasoning_content, else split at the last "</think>").
+ * Qwen3.8 as gwenedeg's Qwen3.8 rendering (src/chat.c: reasoning_content, else split at the last "</think>").
  *
  * Parsing (tscan_*, tool_parse_calls): the reply's content (the text after the reasoning) is scanned as it is
  * generated: text before a "<tool_call>" is content (its trailing whitespace dropped: the template's "\n\n"), a
@@ -369,7 +369,7 @@ static char *trimmed_copy(const RqModel *m, const char *s, size_t n) {
 static int assistant_body(JBuf *b, const RqModel *m, int chat, const Msg *x, int think) {
     // an assistant message after its header (render_assistant), its reasoning R and content C from reasoning_content|trim;
     // else from a content with </think>: Qwen3.5's template (R: before the first </think>, after the last <think> there; C:
-    // after the last </think>, lstrip('\n')), runq's Qwen3.8 form (R: before the last </think>, after the last <think>
+    // after the last </think>, lstrip('\n')), gwenedeg's Qwen3.8 form (R: before the last </think>, after the last <think>
     // there; C: after it; both trimmed). RQ_OK or RQ_ERR_NOMEM
     int q38 = chat == RQ_CHAT_QWEN38, e = RQ_OK;
     const char *t = x->text, *last = strstr(t, "</think>"), *p, *c = t;

@@ -6,7 +6,7 @@
 #include "internal.h"
 
 int GS = 0;
-int rq_iq_gather = 0; // (iquants.h: the AVX-512 i-quant decode by gathers instead of VBMI, RUNQ_IQ_GATHER; a test switch)
+int rq_iq_gather = 0; // (iquants.h: the AVX-512 i-quant decode by gathers instead of VBMI, GWENEDEG_IQ_GATHER; a test switch)
 static int gs_models = 0; // loaded models with weights (all of the same group size GS)
 
 void load_fail(LoadErr *e, const char *fmt, ...) {
@@ -384,7 +384,7 @@ static int prep_pack(const PrepMat *mt, int nm, char *warning, size_t wlen) {
     // 1 if the Q8_0 matrices are repacked for the SIMD kernels (else a warning, if not NULL)
     int pack = 0;
     (void)mt; (void)nm; (void)warning; (void)wlen;
-#ifdef RUNQ_Q8X
+#ifdef GWENEDEG_Q8X
     pack = 1;
     for (int i = 0; i < nm && pack; i++) {
         int q8 = 0; // (roles without a Q8_0 matrix do not count: e.g. F32 alpha / beta of 12 rows)
@@ -407,7 +407,7 @@ static size_t prep_bytes(const QuantizedTensor *t, int d, int k, int pack) {
         sz = (size_t)d * k * sizeof(float);
     else if (t->type != GGML_Q8_0) // Q2_K .. Q6_K, the i-quants (GGUF; d % 16 == 0, k % 256 == 0 checked)
         sz = lq_size(t->type, d, k);
-#ifdef RUNQ_Q8X
+#ifdef GWENEDEG_Q8X
     else if (pack)
         sz = q8x_size(d, k, GS);
 #endif
@@ -522,7 +522,7 @@ static void prepare_worker(void *arg, int tid, int nt) {
             read_at(fd, P->base, q, nr * k, t->q + r0 * k);
             read_at(fd, P->base, s, nr * ng * sizeof(float), t->s + r0 * ng);
         }
-#ifdef RUNQ_Q8X
+#ifdef GWENEDEG_Q8X
         if (pack)
             q8x_pack_blocks(t->p + (size_t)rb0 * ng * Q8X_GROUP(GS), qb, sb, nb, k, GS);
 #endif
@@ -601,7 +601,7 @@ static int prepare_weights(RqModel *m, int fd, int drop, LoadErr *e, char *warni
             t->f = (float *)(w->packed + job[j].off);
         else if (t->type != GGML_Q8_0)
             t->kp = w->packed + job[j].off;
-#ifdef RUNQ_Q8X
+#ifdef GWENEDEG_Q8X
         else if (pack)
             t->p = w->packed + job[j].off;
 #endif
@@ -663,7 +663,7 @@ static size_t ctx_mem(const RqModel *m, int nb, int max_ctx, int nt) {
     if (nb > 1) {
         size_t vr = (size_t)m->att_rows * m->kv_mul; // (per thread: the scores, the partial results)
         n += (size_t)nb * row + (size_t)nt * (att_scores_floats(vr, att_nb) + vr * att_nb * ATT_PSTRIDE(hd)) * sizeof(float);
-#ifdef RUNQ_KQX
+#ifdef GWENEDEG_KQX
         size_t kmax = hid > xs ? hid : xs;
         if (m->kq) n += (size_t)nt * ((GEMM_SCRATCH(kmax) + 63) / 64 * 64);
 #endif
@@ -1128,7 +1128,7 @@ static QuantizedTensor rows_from(const QuantizedTensor *t, int r0, int k) {
     s.b = NULL; // (the file's blocks: not used by the kernels)
     if (t->kp)
         s.kp = t->kp + rb * (k / QK_K) * lq_sb_bytes(t->type);
-#ifdef RUNQ_Q8X
+#ifdef GWENEDEG_Q8X
     else if (t->p)
         s.p = t->p + rb * (k / GS) * Q8X_GROUP(GS);
 #endif

@@ -1,4 +1,4 @@
-/* Batched decode benchmark (the library API, src/runq.h): N independent sequences decoding together,
+/* Batched decode benchmark (the library API, src/gwenedeg.h): N independent sequences decoding together,
  * one row per sequence per rq_forward_batch pass, the logits of every row, greedy (or seeded top-p)
  * sampling per row (rq_sample_batch; -S: rq_sample row by row); aggregate and per-sequence tok/s per
  * (context, N). Built by `make bench-batch`
@@ -13,12 +13,12 @@
  * N = 1 through rq_decode (the single-sequence decode path) as the reference line "dec". -m skips
  * configurations whose KV cache would exceed MAXGB (default 6). -P CHUNK: every pass also prefills CHUNK
  * tokens of another sequence (a mixed pass, as a scheduler interleaving a prompt with decode rows: the
- * prompt's first chunk, positions 0..CHUNK-1, every pass; N may be 0; its prefill tok/s in a last column). A -DRUNQ_PROFILE build also prints
+ * prompt's first chunk, positions 0..CHUNK-1, every pass; N may be 0; its prefill tok/s in a last column). A -DGWENEDEG_PROFILE build also prints
  * the time per phase type and pass of the best rep. Threads: OMP_NUM_THREADS (else the default). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../src/runq.h"
+#include "../src/gwenedeg.h"
 
 static int parse_list(const char *s, int *v, int max) {
     int n = 0;

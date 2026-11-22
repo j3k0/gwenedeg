@@ -107,8 +107,8 @@
  * ds, dm per lane; xs, xf broadcast) with no horizontal operation. 6 float ops per 32 values for
  * Q4_K / Q5_K (ds * xs, cvt, mul, dm * xf, sub, add; ds, dm once per 16-row block and group), 4 for Q3_K / Q6_K.
  */
-#ifndef RUNQ_KQUANTS_H
-#define RUNQ_KQUANTS_H
+#ifndef GWENEDEG_KQUANTS_H
+#define GWENEDEG_KQUANTS_H
 
 #include <stdint.h>
 #include <string.h>
@@ -618,4 +618,4 @@ static inline void kq_dot(int type, float *out, size_t ldo, const uint8_t *wb, i
         q6p_dot(out, ldo, wb, k, nc, xq, ldx, xs, ldxs);
 }
 
-#endif // RUNQ_KQUANTS_H
+#endif // GWENEDEG_KQUANTS_H

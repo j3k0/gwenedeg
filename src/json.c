@@ -1,4 +1,4 @@
-/* JSON parser and writer for runq serve (json.h). */
+/* JSON parser and writer for gwenedeg serve (json.h). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

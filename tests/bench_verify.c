@@ -1,4 +1,4 @@
-/* Verify-pass benchmark (the library API, src/runq.h; TODO S2): the cost of a speculative verify pass, a
+/* Verify-pass benchmark (the library API, src/gwenedeg.h; TODO S2): the cost of a speculative verify pass, a
  * segment of r rows of ONE sequence with every row's logits (RQ_LOGITS_ALL), against one decode step of that
  * sequence (rq_decode, logits) and against r decode rows of r different sequences (one rq_forward_batch pass,
  * one row and its logits per sequence), at a given context length. Built by `make bench-verify`
@@ -15,15 +15,15 @@
  * also carries MIX decode rows of other sequences (a mixed pass, as the server's verify rows next to other
  * requests' decode rows). Reported per configuration: the median and the best pass in ms and
  * f = median / median(dec). -A "NAME=VALUE ..." (up to 3): one more compute context, created with these
- * environment variables set (e.g. "RUNQ_BD=64,2,8,1 RUNQ_SMB=32,32,32,32,0": verify segments on the prefill path
+ * environment variables set (e.g. "GWENEDEG_BD=64,2,8,1 GWENEDEG_SMB=32,32,32,32,0": verify segments on the prefill path
  * and no prefetch in the small-batch kernels, as before TODO S2);
  * every pass then runs on each context in turn (a paired comparison on the shared machine), one table per
- * context and the ratio of each to the first. A -DRUNQ_PROFILE build also prints the mean time per phase type
+ * context and the ratio of each to the first. A -DGWENEDEG_PROFILE build also prints the mean time per phase type
  * and pass of each batched configuration (rq_ctx_profile). Threads: OMP_NUM_THREADS (else the default). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../src/runq.h"
+#include "../src/gwenedeg.h"
 
 static int parse_list(const char *s, int *v, int max) {
     int n = 0;

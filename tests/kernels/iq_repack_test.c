@@ -12,7 +12,7 @@
 #include "../../src/kernels_avx512.h"
 #include "../../src/iquants.h"
 
-#ifndef RUNQ_IQX
+#ifndef GWENEDEG_IQX
 #error "needs the AVX-512 VNNI build"
 #endif
 int rq_iq_gather = 0;

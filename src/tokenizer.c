@@ -219,7 +219,7 @@ void build_tokenizer_gguf(Tokenizer *t, const Gguf *g, int vocab_size) {
     const char *pre = gguf_get_str(g, "tokenizer.ggml.pre", &n);
     int m35 = pre && n == 6 && !memcmp(pre, "qwen35", 6);
     if (!m35 && (!pre || n != 5 || memcmp(pre, "qwen2", 5)))
-        gguf_fail(g, "tokenizer.ggml.pre must be qwen2 or qwen35 (the pre-tokenizers runq implements)%s", NULL);
+        gguf_fail(g, "tokenizer.ggml.pre must be qwen2 or qwen35 (the pre-tokenizers gwenedeg implements)%s", NULL);
     t->marks35 = m35;
     const GgufKV *tk = gguf_get_array(g, "tokenizer.ggml.tokens", GV_STR);
     const GgufKV *ty = gguf_get_array(g, "tokenizer.ggml.token_type", GV_I32);
@@ -766,7 +766,7 @@ int encode(const Tokenizer *t, const char *text, size_t n, int *tokens, int *n_t
 }
 
 // ----------------------------------------------------------------------------
-// API (runq.h)
+// API (gwenedeg.h)
 
 int rq_tokens_push(RqTokens *a, const int *x, int n) {
     if (n <= 0) return RQ_OK; // (x may be NULL then)

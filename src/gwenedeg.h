@@ -1,4 +1,4 @@
-/* runq: Qwen3 (and Qwen3.5-0.8B) inference on the CPU, as a library (the engine of the runq CLI, src/cli.c).
+/* gwenedeg: Qwen3 (and Qwen3.5-0.8B) inference on the CPU, as a library (the engine of the gwenedeg CLI, src/cli.c).
  *
  * Three kinds of objects (docs/library.md):
  *   RqModel  the model: hyperparameters, weights (repacked for the kernels at load), tokenizer, chat
@@ -23,8 +23,8 @@
  * logits do not depend on what it is batched with (tests/api_test.c). Nothing here prints or exits;
  * errors are returned as RQ_ERR_* codes (negative), with a message where it helps.
  */
-#ifndef RUNQ_H
-#define RUNQ_H
+#ifndef GWENEDEG_H
+#define GWENEDEG_H
 
 #include <stddef.h>
 
@@ -49,9 +49,12 @@ double rq_now(void); // monotonic clock, seconds
 // Threads per job of the process-wide pool: n > 0, else OMP_NUM_THREADS, else nproc - nproc/8
 // (Apple Silicon: the performance cores). Call before loading a model; later calls do not resize a
 // started pool, nor change the count once a compute context exists. Also reads the tuning knobs
-// RUNQ_SPIN / RUNQ_SYNC (src/threads.h); returns a warning about them to show, or NULL
+// GWENEDEG_SPIN / GWENEDEG_SYNC (src/threads.h); returns a warning about them to show, or NULL
 const char *rq_threads_init(int n);
 int rq_threads(void);
+// getenv(name), for a GWENEDEG_* name not set its deprecated RUNQ_* one (the names before 2026-11-22): every
+// environment variable the library and the CLI read (GWENEDEG_CHAT_DUMP, GWENEDEG_SMB, ...) goes through it
+const char *rq_getenv(const char *name);
 
 // ------------------------------------------------------------------------------------------ model
 typedef struct RqModel RqModel;
@@ -73,7 +76,7 @@ typedef struct {
                         // if the file is >= 1/4 of the RAM, 1 = dropped, -1 = kept
     int checkpoints;    // Qwen3.5: the checkpoint slots of the sequence the check counts (rq_seq_set_checkpoints; 0: the
                         // default 2)
-    int repack;         // the IQ3_XXS / IQ3_S matmul weights repacked losslessly as 4-bit codes (runq --repack): the same
+    int repack;         // the IQ3_XXS / IQ3_S matmul weights repacked losslessly as 4-bit codes (gwenedeg --repack): the same
                         // values and bit-identical results, less decode work per weight (faster where the matmuls are
                         // compute-bound), 4.19 bits per weight instead of 3.44 / 3.19 (more RAM; the memory check counts
                         // it). RQ_REPACK_ALL, or RQ_REPACK_IQ3_S / _IQ3_XXS bits: those types only; 0 / < 0: none
@@ -110,10 +113,10 @@ typedef struct {
     double mem;  // as RqModelOpts.mem: the view's estimate must fit in this many GiB; 0 = MemAvailable, < 0 = no check
 } RqMtpOpts;
 RqModel *rq_mtp_load(const RqModel *target, const RqMtpOpts *o, char *err, size_t errlen);
-// RqMtpOpts.vocab for a larger vocabulary (runq -D mtp / runq serve --draft mtp without --mtp-vocab; Qwen3.8-27B: the
+// RqMtpOpts.vocab for a larger vocabulary (gwenedeg -D mtp / gwenedeg serve --draft mtp without --mtp-vocab; Qwen3.8-27B: the
 // acceptance of 151,643 and within 1% of all at -G 6 --tau 0.5, the most tok/s; TODO S9d)
 #define RQ_MTP_VOCAB_DEFAULT 100000
-// An MTP view's sequence followed by a caller that batches its rows itself (runq serve; rq_spec_run does this inside).
+// An MTP view's sequence followed by a caller that batches its rows itself (gwenedeg serve; rq_spec_run does this inside).
 // The h inputs of the view's next n rows (positions rq_seq_len(view) ..): row q takes the target's final hidden state at
 // q - 1 from H (hn rows for positions h0 ..; H NULL or hn 0: none), else the one kept with the sequence (rq_mtp_keep),
 // else zeros (row 0: zeros, exact). Returns how many took zeros for an unknown state (RqSpecStats.mtp_approx's);
@@ -174,7 +177,7 @@ double rq_mem_available(void);
 
 // RqModelOpts.repack for a loaded model: per type of its matmul weights (the MTP block not counted) what the repack costs
 // (exact, from the shapes), and IQ1_S / IQ1_M, which are always stored as codes (not optional: their cost is in every
-// load). What it gains depends on the machine and the threads: runq --repack-info loads the model with each choice in
+// load). What it gains depends on the machine and the threads: gwenedeg --repack-info loads the model with each choice in
 // turn and times it (rq_pass_times). RQ_ERR_STATE: no weights
 #define RQ_REPACK_TYPES 4
 typedef struct {
@@ -202,7 +205,7 @@ int rq_pass_times(const RqModel *m, int reps, double *t1, double *t4);
 typedef struct RqSeq RqSeq;
 
 // KV cache type of a sequence: the element type, and the attention's arithmetic. f32 / bf16 / f16: the fp32 attention
-// on the exactly converted values. bf16-dot / f16-dot (opt-in, runq --attn bf16): the bf16 dot-product attention (q,
+// on the exactly converted values. bf16-dot / f16-dot (opt-in, gwenedeg --attn bf16): the bf16 dot-product attention (q,
 // K, the softmax weights and V rounded to bf16, the products as vdpbf16ps does them: ~2x the attention rate on an
 // AVX512_BF16 CPU, less accurate; definition in kernels_avx512.h), on a bf16 cache (its own V layout) or an f16 cache
 // (as f16, rounded again to bf16 when read: slower, a double rounding). q8 / q4 / q4k4 (TODO G3): an 8-bit cache, 8-bit
@@ -280,7 +283,7 @@ size_t rq_seq_kv_bytes(const RqSeq *s, int n);
 // The copied entries are the same bits, so dst continues exactly as src would. Qwen3.5: unless n is src's
 // length, as rq_seq_truncate: src's longest checkpoint <= n, else 0 (rq_seq_len(dst) tells)
 int rq_seq_copy(RqSeq *dst, const RqSeq *src, int n);
-// Sequences on disk (a KV cache tier: runq serve --kv-disk). rq_seq_save writes the sequence's positions
+// Sequences on disk (a KV cache tier: gwenedeg serve --kv-disk). rq_seq_save writes the sequence's positions
 // 0..len-1 to a file: the KV entries (the blocks of 256 positions in use, as in memory), the tokens, the RNG state;
 // Qwen3.5: the recurrent state and the checkpoints held. Written as path.tmp, synced, then renamed to path (a reader
 // never sees a partial file); O_DIRECT where the file system takes it (the page cache is not filled). The bits are
@@ -335,7 +338,7 @@ RqCtx *rq_ctx_new(const RqModel *m, int max_batch, int max_ctx, int *err);
 void rq_ctx_free(RqCtx *c);
 int rq_ctx_max_batch(const RqCtx *c);
 const char *rq_ctx_error(const RqCtx *c); // details of the last error ("" if none)
-// -DRUNQ_PROFILE builds: wall time per batched-prefill phase type, summed over the calls; returns the
+// -DGWENEDEG_PROFILE builds: wall time per batched-prefill phase type, summed over the calls; returns the
 // number of entries (0 otherwise)
 int rq_ctx_profile(const RqCtx *c, const char **names, double *seconds, int max);
 
@@ -443,13 +446,13 @@ int rq_detok_flush(RqDetok *d, char *out, size_t cap);
 //                     the reasoning, it has no opening tag; answered turns lose it: rq_chat_user_history);
 //                     history as the hybrid with thinking. thinking 0
 //                     gives the hybrid's empty think block instead, which is not in this model's template
-//                     (runq serve uses it only for a constrained reply)
+//                     (gwenedeg serve uses it only for a constrained reply)
 //   RQ_CHAT_QWEN35    Qwen3.5: thinking on or off per call, off by default in the CLI (as its template);
 //                     on: rendered as Thinking-2507's ("<think>\n" opens the reply, answered turns lose it),
 //                     off: as the hybrid's. Message texts are trimmed of surrounding whitespace (its template's
 //                     |trim)
 //   RQ_CHAT_QWEN38    Qwen3.8 (a qwen35 file whose template has reasoning_effort): thinking on by default in the CLI
-//                     and runq serve (as its template); user turns and trimming as Qwen3.5's. With thinking on, the
+//                     and gwenedeg serve (as its template); user turns and trimming as Qwen3.5's. With thinking on, the
 //                     reasoning-effort instruction (thinking = RQ_THINK_*, below: medium has none) opens the system
 //                     block: "<|im_start|>system\n" INSTR "\n\n" SYS "<|im_end|>\n", or INSTR alone without a system
 //                     message (rq_chat_system with text NULL; leading system messages are merged with "\n" by
@@ -730,4 +733,4 @@ int rq_seq_fill_synthetic(RqSeq *s, int n, unsigned long long seed);
 #ifdef __cplusplus
 }
 #endif
-#endif // RUNQ_H
+#endif // GWENEDEG_H

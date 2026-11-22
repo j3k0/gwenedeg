@@ -1,4 +1,4 @@
-/* runq serve: an OpenAI-compatible HTTP server on the library (runq.h). Layers, one file each:
+/* gwenedeg serve: an OpenAI-compatible HTTP server on the library (gwenedeg.h). Layers, one file each:
  *   http.c       HTTP/1.1 over POSIX sockets: accept loop, one thread per connection, request parsing
  *                (Content-Length bodies, limits), responses (fixed length or chunked), shutdown
  *   serve.c      the OpenAI layer: routes, request JSON -> a Job (chat template, sampling, stop strings,
@@ -15,13 +15,13 @@
  * serve.c and http.c do not depend on how Jobs are run (Step 10b replaced Step 9's one-job-at-a-time loop
  * with the scheduler behind the same Job interface).
  */
-#ifndef RUNQ_SERVE_H
-#define RUNQ_SERVE_H
+#ifndef GWENEDEG_SERVE_H
+#define GWENEDEG_SERVE_H
 
-#include "runq.h"
+#include "gwenedeg.h"
 #include "json.h"
 
-int serve_main(int argc, char **argv); // `runq serve ...` (cli.c dispatches here)
+int serve_main(int argc, char **argv); // `gwenedeg serve ...` (cli.c dispatches here)
 int rq_repack_parse(const char *v);     // cli.c: --repack=LIST -> RqModelOpts.repack bits, -1 if unknown
 void rq_repack_note(const RqModel *m);  // cli.c: --repack's line on stderr (what was repacked, its cost)
 
@@ -97,7 +97,7 @@ void py_json(JBuf *b, const Js *v);
 void py_str(JBuf *b, const char *s, size_t n);
 void py_float(JBuf *b, double x);
 
-// the conversation of a chat completion request as runq serve renders it (`runq -m render` with "request"); RQ_OK or
+// the conversation of a chat completion request as gwenedeg serve renders it (`gwenedeg -m render` with "request"); RQ_OK or
 // an error with its message; *thinking: the request's thinking mode
 int serve_render(RqModel *m, const Js *body, RqTokens *out, int *thinking, char *err, size_t errlen);
 

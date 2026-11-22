@@ -1,10 +1,10 @@
-# Gwenedeg: Qwen3 inference in C on the CPU (the runq binary and library: src/*.c, derived from qwen3.c;
+# Gwenedeg: Qwen3 inference in C on the CPU (the gwenedeg binary and library: src/*.c, derived from qwen3.c;
 # modules: README.md, Architecture)
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 # macOS (Apple clang): no OpenMP needed (threads.h's pthread pool; OpenMP is only used with
-# -DRUNQ_NO_POOL), -O3 -ffast-math = gcc's -Ofast (deprecated in clang). -ffp-contract=on after it:
+# -DGWENEDEG_NO_POOL), -O3 -ffast-math = gcc's -Ofast (deprecated in clang). -ffp-contract=on after it:
 # -ffast-math's fp-contract=fast is also a backend option that fuses a * b + c into an FMA across
 # statements and functions whatever the source says, so the exact functions (RQ_FP_EXACT, the
 # arithmetic definitions of kquants.h / the attention) would round differently in each build
@@ -20,10 +20,10 @@ endif
 CPPFLAGS += -D_FILE_OFFSET_BITS=64
 LDLIBS  += -lm -lpthread
 
-# the library modules (runq.h) and the CLI; each module is its own translation unit, all numeric code
+# the library modules (gwenedeg.h) and the CLI; each module is its own translation unit, all numeric code
 # of the forward passes is in forward.c (docs/library.md)
 LIB = model gguf forward tokenizer sampler chat threads spec seqfile
-# runq serve (an OpenAI-compatible HTTP server; serve.h): linked into the runq binary, not part of the library
+# gwenedeg serve (an OpenAI-compatible HTTP server; serve.h): linked into the gwenedeg binary, not part of the library
 SRV = json constrain http engine serve tools
 HDR = $(wildcard src/*.h)
 Q8  = models/Qwen3-0.6B-q8.bin
@@ -31,105 +31,105 @@ B   = build
 
 .PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test iq-neon-test iq-repack-test iq-gemm-test api-test tools-test bench-batch bench-verify long-ctx bench-long bench-mtp spec-sweep teacher-force mem-probe bf16dp-test FORCE
 
-all: runq
+all: gwenedeg
 
-# objects per build flavour: $(B)/native (CFLAGS), $(B)/generic (+ -DRUNQ_GENERIC), $(B)/debug
+# objects per build flavour: $(B)/native (CFLAGS), $(B)/generic (+ -DGWENEDEG_GENERIC), $(B)/debug
 # (DBGFLAGS); a .flags stamp per flavour rebuilds its objects when the flags change
 $(B)/native/.flags: FORCE
 	@mkdir -p $(@D); f='$(CC) $(CFLAGS) $(CPPFLAGS)'; echo "$$f" | cmp -s - $@ || echo "$$f" > $@
 $(B)/generic/.flags: FORCE
-	@mkdir -p $(@D); f='$(CC) $(CFLAGS) $(CPPFLAGS) -DRUNQ_GENERIC'; echo "$$f" | cmp -s - $@ || echo "$$f" > $@
+	@mkdir -p $(@D); f='$(CC) $(CFLAGS) $(CPPFLAGS) -DGWENEDEG_GENERIC'; echo "$$f" | cmp -s - $@ || echo "$$f" > $@
 $(B)/debug/.flags: FORCE
 	@mkdir -p $(@D); f='$(CC) $(DBGFLAGS) $(CPPFLAGS)'; echo "$$f" | cmp -s - $@ || echo "$$f" > $@
 
 $(B)/native/%.o: src/%.c $(HDR) $(B)/native/.flags
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 $(B)/generic/%.o: src/%.c $(HDR) $(B)/generic/.flags
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DRUNQ_GENERIC -c $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DGWENEDEG_GENERIC -c $< -o $@
 $(B)/debug/%.o: src/%.c $(HDR) $(B)/debug/.flags
 	$(CC) $(DBGFLAGS) $(CPPFLAGS) -c $< -o $@
 
-runq: $(LIB:%=$(B)/native/%.o) $(SRV:%=$(B)/native/%.o) $(B)/native/cli.o
+gwenedeg: $(LIB:%=$(B)/native/%.o) $(SRV:%=$(B)/native/%.o) $(B)/native/cli.o
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
-runq-debug: $(LIB:%=$(B)/debug/%.o) $(SRV:%=$(B)/debug/%.o) $(B)/debug/cli.o
+gwenedeg-debug: $(LIB:%=$(B)/debug/%.o) $(SRV:%=$(B)/debug/%.o) $(B)/debug/cli.o
 	$(CC) $(DBGFLAGS) $^ $(LDLIBS) -o $@
 
 # Same flags, but the generic C kernels instead of the AVX-512 VNNI ones (kernels_avx512.h);
 # `make test` checks that both give bit-identical logits. (On a CPU without AVX-512 VNNI,
 # plain `make` already builds the generic kernels: the selection is at compile time.)
-runq-generic: $(LIB:%=$(B)/generic/%.o) $(SRV:%=$(B)/generic/%.o) $(B)/generic/cli.o
+gwenedeg-generic: $(LIB:%=$(B)/generic/%.o) $(SRV:%=$(B)/generic/%.o) $(B)/generic/cli.o
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
-debug: runq-debug
+debug: gwenedeg-debug
 
 # the library API test (tests/api_test.c; make test runs it on each model)
-$(B)/api_test: tests/api_test.c src/runq.h $(LIB:%=$(B)/native/%.o)
+$(B)/api_test: tests/api_test.c src/gwenedeg.h $(LIB:%=$(B)/native/%.o)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
 
 # the same on the generic kernels (make test compares the batched passes' digests with the native build's)
-$(B)/api_test-generic: tests/api_test.c src/runq.h $(LIB:%=$(B)/generic/%.o)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DRUNQ_GENERIC $< $(LIB:%=$(B)/generic/%.o) $(LDLIBS) -o $@
+$(B)/api_test-generic: tests/api_test.c src/gwenedeg.h $(LIB:%=$(B)/generic/%.o)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DGWENEDEG_GENERIC $< $(LIB:%=$(B)/generic/%.o) $(LDLIBS) -o $@
 
 api-test: $(B)/api_test $(B)/api_test-generic
 
-# runq serve's tool call parser and Python-style JSON (tests/tools_test.c; no model; make test runs it, group server)
+# gwenedeg serve's tool call parser and Python-style JSON (tests/tools_test.c; no model; make test runs it, group server)
 $(B)/tools_test: tests/tools_test.c src/serve.h src/json.h $(LIB:%=$(B)/native/%.o) $(B)/native/json.o $(B)/native/tools.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(B)/native/json.o $(B)/native/tools.o $(LDLIBS) -o $@
 
 tools-test: $(B)/tools_test
 
 # the batched decode benchmark (tests/bench_batch.c; scripts/bench_batch.sh)
-$(B)/bench_batch: tests/bench_batch.c src/runq.h $(LIB:%=$(B)/native/%.o)
+$(B)/bench_batch: tests/bench_batch.c src/gwenedeg.h $(LIB:%=$(B)/native/%.o)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
 
 bench-batch: $(B)/bench_batch
 
 # the verify-pass benchmark (tests/bench_verify.c: an r-row segment of one sequence vs one decode step vs r decode rows)
-$(B)/bench_verify: tests/bench_verify.c src/runq.h $(LIB:%=$(B)/native/%.o)
+$(B)/bench_verify: tests/bench_verify.c src/gwenedeg.h $(LIB:%=$(B)/native/%.o)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
 
 bench-verify: $(B)/bench_verify
 
 # the long-context driver of tests/check_long.py (tests/long_ctx.c: tokenize a file, logits at given positions, the
 # verify / decode paths there, greedy generation after ~100k tokens), on both kernel sets
-$(B)/long_ctx: tests/long_ctx.c src/runq.h $(LIB:%=$(B)/native/%.o)
+$(B)/long_ctx: tests/long_ctx.c src/gwenedeg.h $(LIB:%=$(B)/native/%.o)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
-$(B)/long_ctx-generic: tests/long_ctx.c src/runq.h $(LIB:%=$(B)/generic/%.o)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DRUNQ_GENERIC $< $(LIB:%=$(B)/generic/%.o) $(LDLIBS) -o $@
+$(B)/long_ctx-generic: tests/long_ctx.c src/gwenedeg.h $(LIB:%=$(B)/generic/%.o)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DGWENEDEG_GENERIC $< $(LIB:%=$(B)/generic/%.o) $(LDLIBS) -o $@
 
 long-ctx: $(B)/long_ctx $(B)/long_ctx-generic
 
 # the long-context timing tool (tests/bench_long.c: decode, verify segments and a prefill chunk at 16k-96k positions
 # on a sequence filled with synthetic KV / state values, rq_seq_fill_synthetic: no prefill of the context; TODO G0 (b))
-$(B)/bench_long: tests/bench_long.c src/runq.h $(LIB:%=$(B)/native/%.o)
+$(B)/bench_long: tests/bench_long.c src/gwenedeg.h $(LIB:%=$(B)/native/%.o)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
 
 bench-long: $(B)/bench_long
 
 # the MTP drafter's costs (tests/bench_mtp.c: a guess, the catch-up rows and the prompt's share at 1k-96k positions on a
 # full-width synthetic file, tests/make_synth_wide.py; TODO S9w)
-$(B)/bench_mtp: tests/bench_mtp.c src/runq.h $(LIB:%=$(B)/native/%.o)
+$(B)/bench_mtp: tests/bench_mtp.c src/gwenedeg.h $(LIB:%=$(B)/native/%.o)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
 
 bench-mtp: $(B)/bench_mtp
 
 # the speculative settings x prompts in one process (tests/spec_sweep.c: the model, its MTP view and a draft model loaded
 # once; one JSON line per run, the outputs checked against plain decoding's; scripts/s9_gate.sh for the 27B, TODO S9d)
-$(B)/spec_sweep: tests/spec_sweep.c src/runq.h $(LIB:%=$(B)/native/%.o)
+$(B)/spec_sweep: tests/spec_sweep.c src/gwenedeg.h $(LIB:%=$(B)/native/%.o)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
 
 spec-sweep: $(B)/spec_sweep
 
 # draft predictions teacher-forced on long token streams (tests/teacher_force.c: the argmax and its probability at given
 # positions; scripts/lookup_accept.py draft, TODO G0 (c))
-$(B)/teacher_force: tests/teacher_force.c src/runq.h $(LIB:%=$(B)/native/%.o)
+$(B)/teacher_force: tests/teacher_force.c src/gwenedeg.h $(LIB:%=$(B)/native/%.o)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
 
 teacher-force: $(B)/teacher_force
 
 # the load-time memory estimate vs the measured RSS, the page cache after the load (tests/mem_probe.c; Linux)
-$(B)/mem_probe: tests/mem_probe.c src/runq.h $(LIB:%=$(B)/native/%.o)
+$(B)/mem_probe: tests/mem_probe.c src/gwenedeg.h $(LIB:%=$(B)/native/%.o)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(LIB:%=$(B)/native/%.o) $(LDLIBS) -o $@
 
 mem-probe: $(B)/mem_probe
@@ -141,10 +141,10 @@ mem-probe: $(B)/mem_probe
 $(B)/iq_repack_test: tests/kernels/iq_repack_test.c src/kernels_avx512.h src/iquants.h src/iq_grids.h src/kquants.h
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $< -o $@
-$(B)/bf16dp_test: tests/bf16dp_test.c src/kernels_avx512.h src/kvtype.h src/runq.h
+$(B)/bf16dp_test: tests/bf16dp_test.c src/kernels_avx512.h src/kvtype.h src/gwenedeg.h
 	@mkdir -p $(@D)
 	$(CC) -O2 -march=native $(CPPFLAGS) $< $(LDLIBS) -o $@
-$(B)/bf16dp_test-emu: tests/bf16dp_test.c src/kernels_avx512.h src/kvtype.h src/runq.h
+$(B)/bf16dp_test-emu: tests/bf16dp_test.c src/kernels_avx512.h src/kvtype.h src/gwenedeg.h
 	@mkdir -p $(@D)
 	$(CC) -O2 -march=native $(CPPFLAGS) -mno-avx512bf16 $< $(LDLIBS) -o $@
 
@@ -173,12 +173,12 @@ $(B)/iq_gemm_test: tests/kernels/iq_gemm_test.c src/kernels_avx512.h src/iquants
 iq-gemm-test: $(B)/iq_gemm_test
 	$(B)/iq_gemm_test
 
-generic: runq-generic
+generic: gwenedeg-generic
 
 clean:
-	rm -rf runq runq-debug runq-generic runq-debug.dSYM tests/kernels/kq_neon_test tests/kernels/iq_neon_test $(B)
+	rm -rf gwenedeg gwenedeg-debug gwenedeg-generic gwenedeg-debug.dSYM tests/kernels/kq_neon_test tests/kernels/iq_neon_test $(B)
 
-# (run_tests.sh builds runq and runq-generic itself, in parallel)
+# (run_tests.sh builds gwenedeg and gwenedeg-generic itself, in parallel)
 test:
 	@if [ -f tests/run_tests.sh ]; then bash tests/run_tests.sh; else echo "no tests yet"; fi
 
@@ -186,10 +186,10 @@ test:
 test-models:
 	@bash tests/run_tests.sh --models
 
-bench: runq
+bench: gwenedeg
 	scripts/bench_qwen3c.sh
 
-bench-prefill: runq
+bench-prefill: gwenedeg
 	scripts/bench_prefill.sh
 
 # Downloads ~2 GB and runs the Python exporter; only if the Q8_0 model is missing.

@@ -1,5 +1,5 @@
-/* The runq command line, on the library API (runq.h): chat (multi-turn, the conversation kept in
- * the KV cache), generate, and the test hooks (-m tokenize / logits / dequant, RUNQ_CHAT_DUMP).
+/* The gwenedeg command line, on the library API (gwenedeg.h): chat (multi-turn, the conversation kept in
+ * the KV cache), generate, and the test hooks (-m tokenize / logits / dequant, GWENEDEG_CHAT_DUMP).
  * Derived from qwen3.c's runq.c main(); all printing and exiting happens here. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,7 +11,7 @@
 #else
     #include <unistd.h>
 #endif
-#include "runq.h"
+#include "gwenedeg.h"
 #include "json.h" // (-m render: the messages as JSON)
 
 static int max_new_tokens = 0; // -n: stop after this many generated tokens, 0 = unlimited
@@ -211,7 +211,7 @@ static char *read_line(FILE *f) {
     return s;
 }
 
-// test hook: RUNQ_CHAT_DUMP=<prefix> writes <prefix>.ids (the token ids in the KV cache at the end,
+// test hook: GWENEDEG_CHAT_DUMP=<prefix> writes <prefix>.ids (the token ids in the KV cache at the end,
 // space-separated) and <prefix>.logits (int32 n, int32 vocab, int32 pos[n], float32 logits[n][vocab]:
 // every logits vector chat sampled from, pos = the position of the token that produced it; those of
 // positions overwritten later, by a re-prefill, are dropped). tests/check.py compares them with
@@ -307,7 +307,7 @@ static void chat(RqModel *m, RqCtx *c, RqSeq *s, const RqSampling *cfg, char *cl
     int reserve = max_new_tokens > 0 ? max_new_tokens : seq_len / 4;
     if (reserve > seq_len / 2) reserve = seq_len / 2;
     if (reserve < 1) reserve = 1;
-    cdump.prefix = getenv("RUNQ_CHAT_DUMP");
+    cdump.prefix = rq_getenv("GWENEDEG_CHAT_DUMP");
     cdump.vocab = info.vocab_size;
 #ifndef _WIN32
     int echo = !isatty(fileno(stdin)); // piped stdin: echo each user line, for a readable transcript
@@ -457,7 +457,7 @@ static void render_one(const RqModel *m, const Js *a, int thinking) {
 int serve_render(RqModel *m, const Js *body, RqTokens *out, int *thinking, char *err, size_t errlen); // serve.c
 
 static void render_request(RqModel *m, const Js *body) {
-    // one chat completion request body rendered as runq serve renders it (tools, tool messages: serve.c, tools.c)
+    // one chat completion request body rendered as gwenedeg serve renders it (tools, tool messages: serve.c, tools.c)
     RqTokens t = { 0 };
     char err[512] = "";
     int thinking = 0, e = serve_render(m, body, &t, &thinking, err, sizeof(err));
@@ -476,7 +476,7 @@ static void render_chat(const RqModel *m, const char *json, int thinking) {
     // -m render (test hook): the token ids of the conversation -i (a JSON array of {"role": system / user /
     // assistant, "content": text}) rendered by rq_chat_render with -r (and -e), space-separated on stdout; or of several
     // (-i: an array of {"messages": [...], "thinking": 0 / 1 (default -r), "reasoning_effort": xhigh / high / medium /
-    // low (default -e)}) or {"request": a chat completion request body} (as runq serve renders it: tools), one line each
+    // low (default -e)}) or {"request": a chat completion request body} (as gwenedeg serve renders it: tools), one line each
     char err[256];
     JsDoc *d = json_parse(json, strlen(json), err, sizeof(err));
     if (!d) { fprintf(stderr, "-m render: invalid JSON: %s\n", err); exit(EXIT_FAILURE); }
@@ -609,9 +609,9 @@ static void print_memory(const RqModel *m, int seq_len) {
 // CLI
 
 static void error_usage(void) {
-    fprintf(stderr, "Usage:   runq <checkpoint> [options]\n");
+    fprintf(stderr, "Usage:   gwenedeg <checkpoint> [options]\n");
     fprintf(stderr, "         checkpoint: a qwen3.c .bin (with its .tokenizer / .template* files) or a GGUF file (Q8_0, Q3_K_M .. Q5_K_M, i-quant mixes)\n");
-    fprintf(stderr, "Example: runq Qwen3-0.6B-Q8_0.gguf -c 4096 -r 1\n");
+    fprintf(stderr, "Example: gwenedeg Qwen3-0.6B-Q8_0.gguf -c 4096 -r 1\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1], default 0.9\n");
@@ -624,7 +624,7 @@ static void error_usage(void) {
     fprintf(stderr, "              tokenize: print the token ids of -i (raw text, no template)\n");
     fprintf(stderr, "              render (test hook): the token ids of the chat template rendering of -i, a JSON array of\n");
     fprintf(stderr, "              messages ({\"role\": \"user\", \"content\": \"...\"}), with -r; or of [{\"request\": BODY}, ...]:\n");
-    fprintf(stderr, "              chat completion request bodies as runq serve renders them (tools)\n");
+    fprintf(stderr, "              chat completion request bodies as gwenedeg serve renders them (tools)\n");
     fprintf(stderr, "              logits: write the logits at every position of -i to -o (binary)\n");
     fprintf(stderr, "  --repack    store the IQ3_XXS / IQ3_S weights as 4-bit codes at load: lossless (bit-identical output), faster\n");
     fprintf(stderr, "              matmuls where compute-bound, +0.75 / +1.0 bit per such weight of RAM (AVX-512 builds)\n");
@@ -674,7 +674,7 @@ static void error_usage(void) {
     exit(EXIT_FAILURE);
 }
 
-int serve_main(int argc, char **argv); // serve.c: `runq serve <checkpoint> ...` (the HTTP server)
+int serve_main(int argc, char **argv); // serve.c: `gwenedeg serve <checkpoint> ...` (the HTTP server)
 
 static void print_mtp_memory(const RqModel *v, int seq_len) {
     // --mem with -D mtp: the MTP view's estimate (rq_mtp_load's check; s9_gate.sh reads it)
@@ -744,7 +744,7 @@ int rq_repack_parse(const char *v) {
 }
 
 void rq_repack_note(const RqModel *m) {
-    // --repack: a line on stderr (what was repacked and its cost; runq serve too)
+    // --repack: a line on stderr (what was repacked and its cost; gwenedeg serve too)
     const double G = 1073741824.0;
     RqRepackInfo ri;
     if (rq_repack_info(m, &ri) != RQ_OK) return;
@@ -1011,7 +1011,7 @@ int main(int argc, char *argv[]) {
         RqModel *m = rq_model_load(checkpoint_path, &o, err, sizeof(err));
         if (!m) die(err);
         enable_thinking = thinking_default(m, enable_thinking, thinking_given, effort, effort_given, 0);
-        // (-m render: the library's rendering for -r as given, e.g. Thinking-2507 with thinking off as runq serve
+        // (-m render: the library's rendering for -r as given, e.g. Thinking-2507 with thinking off as gwenedeg serve
         // renders a constrained request; the chat forces the variant's mode: thinking_for)
         if (rq_chat_check(m, enable_thinking, err, sizeof(err)) == RQ_ERR_LOAD) {
             fprintf(stderr, "Couldn't load prompt template %s\n", err);
@@ -1118,7 +1118,7 @@ int main(int argc, char *argv[]) {
         error_usage();
     }
 
-    // -DRUNQ_PROFILE builds: time per batched-prefill phase
+    // -DGWENEDEG_PROFILE builds: time per batched-prefill phase
     const char *pn[16];
     double pt[16], pf_total = 0;
     int np = rq_ctx_profile(ctx, pn, pt, 16);

@@ -1,4 +1,4 @@
-/* Long-context driver (the library API, src/runq.h; TODO G2): the long-context check (tests/check_long.py) runs runq
+/* Long-context driver (the library API, src/gwenedeg.h; TODO G2): the long-context check (tests/check_long.py) runs gwenedeg
  * through it on texts of 30-100k tokens, which the CLI's hooks cannot take (-i is one argument: 128 KiB at most;
  * -m logits writes every position's logits: 95 GB at 96k for a 248k vocabulary). Built by `make long-ctx`
  * (build/long_ctx, and build/long_ctx-generic on the generic kernels).
@@ -19,7 +19,7 @@
  *       -g G       after the N tokens (and the positions), generate up to G tokens greedily (stop at an end token):
  *                  stdout "gen <ids...>" then "text <the text, escapes as JSON would not need: raw>" lines
  *       -A         every row's logits of the N tokens into OUT, streamed per chunk of -b rows (rq_prefill RQ_LOGITS_ALL:
- *                  the bits of runq -m logits, in its file format: int32 N, vocab, ids[N], float32 logits[N][vocab]; the
+ *                  the bits of gwenedeg -m logits, in its file format: int32 N, vocab, ids[N], float32 logits[N][vocab]; the
  *                  memory of one chunk, not of N rows: scripts/kl_kv.py)
  *       -c CTX     sequence capacity (default N + G + 1); -k f16|bf16|f32|bf16-dot|f16-dot (default f16); -b chunk rows
  *                  (default 512)
@@ -27,7 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../src/runq.h"
+#include "../src/gwenedeg.h"
 
 static void die(const char *what, int e, RqCtx *c) {
     fprintf(stderr, "long_ctx: %s: %s %s\n", what, rq_strerror(e), c ? rq_ctx_error(c) : "");

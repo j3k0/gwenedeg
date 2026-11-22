@@ -1,4 +1,4 @@
-/* runq serve: the OpenAI-compatible layer (serve.h): routes, request validation, chat template
+/* gwenedeg serve: the OpenAI-compatible layer (serve.h): routes, request validation, chat template
  * rendering, Jobs for the engine, JSON / SSE responses, OpenAI-style errors, one log line per request.
  *
  *   POST /v1/chat/completions   (also /chat/completions)
@@ -15,7 +15,7 @@
 int serve_main(int argc, char **argv) {
     (void)argc;
     (void)argv;
-    fprintf(stderr, "runq serve: not available on Windows (the server uses POSIX sockets and threads)\n");
+    fprintf(stderr, "gwenedeg serve: not available on Windows (the server uses POSIX sockets and threads)\n");
     return 1;
 }
 
@@ -107,7 +107,7 @@ static int model_named(const char *req, size_t n, const char *id) {
 static void model_obj(App *a, JBuf *b) {
     jb_cstr(b, "{\"id\": ");
     jb_strz(b, a->model_id);
-    jb_printf(b, ", \"object\": \"model\", \"created\": %lld, \"owned_by\": \"runq\", \"context_length\": %d}", a->created, a->ctx);
+    jb_printf(b, ", \"object\": \"model\", \"created\": %lld, \"owned_by\": \"gwenedeg\", \"context_length\": %d}", a->created, a->ctx);
 }
 
 static void get_models(App *a, HttpConn *c, HttpReq *r, const char *id) {
@@ -220,7 +220,7 @@ static const char *after_think(const char *s) {
 }
 
 static int render38(const RqModel *m, const Msg *msg, int n, int thinking, RqTokens *out) {
-    // Qwen3.8's template (runq.h): the leading system / developer messages merged with "\n" (empty ones skipped) after
+    // Qwen3.8's template (gwenedeg.h): the leading system / developer messages merged with "\n" (empty ones skipped) after
     // the effort instruction (parse_chat refused later ones, as its template does); every assistant message in its think
     // form (rq_chat_reply; its reasoning_content, if given, as the reasoning: "<think>" R "</think>" C), after the
     // assistant header of the user turn before it (rq_chat_user_history) or its own; other sequences as render's
@@ -269,7 +269,7 @@ static int render(const RqModel *m, int chat, const Msg *msg, int n, int thinkin
     // turns, the empty think block with thinking off kept in every user turn); other sequences as HF's
     // template renders them: a later system message as a system block, a user message not followed
     // by an assistant one as a plain block, an assistant message not after a user one with its own
-    // header; ends with the assistant header (+ empty think block with thinking off). The variants (runq.h):
+    // header; ends with the assistant header (+ empty think block with thinking off). The variants (gwenedeg.h):
     // Instruct-2507 keeps assistant messages verbatim (its template does), no think block anywhere;
     // Thinking-2507's generation prompt opens the think block
     int i = 0, e = RQ_OK, open = 0; // open: the last piece ends with the assistant header
@@ -458,7 +458,7 @@ static int parse_spec(App *a, const Js *root, Job *j, ReqErr *e) {
             return -1;
         }
         if (lm == 1) return bad(e, "speculative", "'lookup_min' must be 0 (the default) or 2..16%s", NULL);
-        if (k > 0 && !a->has_draft) return bad(e, "speculative", "'speculative.k' needs a draft (runq serve --draft FILE|mtp)%s", NULL);
+        if (k > 0 && !a->has_draft) return bad(e, "speculative", "'speculative.k' needs a draft (gwenedeg serve --draft FILE|mtp)%s", NULL);
         j->spec_k = (int)k;
         j->spec_lookup = (int)l;
         j->spec_lmin = (int)lm;
@@ -574,7 +574,7 @@ static int parse_chat(App *a, const Js *root, Chat *ch, Job *j, ReqErr *e) {
     pthread_mutex_lock(&a->mu);
     unsigned long long k = ++a->seq;
     pthread_mutex_unlock(&a->mu);
-    if (has_seed && seed > 0) j->seed = (unsigned long long)seed; // (as runq -s: positive seeds as given)
+    if (has_seed && seed > 0) j->seed = (unsigned long long)seed; // (as gwenedeg -s: positive seeds as given)
     else {
         unsigned long long x = has_seed ? (unsigned long long)seed : (unsigned long long)time(NULL) * 1000003ULL + k + (unsigned long long)(rq_now() * 1e6);
         x += 0x9e3779b97f4a7c15ULL; // (splitmix64: a nonzero xorshift state)
@@ -638,7 +638,7 @@ static int parse_chat(App *a, const Js *root, Chat *ch, Job *j, ReqErr *e) {
             if (!sc) return bad(e, "response_format", "response_format json_schema needs json_schema.schema%s", NULL);
             char err[400];
             if (!(ch->con = con_compile(sc, err, sizeof(err))))
-                return bad(e, "response_format", "unsupported json_schema: %s (runq serve constrains the output only to schemas "
+                return bad(e, "response_format", "unsupported json_schema: %s (gwenedeg serve constrains the output only to schemas "
                            "with a finite set of outputs: enum, const, boolean, null, bounded integer, objects of those)", err);
             j->con = ch->con;
             thinking = 0; // (a constrained reply has no reasoning block; Thinking-2507: the empty think block)
@@ -661,7 +661,7 @@ static int parse_chat(App *a, const Js *root, Chat *ch, Job *j, ReqErr *e) {
 static void chunk_head(App *a, JBuf *b, const char *id, const Chat *ch) {
     jb_printf(b, "data: {\"id\": \"%s\", \"object\": \"chat.completion.chunk\", \"created\": %lld, \"model\": ", id, (long long)time(NULL));
     jb_strz(b, ch->model);
-    jb_cstr(b, ", \"system_fingerprint\": \"runq\", \"choices\": [");
+    jb_cstr(b, ", \"system_fingerprint\": \"gwenedeg\", \"choices\": [");
     (void)a;
 }
 
@@ -672,7 +672,7 @@ static void usage_json(JBuf *b, const Job *j) {
 
 static void timings_json(JBuf *b, const Job *j) {
     // llama.cpp's "timings" (prompt_n: the tokens prefilled, cache_n: reused; with speculation draft_n / draft_n_accepted:
-    // the guesses verified and accepted) and runq's: the slot, its length at admission and its common prefix with the
+    // the guesses verified and accepted) and gwenedeg's: the slot, its length at admission and its common prefix with the
     // prompt (so a rollback to a checkpoint shows as common_tokens > cache_n); "speculative": the decode passes, per source
     // (the draft model, the prompt lookup) the passes with guesses, the guesses and the accepted ones, the draft's rows (an
     // MTP view: its guesses' and its follow passes'), and with --draft mtp the view's rows that took zeros for an unknown
@@ -727,7 +727,7 @@ static void wait_job(HttpConn *c, Job *j, double *next_check) {
     if (gone) __atomic_store_n(&j->cancel, 1, __ATOMIC_RELEASE);
 }
 
-static double sse_keepalive = 15; // seconds without a chunk before an SSE comment line (": keep-alive"; env RUNQ_SSE_KEEPALIVE)
+static double sse_keepalive = 15; // seconds without a chunk before an SSE comment line (": keep-alive"; env GWENEDEG_SSE_KEEPALIVE)
 
 static void run_stream(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const char *id) {
     JBuf b = { 0 };
@@ -841,7 +841,7 @@ static void run_once(App *a, HttpConn *c, HttpReq *r, Chat *ch, Job *j, const ch
     JBuf b = { 0 };
     jb_printf(&b, "{\"id\": \"%s\", \"object\": \"chat.completion\", \"created\": %lld, \"model\": ", id, (long long)time(NULL));
     jb_strz(&b, ch->model);
-    jb_cstr(&b, ", \"system_fingerprint\": \"runq\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": ");
+    jb_cstr(&b, ", \"system_fingerprint\": \"gwenedeg\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": ");
     if (j->calls.n > 0 && j->content.n == 0) jb_cstr(&b, "null"); // (as OpenAI: only tool calls)
     else jb_str(&b, j->content.p ? j->content.p : "", j->content.n);
     if (j->thinking) {
@@ -1049,7 +1049,7 @@ static int num_arg(const char *v, int lo, int hi) {
 
 static void usage(void) {
     fprintf(stderr,
-            "Usage:   runq serve <checkpoint> [options]\n"
+            "Usage:   gwenedeg serve <checkpoint> [options]\n"
             "An OpenAI-compatible HTTP server (POST /v1/chat/completions, GET /v1/models, GET /health).\n"
             "Options:\n"
             "  --host <addr>       address to bind, default 127.0.0.1 (no TLS, no auth unless --api-key)\n"
@@ -1080,7 +1080,7 @@ static void usage(void) {
             "  --page-cache <mode> auto|drop|keep: the model file's page cache after the load, default auto (dropped if the\n"
             "                      file is >= 1/4 of the RAM)\n"
             "  --repack[=LIST]     store the IQ3_XXS / IQ3_S weights as 4-bit codes at load (LIST: IQ3_S, IQ3_XXS; default\n"
-            "                      all): bit-identical output, faster where compute-bound, more RAM (runq M --repack-info)\n"
+            "                      all): bit-identical output, faster where compute-bound, more RAM (gwenedeg M --repack-info)\n"
             "  --no-repack         weights as in the file (default)\n"
             "  -b <int>            prompt tokens per pass when no request is decoding, default 512\n"
             "  --chunk <int>       prompt tokens per pass while others decode, default 64\n"
@@ -1129,7 +1129,7 @@ static void usage(void) {
 int serve_main(int argc, char **argv) {
     // argv[0] = "serve"
     if (argc < 2 || argv[1][0] == '-') usage();
-    const char *ka = getenv("RUNQ_SSE_KEEPALIVE"); // (seconds; tests use a short one)
+    const char *ka = rq_getenv("GWENEDEG_SSE_KEEPALIVE"); // (seconds; tests use a short one)
     if (ka && atof(ka) > 0) sse_keepalive = atof(ka);
     const char *path = argv[1], *name = NULL, *host = "127.0.0.1", *key = NULL;
     int port = 8080, ctx = 8192, kv = RQ_KV_DEFAULT, batch = RQ_BATCH_MAX, slots = 0, queue = 64, conns = 128, threads = 0, verbose = 0, maxtok = 0;
@@ -1221,7 +1221,7 @@ int serve_main(int argc, char **argv) {
     int draft_mtp = draft_path && !strcmp(draft_path, "mtp"); // (a draft file named mtp: --draft ./mtp)
 
     // signals first: every thread created from here on has SIGINT / SIGTERM blocked
-    if (http_signals()) { fprintf(stderr, "runq serve: cannot install the signal handlers\n"); return 1; }
+    if (http_signals()) { fprintf(stderr, "gwenedeg serve: cannot install the signal handlers\n"); return 1; }
     const char *warn = rq_threads_init(threads);
     if (warn) fprintf(stderr, "%s\n", warn);
     char err[512];
@@ -1238,7 +1238,7 @@ int serve_main(int argc, char **argv) {
     rq_model_info(m, &a.info);
     if (a.info.warning) fprintf(stderr, "warning: %s\n", a.info.warning);
     if (rq_chat_check(m, 0, err, sizeof(err)) != RQ_OK || rq_chat_check(m, 1, err, sizeof(err)) != RQ_OK) {
-        fprintf(stderr, "runq serve: the chat templates are missing (%s)\n", err);
+        fprintf(stderr, "gwenedeg serve: the chat templates are missing (%s)\n", err);
         return 1;
     }
     if (ctx > a.info.seq_len) ctx = a.info.seq_len;
@@ -1251,8 +1251,8 @@ int serve_main(int argc, char **argv) {
         if (mtp_vocab < 0) mtp_vocab = a.info.vocab_size > RQ_MTP_VOCAB_DEFAULT ? RQ_MTP_VOCAB_DEFAULT : 0;
         RqMtpOpts mto = { mtp_vocab, mem };
         if (!(dm = rq_mtp_load(m, &mto, err, sizeof(err)))) {
-            if (strstr(err, "no MTP block")) fprintf(stderr, "runq serve: --draft mtp: %s has no MTP block\n", path);
-            else fprintf(stderr, "runq serve: --draft mtp: %s\n", err);
+            if (strstr(err, "no MTP block")) fprintf(stderr, "gwenedeg serve: --draft mtp: %s has no MTP block\n", path);
+            else fprintf(stderr, "gwenedeg serve: --draft mtp: %s\n", err);
             rq_model_free(m);
             return 1;
         }
@@ -1262,7 +1262,7 @@ int serve_main(int argc, char **argv) {
         rq_model_mem(dm, &dmm);
         if (rq_spec_check(m, dm, err, sizeof(err)) != RQ_OK || di.seq_len < ctx) {
             if (di.seq_len < ctx) snprintf(err, sizeof(err), "its context (%d) is shorter than -c %d", di.seq_len, ctx);
-            fprintf(stderr, "runq serve: --draft mtp: %s\n", err);
+            fprintf(stderr, "gwenedeg serve: --draft mtp: %s\n", err);
             rq_model_free(dm); // (the view first: it shares the model's parts)
             rq_model_free(m);
             return 1;
@@ -1273,12 +1273,12 @@ int serve_main(int argc, char **argv) {
     } else if (draft_mtp) {
         draft_mtp = 0;
     } else if (draft_path) {
-        if (!(dm = rq_model_load(draft_path, &mo, err, sizeof(err)))) { fprintf(stderr, "runq serve: draft: %s\n", err); return 1; }
+        if (!(dm = rq_model_load(draft_path, &mo, err, sizeof(err)))) { fprintf(stderr, "gwenedeg serve: draft: %s\n", err); return 1; }
         RqModelInfo di;
         rq_model_info(dm, &di);
         if (di.warning) fprintf(stderr, "warning: draft: %s\n", di.warning);
-        if (rq_spec_check(m, dm, err, sizeof(err)) != RQ_OK) { fprintf(stderr, "runq serve: --draft %s: %s\n", draft_path, err); return 1; }
-        if (di.seq_len < ctx) { fprintf(stderr, "runq serve: --draft %s: its context (%d) is shorter than -c %d\n", draft_path, di.seq_len, ctx); return 1; }
+        if (rq_spec_check(m, dm, err, sizeof(err)) != RQ_OK) { fprintf(stderr, "gwenedeg serve: --draft %s: %s\n", draft_path, err); return 1; }
+        if (di.seq_len < ctx) { fprintf(stderr, "gwenedeg serve: --draft %s: its context (%d) is shorter than -c %d\n", draft_path, di.seq_len, ctx); return 1; }
         snprintf(dname, sizeof(dname), "%s", draft_path);
     }
     if (spec_mode < 0) spec_mode = dm || lookup > 0 ? SPEC_AUTO : SPEC_OFF;
@@ -1315,7 +1315,7 @@ int serve_main(int argc, char **argv) {
     double t0 = rq_now();
     a.eng = engine_start(m, &eo, err, sizeof(err));
     if (!a.eng) { // (the models freed: a sanitizer build's leak check at this exit)
-        fprintf(stderr, "runq serve: %s\n", err);
+        fprintf(stderr, "gwenedeg serve: %s\n", err);
         rq_model_free(dm);
         rq_model_free(m);
         return 1;
@@ -1323,35 +1323,35 @@ int serve_main(int argc, char **argv) {
     HttpOpts ho = { host, port, 16384, (size_t)maxbody, conns, 30.0, 120.0 };
     int bound = 0;
     int lfd = http_listen(&ho, &bound, err, sizeof(err));
-    if (lfd < 0) { fprintf(stderr, "runq serve: %s\n", err); return 1; }
+    if (lfd < 0) { fprintf(stderr, "gwenedeg serve: %s\n", err); return 1; }
     char desc[1024];
     engine_describe(a.eng, desc, sizeof(desc));
-    fprintf(stderr, "runq serve: %s as '%s' (context %d of %d, KV %s, %d threads, chat template %s, vocab index %.0f ms)\nrunq serve: %s\n",
+    fprintf(stderr, "gwenedeg serve: %s as '%s' (context %d of %d, KV %s, %d threads, chat template %s, vocab index %.0f ms)\ngwenedeg serve: %s\n",
             path, a.model_id, ctx, a.info.ctx_max, rq_kv_name(kv), rq_threads(), rq_chat_name(a.info.chat), (rq_now() - t0) * 1e3, desc);
-    if (engine_describe_admit(a.eng, desc, sizeof(desc))) fprintf(stderr, "runq serve: %s\n", desc);
+    if (engine_describe_admit(a.eng, desc, sizeof(desc))) fprintf(stderr, "gwenedeg serve: %s\n", desc);
     if (a.spec_mode != SPEC_OFF || dm) {
         char sd[1024], lk[64] = "off";
         engine_describe_spec(a.eng, sd, sizeof(sd));
         if (a.spec_lookup > 0) snprintf(lk, sizeof(lk), "%d guesses (match >= %s%.0d)", a.spec_lookup, a.spec_lmin ? "" : "by cost", a.spec_lmin);
-        fprintf(stderr, "runq serve: speculative decoding %s: draft %s (k <= %d, tau %g), lookup %s; %s\n",
+        fprintf(stderr, "gwenedeg serve: speculative decoding %s: draft %s (k <= %d, tau %g), lookup %s; %s\n",
                 a.spec_mode == SPEC_AUTO ? "auto" : a.spec_mode == SPEC_FIXED ? "fixed" : "off (requests may ask)", dm ? dname : "none",
                 a.spec_k, a.spec_tau, lk, sd);
     } else if (draft_path && !strcmp(draft_path, "mtp")) // (-G 0)
-        fprintf(stderr, "runq serve: speculative decoding off (--draft mtp with -G 0: the MTP block not loaded)\n");
-    fprintf(stderr, "runq serve: listening on http://%s%s%s:%d\n", strchr(host, ':') ? "[" : "", host, strchr(host, ':') ? "]" : "", bound);
+        fprintf(stderr, "gwenedeg serve: speculative decoding off (--draft mtp with -G 0: the MTP block not loaded)\n");
+    fprintf(stderr, "gwenedeg serve: listening on http://%s%s%s:%d\n", strchr(host, ':') ? "[" : "", host, strchr(host, ':') ? "]" : "", bound);
     fflush(stderr);
     http_run(lfd, &ho, handle, &a);
-    fprintf(stderr, "runq serve: shutting down\n");
+    fprintf(stderr, "gwenedeg serve: shutting down\n");
     engine_stop(a.eng, 10.0);
     if (!http_wait_conns(5.0)) {
-        fprintf(stderr, "runq serve: connections still open, exiting anyway\n");
+        fprintf(stderr, "gwenedeg serve: connections still open, exiting anyway\n");
         return 0;
     }
     engine_free(a.eng);
     rq_model_free(dm);
     rq_model_free(m);
     pthread_mutex_destroy(&a.mu);
-    fprintf(stderr, "runq serve: stopped\n");
+    fprintf(stderr, "gwenedeg serve: stopped\n");
     return 0;
 }
 #endif

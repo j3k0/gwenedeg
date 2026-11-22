@@ -11,7 +11,7 @@
 #include "../../src/kernels_neon.h"
 #include "../../src/iquants.h"
 
-#ifndef RUNQ_IQN
+#ifndef GWENEDEG_IQN
 #error "needs the NEON build (AArch64 with the dot product extension)"
 #endif
 

@@ -1,4 +1,4 @@
-/* Internal definitions shared by the runq modules (the public API is runq.h):
+/* Internal definitions shared by the gwenedeg modules (the public API is gwenedeg.h):
  *   model.c      RqModel: loading (.bin, GGUF), weight conversion / repacking, chat templates
  *   gguf.c       the GGUF reader (untrusted input: every count, length and offset checked)
  *   forward.c    RqSeq, RqCtx and every numeric part of the forward passes (decode, batched
@@ -9,10 +9,10 @@
  *   chat.c       chat template rendering, the generation loop (rq_generate)
  *   spec.c       speculative decoding (rq_generate_spec: a draft model's guesses verified by the target)
  *   threads.c    the thread pool (threads.h: phase synchronization)
- *   cli.c        the runq command line (not part of the library)
+ *   cli.c        the gwenedeg command line (not part of the library)
  */
-#ifndef RUNQ_INTERNAL_H
-#define RUNQ_INTERNAL_H
+#ifndef GWENEDEG_INTERNAL_H
+#define GWENEDEG_INTERNAL_H
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,11 +29,11 @@
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
-#include "runq.h"
+#include "gwenedeg.h"
 #include "kvtype.h"   // the KV cache types (RQ_KV_*): element formats, tile sizes
-// AVX-512 VNNI kernels (defines RUNQ_VNNI when built for AVX-512 VNNI without -DRUNQ_GENERIC)
+// AVX-512 VNNI kernels (defines GWENEDEG_VNNI when built for AVX-512 VNNI without -DGWENEDEG_GENERIC)
 #include "kernels_avx512.h"
-// NEON K-quant kernels (AArch64 with the dot product extension; defines RUNQ_NEON, RUNQ_KQX)
+// NEON K-quant kernels (AArch64 with the dot product extension; defines GWENEDEG_NEON, GWENEDEG_KQX)
 #include "kernels_neon.h"
 // K-quants (GGUF Q3_K / Q4_K / Q5_K / Q6_K): block formats, repacked layouts, arithmetic, generic kernels
 #include "kquants.h"
@@ -43,9 +43,9 @@
 #include "threads.h"
 // the per-thread GEMM scratch bytes for k columns: a K-quant tile (KQX_SCRATCH), AVX-512: or a Q2_K / i-quant tile
 // (IQX_SCRATCH), the larger
-#ifdef RUNQ_IQX
+#ifdef GWENEDEG_IQX
 #define GEMM_SCRATCH(k) (IQX_SCRATCH(k) > KQX_SCRATCH(k) ? IQX_SCRATCH(k) : KQX_SCRATCH(k))
-#elif defined RUNQ_KQX
+#elif defined GWENEDEG_KQX
 #define GEMM_SCRATCH(k) KQX_SCRATCH(k)
 #endif
 
@@ -53,7 +53,7 @@
 // setting of the kernels, read in their loops (a parameter would change the -Ofast code generation
 // of the exact functions); set by rq_model_load, which rejects a second model with another one
 extern int GS;
-extern int rq_iq_gather; // RUNQ_IQ_GATHER (iquants.h)
+extern int rq_iq_gather; // GWENEDEG_IQ_GATHER (iquants.h)
 
 static inline uint64_t fnv1a64(uint64_t h, const void *p, size_t n) {
     // FNV-1a over n bytes, continuing from h (start: 1469598103934665603)
@@ -293,9 +293,9 @@ struct RqModel {
 // range ATT512_BC blocks at a time in groups of at most ATT512_NV vectors, the generic C one block and vector at a
 // time; the NEON kernel scores a group over its whole range
 static inline size_t att_scores_floats(size_t vr, size_t att_nb) {
-#if defined(RUNQ_ATTNEON)
+#if defined(GWENEDEG_ATTNEON)
     return vr * att_nb * ATT_P;
-#elif defined(RUNQ_ATT512)
+#elif defined(GWENEDEG_ATT512)
     (void)vr; (void)att_nb;
     return (size_t)ATT512_NV * ATT512_BC * ATT_P;
 #else
@@ -422,4 +422,4 @@ static inline void seq_grow(RqSeq *s, int n) {
 // the memory accounting's pages (rq_seq_mem, rq_seq_kv_bytes: 4 KiB, whatever the system's)
 static inline size_t mem_pages(size_t n) { return (n + 4095) / 4096 * 4096; }
 
-#endif // RUNQ_INTERNAL_H
+#endif // GWENEDEG_INTERNAL_H

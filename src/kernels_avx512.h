@@ -2,7 +2,7 @@
  * the same for the K-quants (Q3_K / Q4_K / Q5_K / Q6_K on the Q3P / Q4P / Q5P / Q6P layouts of kquants.h) and the attention.
  *
  * Enabled when the compiler targets AVX-512 F/BW/VNNI (e.g. -march=native on Zen 4 / Ice Lake+)
- * and RUNQ_GENERIC is not defined; it then defines RUNQ_VNNI. Otherwise this header is empty and
+ * and GWENEDEG_GENERIC is not defined; it then defines GWENEDEG_VNNI. Otherwise this header is empty and
  * forward.c uses its generic C kernels (dot_q8, dot_q8_x4).
  *
  * Weights are repacked once at load ("Q8P" layout) so that the 16 dword lanes of a zmm hold 16
@@ -25,8 +25,8 @@
  * (explicit-rounding intrinsics, which gcc can neither contract into an FMA nor reassociate under
  * -Ofast). So the results are bit-identical to the generic kernels.
  */
-#ifndef RUNQ_KERNELS_AVX512_H
-#define RUNQ_KERNELS_AVX512_H
+#ifndef GWENEDEG_KERNELS_AVX512_H
+#define GWENEDEG_KERNELS_AVX512_H
 #include "kvtype.h"
 
 // Attention constants, shared by the AVX-512 attention below and the generic C one in forward.c
@@ -76,8 +76,8 @@ static inline uint16_t f32_bf16_daz(float f) {
     return (u & 0x7f800000u) ? f32_bf16(f) : (uint16_t)((u >> 16) & 0x8000u);
 }
 
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && !defined(RUNQ_GENERIC)
-#define RUNQ_VNNI 1
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && !defined(GWENEDEG_GENERIC)
+#define GWENEDEG_VNNI 1
 #include <immintrin.h>
 
 #define Q8P_ROWS 16
@@ -1059,18 +1059,18 @@ static void smb512_rows(int type, float *out, size_t ldo, const int8_t *xq, size
 }
 
 // the small-batch interface of forward.c (AVX-512 only: other builds keep the GEMM, the same results)
-#define RUNQ_SMB 1
+#define GWENEDEG_SMB 1
 #define smb_rows smb512_rows
 
 // the K-quant SIMD kernel interface of forward.c (kernels_neon.h implements the same on AArch64)
-#define RUNQ_KQX 1
+#define GWENEDEG_KQX 1
 #define kqx_c16 kq512_c16
 #define kqx_gemv_rows kq512_gemv_rows
 #define kqx_gemm_item kq512_gemm_item
 #define KQX_SCRATCH KQ512_SCRATCH
 #define kqx_nb q8p_nb
 // the Q8_0 SIMD kernel interface (kernels_neon.h: the same on AArch64, Q8N layout)
-#define RUNQ_Q8X 1
+#define GWENEDEG_Q8X 1
 #define Q8X_GROUP Q8P_GROUP
 #define q8x_size q8p_size
 #define q8x_ok q8p_ok
@@ -1083,7 +1083,7 @@ static void smb512_rows(int type, float *out, size_t ldo, const int8_t *xq, size
 
 /* ---------------------------------------------------------------------------------------------
  * fp32 attention (AVX-512F), for decode (rq_decode) and prefill (rq_forward_batch) alike, through
- * attention_kv() in forward.c; RUNQ_GENERIC or a CPU without AVX-512F uses the generic C version
+ * attention_kv() in forward.c; GWENEDEG_GENERIC or a CPU without AVX-512F uses the generic C version
  * there (attention_vec), which computes the same operations in the same order, so all give
  * bit-identical results.
  *
@@ -1145,8 +1145,8 @@ static void smb512_rows(int type, float *out, size_t ldo, const int8_t *xq, size
  * Neither changes a bit: the vectors are independent and each block's partial result is computed
  * whole by one call.
  */
-#if defined(__AVX512F__) && !defined(RUNQ_GENERIC)
-#define RUNQ_ATT512 1
+#if defined(__AVX512F__) && !defined(GWENEDEG_GENERIC)
+#define GWENEDEG_ATT512 1
 #include <immintrin.h>
 #include <float.h>
 
@@ -1437,7 +1437,7 @@ static void att512_kv(int kvt, int nv, const float *const *q, float *const *out,
 }
 
 /* ---------------------------------------------------------------------------------------------
- * bf16 dot-product attention (the sequence's KV type RQ_KV_BF16_DOT / RQ_KV_F16_DOT, runq --attn bf16; TODO G4 (b)):
+ * bf16 dot-product attention (the sequence's KV type RQ_KV_BF16_DOT / RQ_KV_F16_DOT, gwenedeg --attn bf16; TODO G4 (b)):
  * the two products of the attention as vdpbf16ps does them, on q, K, the softmax weights and V rounded to bf16, so
  * twice the dot-product rate of the fp32 FMAs (Zen 4: one vdpbf16ps per cycle per core, 64 FLOP). Opt-in: it is less
  * accurate than the fp32 attention (docs/usage.md "KV cache types", docs/notes/qwen38-speculative.md "G4"). A sequence's every path (prefill,
@@ -1880,4 +1880,4 @@ static void att512_kv_dot(int kvt, int nv, const float *const *q, float *const *
 }
 
 #endif // AVX-512F attention
-#endif // RUNQ_KERNELS_AVX512_H
+#endif // GWENEDEG_KERNELS_AVX512_H

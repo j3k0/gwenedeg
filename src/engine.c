@@ -1,4 +1,4 @@
-/* runq serve's engine (serve.h): one thread runs every Job on one compute context, with continuous
+/* gwenedeg serve's engine (serve.h): one thread runs every Job on one compute context, with continuous
  * batching: each engine step is one rq_forward_batch pass over (a) the next token(s) of every decoding
  * job (one row each; a constrained job's forced tokens ride along with its sampled one) and (b) prompt
  * chunks of jobs being prefilled, within a token budget per pass (--chunk while other jobs decode, -b
@@ -8,7 +8,7 @@
  * a pass.
  *
  * Bit-identity: a sequence's logits do not depend on the other rows of a pass, on the chunking or the
- * thread count (runq.h), and each job has its own sequence (slot) with its own RNG, so a request gives
+ * thread count (gwenedeg.h), and each job has its own sequence (slot) with its own RNG, so a request gives
  * the same output whatever it is batched with (tests/server_test.py, group batch).
  *
  * KV memory: a pool of sequences (slots, --slots, bounded by --kv-mem, each counted with its KV cache and, for
@@ -40,7 +40,7 @@
  *
  * Generation, per job (as Step 9's one-job loop did it): the RNG is seeded per request and draws once
  * per prompt token but the last, as the CLI's chat does for a first turn (rq_generate), however much of
- * the prompt was cached: a seeded request gives the same text as `runq -m chat -s SEED` on the same
+ * the prompt was cached: a seeded request gives the same text as `gwenedeg -m chat -s SEED` on the same
  * single-turn conversation. Then sample / feed until an end token (not fed), max tokens, a stop string,
  * the end of the context, a cancel (client gone), the deadline or the shutdown's grace period. With a
  * json_schema constraint (constrain.c) the forced tokens are appended without a forward pass of their
@@ -129,7 +129,7 @@ struct Engine {
     // the MTP drafter (--draft mtp: dm is the model's MTP view; below "the MTP drafter"): the hidden state's width, the
     // target's pass's hidden rows (H: maxb x dim, positions as the pass's segments) and the view's passes' h inputs (Hin),
     // auto's prior per guess (rq_spec_prior), the counters of the -v summary (A: the guesses' passes, B: the follow passes;
-    // the steps' time), RUNQ_TEST_MTP_CHECK (the at-rest check after each step) and RUNQ_TEST_MTP_DUMP (a directory: the
+    // the steps' time), GWENEDEG_TEST_MTP_CHECK (the at-rest check after each step) and GWENEDEG_TEST_MTP_DUMP (a directory: the
     // finished jobs' sequences; tests only)
     int mtp, dim;
     float *H, *Hin;
@@ -158,7 +158,7 @@ struct Engine {
     double dk_max;
     // the disk watch (dk_watch): the free space kept (--kv-disk-free, bytes), the room always kept for one full session (a
     // slot's sequences at ctx: dk_open), the next check, the heartbeat's last touch, the last low-space warning; the
-    // test hooks' check period (s) and free-space file (RUNQ_TEST_KV_CHECK, RUNQ_TEST_DISKFREE: bytes)
+    // test hooks' check period (s) and free-space file (GWENEDEG_TEST_KV_CHECK, GWENEDEG_TEST_DISKFREE: bytes)
     double dk_res, dk_floor, dk_chk, dk_beat, dk_warn, dk_every;
     const char *df_file;
     struct { int spill, slot, load, L, Lv; } plan; // (slots / entry id, -1: none; Lv: the saved tokens' common prefix with the prompt)
@@ -167,7 +167,7 @@ struct Engine {
     int *rv;              // --admit bound: the idle slots a reclaim may take (nslot)
     double job_max;       // the lease of a -c job that speculates with the defaults (the startup's check)
     // step 3's live budget: MemAvailable as last read (-1: none, then the static budget only), when; the test hook's file
-    // (RUNQ_TEST_MEMAVAILABLE: bytes, read at each use); the last warning; /health's snapshot (under mu)
+    // (GWENEDEG_TEST_MEMAVAILABLE: bytes, read at each use); the last warning; /health's snapshot (under mu)
     double ma, ma_t, ma_warn, ma_res; // (ma_res: the slots' resident memory at that reading: mem_avail)
     const char *ma_file;
     int kcap;             // --admit bound, Qwen3.5 / 3.8: a request's guesses at most (engine_submit; the most one -c job holds)
@@ -179,13 +179,13 @@ struct Engine {
     double ow_warn;
     // the swap (--admit chunk, --kv-disk DIR: dk_dir/swap): the jobs to swap out in this step and the one to swap in (into
     // slot swin_si), planned under mu (mem_renewals), done by sw_run without it; the jobs swapped out, their files' bytes
-    // (outside --kv-disk-max), the swaps, RUNQ_TEST_SWAP_DELAY (s: a sleep in each swap-out; tests only)
+    // (outside --kv-disk-max), the swaps, GWENEDEG_TEST_SWAP_DELAY (s: a sleep in each swap-out; tests only)
     char *sw_dir;
     Run **swo, *swin;
     int nswo, swin_si, nswap;
     double sw_bytes, sw_delay;
     unsigned long long swaps;
-    const char *sw_fail;  // RUNQ_TEST_SWAP_FAIL=FILE (tests only): "draft-save" / "draft-load" in it make the draft's swap I/O fail
+    const char *sw_fail;  // GWENEDEG_TEST_SWAP_FAIL=FILE (tests only): "draft-save" / "draft-load" in it make the draft's swap I/O fail
     // --admit-yield (mem_renewals): e->run's capacity (parallel + queue: yielded jobs hold no seat), the jobs yielded (no
     // seat; nrun - nyld seats taken), the earliest yield of those still waiting (0: none; the queue's younger jobs wait
     // behind it), a yielded job first for a seat but not back yet (admissions wait)
@@ -960,7 +960,7 @@ static void dk_path(const Engine *e, int id, int draft, char *buf, size_t n) {
 
 static double dk_free(const Engine *e) {
     struct statvfs v;
-    if (e->df_file) { // (RUNQ_TEST_DISKFREE: bytes, read at each use)
+    if (e->df_file) { // (GWENEDEG_TEST_DISKFREE: bytes, read at each use)
         FILE *f = fopen(e->df_file, "r");
         double b = -1;
         if (f) {
@@ -1063,7 +1063,7 @@ static void dk_purge(Engine *e, double want) {
         snprintf(p, sizeof(p), "%s/%s", e->o.kv_disk, best);
         double b = dir_scan(p, 1, NULL);
         close(lk);
-        fprintf(stderr, "runq serve: --kv-disk: %s removed (unused for %.1f h, %.2f GiB): %.2f GiB free, --kv-disk-free %.2f\n", p,
+        fprintf(stderr, "gwenedeg serve: --kv-disk: %s removed (unused for %.1f h, %.2f GiB): %.2f GiB free, --kv-disk-free %.2f\n", p,
                 (wall - bt) / 3600.0, b / 1073741824.0, fr / 1073741824.0, e->dk_res / 1073741824.0);
     }
 }
@@ -1073,7 +1073,7 @@ static void dk_low(Engine *e, double fr, const char *what) {
     double now = rq_now();
     if (e->dk_warn > 0 && now - e->dk_warn < 3600) return;
     e->dk_warn = now;
-    fprintf(stderr, "runq serve: --kv-disk: %.2f GiB free under %s, below --kv-disk-free %.2f GiB; %s\n", fr / 1073741824.0,
+    fprintf(stderr, "gwenedeg serve: --kv-disk: %.2f GiB free under %s, below --kv-disk-free %.2f GiB; %s\n", fr / 1073741824.0,
             e->o.kv_disk, e->dk_res / 1073741824.0, what);
 }
 
@@ -1137,13 +1137,13 @@ static int dk_add(Engine *e, int id, double used) {
     dk_path(e, id, 0, p, sizeof(p));
     int rc = rq_seq_file_info(e->m, p, &d.f, &d.tok);
     if (rc != RQ_OK && rc != RQ_ERR_MISMATCH) {
-        fprintf(stderr, "runq serve: --kv-disk: %s: %s, skipped\n", p, rq_strerror(rc));
+        fprintf(stderr, "gwenedeg serve: --kv-disk: %s: %s, skipped\n", p, rq_strerror(rc));
         free(d.tok);
         if (id >= e->dk_next) e->dk_next = id + 1; // (its id stays taken)
         return -1;
     }
     if (rc != RQ_OK || d.f.kv_type != e->o.kv_type) {
-        fprintf(stderr, "runq serve: --kv-disk: %s: %s, removed\n", p, rc != RQ_OK ? rq_strerror(rc) : "another KV type");
+        fprintf(stderr, "gwenedeg serve: --kv-disk: %s: %s, removed\n", p, rc != RQ_OK ? rq_strerror(rc) : "another KV type");
         free(d.tok);
         unlink(p);
         dk_path(e, id, 1, p, sizeof(p));
@@ -1162,7 +1162,7 @@ static int dk_add(Engine *e, int id, double used) {
         if (e->dm && !why)
             d.dlen = df.len;
         else if (e->dm) {
-            fprintf(stderr, "runq serve: --kv-disk: %s: not the draft's (%s), removed\n", p, why);
+            fprintf(stderr, "gwenedeg serve: --kv-disk: %s: not the draft's (%s), removed\n", p, why);
             unlink(p);
             st.st_size = 0;
         }
@@ -1211,7 +1211,7 @@ static int sw_open(Engine *e, char *err, size_t errlen) {
             nf += !unlink(p);
         }
     closedir(dir);
-    if (nf) fprintf(stderr, "runq serve: --admit chunk: %d leftover swap file(s) removed from %s\n", nf, e->sw_dir);
+    if (nf) fprintf(stderr, "gwenedeg serve: --admit chunk: %d leftover swap file(s) removed from %s\n", nf, e->sw_dir);
     double fr = dk_free(e), B = e->o.kv_mem * 1073741824.0;
     if (fr >= 0 && fr + (double)e->dk_bytes < B + DK_RESERVE) {
         snprintf(err, errlen, "--admit chunk: the swap needs the memory budget's %.2f GiB + %.0f GiB kept free under %s, it has %.2f GiB "
@@ -1236,7 +1236,7 @@ static int dk_open(Engine *e, char *err, size_t errlen) {
     char p[4096];
     snprintf(p, sizeof(p), "%s/lock", e->dk_dir);
     if ((e->dk_lock = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0644)) < 0 || flock(e->dk_lock, LOCK_EX | LOCK_NB)) {
-        snprintf(err, errlen, "--kv-disk: %s: %s", p, e->dk_lock < 0 ? strerror(errno) : "in use by another runq serve");
+        snprintf(err, errlen, "--kv-disk: %s: %s", p, e->dk_lock < 0 ? strerror(errno) : "in use by another gwenedeg serve");
         return -1;
     }
     DIR *dir = opendir(e->dk_dir);
@@ -1269,14 +1269,14 @@ static int dk_open(Engine *e, char *err, size_t errlen) {
     e->dk_max = e->o.kv_disk_max > 0 ? e->o.kv_disk_max * 1073741824.0 : fr >= 0 ? 0.5 * (fr + (double)e->dk_bytes) : 16.0 * 1073741824.0;
     if (e->o.kv_disk_max <= 0 && e->dk_max < e->dk_floor) e->dk_max = e->dk_floor;
     if (e->o.kv_disk_max > 0 && e->dk_max < e->dk_floor)
-        fprintf(stderr, "runq serve: --kv-disk-max %.2f GiB holds less than one full session (%.2f GiB at %d positions)\n", e->o.kv_disk_max,
+        fprintf(stderr, "gwenedeg serve: --kv-disk-max %.2f GiB holds less than one full session (%.2f GiB at %d positions)\n", e->o.kv_disk_max,
                 e->dk_floor / 1073741824.0, e->o.ctx);
     dk_beat(e);
     e->dk_chk = rq_now() + e->dk_every;
     dk_fit(e, 0, -1);
     fr = dk_free(e);
     if (fr >= 0 && fr + (double)e->dk_bytes < e->dk_floor + DK_RESERVE)
-        fprintf(stderr, "runq serve: --kv-disk: %.2f GiB free under %s (our files included): less than one full session (%.2f GiB) + "
+        fprintf(stderr, "gwenedeg serve: --kv-disk: %.2f GiB free under %s (our files included): less than one full session (%.2f GiB) + "
                 "%.0f GiB kept free, the disk tier saves what fits\n", (fr + (double)e->dk_bytes) / 1073741824.0, e->o.kv_disk,
                 e->dk_floor / 1073741824.0, DK_RESERVE / 1073741824.0);
     return 0;
@@ -1470,7 +1470,7 @@ static int dk_go(Engine *e, Job *j, int si, int src, int L) {
 typedef struct { double kv, st; } Mem;
 
 static double mem_read(const char *file) {
-    // MemAvailable in bytes (-1: unknown, e.g. not Linux), or the test hook's (RUNQ_TEST_MEMAVAILABLE=FILE: bytes)
+    // MemAvailable in bytes (-1: unknown, e.g. not Linux), or the test hook's (GWENEDEG_TEST_MEMAVAILABLE=FILE: bytes)
     if (!file) return rq_mem_available();
     FILE *f = fopen(file, "r");
     double v;
@@ -1994,7 +1994,7 @@ static int mem_swap_in(Engine *e, Run *r, int oldest) {
 }
 
 static int sw_failing(const Engine *e, const char *what) {
-    // RUNQ_TEST_SWAP_FAIL=FILE (tests only): whether the file names this I/O ("draft-save", "draft-load": it then fails), read
+    // GWENEDEG_TEST_SWAP_FAIL=FILE (tests only): whether the file names this I/O ("draft-save", "draft-load": it then fails), read
     // at each use
     if (!e->sw_fail) return 0;
     FILE *f = fopen(e->sw_fail, "r");
@@ -2985,7 +2985,7 @@ static void mtp_follow(Engine *e, int nseg) {
 }
 
 static void mtp_check(Engine *e) {
-    // RUNQ_TEST_MTP_CHECK=1 (tests only; engine_main, after each step): every slot's view at rest, by the public calls.
+    // GWENEDEG_TEST_MTP_CHECK=1 (tests only; engine_main, after each step): every slot's view at rest, by the public calls.
     // I1 every row final; a running job's view ahead only while its prompt is prefilled, as a prefix of the prompt; else I2
     // the target's tokens, I3 as long as the target (to its capacity) and I4 the target's state at its last position kept
     // (not at the capacity), unless no B has run yet or a failed one left a gap; an idle slot's: the target's tokens as far
@@ -3011,7 +3011,7 @@ static void mtp_check(Engine *e) {
 }
 
 static void mtp_dump(Engine *e, Run *r) {
-    // RUNQ_TEST_MTP_DUMP=DIR (tests only; reap): a job that finished (no error status) with "mtp_approx" 0 in its timings
+    // GWENEDEG_TEST_MTP_DUMP=DIR (tests only; reap): a job that finished (no error status) with "mtp_approx" 0 in its timings
     // ("speculative" not off; and none after it was published: mlate) after a follow pass: its target's and view's sequences as DIR/<job>.rqseq and .draft.rqseq
     // (the view's in version 2 with its kept state), for api_test --mtp-seqcheck
     if (r->si < 0 || r->mfol == 0 || r->j->status || r->j->spec == SPEC_OFF || r->j->sp_mtp_approx != 0 || r->mlate) return;
@@ -3021,7 +3021,7 @@ static void mtp_dump(Engine *e, Run *r) {
     int rc = rq_seq_save(sl->seq, p);
     snprintf(p, sizeof(p), "%s/%d.draft.rqseq", e->mtp_dump, r->id);
     if (rc == RQ_OK) rc = rq_seq_save(sl->dseq, p);
-    if (rc != RQ_OK) fprintf(stderr, "[engine] RUNQ_TEST_MTP_DUMP: job %d not saved: %s\n", r->id, rq_strerror(rc));
+    if (rc != RQ_OK) fprintf(stderr, "[engine] GWENEDEG_TEST_MTP_DUMP: job %d not saved: %s\n", r->id, rq_strerror(rc));
 }
 
 static void step(Engine *e, int stopping) {
@@ -3624,7 +3624,7 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
         int L = o->calib < o->ctx - 32 ? o->calib : o->ctx - 32;
         if ((rc = rq_pass_cost_measure(e->c, e->slot[0].seq, L, 5, &e->tcost)) != RQ_OK ||
             (e->dm && (rc = rq_pass_cost_measure(e->dc, e->slot[0].dseq, L, 5, &e->dcost)) != RQ_OK))
-            fprintf(stderr, "runq serve: the speculation cost calibration failed (%s): estimates instead\n", rq_strerror(rc));
+            fprintf(stderr, "gwenedeg serve: the speculation cost calibration failed (%s): estimates instead\n", rq_strerror(rc));
         if (e->hybrid) rq_seq_set_checkpoints(e->slot[0].seq, e->ckn);
         if (e->dhybrid) rq_seq_set_checkpoints(e->slot[0].dseq, e->ckn);
         // (the calibration's positions given back, in both modes: up to --spec-calibrate of them stayed resident)
@@ -3642,20 +3642,20 @@ Engine *engine_start(RqModel *m, const EngineOpts *o, char *err, size_t errlen) 
     // tokens and headers, the MTP view's kept state)
     e->dk_res = o->kv_disk_free * 1073741824.0 > DK_RESERVE ? o->kv_disk_free * 1073741824.0 : DK_RESERVE; // (1 GiB at least, as before)
     e->dk_floor = (double)e->sm.total + (double)e->dsm.total + 2.0 * (4.0 * o->ctx + 3 * 4096.0);
-    const char *kc = getenv("RUNQ_TEST_KV_CHECK"), *kf = getenv("RUNQ_TEST_DISKFREE"); // (tests: the watch's period, s; the free space)
+    const char *kc = rq_getenv("GWENEDEG_TEST_KV_CHECK"), *kf = rq_getenv("GWENEDEG_TEST_DISKFREE"); // (tests: the watch's period, s; the free space)
     e->dk_every = kc && atof(kc) > 0 ? atof(kc) : DK_CHECK;
     e->df_file = kf && *kf ? kf : NULL;
     if (o->kv_disk && *o->kv_disk && dk_open(e, err, errlen)) {
         engine_free(e);
         return NULL;
     }
-    const char *mf = getenv("RUNQ_TEST_MEMAVAILABLE"); // (step 3's test hook: MemAvailable from this file)
+    const char *mf = rq_getenv("GWENEDEG_TEST_MEMAVAILABLE"); // (step 3's test hook: MemAvailable from this file)
     e->ma_file = mf && *mf ? mf : NULL;
-    const char *sd = getenv("RUNQ_TEST_SWAP_DELAY"); // (tests: s of sleep in each swap-out, so that one lasts)
+    const char *sd = rq_getenv("GWENEDEG_TEST_SWAP_DELAY"); // (tests: s of sleep in each swap-out, so that one lasts)
     e->sw_delay = sd && *sd ? atof(sd) : 0;
-    const char *sf = getenv("RUNQ_TEST_SWAP_FAIL"); // (tests: a file naming the swap I/O to fail, draft-save / draft-load)
+    const char *sf = rq_getenv("GWENEDEG_TEST_SWAP_FAIL"); // (tests: a file naming the swap I/O to fail, draft-save / draft-load)
     e->sw_fail = sf && *sf ? sf : NULL;
-    const char *mc = getenv("RUNQ_TEST_MTP_CHECK"), *md = getenv("RUNQ_TEST_MTP_DUMP"); // (tests: the MTP view's at-rest check, dumps)
+    const char *mc = rq_getenv("GWENEDEG_TEST_MTP_CHECK"), *md = rq_getenv("GWENEDEG_TEST_MTP_DUMP"); // (tests: the MTP view's at-rest check, dumps)
     e->mtp_chk = e->mtp && mc && !strcmp(mc, "1");
     e->mtp_dump = e->mtp && md && *md ? md : NULL;
     if (e->o.admit_margin < 0) e->o.admit_margin = 0;
@@ -3732,7 +3732,7 @@ int engine_describe_admit(Engine *e, char *buf, size_t n) {
     double A = mem_read(e->ma_file); // (not mem_avail: the engine thread's)
     if (A >= 0)
         l += snprintf(buf + l, n - l, "; live budget: MemAvailable (%.2f GiB%s) - margin %.2f GiB - the running jobs' growth", A / G,
-                      e->ma_file ? ", RUNQ_TEST_MEMAVAILABLE" : "", e->o.admit_margin);
+                      e->ma_file ? ", GWENEDEG_TEST_MEMAVAILABLE" : "", e->o.admit_margin);
     else l += snprintf(buf + l, n - l, "; no live budget (no MemAvailable)");
     if (st > 0) l += snprintf(buf + l, n - l, "; a request's guesses at most %d", e->kcap);
     if (e->o.admit == ADMIT_CHUNK) {

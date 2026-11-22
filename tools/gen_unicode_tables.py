@@ -15,7 +15,7 @@ The Qwen2/Qwen3 pre-tokenizer regex (tokenizer.json) needs three classes, Qwen3.
              (Oniguruma) uses for \\s. Not Python's str.isspace(), which also has U+001C..U+001F
              (checked against HF: "x\\x1c\\x1cy" splits like punctuation, "x\\u3000\\u3000y" like space).
 Everything else is "other". The table is a sorted list of disjoint ranges, each with one class,
-looked up by binary search (ASCII has a fast path in runq.c).
+looked up by binary search (ASCII has a fast path in src/tokenizer.c).
 The Unicode version is that of the Python running this script (written into the header); HF
 tokenizers 0.21.4 agrees with Unicode 15.1 on the 15.1 additions (e.g. CJK Ext. I is \\p{L}).
 
@@ -26,7 +26,7 @@ the older combining marks and on all primary composites, except for characters a
   HF_CCC0          combining marks that HF treats as ccc 0 (never reordered)
   HF_NO_DECOMP     U+11938 DIVES AKURU VOWEL SIGN O (13.0): no decomposition, so 11935 + 11930
                    does not compose
-The tables apply these overrides (runq must match HF's ids), unless --unicode-only.
+The tables apply these overrides (gwenedeg must match HF's ids), unless --unicode-only.
 Tables: entries for every code point with ccc != 0, NFC_QC != Yes or a canonical decomposition
 (Hangul syllables are algorithmic, not listed), sorted, binary search; full decompositions in a
 pool; primary composites as sorted (first, second) keys; two bitmaps over 64-code-point blocks
@@ -73,7 +73,7 @@ def classify(cp, ws):
 
 
 def nfc_data(hf_compat):
-    """ccc, full canonical decompositions, composition pairs and NFC_QC as runq applies them"""
+    """ccc, full canonical decompositions, composition pairs and NFC_QC as gwenedeg applies them"""
     ccc0 = {c for lo, hi in HF_CCC0 for c in range(lo, hi + 1)} if hf_compat else set()
     nodec = set(HF_NO_DECOMP) if hf_compat else set()
     cps = [c for c in range(0x110000) if not 0xD800 <= c <= 0xDFFF]
@@ -103,7 +103,7 @@ def nfc_data(hf_compat):
         qc[b] = 1  # Maybe
     for b in HANGUL_VT:
         qc[b] = 1
-    # size bounds that runq.c relies on: NFC output <= 3x the input bytes, <= 2 code points per byte
+    # size bounds that src/tokenizer.c relies on: NFC output <= 3x the input bytes, <= 2 code points per byte
     u8 = lambda cs: len("".join(map(chr, cs)).encode())
     for c, d in dec.items():
         assert u8(d) <= 3 * u8([c]) and len(d) <= 2 * u8([c]) and len(d) <= 7, hex(c)

@@ -10,8 +10,8 @@
 #endif
 #define ATT_NV_MAX 64 // max query vectors per attention_kv call
 
-#ifdef RUNQ_PROFILE
-// build with -DRUNQ_PROFILE: wall time per batched-prefill phase type (rq_ctx_profile)
+#ifdef GWENEDEG_PROFILE
+// build with -DGWENEDEG_PROFILE: wall time per batched-prefill phase type (rq_ctx_profile)
 enum { PF_NORM, PF_QKV, PF_ROPE, PF_ATT, PF_WO, PF_FFN13, PF_SWIGLU, PF_FFN2, PF_CLS, PF_BDQKV, PF_BDFFN13, PF_DNPREP, PF_DNREC, PF_DNOUT, PF_N };
 static const char *pf_name[PF_N] = { "norm+quant+resid", "gemm qkv", "qk-norm+rope+kv", "attention+quant",
                                      "gemm wo", "gemm w1+w3", "swiglu+quant", "gemm w2", "classifier",
@@ -23,7 +23,7 @@ static const char *pf_name[PF_N] = { "norm+quant+resid", "gemm qkv", "qk-norm+ro
 #define PROF(c, i) ((void)0)
 #endif
 
-static void smb_config(RqCtx *c); // (RUNQ_SMB, RUNQ_BD: below)
+static void smb_config(RqCtx *c); // (GWENEDEG_SMB, GWENEDEG_BD: below)
 
 // rows b0..b0+n-1 of a batched pass: seq's positions pos0..; the segment's logits mode, its hidden rows' output and its
 // MTP view's h input rows (RqSegment.hidden / h_in, NULL: none / zeros)
@@ -94,7 +94,7 @@ struct RqCtx {
     // speculative verify segment: batch_decode_worker): at most bd_max rows; the norms as an epilogue up to bd_epi
     // rows (else a phase); a row block's attention split over its blocks of ATT_P positions when the pass has fewer
     // than bd_split * threads (row block, kv head) items; the small-batch kernels up to smb_max rows per weight
-    // type (gemm_plan). Tuning: RUNQ_SMB, RUNQ_BD
+    // type (gemm_plan). Tuning: GWENEDEG_SMB, GWENEDEG_BD
     int smb_max[5], smb_pf, bd_max, bd_epi, bd_split, bd_seg;
     float *att_sp; size_t att_sp_n; // split attention: per (row, query head, block) partial results
     int *row_it0;       // batch_decode_worker: attention items of row blocks 0..u-1 (per kv head)
@@ -102,7 +102,7 @@ struct RqCtx {
     void *probindex_t;  // the same per thread (rq_sample_batch), allocated at its first use
     int probindex_nt;
     char err[256];      // the last error's details
-#ifdef RUNQ_PROFILE
+#ifdef GWENEDEG_PROFILE
     double pf_time[PF_N], pf_t;
 #endif
 };
@@ -674,7 +674,7 @@ RqCtx *rq_ctx_new(const RqModel *mc, int nb_max, int max_ctx, int *err) {
             c->bq_c16 = calloc(nb * (xs / 16) + 1, sizeof(int32_t));
             c->bh_c16 = calloc(nb * (p->hidden_dim / 16) + 1, sizeof(int32_t));
             if (!c->bq_xf || !c->bh_xf || !c->bq_c16 || !c->bh_c16) goto fail;
-#ifdef RUNQ_KQX
+#ifdef GWENEDEG_KQX
             int kmax = p->hidden_dim > xs ? p->hidden_dim : xs;
             c->kq_scr_bytes = (GEMM_SCRATCH(kmax) + 63) / 64 * 64;
             c->kq_scr = aligned_alloc(64, c->kq_scr_bytes * c->nt);
@@ -784,7 +784,7 @@ void *ctx_sampler_scratch_threads(RqCtx *c, int nt) {
 int ctx_vocab(const RqCtx *c) { return c->m->config.vocab_size; }
 
 int rq_ctx_profile(const RqCtx *c, const char **names, double *seconds, int max) {
-#ifdef RUNQ_PROFILE
+#ifdef GWENEDEG_PROFILE
     int n = max < PF_N ? max : PF_N;
     for (int i = 0; i < n; i++) {
         names[i] = pf_name[i];
@@ -965,12 +965,12 @@ static inline const QuantizedTensor *ab_item(const QuantizedTensor *wa, const Qu
 // (xf != NULL) the activation group sums xf of kquants.h, plus for the AVX-512 K-quant GEMV the
 // -32 * sums of 16 (c16, Q6_K; Q3_K: c16 / 8); matvec_rows: rows i0..i1-1
 static inline void matvec_prep(int32_t *corr, float *xf, int32_t *c16, QuantizedTensor *x, int i0, int n) {
-#ifdef RUNQ_Q8X
+#ifdef GWENEDEG_Q8X
     q8x_gemv_corr(corr + i0 / GS, x->q + i0, n, GS);
 #else
     (void)corr;
 #endif
-#ifdef RUNQ_KQX
+#ifdef GWENEDEG_KQX
     if (c16)
         kqx_c16(c16 + i0 / 16, x->q + i0, n);
 #else
@@ -988,7 +988,7 @@ static inline void matvec_rows(float *xout, QuantizedTensor *x, const int32_t *c
         return;
     }
     if (w->kp) { // K-quants, 16-row blocks (kquants.h; AVX-512: kernels_avx512.h)
-#ifdef RUNQ_KQX
+#ifdef GWENEDEG_KQX
         kqx_gemv_rows(w->type, xout, x->q, x->s, xf, c16, w->kp, n, i0 / KQ_ROWS, i1 / KQ_ROWS);
 #else
         (void)c16;
@@ -998,7 +998,7 @@ static inline void matvec_rows(float *xout, QuantizedTensor *x, const int32_t *c
 #endif
         return;
     }
-#ifdef RUNQ_Q8X
+#ifdef GWENEDEG_Q8X
     if (w->p) { q8x_gemv_rows(xout, x->q, x->s, corr, w->p, n, GS, i0 / 16, i1 / 16); return; }
 #else
     (void)corr;
@@ -1073,7 +1073,7 @@ typedef struct {
 // over at most smb_max rows of its weight type (else the GEMM's tiles), and always in batch_decode_worker.
 // Crossover (one thread, measured in Step 10a): Q4_K / Q6_K faster than the GEMM up to ~24 rows (1.6-2.3x at
 // 1-4 rows: no tile unpacking), equal at 32, ~4% slower at 48-64; Q8_0 equal (the GEMM tile streams the
-// packed weights too). RUNQ_SMB=Q8,Q4,Q6,Q5,pf,Q3 overrides them (tuning; 0 = never). Results never depend on it.
+// packed weights too). GWENEDEG_SMB=Q8,Q4,Q6,Q5,pf,Q3 overrides them (tuning; 0 = never). Results never depend on it.
 // The K-quant kernels prefetch their weights SMB_PF bytes ahead (TODO S2, 8 threads, Qwen3-8B Q4_K_M, 500
 // positions: a verify segment of 2 / 4 / 6 rows -10% / -12% / -5%, 1 and 9 rows unchanged; 1,024 / 2,048 / 8,192
 // bytes: about the same; Q8_0: none of it, within noise or up to +5% at 1-2 rows, so its kernel does not prefetch)
@@ -1091,7 +1091,7 @@ enum { SMB_Q8, SMB_Q4, SMB_Q6, SMB_Q5, SMB_Q3 };
 
 static void env_ints(const char *name, int *v, int n) {
     // comma-separated integers from the environment variable name into v[0..n-1] (missing: unchanged)
-    const char *e = getenv(name);
+    const char *e = rq_getenv(name);
     for (int i = 0; e && *e && i < n; i++) {
         if (*e != ',') v[i] = atoi(e);
         e = strchr(e, ',');
@@ -1100,18 +1100,18 @@ static void env_ints(const char *name, int *v, int n) {
 }
 
 static void smb_config(RqCtx *c) {
-    // the context's small-batch / batched-decode settings: defaults, RUNQ_SMB=Q8,Q4,Q6,Q5,pf,Q3 (rows per weight
-    // type; the kernels' prefetch distance in bytes; Q3_K's rows are the 6th value: pf was there first), RUNQ_BD=max,epi,split,seg
+    // the context's small-batch / batched-decode settings: defaults, GWENEDEG_SMB=Q8,Q4,Q6,Q5,pf,Q3 (rows per weight
+    // type; the kernels' prefetch distance in bytes; Q3_K's rows are the 6th value: pf was there first), GWENEDEG_BD=max,epi,split,seg
     int smb[6] = { 32, 32, 32, 32, SMB_PF, 32 };
-    env_ints("RUNQ_SMB", smb, 6);
-    const char *ig = getenv("RUNQ_IQ_GATHER"); // (iquants.h: the gather decode of the i-quants, a test switch; process-wide)
+    env_ints("GWENEDEG_SMB", smb, 6);
+    const char *ig = rq_getenv("GWENEDEG_IQ_GATHER"); // (iquants.h: the gather decode of the i-quants, a test switch; process-wide)
     rq_iq_gather = ig && atoi(ig) != 0;
     memcpy(c->smb_max, smb, 4 * sizeof(int));
     c->smb_max[SMB_Q3] = smb[5];
     c->smb_pf = smb[4];
     int bd[4] = { BD_MAX, 2, 8, BD_SEG };
-    env_ints("RUNQ_BD", bd, 4);
-#ifdef RUNQ_NEON
+    env_ints("GWENEDEG_BD", bd, 4);
+#ifdef GWENEDEG_NEON
     bd[0] = 0; // (NEON: its GEMM for batched rows, as before; no small-batch kernels there yet)
 #endif
     c->bd_max = bd[0] < c->nb_max ? bd[0] : c->nb_max;
@@ -1127,7 +1127,7 @@ static inline int smb_slot(int type) {
 
 static inline int smb_use(const RqCtx *c, const QuantizedTensor *w, int nb) {
     // the small-batch kernel for nb rows of w
-#ifdef RUNQ_SMB
+#ifdef GWENEDEG_SMB
     if (w->kp) return !iq_type(w->type) && nb <= c->smb_max[smb_slot(w->type)]; // (Q2_K, i-quants: iq_rows)
     return w->p && nb <= c->smb_max[SMB_Q8];
 #else
@@ -1145,14 +1145,14 @@ static void gemm_plan(const RqCtx *c, Gemm *g, int nj, const MatJob *job, Quanti
     for (int j = 0; j < nj; j++) {
         g->job[j] = job[j];
         g->tiled[j] = 0;
-#ifdef RUNQ_KQX
+#ifdef GWENEDEG_KQX
         g->tiled[j] = job[j].w->kp != NULL && !iq_type(job[j].w->type); // (Q2_K, i-quants: blocks over all rows, iq_rows)
 #endif
-#ifdef RUNQ_IQX
+#ifdef GWENEDEG_IQX
         if (job[j].w->kp && iq_type(job[j].w->type) && nb >= IQX_MIN)
             g->tiled[j] = 1; // (Q2_K, i-quants, AVX-512: their tiled GEMM from IQX_MIN rows, iqx_gemm_item)
 #endif
-#ifdef RUNQ_Q8X
+#ifdef GWENEDEG_Q8X
         g->tiled[j] |= job[j].w->p != NULL;
 #endif
         g->smb[j] = smb_use(c, job[j].w, nb);
@@ -1164,7 +1164,7 @@ static void gemm_plan(const RqCtx *c, Gemm *g, int nj, const MatJob *job, Quanti
     }
     g->nbi = nb;
     g->nchunk = 1;
-#if defined RUNQ_Q8X || defined RUNQ_KQX
+#if defined GWENEDEG_Q8X || defined GWENEDEG_KQX
     if (ntile) {
         g->nbi = kqx_nb(nb, ntile, nt);
         g->nchunk = (nb + g->nbi - 1) / g->nbi;
@@ -1195,29 +1195,29 @@ NO_FP_CONTRACT static void gemm_item(const Gemm *g, int it, uint8_t *scr, const 
             f32_rows(jb->out + (size_t)b * jb->ldo, w->f, g->xa + (size_t)b * g->ldxa, k, i0, i1);
         return;
     }
-#ifdef RUNQ_SMB
+#ifdef GWENEDEG_SMB
     if (g->smb[j]) { // 16-row block i, all rows
         smb_rows(w->kp ? w->type : 0, jb->out, jb->ldo, x->q, ldx, x->s, g->corr, g->xf, g->c16, nb, w->kp ? w->kp : w->p, k, GS,
                  i, i + 1, g->pf);
         return;
     }
 #endif
-#if defined RUNQ_Q8X || defined RUNQ_KQX
+#if defined GWENEDEG_Q8X || defined GWENEDEG_KQX
     if (g->tiled[j]) {
         int t = i / g->nchunk, ch = i % g->nchunk;
-#ifdef RUNQ_IQX
+#ifdef GWENEDEG_IQX
         if (w->kp && iq_type(w->type)) {
             iqx_gemm_item(jb->out, jb->ldo, w->kp, w->type, jb->d, t, ch, g->nbi, x->q, x->s, ldx, nb, k, g->c16, scr, last);
             return;
         }
 #endif
-#ifdef RUNQ_KQX
+#ifdef GWENEDEG_KQX
         if (w->kp) {
             kqx_gemm_item(jb->out, jb->ldo, w->kp, w->type, jb->d, t, ch, g->nbi, x->q, x->s, ldx, nb, k, g->xf, g->c16, scr, last);
             return;
         }
 #endif
-#ifdef RUNQ_Q8X
+#ifdef GWENEDEG_Q8X
         q8x_gemm_item(jb->out, jb->ldo, w->p, jb->d, t, ch, g->nbi, x->q, x->s, ldx, nb, k, GS, g->corr);
 #endif
         return;
@@ -1295,7 +1295,7 @@ static void qk_norm_rope(float *v, int n_heads, int stride, const float *norm_w,
 
 // Attention. The arithmetic is defined in kernels_avx512.h (with the KV cache tile layout):
 // AVX-512 builds use att512_kv there, the others attention_vec below, the same operations in the
-// same order (bit-identical results; tested by make test's kernels/* with -DRUNQ_GENERIC).
+// same order (bit-identical results; tested by make test's kernels/* with -DGWENEDEG_GENERIC).
 // gcc: no FP contraction or reassociation in this C version (it would round differently)
 #if defined(__GNUC__) && !defined(__clang__)
     #define ATT_EXACT __attribute__((optimize("fp-contract=off", "no-associative-math", "no-reciprocal-math")))
@@ -1467,7 +1467,7 @@ static void kv_block_f32(int kvt, float *kf, float *vf, const uint16_t *kh, cons
 #if defined(__x86_64__) || defined(__i386__)
 #include <xmmintrin.h>
 static inline unsigned att_ftz_on(void) {
-    // MXCSR's FTZ and DAZ for a bf16 dot-product attention call (the instruction's rule; runq's -Ofast startup sets
+    // MXCSR's FTZ and DAZ for a bf16 dot-product attention call (the instruction's rule; gwenedeg's -Ofast startup sets
     // them already); returns the MXCSR to restore
     unsigned c = _mm_getcsr();
     if ((c & 0x8040) != 0x8040)
@@ -1797,7 +1797,7 @@ static void attention_part_q(int att, int nv, const float *const *q, float *cons
             break;
         const uint8_t *kb = (const uint8_t *)kt + b * bsk, *vb = (const uint8_t *)vt + b * bsv;
         int ntl = (nmax + ATT_T - 1) / ATT_T;
-#ifdef RUNQ_ATT512
+#ifdef GWENEDEG_ATT512
         if (att512_ok(hd))
             att512_q_f32(att, conv, conv + (size_t)ATT_P * hd, kb, vb, ntl, hd);
         else
@@ -1829,7 +1829,7 @@ static void attention_part(int att, int nv, const float *const *q, float *const 
     }
     if (att & KV_DOT) {
         unsigned csr = att_ftz_on();
-#ifdef RUNQ_ATT512
+#ifdef GWENEDEG_ATT512
         if (att512_ok(hd))
             att512_kv_dot(kvt, nv, q, out, part, np, b0, b1, kt, vt, bs, hd, scale, S, (uint16_t *)conv);
         else
@@ -1838,10 +1838,10 @@ static void attention_part(int att, int nv, const float *const *q, float *const 
         att_ftz_off(csr);
         return;
     }
-#ifdef RUNQ_ATT512
+#ifdef GWENEDEG_ATT512
     if (att512_ok(hd)) { att512_kv(kvt, nv, q, out, part, np, b0, b1, kt, vt, bs, hd, scale, S); return; }
 #endif
-#ifdef RUNQ_ATTNEON
+#ifdef GWENEDEG_ATTNEON
     if (attn_ok(hd)) { attn_kv(kvt, nv, q, out, part, np, b0, b1, kt, vt, bs, hd, scale, S); return; }
 #endif
     // generic C: per block of ATT_P positions (a 16-bit cache converted to fp32 once, for all the
@@ -2374,7 +2374,7 @@ static void kv_populate_one(const RqSeq *s, const Config *p, int pos0, int n, in
 #endif
 }
 
-// rq_seq_fill_synthetic (a test hook, runq.h): a long context without its prefill, for timing (TODO G0 (b))
+// rq_seq_fill_synthetic (a test hook, gwenedeg.h): a long context without its prefill, for timing (TODO G0 (b))
 typedef struct { RqSeq *s; int n, next; uint64_t seed; } FillJob;
 
 static inline float fill_val(uint64_t *x, float a) {
@@ -2876,7 +2876,7 @@ typedef struct {
 // (a linear layer: 10 with its 3 recurrence phases; the hidden rows without logits: 1; an MTP view's input: 2)
 static int prefill_phases(const RqModel *m, int nhid) { return 10 * m->config.n_layers + 4 + (nhid > 0) + 2 * (m->mtp_of != NULL); }
 
-#ifdef RUNQ_PROFILE
+#ifdef GWENEDEG_PROFILE
 #define PPROF(i) do { if (tid == 0) PROF(c, i); } while (0)
 #else
 #define PPROF(i) ((void)0)
@@ -3331,7 +3331,7 @@ static void rows_mm(const RqCtx *c, QuantizedTensor *w, float *out, int ldo, Qua
         iq_rows(w->type, out, ldo, x->q, ldx, x->s, c16, nb, w->kp, k, i0 / 16, i1 / 16);
         return;
     }
-#ifdef RUNQ_SMB
+#ifdef GWENEDEG_SMB
     if (w->kp || w->p) {
         smb_rows(w->kp ? w->type : 0, out, ldo, x->q, ldx, x->s, corr, xf, c16, nb, w->kp ? w->kp : w->p, k, GS, i0 / 16, i1 / 16,
                  c->smb_pf);

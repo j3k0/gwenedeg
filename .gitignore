@@ -1,6 +1,6 @@
-/runq
-/runq-debug
-/runq-generic
+/gwenedeg
+/gwenedeg-debug
+/gwenedeg-generic
 /models/
 /.venv/
 /logs/
@@ -8,7 +8,7 @@
 __pycache__/
 *.part
 *.o
-/runq-debug.dSYM/
+/gwenedeg-debug.dSYM/
 /tests/kernels/kq_neon_test
 /tests/kernels/iq_neon_test
 /tests/kernels/iq_repack_test
@@ -17,5 +17,12 @@ __pycache__/
 /.venv-hf5/
 /*.key
 /kv-cache/
+/gwenedeg.new
+/gwenedeg.prev*
+# the binaries' names before 2026-11-22 (a checkout built before the rename)
+/runq
+/runq-debug
+/runq-generic
+/runq-debug.dSYM/
 /runq.new
 /runq.prev*

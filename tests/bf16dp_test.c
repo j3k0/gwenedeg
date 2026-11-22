@@ -24,7 +24,7 @@
 #include <math.h>
 #include "../src/kernels_avx512.h"
 
-#if !defined(RUNQ_ATT512)
+#if !defined(GWENEDEG_ATT512)
 int main(void) {
     printf("SKIP bf16dp_test: not an AVX-512 build\n");
     return 0;

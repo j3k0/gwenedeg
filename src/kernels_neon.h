@@ -23,12 +23,12 @@
  * of the group, then Q4: ds, dm as fp32; Q3 / Q6: sc_j0, sc_j1 as int32, d as fp32), then register tiles
  * of KQN_RQ quads x KQN_C activation rows read it with no unpacking in the inner loop.
  */
-#ifndef RUNQ_KERNELS_NEON_H
-#define RUNQ_KERNELS_NEON_H
+#ifndef GWENEDEG_KERNELS_NEON_H
+#define GWENEDEG_KERNELS_NEON_H
 
-#if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD) && !defined(RUNQ_GENERIC) && !defined(RUNQ_KQX)
-#define RUNQ_NEON 1
-#define RUNQ_KQX 1 // K-quant SIMD kernels: kqx_* (forward.c)
+#if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD) && !defined(GWENEDEG_GENERIC) && !defined(GWENEDEG_KQX)
+#define GWENEDEG_NEON 1
+#define GWENEDEG_KQX 1 // K-quant SIMD kernels: kqx_* (forward.c)
 // clang's arm_neon.h defines vmulq_f32, vaddq_f32, ... as inline functions with plain C operators,
 // which take the FP options of the place the header is included at, not of their callers: under
 // -ffast-math they would be fused into fmla / fmls and reassociated after inlining, even inside
@@ -611,7 +611,7 @@ static void kqx_gemm_item(float *out, int ldo, const uint8_t *kp, int type, int 
  * follow: arm64 and x86 Q8_0 logits differ in the last bits, as they already did with the generic
  * kernels.)
  */
-#define RUNQ_Q8X 1 // Q8_0 SIMD kernels: q8x_* (forward.c)
+#define GWENEDEG_Q8X 1 // Q8_0 SIMD kernels: q8x_* (forward.c)
 #define Q8N_ROWS 16
 #define Q8X_GROUP(gs) (Q8N_ROWS * (gs) + Q8N_ROWS * 4) // bytes per (block, group): 16 x gs + 64
 // GEMM register tile: Q8N_RQ quads (1, 2 or 4) x Q8N_C activation rows (1..Q8N_CMAX)
@@ -1106,14 +1106,14 @@ static inline int attn_ok(int hd) { return hd % 64 == 0 && hd <= ATTN_HDMAX; }
 static void attn_kv(int kvt, int nv, const float *const *q, float *const *out, float *const *part, const int *np, int b0,
                     int b1, const void *kt, const void *vt, size_t bs, int hd, float scale, float *s) {
     // nv query vectors of one kv head (any nv), in groups of ATTN_NV (attn_group_t); kvt: cache type, 0
-    // fp32, 1 bf16, 2 f16 (KV_F32, KV_BF16, KV_F16: RQ_KV_* of runq.h); bs: elements from a head's block to its next
+    // fp32, 1 bf16, 2 f16 (KV_F32, KV_BF16, KV_F16: RQ_KV_* of gwenedeg.h); bs: elements from a head's block to its next
     for (int g = 0; g < nv; g += ATTN_NV) {
         int gn = nv - g < ATTN_NV ? nv - g : ATTN_NV;
         (kvt == 2 ? attn_group_f16 : kvt ? attn_group_bf16 : attn_group_f32)(gn, q + g, out + g, part ? part + g : NULL,
                                                                           np + g, b0, b1, kt, vt, bs, hd, scale, s);
     }
 }
-#define RUNQ_ATTNEON 1
+#define GWENEDEG_ATTNEON 1
 
 #endif // NEON
-#endif // RUNQ_KERNELS_NEON_H
+#endif // GWENEDEG_KERNELS_NEON_H

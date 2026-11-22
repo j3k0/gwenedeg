@@ -1,7 +1,7 @@
 /* Low-bit GGUF quants: Q2_K and ggml's i-quants IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS (as in
  * llama.cpp's IQ2_M / IQ3_M / "IQ2-mix" files, e.g. Underdog Saluki 27B 1.0): the block formats, their dequantization,
  * the repacked layouts the matmul kernels read, the arithmetic of a matmul output (the definition below), the generic
- * C kernel, the AVX-512 VNNI one and the NEON one (any build: the generic one; RUNQ_VNNI: iq512_*; NEON: iqn_*). Like
+ * C kernel, the AVX-512 VNNI one and the NEON one (any build: the generic one; GWENEDEG_VNNI: iq512_*; NEON: iqn_*). Like
  * kquants.h for Q3_K .. Q6_K, and on the same activations (int8 xq in groups of 32 with fp32 scales xs), so a matrix
  * of any of these types can sit next to K-quant and Q8_0 ones (a fused q / k / v or gate / up phase mixes them).
  *
@@ -86,8 +86,8 @@
  *   I4XS    SB 2240 (140; file 136). +32 int8 sc[8][16] (16 g + r: ls - 32). +192 + 256 g: 4 chunks c of 64 bytes: lane
  *           r, byte b: low nibble = q of column 32 g + 8 c + b, high nibble = of column + 4 (Q4P's nibble order)
  */
-#ifndef RUNQ_IQUANTS_H
-#define RUNQ_IQUANTS_H
+#ifndef GWENEDEG_IQUANTS_H
+#define GWENEDEG_IQUANTS_H
 
 #include <stdint.h>
 #include <string.h>
@@ -98,7 +98,7 @@
 enum { GGML_Q2_K = 10, GGML_IQ2_XXS = 16, GGML_IQ2_XS = 17, GGML_IQ3_XXS = 18, GGML_IQ1_S = 19, GGML_IQ3_S = 21,
        GGML_IQ2_S = 22, GGML_IQ4_XS = 23, GGML_IQ1_M = 29 }; // ggml type numbers
 
-// runq-internal types (never in a file): IQ3_XXS / IQ3_S matmul weights repacked at load as 4-bit codes (RqModelOpts.repack,
+// gwenedeg-internal types (never in a file): IQ3_XXS / IQ3_S matmul weights repacked at load as 4-bit codes (RqModelOpts.repack,
 // --repack; docs/iquants.md). Each value v is stored as n = e | (v < 0) << 3, e its magnitude's index (IQ3_S: |v| = 2 e + 1;
 // IQ3_XXS: |v| = 4, 12, .. 52, 62 = e << 3 | 4, but 62 for e 7), in IQ4_XS's nibble layout; the D and the scales as the
 // base type's. The same v, S and D: bit-identical results; the kernels decode a nibble with one vpshufb instead of the
@@ -697,8 +697,8 @@ KQ_EXACT static void iq_dot(int type, float *out, size_t ldo, const uint8_t *wb,
 
 // ---------------------------------------------------------------------------- AVX-512 VNNI
 
-#ifdef RUNQ_VNNI
-#define RUNQ_IQX 1
+#ifdef GWENEDEG_VNNI
+#define GWENEDEG_IQX 1
 
 static inline __m512i iq512_u8(const uint8_t *p) { return _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)p)); }
 static inline __m512i iq512_bc4(const int8_t *p) { int32_t v; memcpy(&v, p, 4); return _mm512_set1_epi32(v); }
@@ -721,7 +721,7 @@ static inline __m512i iq512_sgn(__m512i m, const uint8_t *mp, __m512i B) {
     return _mm512_mask_sub_epi8(_mm512_add_epi8(B, m), _cvtu64_mask64(k), B, m);
 }
 
-// AVX512-VBMI decode (Zen 4, Ice Lake and later; RUNQ_IQ_GATHER: the gathers below instead). The 64 lane-major grid
+// AVX512-VBMI decode (Zen 4, Ice Lake and later; GWENEDEG_IQ_GATHER: the gathers below instead). The 64 lane-major grid
 // indices of a group are looked up in the byte tables of iq_grids.h (the codes of each grid entry, 2 or 3 bits per
 // value: iq2*_clo / _chi, iq3*_ca / _cb) with vpermi2b over 128 entries and a blend tree on the higher index bits (k8, k9
 // by pext from the hi bytes), 64 lookups per instruction; IQ1's codes are stored (no lookup). Each step's codes are then
@@ -729,9 +729,9 @@ static inline __m512i iq512_sgn(__m512i m, const uint8_t *mp, __m512i B) {
 // only depends on the code bits, the negative values by a second, masked vpermb on the table of B - |v| (IQ1: of delta
 // -1; IQ3: 2 B - (B + |v|)). The same integers as the gathers' and iq_unpack_group's. 2.6-3.3x the gathers' speed on
 // Zen 4 (~2.5 gathered elements / ns per core; docs/iquants.md)
-#if defined(__AVX512VBMI__) && defined(__BMI2__) && !defined(RUNQ_IQ_GATHER)
-#define RUNQ_IQ_VBMI 1
-// RUNQ_IQ_GATHER=1 in the environment (read by rq_ctx_new: smb_config) selects the gather decode below at run time: the
+#if defined(__AVX512VBMI__) && defined(__BMI2__) && !defined(GWENEDEG_IQ_GATHER)
+#define GWENEDEG_IQ_VBMI 1
+// GWENEDEG_IQ_GATHER=1 in the environment (read by rq_ctx_new: smb_config) selects the gather decode below at run time: the
 // test suite checks that both give the same logits (the gather decode is what AVX-512 CPUs without VBMI run)
 extern int rq_iq_gather;
 
@@ -870,7 +870,7 @@ static inline __attribute__((always_inline)) int iq512_group_vbmi(const int type
 static inline __attribute__((always_inline)) void iq512_group(const int type, const uint8_t *o, int g, __m512i w[8],
                                                               __m512i *S0, __m512i *S1, __m512i *M0, __m512i *M1) {
     // group g of a repacked super-block: the 8 steps of biased codes v + B (u8), the sub-block scales (Q2_K: the mins)
-#ifdef RUNQ_IQ_VBMI
+#ifdef GWENEDEG_IQ_VBMI
     if (!rq_iq_gather && iq512_group_vbmi(type, o, g, w, S0, S1)) return;
 #endif
     const __m512i B = _mm512_set1_epi8((char)iq_bias(type)), n15 = _mm512_set1_epi32(15);
@@ -1298,14 +1298,14 @@ static void iqx_gemm_item(float *out, int ldo, const uint8_t *kp, int type, int 
                                      c16 + (size_t)b * n16, n16, out + (size_t)b * ldo + (size_t)rb0 * KQ_ROWS, ldo, Bi);
     }
 }
-#endif // RUNQ_VNNI
+#endif // GWENEDEG_VNNI
 
 static void iq_r_convert(int type, uint8_t *o, const uint8_t *sb) {
     // super-block sb in the layout of iq_base(type) (IQ3_XXS / IQ3_S) -> the 4-bit codes of type at o (iq_pack_blocks;
     // rq_repack_info's samples): D and the scales copied, n = e | (v < 0) << 3 with e = |v| >> 1 (IQ3_S) or >> 3 (IQ3_XXS)
     int base = iq_base(type), sh = type == GGML_IQ3_S_R ? 1 : 3;
     memcpy(o, sb, 96); // (D: 16 fp16; the scales: a nibble per group and row, as both bases)
-#ifdef RUNQ_VNNI
+#ifdef GWENEDEG_VNNI
     const __m512i B = _mm512_set1_epi8((char)iq_bias(base)), m7 = _mm512_set1_epi8(7), b8 = _mm512_set1_epi8(8);
     for (int g = 0; g < 8; g++) {
         __m512i w[8], S0, S1, M0, M1;
@@ -1338,8 +1338,8 @@ static void iq_r_convert(int type, uint8_t *o, const uint8_t *sb) {
 
 // ---------------------------------------------------------------------------- NEON (AArch64 + dot product)
 
-#if defined(RUNQ_NEON) && !defined(RUNQ_IQX)
-#define RUNQ_IQN 1
+#if defined(GWENEDEG_NEON) && !defined(GWENEDEG_IQX)
+#define GWENEDEG_IQN 1
 // The definition on sdot by element (vdotq_laneq_s32: s8 x s8, so the signed values v directly, no bias and no c16):
 // a 16-byte quarter of a lane-major 64-byte field is one "quad" (rows 4 qd .. 4 qd + 3, dword lane r' = row 4 qd + r'),
 // as in kernels_neon.h. Per group and quad the 8 steps of 4 columns are decoded into registers w[t] (byte 4 r' + b = v of
@@ -1685,7 +1685,7 @@ static inline void iqn_fns(int type, IqnFn *f1, IqnFn *f8, IqnFn *fw) {
     }
 #undef IQN_FNS
 }
-#endif // RUNQ_NEON
+#endif // GWENEDEG_NEON
 
 static void iq_rows(int type, float *out, size_t ldo, const int8_t *xq, size_t ldx, const float *xs, const int32_t *c16,
                     int nb, const uint8_t *kp, int k, int rb0, int rb1) {
@@ -1693,7 +1693,7 @@ static void iq_rows(int type, float *out, size_t ldo, const int8_t *xq, size_t l
     // its scales at xs + b * ldx / GS = 32, its sums of 16 at c16 + b * k / 16; c16 is only read by the AVX-512 kernels)
     int nsb = k / QK_K;
     size_t sbb = (size_t)iq_sb_bytes(type), ldxs = ldx / 32;
-#ifdef RUNQ_IQX
+#ifdef GWENEDEG_IQX
     Iq512Fn f1, f8;
     iq512_fns(type, &f1, &f8);
     for (int rb = rb0; rb < rb1; rb++) {
@@ -1706,7 +1706,7 @@ static void iq_rows(int type, float *out, size_t ldo, const int8_t *xq, size_t l
             f8(out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo, wb, nsb, nb - b < 8 ? nb - b : 8, xq + (size_t)b * ldx, ldx,
                xs + (size_t)b * ldxs, ldxs, c16 + (size_t)b * (k / 16), (size_t)k / 16);
     }
-#elif defined(RUNQ_IQN)
+#elif defined(GWENEDEG_IQN)
     (void)c16;
     IqnFn f1, f8, fw;
     iqn_fns(type, &f1, &f8, &fw);
@@ -1736,10 +1736,10 @@ static void iq_rows(int type, float *out, size_t ldo, const int8_t *xq, size_t l
 static inline int iq_repack_type(int type) {
     // the layout --repack gives a matmul weight of this type: IQ3_XXS / IQ3_S -> their 4-bit codes (*_R) on the AVX-512
     // builds (the only kernels for them; elsewhere unchanged), any other type unchanged
-#ifdef RUNQ_IQX
+#ifdef GWENEDEG_IQX
     if (type == GGML_IQ3_XXS || type == GGML_IQ3_S) return type | IQ_R;
 #endif
     return type;
 }
 
-#endif // RUNQ_IQUANTS_H
+#endif // GWENEDEG_IQUANTS_H

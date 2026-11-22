@@ -1,4 +1,4 @@
-/* MTP drafter costs (the library API, src/runq.h; TODO S9w, docs/notes/qwen38-speculative.md "The MTP drafter (S9)"): what a
+/* MTP drafter costs (the library API, src/gwenedeg.h; TODO S9w, docs/notes/qwen38-speculative.md "The MTP drafter (S9)"): what a
  * guess of a model's MTP block (rq_mtp_load: a view of one attention layer + the target's classifier) costs at a
  * context of L positions, on a file with the target's full width (tests/make_synth_wide.py: Qwen3.8-27B's dimensions,
  * a short trunk, its real MTP block and classifier sizes), without the 27B. The sequences are filled with synthetic KV
@@ -8,7 +8,7 @@
  *              cost model's estimate without a calibration: RqModelMem.read)
  *   catch r    a segment of r = a + 1 MTP rows without logits (the catch-up of a round after a accepted guesses) and
  *              the same with the last row's logits (the round's first guess riding in it), first view of -V, a = 0..-A
- *   row V / dec V  (TODO S9c.1) one MTP row with its logits and hidden state (runq serve's guesses: h' kept) as a 1-row
+ *   row V / dec V  (TODO S9c.1) one MTP row with its logits and hidden state (gwenedeg serve's guesses: h' kept) as a 1-row
  *              rq_forward_batch, resp. through rq_decode_hidden (the decode path); dec 1: rq_decode_hidden without logits
  *              (the follow pass's one row; vs catch 1); with the prompt rows also the target's one row with its logits and
  *              hidden state (trow: a 1-row rq_forward_batch, tdec: rq_decode_hidden): the engine's one-row path choice
@@ -21,13 +21,13 @@
  *
  *   build/bench_mtp MODEL [-L 1024,16384,49152,98304] [-V 0,100000,151643] [-k f16,q8] [-r REPS] [-p PROMPT_REPS]
  *                         [-P 512] [-A 6] [-X 64] [-m GiB]
- * Defaults: -r 9, -p 3 (0: no prompt rows), -P 512 (the CLI's and runq serve's prefill chunk), -A 6, -X 64. -m: the
+ * Defaults: -r 9, -p 3 (0: no prompt rows), -P 512 (the CLI's and gwenedeg serve's prefill chunk), -A 6, -X 64. -m: the
  * loads' memory budget (RqModelOpts.mem / RqMtpOpts.mem; default MemAvailable). Threads: OMP_NUM_THREADS (else the
  * default). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../src/runq.h"
+#include "../src/gwenedeg.h"
 
 static int parse_list(const char *s, int *v, int max) {
     int n = 0;

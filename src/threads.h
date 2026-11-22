@@ -23,20 +23,20 @@
  * processes; the publisher wakes sleepers only if there are any (no syscall in the common case).
  * Results do not depend on which thread runs an item (each output is computed whole by one thread,
  * as with the static schedules before), so any thread count and any interleaving give the same bits.
- * Static mode (RUNQ_SYNC=static, for comparison, OpenMP-region builds only): no stealing and no
+ * Static mode (GWENEDEG_SYNC=static, for comparison, OpenMP-region builds only): no stealing and no
  * shared counter, thread t does exactly its range [t n / nt, (t + 1) n / nt) of every phase, i.e. a
  * barrier per phase with the same wait.
  *
  * Parallel region (rq_parallel): a persistent pthread pool (default, except on Windows), which waits
  * at the end only for the threads that actually joined the job (a worker that has not started when
  * the work is done skips it), with the same spin-then-futex wait for the next job. With
- * -DRUNQ_NO_POOL (and on Windows) `#pragma omp parallel` instead: libgomp's fork / join per job is
+ * -DGWENEDEG_NO_POOL (and on Windows) `#pragma omp parallel` instead: libgomp's fork / join per job is
  * itself a barrier every thread must reach, and at 16 threads on the 16-vCPU VM decode got ~70 tok/s
  * that way vs ~150-170 with the pool (~2-20 before, with OpenMP barriers). The pool also gives a
  * ThreadSanitizer build without OpenMP (libgomp is not instrumented).
  */
-#ifndef RUNQ_THREADS_H
-#define RUNQ_THREADS_H
+#ifndef GWENEDEG_THREADS_H
+#define GWENEDEG_THREADS_H
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -74,10 +74,10 @@
 #ifdef _OPENMP
     #include <omp.h>
 #endif
-#if !defined(_WIN32) && !defined(RUNQ_NO_POOL) && !defined(RUNQ_POOL)
-    #define RUNQ_POOL 1
+#if !defined(_WIN32) && !defined(GWENEDEG_NO_POOL) && !defined(GWENEDEG_POOL)
+    #define GWENEDEG_POOL 1
 #endif
-#ifdef RUNQ_POOL
+#ifdef GWENEDEG_POOL
     #include <pthread.h>
 #endif
 
@@ -98,7 +98,7 @@
 #define RQ_SPIN_JOB 20000 // ~0.55 ms: covers the serial part between two decode steps (sampling at -t > 0)
 #endif
 extern int rq_spin_dec, rq_spin_pf; // (threads.c)
-extern int rq_static; // RUNQ_SYNC=static: fixed item ranges per thread (a plain barrier per phase)
+extern int rq_static; // GWENEDEG_SYNC=static: fixed item ranges per thread (a plain barrier per phase)
 
 static void rq_sleep(int *word, int v) {
     // until *word (probably) differs from v
@@ -328,6 +328,6 @@ int rq_ncpu(void);            // online CPUs
 int rq_ncpu_perf(void);       // Apple Silicon: the performance cores, else 0
 void rq_parallel(RqFn fn, void *ctx); // run fn on every thread of the pool (tid 0 = the caller)
 int rq_nthreads(void);        // threads of a job
-const char *rq_config(void);  // tuning knobs from the environment (RUNQ_SPIN, RUNQ_SYNC); a warning or NULL
+const char *rq_config(void);  // tuning knobs from the environment (GWENEDEG_SPIN, GWENEDEG_SYNC); a warning or NULL
 
-#endif // RUNQ_THREADS_H
+#endif // GWENEDEG_THREADS_H

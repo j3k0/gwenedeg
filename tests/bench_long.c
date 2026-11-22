@@ -1,4 +1,4 @@
-/* Long-context timing (the library API, src/runq.h; TODO G0 (b)): what a turn of an agentic session costs at a context
+/* Long-context timing (the library API, src/gwenedeg.h; TODO G0 (b)): what a turn of an agentic session costs at a context
  * of L positions, without prefilling L tokens first (hours for Qwen3.8-27B at 96k): the sequence is filled with
  * synthetic KV entries and recurrent state (rq_seq_fill_synthetic; the passes' cost does not depend on the values),
  * then per L:
@@ -13,14 +13,14 @@
  *
  *   build/bench_long MODEL [-L 16384,32768,65536,98304] [-R 2,4,8] [-P 2560] [-r REPS] [-p PREFILL_REPS] [-c]
  *                          [-k f16] [-b 512] [-m GiB] [-D DRAFT [-a P_MODEL] [-C CALIB_L] [-W MS,F2,F3,... -A SCALE]]
- * Defaults: -r 9 (dec, seg), -p 2 (pre; 0: none), -b 512 (the CLI's and runq serve's prefill chunk). -m: the load's
+ * Defaults: -r 9 (dec, seg), -p 2 (pre; 0: none), -b 512 (the CLI's and gwenedeg serve's prefill chunk). -m: the load's
  * memory budget (RqModelOpts.mem; default MemAvailable). Threads: OMP_NUM_THREADS (else the default).
- * Speculation's choice by position (TODO G7, runq serve's auto policy): with -D, the draft model's decode step at each L
+ * Speculation's choice by position (TODO G7, gwenedeg serve's auto policy): with -D, the draft model's decode step at each L
  * too (its sequence filled the same way), then per L the best of a plain step, k = r - 1 model guesses (a segment of r
  * rows + k draft steps) and n = r - 1 lookup guesses (a segment of r rows), for each r of -R, under rq_spec_choose's
  * formula with the measured times at L: tokens per pass 1 + p + .. + p^n, p = -a for the model (default 0.6), a 4-token
  * lookup match's prior (rq_lookup_prior); three cases: no lookup match (model or plain), a 4-token match (all three), the
- * lookup alone (no draft). -C L1 (default 8192, 0: none): the same choice from the cost model runq serve calibrates at its
+ * lookup alone (no draft). -C L1 (default 8192, 0: none): the same choice from the cost model gwenedeg serve calibrates at its
  * start (rq_pass_cost_measure at L1 positions, linear in the position), to compare. -W / -A: an extrapolation (e.g.
  * synth-27b to Qwen3.8-27B): a pass of r rows at L costs MS x F(r) (F(1) = 1, F2 for 2 rows, ...; the last factor's
  * slope past them) + SCALE x (its measured time at L - at the first -L), the model's own short-context costs plus its
@@ -28,7 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../src/runq.h"
+#include "../src/gwenedeg.h"
 
 static int parse_list(const char *s, int *v, int max) {
     int n = 0;

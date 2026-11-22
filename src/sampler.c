@@ -45,7 +45,7 @@ int sample_argmax(float *probabilities, int n) {
     for (int i = 1; i < n; i++)
         max_p = probabilities[i] > max_p ? probabilities[i] : max_p;
     int i = 0;
-#if defined(__AVX512F__) && !defined(RUNQ_GENERIC)
+#if defined(__AVX512F__) && !defined(GWENEDEG_GENERIC)
     __m512 m = _mm512_set1_ps(max_p);
     for (; i + 16 <= n; i += 16) {
         __mmask16 k = _mm512_cmp_ps_mask(_mm512_loadu_ps(probabilities + i), m, _CMP_EQ_OQ);
@@ -96,7 +96,7 @@ static int topp_candidates(const float *p, int n, float cutoff, ProbIndex *out) 
     // the (prob, index) of every p[i] >= cutoff, in index order; returns their count. They are few
     // (median ~40 of 151,936 at -t 0.8 -p 0.9), so the scan looks for blocks holding any
     int n0 = 0, i = 0;
-#if defined(__AVX512F__) && !defined(RUNQ_GENERIC)
+#if defined(__AVX512F__) && !defined(GWENEDEG_GENERIC)
     __m512 c = _mm512_set1_ps(cutoff);
     for (; i + 16 <= n; i += 16) // one compare per 16 values, then the set bits
         for (__mmask16 m = _mm512_cmp_ps_mask(_mm512_loadu_ps(p + i), c, _CMP_GE_OQ); m; m &= m - 1) {

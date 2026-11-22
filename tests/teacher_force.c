@@ -1,6 +1,6 @@
 /* Teacher-forced draft predictions on long token streams (TODO G0 (c), scripts/lookup_accept.py `draft`): what a
  * draft model would guess at every position of the given replies, given everything before them (an agentic
- * session's context: tool results, earlier replies). `runq -m logits` writes every position's full logits (~1 MB per
+ * session's context: tool results, earlier replies). `gwenedeg -m logits` writes every position's full logits (~1 MB per
  * position for a 248k vocabulary); this keeps only the argmax and its probability at the positions asked for.
  *
  *   build/teacher_force MODEL IN OUT [-b 512] [-k f16]
@@ -19,7 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include "../src/runq.h"
+#include "../src/gwenedeg.h"
 
 static void die(const char *what, int e, RqCtx *c) {
     fprintf(stderr, "teacher_force: %s: %s %s\n", what, rq_strerror(e), c ? rq_ctx_error(c) : "");

@@ -1,6 +1,6 @@
 /* The thread pool of threads.h (one per process) and the threading configuration. */
 #include "threads.h"
-#include "runq.h"
+#include "gwenedeg.h"
 
 int rq_spin_dec = RQ_SPIN_DEC, rq_spin_pf = RQ_SPIN_PF;
 int rq_static = 0;
@@ -14,7 +14,7 @@ void rq_set_threads(int n) {
     if (rq_fixed) return; // (a compute context's per-thread scratch is sized for it: rq_threads_fix)
     rq_nt = n < 1 ? 1 : n > 256 ? 256 : n;
 #ifdef _OPENMP
-    omp_set_num_threads(rq_nt); // (the OpenMP parallel region of -DRUNQ_NO_POOL / Windows)
+    omp_set_num_threads(rq_nt); // (the OpenMP parallel region of -DGWENEDEG_NO_POOL / Windows)
 #endif
 }
 
@@ -61,7 +61,7 @@ static int rq_threads_cfg(void) {
     return n ? n : 1;
 }
 
-#ifdef RUNQ_POOL
+#ifdef GWENEDEG_POOL
 // Persistent pool: nt - 1 workers (tid 1..nt-1) + the caller (tid 0). Job protocol: the caller sets
 // fn / ctx, opens state (bit 0 = closed, the rest 2 x workers inside), then bumps gen (futex word);
 // a worker that sees a new gen enters only while the job is open. After its own share the caller
@@ -157,20 +157,20 @@ int rq_nthreads(void) { return rq_threads_cfg(); }
 #endif
 
 const char *rq_config(void) {
-    // tuning knobs from the environment (RUNQ_SPIN=decode[,prefill], RUNQ_SYNC=static); a warning
+    // tuning knobs from the environment (GWENEDEG_SPIN=decode[,prefill], GWENEDEG_SYNC=static); a warning
     // for the caller to show, or NULL
-    const char *e = getenv("RUNQ_SPIN");
+    const char *e = rq_getenv("GWENEDEG_SPIN");
     if (e) {
         rq_spin_dec = rq_spin_pf = atoi(e);
         if (strchr(e, ','))
             rq_spin_pf = atoi(strchr(e, ',') + 1);
     }
-    e = getenv("RUNQ_SYNC");
+    e = rq_getenv("GWENEDEG_SYNC");
     if (e && !strcmp(e, "static")) rq_static = 1;
-#ifdef RUNQ_POOL
+#ifdef GWENEDEG_POOL
     if (rq_static) {
         rq_static = 0;
-        return "RUNQ_SYNC=static: not with the pool (workers may skip a job), ignored";
+        return "GWENEDEG_SYNC=static: not with the pool (workers may skip a job), ignored";
     }
 #endif
     return NULL;
@@ -197,6 +197,16 @@ const char *rq_threads_init(int n) {
 }
 
 int rq_threads(void) { return rq_nthreads(); }
+
+const char *rq_getenv(const char *name) {
+    // getenv(name); for a GWENEDEG_* variable not set, its deprecated RUNQ_* name (the binary and its environment
+    // variables were called runq / RUNQ_* until 2026-11-22)
+    const char *v = getenv(name);
+    if (v || strncmp(name, "GWENEDEG_", 9)) return v;
+    char old[128];
+    snprintf(old, sizeof(old), "RUNQ_%s", name + 9);
+    return getenv(old);
+}
 
 int rq_threads_fix(void) {
     // the threads of every later job, fixed from now on (rq_ctx_new sizes a context's per-thread scratch by it;

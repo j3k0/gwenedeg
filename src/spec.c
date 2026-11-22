@@ -220,7 +220,7 @@ static void ck_slots(RqSeq *s, int n) {
 }
 
 // ------------------------------------------------------------------------------------------- the MTP drafter
-// (TODO S9; runq.h, docs/notes/qwen38-speculative.md "The MTP drafter (S9)") The draft is the target's MTP view (rq_mtp_load):
+// (TODO S9; gwenedeg.h, docs/notes/qwen38-speculative.md "The MTP drafter (S9)") The draft is the target's MTP view (rq_mtp_load):
 // its row q, (x_q, h_{q-1}), predicts x_{q+1}, h_{q-1} = the target's final hidden state at q - 1, which exists only
 // during the target's pass that computes it. So the view follows the target in lockstep, from the hidden rows of the
 // target's last pass only (H: positions h0 .. h0 + hn - 1) and the one kept with its sequence (hprev at hpos):
@@ -240,7 +240,7 @@ static void ck_slots(RqSeq *s, int n) {
 // The view's rows are bit-identical batched or alone (forward.c), so its guesses do not depend on how its rows are
 // grouped into passes, nor do the target's rows on hidden being asked for: the output stays plain decoding's.
 // llama.cpp (common/speculative.cpp, draft-mtp) differs: it drops row P after drafting and runs it again with the next
-// verify batch (the same inputs: runq keeps it), and a request after a prefix reuse starts from a stale h (runq: the
+// verify batch (the same inputs: gwenedeg keeps it), and a request after a prefix reuse starts from a stale h (gwenedeg: the
 // target's, or zeros counted)
 typedef struct {
     RqCtx *c;           // the view's context and sequence
@@ -286,7 +286,7 @@ static int mtp_init(Mtp *x, RqCtx *dc, RqSeq *ms, int hrows, int rrows, RqSpecSt
     return RQ_OK;
 }
 
-// the h rule and the view's bookkeeping, public for a caller that batches the view's rows itself (runq serve: runq.h)
+// the h rule and the view's bookkeeping, public for a caller that batches the view's rows itself (gwenedeg serve: gwenedeg.h)
 int rq_mtp_hin(const RqSeq *view, const float *H, int h0, int hn, int n, float *hin) {
     // rows q = len .. len + n - 1: h_{q-1} from H, else the kept one (hprev at hpos), else zeros (row 0: exact)
     if (!view || !view->m->mtp_of || n < 0) return RQ_ERR_ARG;
@@ -652,7 +652,7 @@ int rq_prefill_spec(RqCtx *c, RqSeq *s, RqCtx *dc, RqSeq *ds, const int *tokens,
 }
 
 // ------------------------------------------------------------------------------------ the cost model (TODO G7)
-// A pass of R rows: t_w f(R) + att S1 + att_x S2 (runq.h: S1 the segments' first positions, S2 the others'). Calibrated
+// A pass of R rows: t_w f(R) + att S1 + att_x S2 (gwenedeg.h: S1 the segments' first positions, S2 the others'). Calibrated
 // on an empty sequence filled
 // with synthetic values (rq_seq_fill_synthetic: the passes' time does not depend on them): every configuration once
 // per rep in turn, the fastest per configuration (a shared machine's load only ever adds time; the differences below

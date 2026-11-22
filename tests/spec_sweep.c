@@ -1,4 +1,4 @@
-/* The speculative loop's settings x prompts in one process (the library API, src/runq.h; TODO S9d, PLAN-S9-mtp.md 8):
+/* The speculative loop's settings x prompts in one process (the library API, src/gwenedeg.h; TODO S9d, PLAN-S9-mtp.md 8):
  * the model, its MTP view (rq_mtp_load; one at a time, reloaded when a setting's --mtp-vocab differs) and optionally
  * a draft model are loaded once, then for each reasoning mode (-r), prompt and setting (-S), -R times: fresh sequences,
  * the prompt rendered as the CLI's chat renders one -i turn (rq_chat_system without a system message + rq_chat_user;
@@ -12,21 +12,21 @@
  *   build/spec_sweep MODEL [-S SETTING]... [-P chat,code,math,summ] [-i TEXT]... [-r 1,0] [-n 256] [-c 4096] [-k f16]
  *                          [-b 512] [-t 0] [-p 0.95] [-K 0] [-s 42] [-R 1] [-D DRAFT.gguf] [--mem GiB] [--list]
  *                          [--repack[=IQ3_S|IQ3_XXS]]
- * SETTING: plain, or mtp (the model's MTP block) / draft (-D's model), then runq's options for it: -G k (default 3),
- * --tau T, --mtp-vocab N (mtp; default 0 = all, not runq's 100000), --lookup N, --lookup-min L, --spec auto; e.g.
+ * SETTING: plain, or mtp (the model's MTP block) / draft (-D's model), then gwenedeg's options for it: -G k (default 3),
+ * --tau T, --mtp-vocab N (mtp; default 0 = all, not gwenedeg's 100000), --lookup N, --lookup-min L, --spec auto; e.g.
  * -S "mtp -G 6 --tau 0.3", -S "draft -G 3" (lookup alone: "plain --lookup 4"). Default settings: plain, "mtp -G 3". -P: built-in prompts (TODO S7's, from
  * scripts/spec_accept.py: chat TCP vs UDP, code a C linked-list reversal, math the train's average speed, summ the
  * bike-lane article in three bullet points); -i adds one of its own (custom1, ...). -r: the reasoning modes (1: on,
- * Qwen3.8's default effort; 0: off). -t / -p / -K / -s: sampling as runq's (-t 0: greedy; seeded runs equal plain's
+ * Qwen3.8's default effort; 0: off). -t / -p / -K / -s: sampling as gwenedeg's (-t 0: greedy; seeded runs equal plain's
  * too). --mem: the loads' budget in GiB, used up in turn (the model's estimate checked against it, the MTP view's
  * against what is left, the draft's against the rest; RqModelOpts.mem / RqMtpOpts.mem); not given: MemAvailable at
  * each load. --list: the plan only (no model loaded), one line "plan ctx C kv K kmax X mtp 0|1 vocabs V,.. draft
- * PATH|- runs N" for s9_gate.sh's estimate, then the runs. --repack[=TYPE]: RqModelOpts.repack (runq --repack; the model
+ * PATH|- runs N" for s9_gate.sh's estimate, then the runs. --repack[=TYPE]: RqModelOpts.repack (gwenedeg --repack; the model
  * and a draft model). Threads: OMP_NUM_THREADS (else the default). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../src/runq.h"
+#include "../src/gwenedeg.h"
 
 static const char *ARTICLE =
     "The city council voted on Tuesday to approve a new bike lane network covering 42 kilometers of "
@@ -54,7 +54,7 @@ static void die(const char *what, int e, RqCtx *c) {
 }
 
 static int parse_setting(const char *s, Setting *o) {
-    // "plain" / "mtp" / "draft" + runq's options for it; 0 on a bad one
+    // "plain" / "mtp" / "draft" + gwenedeg's options for it; 0 on a bad one
     memset(o, 0, sizeof(*o));
     snprintf(o->desc, sizeof(o->desc), "%s", s);
     char b[160];

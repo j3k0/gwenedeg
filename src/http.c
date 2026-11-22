@@ -1,4 +1,4 @@
-/* HTTP/1.1 server for runq serve (http.h). POSIX only (serve.c reports the server as unavailable on
+/* HTTP/1.1 server for gwenedeg serve (http.h). POSIX only (serve.c reports the server as unavailable on
  * Windows). */
 #ifndef _WIN32
 #define _GNU_SOURCE
@@ -18,11 +18,11 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include "runq.h"
+#include "gwenedeg.h"
 #include "http.h"
 
 // Portability: one code path on Linux and macOS (macOS has no SOCK_CLOEXEC / accept4; older SDKs no
-// MSG_NOSIGNAL). FD_CLOEXEC is set with fcntl right after socket() / accept() / pipe(): runq never forks
+// MSG_NOSIGNAL). FD_CLOEXEC is set with fcntl right after socket() / accept() / pipe(): gwenedeg never forks
 // or execs, so the window between the two calls is harmless and the flag is hygiene only. SIGPIPE: the
 // guarantee is http_signals' process-wide SIG_IGN (installed before the listener exists), so a write to
 // a connection the client closed fails with EPIPE / ECONNRESET on both systems and only that connection
@@ -178,7 +178,7 @@ int http_peer_gone(HttpConn *c) {
 }
 
 static void hdr_common(char *h, size_t cap, HttpReq *r, int status, const char *ctype) {
-    snprintf(h, cap, "HTTP/1.1 %d %s\r\nServer: runq\r\nContent-Type: %s\r\nConnection: %s\r\n", status,
+    snprintf(h, cap, "HTTP/1.1 %d %s\r\nServer: gwenedeg\r\nContent-Type: %s\r\nConnection: %s\r\n", status,
              http_reason(status), ctype, r && r->keep_alive ? "keep-alive" : "close");
 }
 

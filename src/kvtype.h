@@ -1,9 +1,9 @@
-/* KV cache types (runq.h's RQ_KV_*): element formats of the K and V caches, tile sizes. Shared by internal.h and the
+/* KV cache types (gwenedeg.h's RQ_KV_*): element formats of the K and V caches, tile sizes. Shared by internal.h and the
  * attention kernels (kernels_avx512.h, also included alone by tests/bf16dp_test.c). */
-#ifndef RUNQ_KVTYPE_H
-#define RUNQ_KVTYPE_H
+#ifndef GWENEDEG_KVTYPE_H
+#define GWENEDEG_KVTYPE_H
 #include <stddef.h>
-#include "runq.h"
+#include "gwenedeg.h"
 
 // KV cache element type: fp32, bf16 or f16 (16-bit: half the bytes; layouts in kernels_avx512.h), q8 / q4 / q4k4
 // (8-bit; 8-bit K and 4-bit V; 4-bit K and V: per-32-dim scales, rotated: forward.c, "8-bit / 4-bit KV cache"); KV_DOT:
@@ -37,4 +37,4 @@ static inline size_t kv_tile_bytes(int t, int hd, int kv) {
 }
 
 
-#endif // RUNQ_KVTYPE_H
+#endif // GWENEDEG_KVTYPE_H

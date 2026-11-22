@@ -1,4 +1,4 @@
-/* Unit tests of runq serve's tool calls (src/tools.c): the reply parser (tscan_*, tool_parse_calls: content before
+/* Unit tests of gwenedeg serve's tool calls (src/tools.c): the reply parser (tscan_*, tool_parse_calls: content before
  * a call, several calls, multi-line and nested JSON parameters, typed arguments, unicode, malformed and cut blocks,
  * text after the calls, parallel_tool_calls false), each case fed whole and in pieces of 1, 2, 3, 5 and 7 bytes (the
  * scanner sees the reply as it is generated); Python's json.dumps (py_json, py_float: what transformers' tojson writes

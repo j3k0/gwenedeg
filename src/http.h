@@ -1,12 +1,12 @@
-/* A small HTTP/1.1 server over POSIX sockets for runq serve (http.c): an accept loop, one thread per
+/* A small HTTP/1.1 server over POSIX sockets for gwenedeg serve (http.c): an accept loop, one thread per
  * connection (at most max_conns; more get a 503), keep-alive (HTTP/1.1 default, `Connection: close`
  * honoured, HTTP/1.0 keep-alive on request), request bodies by Content-Length only (chunked uploads get
  * 411), limits on the header and body sizes (431 / 413), timeouts for a slow or idle client, responses
  * with a Content-Length or chunked (streaming), `Expect: 100-continue`, shutdown on SIGINT / SIGTERM.
  * Not a general web server: no TLS, no pipelining guarantees beyond sequential requests, no ranges.
  */
-#ifndef RUNQ_HTTP_H
-#define RUNQ_HTTP_H
+#ifndef GWENEDEG_HTTP_H
+#define GWENEDEG_HTTP_H
 
 #include <stddef.h>
 

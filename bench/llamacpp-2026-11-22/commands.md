@@ -27,6 +27,9 @@ scripts/s9c_bench.py ... (the same) --long 32768 --turns 3 --label runq-long    
 # llama.cpp, 1 slot (lc1.cmd) / 4 slots (lc4.cmd), q8_0 K / q4_0 V
 scripts/s9c_bench.py --model MODEL --server-cmd "$(cat lc1.cmd)" --short --think 1,0 --label lc1-short
 scripts/s9c_bench.py --model MODEL --server-cmd "$(cat lc4.cmd)" --short --think 1,0 --label lc4-short
+# the same two with f16 K / V (lc1f16s.cmd, lc4f16s.cmd: -ctk f16 -ctv f16, all else equal, -c 98304), 13:13-14:27Z
+scripts/s9c_bench.py --model MODEL --server-cmd "$(cat lc1f16s.cmd)" --short --think 1,0 --label lc1f16-short
+scripts/s9c_bench.py --model MODEL --server-cmd "$(cat lc4f16s.cmd)" --short --think 1,0 --label lc4f16-short
 scripts/s9c_bench.py --model MODEL --server-cmd "$(cat lc1.cmd)" --long 32768 --turns 2 --label lc1-long
 # llama.cpp, f16 K / V (lc1f16.cmd, -c 49152), the 32k session only
 scripts/s9c_bench.py --model MODEL --server-cmd "$(cat lc1f16.cmd)" --long 32768 --turns 2 --label lc1f16-long

@@ -64,3 +64,7 @@ run a second time with f16/f16 (`-c 49152`) as mainline's better configuration.
 
 `llama-server -m {model} -c 98304 -np 1|4 -t 14 -fa on -ctk q8_0 -ctv q4_0 -ub 512 -b 2048 -lm none --no-repack
 --ctx-checkpoints 4|2 -cram 512 --jinja` (`commands.md`).
+
+Repeated with `-ctk f16 -ctv f16` and nothing else changed (`lc1f16s.cmd`, `lc4f16s.cmd`; 98,304 positions fit: peak RSS
+17.8 / 19.0 GiB): faster on every short-request row too (one client 5.2 / 4.9 tok/s against 3.5 / 3.7, short prefill
+68-78 against 48-58 tok/s), so f16 is mainline's best measured configuration throughout.

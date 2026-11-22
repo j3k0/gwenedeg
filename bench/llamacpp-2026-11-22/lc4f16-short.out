@@ -1,0 +1,27 @@
+== lc4f16-short start 2026-11-22T13:52:56Z load 16.57 17.05 15.88 avail 20.4G
+cmd: python3 -I ./scripts/s9c_bench.py --model ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf --server-cmd llama.cpp/build/bin/llama-server -m {model} -c 98304 -np 4 -t 14 -fa on -ctk f16 -ctv f16 -ub 512 -b 2048 -lm none --no-repack --ctx-checkpoints 2 -cram 512 --jinja --host 127.0.0.1 --port {port} --short --think 1,0 --label lc4f16-short --json runs/lc4f16-short.json
+s9c_bench lc4f16-short: llama.cpp/build/bin/llama-server -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -c 98304 -np 4 -t 14 -fa on -ctk f16 -ctv f16 -ub 512 -b 2048 -lm none --no-repack --ctx-checkpoints 2 -cram 512 --jinja --host 127.0.0.1 --port 58493 (loaded in 13.8 s)
+  think 1 greedy lcb1  1 client: 4.519 tok/s, prompt 869 (13158.792 ms), 512 tokens, model None, mtp_approx None
+  think 1 greedy lcb2  1 client: 4.705 tok/s, prompt 824 (13002.728 ms), 512 tokens, model None, mtp_approx None
+  think 1 greedy code  1 client: 4.754 tok/s, prompt 2478 (33534.699 ms), 78 tokens, model None, mtp_approx None
+  think 1 greedy tool  1 client: 4.824 tok/s, prompt 95 (2517.49 ms), 76 tokens, model None, mtp_approx None
+  think 1 seeded lcb1  1 client: 4.731 tok/s, prompt 4 (708.897 ms), 512 tokens, model None, mtp_approx None
+  think 1 seeded lcb2  1 client: 4.33 tok/s, prompt 4 (717.956 ms), 512 tokens, model None, mtp_approx None
+  think 1 seeded code  1 client: 4.639 tok/s, prompt 260 (4376.811 ms), 112 tokens, model None, mtp_approx None
+  think 1 seeded tool  1 client: 5.288 tok/s, prompt 95 (2641.601 ms), 57 tokens, model None, mtp_approx None
+  think 1 greedy 4 clients: 1178 tokens in 249.5 s = 4.72 tok/s
+  think 1 seeded 4 clients: 1304 tokens in 230.3 s = 5.66 tok/s
+  think 0 greedy lcb1  1 client: 5.081 tok/s, prompt 829 (11209.129 ms), 512 tokens, model None, mtp_approx None
+  think 0 greedy lcb2  1 client: 4.785 tok/s, prompt 784 (10492.46 ms), 512 tokens, model None, mtp_approx None
+  think 0 greedy code  1 client: 4.263 tok/s, prompt 2442 (33484.691 ms), 59 tokens, model None, mtp_approx None
+  think 0 greedy tool  1 client: 4.202 tok/s, prompt 97 (2612.831 ms), 29 tokens, model None, mtp_approx None
+  think 0 seeded lcb1  1 client: 4.942 tok/s, prompt 4 (1259.22 ms), 512 tokens, model None, mtp_approx None
+  think 0 seeded lcb2  1 client: 5.268 tok/s, prompt 4 (686.795 ms), 512 tokens, model None, mtp_approx None
+  think 0 seeded code  1 client: 5.335 tok/s, prompt 262 (4665.051 ms), 59 tokens, model None, mtp_approx None
+  think 0 seeded tool  1 client: 5.13 tok/s, prompt 97 (2658.549 ms), 54 tokens, model None, mtp_approx None
+  think 0 greedy 4 clients: 1112 tokens in 233.0 s = 4.77 tok/s
+  think 0 seeded 4 clients: 1129 tokens in 196.1 s = 5.76 tok/s
+s9c_bench lc4f16-short think1: 1 client mean 4.724 tok/s (8 requests); 4 clients greedy 4.721, seeded 5.662 tok/s
+s9c_bench lc4f16-short think0: 1 client mean 4.876 tok/s (8 requests); 4 clients greedy 4.772, seeded 5.756 tok/s
+s9c_bench lc4f16-short: peak VmHWM 18.98 GiB, committed 0 GiB; server exit 0; 0 errors; runs/lc4f16-short.json
+== lc4f16-short end 2026-11-22T14:26:45Z rc 0 load 15.18 14.87 15.17

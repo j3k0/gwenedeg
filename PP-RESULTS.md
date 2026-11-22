@@ -262,6 +262,10 @@ with the change runq's CLI does 101-103. If the server follows the CLI as before
 prefill (471 vs 319 s) was not re-measured: there attention is a larger share and the gain will be smaller. Both are
 server measurements for a later window (`scripts/s9c_bench.py` as in `bench/ikllama-2026-11-21/`).
 
+**Measured 2026-11-22** (BENCHMARKS.md, the runq vs llama.cpp vs ik_llama.cpp section): the server's short prompts now
+prefill at 101-111 tok/s against ik's 117-125 (0.79-0.95x per identical request), the cold 32k prompt in 391 s against
+ik's 309 s the same day (0.79x). The short-prompt estimate above was about right; at 32k the gap is ~1.27x.
+
 ## Needs a measurement window (done 2026-11-21: the section above)
 
 One command, from the worktree, with the live server stopped (≈ 13 GB free RAM needed):

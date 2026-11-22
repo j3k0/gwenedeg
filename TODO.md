@@ -400,7 +400,8 @@ Q6_K files; 9B Q8_0 is 9.5 GB) and the 4B's Q4_K_M (Qwen3.8-27B Q4_K_M, the same
   register tile on u8 codes), bit-identical; 17408 x 5120 at 512 rows, 8 threads: 1.43-2.11x per type (IQ3_S 2.11x).
   The ISTA 27B (2026-11-21 window, BENCHMARKS.md): bit-identical; prefill 81-83 -> 101-103 tok/s at 14 threads with
   `--repack` (1.24x; 1.35x at 8 threads, 1.49x without `--repack`). Open: why the GEMM phases gain 1.32x where the
-  micro-benchmark says ~1.5x (`perf` at 14 threads); the server workloads vs ik_llama.cpp again (`scripts/s9c_bench.py`);
+  micro-benchmark says ~1.5x (`perf` at 14 threads); ~~the server workloads vs ik_llama.cpp again~~ done 2026-11-22
+  (`bench/llamacpp-2026-11-22/`: short prompts 0.79-0.95x of ik, the cold 32k prompt 391 s, mainline llama.cpp added);
   NEON (still `iq_rows`, 32 rows per pass).
 - [x] **`--repack`** (2026-11-09; docs/iquants.md, `--repack: 4-bit codes`): IQ3_S / IQ3_XXS stored as 4-bit codes at load,
   bit-identical; `--repack[=LIST]`, `--no-repack`, `--repack-info` (CLI, `runq serve`, `spec_sweep`). ISTA 27B, 8 threads:

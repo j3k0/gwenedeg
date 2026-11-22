@@ -11,7 +11,7 @@ that is not rewritten when the code moves on.
 |---|---|---|
 | [usage.md](usage.md) | reference | command line options, the load-time memory check, chat behaviour, chat templates and thinking, speculative decoding (draft model, MTP drafter, prompt lookup), KV cache types, platform and format limitations |
 | [models.md](models.md) | reference | the download sets and files, Qwen3.5's recurrent state, qwen3.c's `.bin`, what is not supported |
-| [../BENCHMARKS.md](../BENCHMARKS.md) | measurements | every speed and quality table with its date, setup and caveats; the comparison with ik_llama.cpp; Apple M1 Pro |
+| [../BENCHMARKS.md](../BENCHMARKS.md) | measurements | every speed and quality table with its date, setup and caveats; the comparison with llama.cpp and ik_llama.cpp; Apple M1 Pro |
 
 ## Running the server
 
@@ -46,7 +46,8 @@ that is not rewritten when the code moves on.
 - Measurements say when, on what and how they were taken. The development machine is a shared 16-vCPU AMD EPYC Genoa
   VM, so numbers carry ±15-30% run-to-run noise unless a table says otherwise; do not compare numbers across tables
   that name different sessions.
-- Claims of speed against another engine exist for one case only: Qwen3.8-27B IQ3_S against ik_llama.cpp on one VM
-  ([BENCHMARKS.md](../BENCHMARKS.md#qwen38-27b-iq3_s-vs-ik_llamacpp-server-workloads-2026-11-21)).
+- Claims of speed against another engine exist for one case only: Qwen3.8-27B IQ3_S against mainline llama.cpp and
+  ik_llama.cpp on one VM
+  ([BENCHMARKS.md](../BENCHMARKS.md#qwen38-27b-iq3_s-runq-vs-llamacpp-vs-ik_llamacpp-server-workloads-2026-11-22)).
 - "Step N", "S9c", "G7" and similar labels are the development steps of [TODO.md](../TODO.md) and the History table of
   [DEVELOPMENT.md](DEVELOPMENT.md#history); the old development log is in git: `git show b3e48a3:TODO.md`.

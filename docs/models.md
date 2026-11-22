@@ -7,7 +7,7 @@ how to run them, [usage.md](usage.md).
 runq reads the model's weights, tokenizer and hyperparameters from the GGUF file (chat templates are built in), and
 qwen3.c's Q8_0 `.bin` export. `scripts/download_models.py --list` shows every downloadable set; each file is checked
 by sha256 or git blob hash at a pinned Hugging Face revision. The IQ3_S-mtp file of ISTA-DASLab used in the
-ik_llama.cpp comparison (Qwen3.8-27B, 12.1 GB, with its MTP block) is not one of the sets.
+llama.cpp / ik_llama.cpp comparison (Qwen3.8-27B, 12.1 GB, with its MTP block) is not one of the sets.
 
 ## Download sets
 

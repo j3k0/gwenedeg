@@ -42,30 +42,26 @@ Every number below says when, where and how it was measured; the full tables, se
 other workloads (run-to-run noise ±15-30%).
 
 **Qwen3.8-27B against llama.cpp and ik_llama.cpp** (2026-11-22, one day, the same IQ3_S file of 12.1 GB, 14 threads,
-an 8-bit K / 4-bit V cache in all three (mainline at 32k also with f16, where it is much faster), the same server benchmark `scripts/s9c_bench.py`; our tuning of both other
-engines: [BENCHMARKS.md](BENCHMARKS.md#qwen38-27b-iq3_s-runq-vs-llamacpp-vs-ik_llamacpp-server-workloads-2026-11-22)):
+the same server benchmark `scripts/s9c_bench.py`; setups, tuning and all configurations:
+[BENCHMARKS.md](BENCHMARKS.md#qwen38-27b-iq3_s-runq-vs-llamacpp-vs-ik_llamacpp-server-workloads-2026-11-22)):
 
-| tok/s unless noted | runq serve (MTP drafting) | llama.cpp (mainline, no MTP) | ik_llama.cpp, 1 slot + MTP |
+| tok/s unless noted | runq serve (MTP, 8/4-bit KV) | llama.cpp (f16 KV, no MTP) | ik_llama.cpp (1 slot + MTP, 8/4-bit KV) |
 |---|---|---|---|
-| decode, 1 client, thinking on / off | **17.5 / 21.2** | 3.5 / 3.7 (1 slot; 4.4 / 3.7 with 4) | 9.6 / 11.3 |
-| decode, 4 clients at once (aggregate), thinking on / off | **23.0 / 26.2** | 4.4 / 3.5 (4 slots) | 7.3 / 8.6 (queued behind one slot) |
-| decode in a 32-37k-token session | **14.0-14.8** | 3.8-3.9 (f16 cache; 1.5-1.6 with 8/4-bit) | 2.1-2.5 |
-| a pi-shaped follow-up turn (+2.5k tokens) on a 32k session, wall | **72-75 s** | 218-224 s (f16 cache; 1,261-1,357 s with 8/4-bit) | 273-285 s |
-| prefill, 0.8-2.5k-token prompts | 101-111 | 48-58 | **117-125** |
-| prefill, a cold 31.8k-token prompt | 391 s | 682 s (f16 cache; 5,057 s with 8/4-bit) | **309 s** |
-| perplexity on the same tokens (prose / code) | 9.483 / 7.133 | 9.480 / 7.141 | 9.493 / 7.145 |
+| decode, 1 client, thinking on / off | **17.5 / 21.2** | 5.2 / 4.9 | 9.6 / 11.3 |
+| decode, 4 clients at once (aggregate), thinking on / off | **23.0 / 26.2** | 5.2 / 5.3 (4 slots) | 7.3 / 8.6 (queued) |
+| decode in a 32-37k-token session | **14.0-14.8** | 3.8-3.9 | 2.1-2.5 |
+| a pi-shaped follow-up turn (+2.5k tokens) on a 32k session, wall | **72-75 s** | 218-224 s | 273-285 s |
+| prefill, 0.8-2.5k-token prompts | 101-111 | 68-78 | **117-125** |
+| prefill, a cold 31.8k-token prompt | 391 s | 682 s | **309 s** |
+| perplexity on the same tokens (prose / code) | 9.483 / 7.133 | 9.480 / 7.141 (8/4-bit KV) | 9.493 / 7.145 |
 
-Same quality (the perplexities differ by at most 0.2%, within the standard error). Per cell, against mainline
-llama.cpp's better configuration in each row, runq decodes 4.0-5.7x faster at one client, 4.9-8.1x at four clients and
-3.7-3.9x in the 32k session, prefills 1.8-2.4x faster on the short prompts and 1.7x faster on the cold 32k prompt, and
-finishes a follow-up turn 3.0x sooner. Mainline runs this file's MTP block, but on this CPU drafting made it slower at
-every draft length of 1-6, and its 8-bit K / 4-bit V cache (the bit widths of runq's) costs it 4.4x of prefill speed
-at an 8k depth, so its long-context rows give its f16-cache numbers first. Against ik_llama.cpp (the same day), runq
-decodes 1.8-1.9x faster at one client, 2.6-3.6x at four and 5.5-7.2x in the 32k session; ik prefills faster: runq's
-prefill is 0.79-0.95x of ik's per identical short request (about 0.7x before the i-quant tiled GEMM) and 0.79x on the
-cold 32k prompt. One run per cell on a shared VM; both other engines were configured and tuned by us from their
-documentation, and their authors may know better settings; the KV caches have equal bit widths but are not the same
-quantizer. Other engines (vLLM's CPU backend) and other CPUs were not measured.
+llama.cpp is shown in its best measured configuration: an f16 KV cache, faster for it than 8-bit K / 4-bit V in every
+row, and no MTP, which made it slower at every draft length. Against it, runq decodes 3.4-4.4x faster at one client,
+4.1-5.7x at four and 3.7-3.9x at 32k, and prefills 1.3-1.5x faster on short prompts and 1.7x faster on the cold 32k
+prompt. Against ik_llama.cpp, runq decodes 1.8-1.9x faster at one client, 2.6-3.6x at four and 5.5-7.2x at 32k; ik
+prefills faster (runq at 0.79-0.95x on short prompts, 0.79x at 32k). Quality is the same: perplexities within 0.2%.
+One run per cell on a shared VM, and we configured the other two engines from their documentation, so their authors
+may know better settings.
 
 Smaller models, same VM (2026-10-26, best of 2, 8 / 12 threads): Qwen3-0.6B Q8_0 prefills 1,813 / 2,287 tok/s and decodes
 207 / 165; its Q4_K_M 1,721 / 2,338 and 278 / 373; Qwen3.5-4B Q8_0 308 / 443 and 31 / 30; Qwen3.8-27B Q4_K_M 45 / 65 and

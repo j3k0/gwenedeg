@@ -150,22 +150,26 @@ tuning: [bench/llamacpp-2026-11-22/](bench/llamacpp-2026-11-22/).
 | CPU | AMD EPYC Genoa (Zen 4), 16 vCPUs, 32 MB L3, 30 GB RAM, AVX-512 VNNI / VBMI / BF16 (the same KVM VM as below; only the daytime runq server stopped for the day, other services running: 1-min load 1-20, see Caveats) |
 | model | `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (3.44 bpw, 12.1 GB, with its MTP block), thinking on and off |
 | runq | `50ba538` (main + the i-quant tiled GEMM), gcc 14.2.0; `runq serve --ctx 98304 --draft mtp -G 6 --tau 0.5 --repack -k q4-dot --slots 6 --parallel 4 --admit bound`, 14 threads, `--kv-disk` in a temporary directory (the production arguments) |
-| llama.cpp | `225a5345bbb0` (master of 2026-11-22 03:25Z), Release, `-DGGML_NATIVE=ON`, gcc 14.2.0 (`-march=native`; `ggml_cpu_has_avx512 / _vnni / _vbmi / _bf16` all 1); `llama-server -t 14 -fa on -ctk q8_0 -ctv q4_0 -ub 512 -b 2048 -lm none --no-repack --ctx-checkpoints 4 -cram 512 --jinja`, `-np 1` / `-np 4` at `-c 98304`, 14 threads. Tuned with `llama-bench` (threads, ubatch, repacking, mmap) and a server draft-length probe: [tune.md](bench/llamacpp-2026-11-22/tune.md) |
+| llama.cpp | `225a5345bbb0` (master of 2026-11-22 03:25Z), Release, `-DGGML_NATIVE=ON`, gcc 14.2.0 (`-march=native`; `ggml_cpu_has_avx512 / _vnni / _vbmi / _bf16` all 1); `llama-server -t 14 -fa on -ctk q8_0 -ctv q4_0 -ub 512 -b 2048 -lm none --no-repack --ctx-checkpoints 4 -cram 512 --jinja`, `-np 1` / `-np 4` at `-c 98304`, 14 threads; every run repeated with `-ctk f16 -ctv f16` (the same flags and context otherwise; `--long` at `-c 49152`), which is faster for mainline everywhere. Tuned with `llama-bench` (threads, ubatch, repacking, mmap) and a server draft-length probe: [tune.md](bench/llamacpp-2026-11-22/tune.md) |
 | ik_llama.cpp | `ac8d544b` (2026-11-19), the build and commands of the section below: `llama-server -fa on -ctk q8_0 -ctv q4_0 -rtr -ub 1024 -b 2048 -t 14 --spec-type mtp:n_max=6,p_min=0.5 --ctx-checkpoints 4 --jinja -cram 512`, `-c 16384` (`--short`) / `-c 49152` (`--long`), 1 slot + MTP |
-| equal settings | 14 threads; KV cache 8-bit K + 4-bit V for the main tables (runq `q4-dot` = mainline / ik `q8_0` K / `q4_0` V: equal bit widths, not the same quantizer; mainline with an f16 cache also measured at 32k); greedy and seeded (T 1, top-p 0.95, top-k 20, seed 42); `scripts/s9c_bench.py` unchanged, `--server-cmd` for the other engines; 22 GB memory cap, no swap, one model process at a time, the bench lock held |
+| equal settings | 14 threads; KV cache 8-bit K + 4-bit V (runq `q4-dot` = mainline / ik `q8_0` K / `q4_0` V: equal bit widths, not the same quantizer), and mainline also with an f16 cache, its faster configuration; greedy and seeded (T 1, top-p 0.95, top-k 20, seed 42); `scripts/s9c_bench.py` unchanged, `--server-cmd` for the other engines; 22 GB memory cap, no swap, one model process at a time, the bench lock held |
 | speculative decoding | runq: MTP, up to 6 guesses, tau 0.5. Mainline runs this file's MTP block (`--spec-type draft-mtp`, also with several slots; the drafts are accepted), but every draft length of 1-6 decoded **slower** than no drafting on this CPU, so its runs below have **no MTP**; ik: MTP as before |
 | prompts | as below: `bench/s9c/`, two LiveCodeBench-shaped prompts and two agent-shaped ones, `max_tokens` 512; a 31,755-token cold prompt + 2 follow-up turns of ~2,500 new tokens |
 
 **Short requests** (tok/s per request, mean of 8 at one client; 4 clients: aggregate tokens / the round's wall time):
 
-| | runq | llama.cpp, 1 slot | llama.cpp, 4 slots | ik_llama.cpp, 1 slot + MTP |
-|---|---|---|---|---|
-| thinking on, 1 client | **17.5** | 3.5 | 4.4 | 9.6 |
-| thinking on, 4 clients (greedy / seeded) | **23.0 / 23.0** | 2.7 / 2.7 (queued behind one slot) | 4.7 / 4.2 | 8.0 / 6.6 (queued) |
-| thinking off, 1 client | **21.2** | 3.7 | 3.7 | 11.3 |
-| thinking off, 4 clients (greedy / seeded) | **27.0 / 25.4** | 3.0 / 3.0 (queued) | 3.3 / 3.7 | 7.6 / 9.6 (queued) |
-| prefill, 0.8-2.5k-token prompts, tok/s | 101-111 | 48-58 | 49-55 | **117-125** |
-| peak RSS (GiB) | 17.4 (98k context) | 14.7 (98k) | 15.9 (98k) | 17.7 (16k) |
+| | runq | llama.cpp, 1 slot, q8_0 / q4_0 | llama.cpp, 4 slots, q8_0 / q4_0 | llama.cpp, 1 slot, f16 | llama.cpp, 4 slots, f16 | ik_llama.cpp, 1 slot + MTP |
+|---|---|---|---|---|---|---|
+| thinking on, 1 client | **17.5** | 3.5 | 4.4 | 5.2 | 4.7 | 9.6 |
+| thinking on, 4 clients (greedy / seeded) | **23.0 / 23.0** | 2.7 / 2.7 (queued behind one slot) | 4.7 / 4.2 | 4.2 / 4.0 (queued) | 4.7 / 5.7 | 8.0 / 6.6 (queued) |
+| thinking off, 1 client | **21.2** | 3.7 | 3.7 | 4.9 | 4.9 | 11.3 |
+| thinking off, 4 clients (greedy / seeded) | **27.0 / 25.4** | 3.0 / 3.0 (queued) | 3.3 / 3.7 | 3.6 / 3.5 (queued) | 4.8 / 5.8 | 7.6 / 9.6 (queued) |
+| prefill, 0.8-2.5k-token prompts, tok/s | 101-111 | 48-58 | 49-55 | 68-78 | 63-74 | **117-125** |
+| peak RSS (GiB) | 17.4 (98k context) | 14.7 (98k) | 15.9 (98k) | 17.8 (98k) | 19.0 (98k) | 17.7 (16k) |
+
+Mainline's best measured configuration per row, the one the ratios below use: f16 with 1 slot for one client (thinking
+on 5.2; off 4.86 / 4.88 with 1 / 4 slots) and for the short prefill; f16 with 4 slots for 4 clients. The f16 runs are
+13:13-14:27Z, the q8_0 / q4_0 ones 07:43-09:28Z (similar load, 14-18).
 
 **Long context** (the 31,755-token cold prompt, then two turns adding ~2,500 tokens each; thinking on, greedy, 512 new
 tokens):
@@ -192,11 +196,12 @@ mainline within 0.03-0.11% of runq, ik within 0.1-0.2% — the same quality.
 4.86, ik 124.2 / 5.13. runq's equivalent is its CLI on a 524-token prompt, 128 new tokens, plain decoding (`--repack`,
 `q4-dot`, 2 runs): **107-110 / 13.8-15.1**.
 
-**Reading** (against each engine's better configuration per row): runq decodes **4.0-5.7x** faster than mainline on
-short requests at one client and **4.9-8.1x** with 4 clients (against its 4 slots; 8.4-8.9x against its 1 slot),
-**3.7-3.9x** faster than mainline's f16-cache configuration at 32-37k context, and prefills short prompts **1.8-2.4x**
-faster and the cold 32k prompt **1.7x** faster than that f16 configuration (12.9x against its equal-bit-width cache); a
-follow-up turn on the 32k session finishes 3.0x sooner (17-18x against the q8_0 / q4_0 cache). Against ik_llama.cpp,
+**Reading** (against mainline's best measured configuration per row, f16 cache throughout): runq decodes **3.4-4.4x**
+faster than mainline on short requests at one client and **4.1-5.7x** with 4 clients (against its 4 slots), **3.7-3.9x**
+faster at 32-37k context, and prefills short prompts **1.3-1.5x** faster per identical request and the cold 32k prompt
+**1.7x** faster; a follow-up turn on the 32k session finishes 3.0x sooner. Against mainline with the equal-bit-width
+q8_0 / q4_0 cache the factors are 4.0-8.1x (short decode), 1.8-2.4x (short prefill), 12.9x (cold 32k) and 17-18x
+(a follow-up turn). Against ik_llama.cpp,
 runs of the same day: runq decodes 1.8-1.9x faster at one client, 2.6-3.6x with 4 clients, 5.5-7.2x at 32k context,
 and a follow-up turn finishes 3.7-4.0x sooner; **ik prefills faster**, less so than before the tiled GEMM: runq's
 short-prompt prefill is **0.79-0.95x** of ik's per identical request (101-111 vs 117-125 tok/s; about 0.7x, 81-84 vs
@@ -214,10 +219,11 @@ turn's 2.5k tokens 0.91-0.94x (37-39 s vs 35-36 s). Quality is equal.
 - llama.cpp and ik_llama.cpp were configured by us from their docs and tuned with `llama-bench`; their authors may know
   better settings. Mainline's MTP slowdown is measured, not explained (a k+1-token verification pass costs about as
   much as k+1 single-token passes here); its quantized-cache slowdown at depth shows in `llama-bench` alone.
-- Equal KV bit widths, not the same quantizer, for the main tables; the f16 column is not bit-width-equal and is the
-  one to read for mainline's best 32k result.
-- Mainline is not slower for lack of context: both its servers ran at 98,304 positions with the full model and the
-  q8_0 / q4_0 cache (peak RSS 14.7-15.9 GiB). ik could not (its OOMs of 2026-11-21); its 16k / 48k contexts do not
+- Equal KV bit widths, not the same quantizer, between runq and ik and mainline's q8_0 / q4_0 columns; mainline's f16
+  columns (its best) hold 2.6x runq's KV bits. Mainline's quality was measured with q8_0 / q4_0 only (f16 can only be
+  as good or better).
+- Mainline is not slower for lack of context: its short-request servers ran at 98,304 positions with the full model,
+  with either cache (peak RSS 14.7-19.0 GiB). ik could not (its OOMs of 2026-11-21); its 16k / 48k contexts do not
   change its speed at those depths.
 - Not measured: vLLM's CPU backend, other engines, other CPUs.
 

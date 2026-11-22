@@ -1,0 +1,9 @@
+== micro-ik start 2026-11-22T06:11:49Z load 15.20 15.70 13.71 avail 18.9G
+cmd: ik_llama.cpp/build/bin/llama-bench -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -fa 1 -ctk q8_0 -ctv q4_0 -t 14 -ub 1024 -b 2048 -rtr -p 512 -n 128 -r 2 -v
+| model                          |       size |     params | backend    | threads | n_ubatch | type_k | type_v | rtr |          test |              t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | -------: | -----: | -----: | --: | ------------: | ---------------: |
+| qwen35 27B IQ3_S - 3.4375 bpw  |  10.95 GiB |    26.90 B | CPU        |      14 |     1024 |   q8_0 |   q4_0 |   1 |         pp512 |    124.16 ± 1.31 |
+| qwen35 27B IQ3_S - 3.4375 bpw  |  10.95 GiB |    26.90 B | CPU        |      14 |     1024 |   q8_0 |   q4_0 |   1 |         tg128 |      5.13 ± 0.23 |
+
+build: ac8d544b (5278)
+== micro-ik end 2026-11-22T06:12:52Z rc 0 load 14.99 15.54 13.80

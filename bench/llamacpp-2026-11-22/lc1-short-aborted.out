@@ -1,0 +1,5 @@
+== lc1-short start 2026-11-22T07:24:43Z load 8.66 14.80 14.13 avail 21.5G
+cmd: python3 -I ./scripts/s9c_bench.py --model ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf --server-cmd llama.cpp/build/bin/llama-server -m {model} -c 98304 -np 1 -t 14 -fa on -ctk q8_0 -ctv q4_0 -ub 512 -b 2048 -lm none --no-repack --spec-type draft-mtp --spec-draft-n-max 6 --spec-draft-p-min 0.5 --ctx-checkpoints 4 -cram 512 --jinja --host 127.0.0.1 --port {port} --short --think 1,0 --label lc1-short --json runs/lc1-short.json
+s9c_bench lc1-short: llama.cpp/build/bin/llama-server -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -c 98304 -np 1 -t 14 -fa on -ctk q8_0 -ctv q4_0 -ub 512 -b 2048 -lm none --no-repack --spec-type draft-mtp --spec-draft-n-max 6 --spec-draft-p-min 0.5 --ctx-checkpoints 4 -cram 512 --jinja --host 127.0.0.1 --port 52317 (loaded in 10.7 s)
+  think 1 greedy lcb1  1 client: 3.649 tok/s, prompt 869 (17191.052 ms), 512 tokens, model None, mtp_approx None
+  think 1 greedy lcb2  1 client: 3.987 tok/s, prompt 782 (13331.362 ms), 512 tokens, model None, mtp_approx None

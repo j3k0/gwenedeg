@@ -1,0 +1,143 @@
+== smoke-c98k start 2026-11-22T05:46:17Z load 2.90 3.40 2.54 avail 18.4G
+cmd: bash -c llama.cpp/build/bin/llama-server -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -c 98304 -np 1 -t 14 -fa on -ctk q8_0 -ctv q4_0 --jinja --spec-type draft-mtp --spec-draft-n-max 6 --spec-draft-p-min 0.5 --host 127.0.0.1 --port 18731 > smoke-c98k.log 2>&1 & P=$!; for i in $(seq 1 300); do curl -s 127.0.0.1:18731/health | grep -q ok && break; kill -0 $P 2>/dev/null || break; sleep 1; done; curl -s 127.0.0.1:18731/health; echo; grep VmHWM /proc/$P/status; curl -s 127.0.0.1:18731/v1/chat/completions -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":"Write a Python function that reverses a string."}],"max_tokens":200,"temperature":0}' | head -c 3000; echo; grep VmHWM /proc/$P/status; kill $P; wait $P
+== smoke-c98k end 2026-11-22T05:46:51Z rc 0 load 6.03 4.05 2.79
+== tune1 start 2026-11-22T05:47:25Z load 3.65 3.68 2.71 avail 18.8G
+cmd: llama.cpp/build/bin/llama-bench -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -fa on -ctk q8_0 -ctv q4_0 -t 14,16 -ub 512,1024,2048 -p 2048 -n 64 -r 2 -v
+== tune1 end 2026-11-22T06:05:31Z rc 0 load 20.72 18.28 13.32
+== tune2 start 2026-11-22T06:05:44Z load 17.92 17.76 13.20 avail 18.7G
+cmd: llama.cpp/build/bin/llama-bench -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -fa on -ctk q8_0 -ctv q4_0 -t 14 -ub 2048 -p 2048 -n 64 -r 2 --repack 0,1 -v
+== tune2 end 2026-11-22T06:10:30Z rc 0 load 15.23 15.85 13.59
+== micro512 start 2026-11-22T06:10:30Z load 15.23 15.85 13.59 avail 18.9G
+cmd: llama.cpp/build/bin/llama-bench -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -fa on -ctk q8_0 -ctv q4_0 -t 14 -p 512 -n 128 -r 2 -v
+== micro512 end 2026-11-22T06:11:49Z rc 0 load 15.20 15.70 13.71
+== micro-ik start 2026-11-22T06:11:49Z load 15.20 15.70 13.71 avail 18.9G
+cmd: ik_llama.cpp/build/bin/llama-bench -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -fa 1 -ctk q8_0 -ctv q4_0 -t 14 -ub 1024 -b 2048 -rtr -p 512 -n 128 -r 2 -v
+== micro-ik end 2026-11-22T06:12:52Z rc 0 load 14.99 15.54 13.80
+== runq-short start 2026-11-22T06:14:27Z load 3.38 11.44 12.50 avail 19.0G
+cmd: env OMP_NUM_THREADS=14 python3 -I ./scripts/s9c_bench.py --model ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf --serve-args --ctx 98304 --draft mtp -G 6 --tau 0.5 --repack -k q4-dot --slots 6 --parallel 4 --admit bound --kv-disk runs/kv-runq-short --kv-disk-max 10 --kv-disk-free 14 -v --short --think 1,0 --label runq-short --json runs/runq-short.json
+== runq-short end 2026-11-22T06:23:37Z rc 0 load 13.98 14.23 13.61
+== runq-long start 2026-11-22T06:57:31Z load 2.01 1.88 3.03 avail 18.3G
+cmd: env OMP_NUM_THREADS=14 python3 -I ./scripts/s9c_bench.py --model ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf --serve-args --ctx 98304 --draft mtp -G 6 --tau 0.5 --repack -k q4-dot --slots 6 --parallel 4 --admit bound --kv-disk runs/kv-runq-long --kv-disk-max 10 --kv-disk-free 14 -v --long 32768 --turns 3 --label runq-long --json runs/runq-long.json
+== runq-long end 2026-11-22T07:08:39Z rc 0 load 17.75 16.59 10.95
+== tune3 start 2026-11-22T07:09:07Z load 13.26 15.62 10.78 avail 17.9G
+cmd: llama.cpp/build/bin/llama-bench -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -fa on -ctk q8_0 -ctv q4_0 -t 14 -ub 512 -lm mmap,none --repack 0,1 -p 2048 -n 64 -r 3
+== tune3 end 2026-11-22T07:23:57Z rc 0 load 17.66 17.17 14.81
+== lc1-short start 2026-11-22T07:24:43Z load 8.66 14.80 14.13 avail 21.5G
+cmd: python3 -I ./scripts/s9c_bench.py --model ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf --server-cmd llama.cpp/build/bin/llama-server -m {model} -c 98304 -np 1 -t 14 -fa on -ctk q8_0 -ctv q4_0 -ub 512 -b 2048 -lm none --no-repack --spec-type draft-mtp --spec-draft-n-max 6 --spec-draft-p-min 0.5 --ctx-checkpoints 4 -cram 512 --jinja --host 127.0.0.1 --port {port} --short --think 1,0 --label lc1-short --json runs/lc1-short.json
+== lc1-short aborted 2026-11-22T07:31:13Z (n_max 6 verify cost; draft-length sweep first)
+== probe-spec start 2026-11-22T07:31:32Z load 9.41 14.27 14.37 avail 21.7G
+cmd: python3 -I ../probe_spec.py probe-spec.md
+== probe-spec end 2026-11-22T07:43:09Z rc 0 load 15.57 15.25 14.90
+== lc1-short start 2026-11-22T07:43:37Z load 10.84 14.17 14.55 avail 21.2G
+cmd: python3 -I ./scripts/s9c_bench.py --model ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf --server-cmd llama.cpp/build/bin/llama-server -m {model} -c 98304 -np 1 -t 14 -fa on -ctk q8_0 -ctv q4_0 -ub 512 -b 2048 -lm none --no-repack --ctx-checkpoints 4 -cram 512 --jinja --host 127.0.0.1 --port {port} --short --think 1,0 --label lc1-short --json runs/lc1-short.json
+== lc1-short end 2026-11-22T08:43:35Z rc 0 load 17.38 17.16 17.33
+== lc4-short start 2026-11-22T08:43:35Z load 17.38 17.16 17.33 avail 20.2G
+cmd: python3 -I ./scripts/s9c_bench.py --model ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf --server-cmd llama.cpp/build/bin/llama-server -m {model} -c 98304 -np 4 -t 14 -fa on -ctk q8_0 -ctv q4_0 -ub 512 -b 2048 -lm none --no-repack --ctx-checkpoints 2 -cram 512 --jinja --host 127.0.0.1 --port {port} --short --think 1,0 --label lc4-short --json runs/lc4-short.json
+== lc4-short end 2026-11-22T09:28:15Z rc 0 load 18.06 18.09 17.68
+== lc1-long start 2026-11-22T09:28:15Z load 18.06 18.09 17.68 avail 19.7G
+cmd: python3 -I ./scripts/s9c_bench.py --model ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf --server-cmd llama.cpp/build/bin/llama-server -m {model} -c 98304 -np 1 -t 14 -fa on -ctk q8_0 -ctv q4_0 -ub 512 -b 2048 -lm none --no-repack --ctx-checkpoints 4 -cram 512 --jinja --host 127.0.0.1 --port {port} --long 32768 --turns 2 --label lc1-long --json runs/lc1-long.json
+== lc1-long end 2026-11-22T11:41:54Z rc 0 load 15.89 15.86 15.63
+== ppl-prose start 2026-11-22T11:42:18Z load 11.24 14.77 15.27 avail 20.6G
+cmd: llama.cpp/build/bin/llama-perplexity -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -f q_prose.txt -c 2048 -b 2048 -ub 512 -t 14 -fa on -ctk q8_0 -ctv q4_0 -lm none --no-repack
+== ppl-prose end 2026-11-22T11:42:18Z rc 1 load 11.24 14.77 15.27
+== ppl-code start 2026-11-22T11:42:18Z load 11.24 14.77 15.27 avail 20.6G
+cmd: llama.cpp/build/bin/llama-perplexity -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -f q_code.txt -c 3072 -b 3072 -ub 512 -t 14 -fa on -ctk q8_0 -ctv q4_0 -lm none --no-repack
+== ppl-code end 2026-11-22T11:42:18Z rc 1 load 11.24 14.77 15.27
+== ppl-prose start 2026-11-22T11:42:25Z load 10.34 14.52 15.19 avail 20.6G
+cmd: llama.cpp/build/bin/llama-perplexity -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -f q_prose.txt -c 2048 -b 2048 -ub 512 -t 14 -fa on -ctk q8_0 -ctv q4_0 -lm none --no-repack
+== ppl-prose end 2026-11-22T11:43:59Z rc 0 load 14.86 14.84 15.23
+== ppl-code start 2026-11-22T11:43:59Z load 14.86 14.84 15.23 avail 20.7G
+cmd: llama.cpp/build/bin/llama-perplexity -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -f q_code.txt -c 3072 -b 3072 -ub 512 -t 14 -fa on -ctk q8_0 -ctv q4_0 -lm none --no-repack
+== ppl-code end 2026-11-22T11:46:33Z rc 0 load 15.53 15.06 15.24
+== depth-q84 start 2026-11-22T11:46:50Z load 12.55 14.42 15.02 avail 20.8G
+cmd: llama.cpp/build/bin/llama-bench -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -fa on -ctk q8_0 -ctv q4_0 -t 14 -ub 512 -lm none --repack 0 -p 512 -n 32 -d 0,8192 -r 1
+== depth-q84 end 2026-11-22T11:53:42Z rc 0 load 14.08 14.80 15.01
+== depth-f16 start 2026-11-22T11:53:42Z load 14.08 14.80 15.01 avail 20.8G
+cmd: llama.cpp/build/bin/llama-bench -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -fa on -ctk f16 -ctv f16 -t 14 -ub 512 -lm none --repack 0 -p 512 -n 32 -d 0,8192 -r 1
+== depth-f16 end 2026-11-22T11:56:29Z rc 0 load 15.41 14.94 15.02
+== depth-q88 start 2026-11-22T11:56:44Z load 12.08 14.22 14.78 avail 20.9G
+cmd: llama.cpp/build/bin/llama-bench -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -fa on -ctk q8_0 -ctv q8_0 -t 14 -ub 512 -lm none --repack 0 -p 512 -n 32 -d 8192 -r 1
+== depth-q88 end 2026-11-22T12:02:17Z rc 0 load 14.50 14.44 14.68
+== lc1f16-long start 2026-11-22T12:02:25Z load 13.50 14.23 14.62 avail 21.0G
+cmd: python3 -I ./scripts/s9c_bench.py --model ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf --server-cmd llama.cpp/build/bin/llama-server -m {model} -c 49152 -np 1 -t 14 -fa on -ctk f16 -ctv f16 -ub 512 -b 2048 -lm none --no-repack --ctx-checkpoints 4 -cram 512 --jinja --host 127.0.0.1 --port {port} --long 32768 --turns 2 --label lc1f16-long --json runs/lc1f16-long.json
+== lc1f16-long end 2026-11-22T12:23:36Z rc 0 load 14.83 15.01 14.97
+== micro-runq1 start 2026-11-22T12:24:18Z load 7.18 12.96 14.28 avail 20.9G
+cmd: env OMP_NUM_THREADS=14 ./runq ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -c 1024 -r 0 -t 0 -n 128 -b 512 --repack -k q4-dot -i CHAPTER I
+
+ST. JAGO--CAPE DE VERD ISLANDS
+
+Porto Praya--Ribeira Grande--Atmospheric Dust with Infusoria--Habits of
+a Sea-slug and Cuttle-fish--St. Paul's Rocks, non-volcanic--Singular
+Incrustations--Insects the first Colonists of Islands--Fernando
+Noronha--Bahia--Burnished Rocks--Habits of a Diodon--Pelagic Confervae
+and Infusoria--Causes of discoloured Sea.
+
+
+AFTER having been twice driven back by heavy southwestern gales, Her
+Majesty's ship Beagle, a ten-gun brig, under the command of Captain
+Fitz Roy, R. N., sailed from Devonport on the 27th of December, 1831.
+The object of the expedition was to complete the survey of Patagonia
+and Tierra del Fuego, commenced under Captain King in 1826 to 1830,--to
+survey the shores of Chile, Peru, and of some islands in the
+Pacific--and to carry a chain of chronometrical measurements round the
+World. On the 6th of January we reached Teneriffe, but were prevented
+landing, by fears of our bringing the cholera: the next morning we saw
+the sun rise behind the rugged outline of the Grand Canary island, and
+suddenly illuminate the Peak of Teneriffe, whilst the lower parts were
+veiled in fleecy clouds.  This was the first of many delightful days
+never to be forgotten. On the 16th of January, 1832, we anchored at
+Porto Praya, in St. Jago, the chief island of the Cape de Verd
+archipelago.
+
+The neighbourhood of Porto Praya, viewed from the sea, wears a desolate
+aspect.  The volcanic fires of a past age, and the scorching heat of a
+tropical sun, have in most places rendered the soil unfit for
+vegetation.  The country rises in successive steps of table-land,
+interspersed with some truncate conical hills, and the horizon is
+bounded by an irregular chain of more lofty mountains.  The scene, as
+beheld through the hazy atmosphere of this climate, is one of great
+interest; if, indeed, a person, fre Summarize.
+== micro-runq1 end 2026-11-22T12:24:38Z rc 0 load 8.00 12.79 14.20
+== micro-runq2 start 2026-11-22T12:24:38Z load 8.00 12.79 14.20 avail 21.2G
+cmd: env OMP_NUM_THREADS=14 ./runq ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -c 1024 -r 0 -t 0 -n 128 -b 512 --repack -k q4-dot -i CHAPTER I
+
+ST. JAGO--CAPE DE VERD ISLANDS
+
+Porto Praya--Ribeira Grande--Atmospheric Dust with Infusoria--Habits of
+a Sea-slug and Cuttle-fish--St. Paul's Rocks, non-volcanic--Singular
+Incrustations--Insects the first Colonists of Islands--Fernando
+Noronha--Bahia--Burnished Rocks--Habits of a Diodon--Pelagic Confervae
+and Infusoria--Causes of discoloured Sea.
+
+
+AFTER having been twice driven back by heavy southwestern gales, Her
+Majesty's ship Beagle, a ten-gun brig, under the command of Captain
+Fitz Roy, R. N., sailed from Devonport on the 27th of December, 1831.
+The object of the expedition was to complete the survey of Patagonia
+and Tierra del Fuego, commenced under Captain King in 1826 to 1830,--to
+survey the shores of Chile, Peru, and of some islands in the
+Pacific--and to carry a chain of chronometrical measurements round the
+World. On the 6th of January we reached Teneriffe, but were prevented
+landing, by fears of our bringing the cholera: the next morning we saw
+the sun rise behind the rugged outline of the Grand Canary island, and
+suddenly illuminate the Peak of Teneriffe, whilst the lower parts were
+veiled in fleecy clouds.  This was the first of many delightful days
+never to be forgotten. On the 16th of January, 1832, we anchored at
+Porto Praya, in St. Jago, the chief island of the Cape de Verd
+archipelago.
+
+The neighbourhood of Porto Praya, viewed from the sea, wears a desolate
+aspect.  The volcanic fires of a past age, and the scorching heat of a
+tropical sun, have in most places rendered the soil unfit for
+vegetation.  The country rises in successive steps of table-land,
+interspersed with some truncate conical hills, and the horizon is
+bounded by an irregular chain of more lofty mountains.  The scene, as
+beheld through the hazy atmosphere of this climate, is one of great
+interest; if, indeed, a person, fre Summarize.
+== micro-runq2 end 2026-11-22T12:24:58Z rc 0 load 8.86 12.70 14.14
+== ik1-short start 2026-11-22T12:25:27Z load 6.11 11.75 13.78 avail 20.9G
+cmd: python3 -I ./scripts/s9c_bench.py --model ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf --server-cmd ik_llama.cpp/build/bin/llama-server -m {model} -c 16384 -np 1 -t 14 -fa on -ctk q8_0 -ctv q4_0 -rtr -ub 1024 -b 2048 -cram 512 --spec-type mtp:n_max=6,p_min=0.5 --ctx-checkpoints 4 --jinja --host 127.0.0.1 --port {port} --short --think 1,0 --label ik1-short --json runs/ik1-short.json
+== ik1-short end 2026-11-22T12:50:38Z rc 0 load 13.90 14.55 14.64
+== ik1-long start 2026-11-22T12:50:53Z load 10.90 13.85 14.41 avail 21.2G
+cmd: python3 -I ./scripts/s9c_bench.py --model ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf --server-cmd ik_llama.cpp/build/bin/llama-server -m {model} -c 49152 -np 1 -t 14 -fa on -ctk q8_0 -ctv q4_0 -rtr -ub 1024 -b 2048 -cram 512 --spec-type mtp:n_max=6,p_min=0.5 --ctx-checkpoints 4 --jinja --host 127.0.0.1 --port {port} --long 32768 --turns 2 --label ik1-long --json runs/ik1-long.json
+== ik1-long end 2026-11-22T13:08:49Z rc 0 load 9.70 10.73 12.21

@@ -1,0 +1,15 @@
+== tune3 start 2026-11-22T07:09:07Z load 13.26 15.62 10.78 avail 17.9G
+cmd: llama.cpp/build/bin/llama-bench -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -fa on -ctk q8_0 -ctv q4_0 -t 14 -ub 512 -lm mmap,none --repack 0,1 -p 2048 -n 64 -r 3
+| model                          |       size |     params | backend    | threads | type_k | type_v |  fa |         lm | rpk |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | -----: | -----: | --: | ---------: | --: | --------------: | -------------------: |
+| qwen35 27B IQ3_S - 3.4375 bpw  |  11.28 GiB |    27.32 B | CPU        |      14 |   q8_0 |   q4_0 |   1 |       mmap |   0 |          pp2048 |         48.88 ± 0.76 |
+| qwen35 27B IQ3_S - 3.4375 bpw  |  11.28 GiB |    27.32 B | CPU        |      14 |   q8_0 |   q4_0 |   1 |       mmap |   0 |            tg64 |          3.77 ± 0.08 |
+| qwen35 27B IQ3_S - 3.4375 bpw  |  11.28 GiB |    27.32 B | CPU        |      14 |   q8_0 |   q4_0 |   1 |       mmap |   1 |          pp2048 |         48.15 ± 0.74 |
+| qwen35 27B IQ3_S - 3.4375 bpw  |  11.28 GiB |    27.32 B | CPU        |      14 |   q8_0 |   q4_0 |   1 |       mmap |   1 |            tg64 |          3.96 ± 0.21 |
+| qwen35 27B IQ3_S - 3.4375 bpw  |  11.28 GiB |    27.32 B | CPU        |      14 |   q8_0 |   q4_0 |   1 |       none |   0 |          pp2048 |         52.26 ± 0.91 |
+| qwen35 27B IQ3_S - 3.4375 bpw  |  11.28 GiB |    27.32 B | CPU        |      14 |   q8_0 |   q4_0 |   1 |       none |   0 |            tg64 |          4.92 ± 0.50 |
+| qwen35 27B IQ3_S - 3.4375 bpw  |  11.28 GiB |    27.32 B | CPU        |      14 |   q8_0 |   q4_0 |   1 |       none |   1 |          pp2048 |         47.51 ± 0.35 |
+| qwen35 27B IQ3_S - 3.4375 bpw  |  11.28 GiB |    27.32 B | CPU        |      14 |   q8_0 |   q4_0 |   1 |       none |   1 |            tg64 |          4.23 ± 0.39 |
+
+build: 225a534 (50)
+== tune3 end 2026-11-22T07:23:57Z rc 0 load 17.66 17.17 14.81

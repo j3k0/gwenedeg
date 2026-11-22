@@ -1,0 +1,28 @@
+== ppl-code start 2026-11-22T11:43:59Z load 14.86 14.84 15.23 avail 20.7G
+cmd: llama.cpp/build/bin/llama-perplexity -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -f q_code.txt -c 3072 -b 3072 -ub 512 -t 14 -fa on -ctk q8_0 -ctv q4_0 -lm none --no-repack
+0.00.534.145 W model has unused tensor blk.64.attn_norm.weight (size = 20480 bytes) -- ignoring
+0.00.534.156 W model has unused tensor blk.64.post_attention_norm.weight (size = 20480 bytes) -- ignoring
+0.00.534.162 W model has unused tensor blk.64.attn_q.weight (size = 51609600 bytes) -- ignoring
+0.00.534.164 W model has unused tensor blk.64.attn_k.weight (size = 4300800 bytes) -- ignoring
+0.00.534.166 W model has unused tensor blk.64.attn_v.weight (size = 4300800 bytes) -- ignoring
+0.00.534.173 W model has unused tensor blk.64.attn_output.weight (size = 25804800 bytes) -- ignoring
+0.00.534.175 W model has unused tensor blk.64.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+0.00.534.178 W model has unused tensor blk.64.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+0.00.534.180 W model has unused tensor blk.64.ffn_gate.weight (size = 73113600 bytes) -- ignoring
+0.00.534.182 W model has unused tensor blk.64.ffn_down.weight (size = 73113600 bytes) -- ignoring
+0.00.534.184 W model has unused tensor blk.64.ffn_up.weight (size = 73113600 bytes) -- ignoring
+0.00.534.187 W model has unused tensor blk.64.nextn.eh_proj.weight (size = 43008000 bytes) -- ignoring
+0.00.534.230 W model has unused tensor blk.64.nextn.enorm.weight (size = 20480 bytes) -- ignoring
+0.00.534.233 W model has unused tensor blk.64.nextn.hnorm.weight (size = 20480 bytes) -- ignoring
+0.00.534.241 W model has unused tensor blk.64.nextn.shared_head_norm.weight (size = 20480 bytes) -- ignoring
+0.09.453.420 I cmn          init: llama threadpool init, n_threads = 14
+0.09.829.037 I 
+0.09.829.214 I system_info: n_threads = 14 (n_threads_batch = 14) / 16 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.09.829.233 I perplexity: tokenizing the input ..
+0.09.836.991 I perplexity: tokenization took 7.753 ms
+0.09.837.012 I perplexity: calculating perplexity over 2 chunks, n_ctx=3072, batch_size=3072, n_seq=1
+1.21.423.005 I perplexity: 71.59 seconds per pass - ETA 2.38 minutes
+[1]7.1409,[2]3.5999,
+2.32.583.108 I Final estimate: PPL = 3.5999 +/- 0.14305
+
+== ppl-code end 2026-11-22T11:46:33Z rc 0 load 15.53 15.06 15.24

@@ -1,0 +1,9 @@
+== micro512 start 2026-11-22T06:10:30Z load 15.23 15.85 13.59 avail 18.9G
+cmd: llama.cpp/build/bin/llama-bench -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -fa on -ctk q8_0 -ctv q4_0 -t 14 -p 512 -n 128 -r 2 -v
+| model                          |       size |     params | backend    | threads | type_k | type_v |  fa |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | -----: | -----: | --: | --------------: | -------------------: |
+| qwen35 27B IQ3_S - 3.4375 bpw  |  11.28 GiB |    27.32 B | CPU        |      14 |   q8_0 |   q4_0 |   1 |           pp512 |         68.45 ± 0.83 |
+| qwen35 27B IQ3_S - 3.4375 bpw  |  11.28 GiB |    27.32 B | CPU        |      14 |   q8_0 |   q4_0 |   1 |           tg128 |          4.86 ± 0.18 |
+
+build: 225a534 (50)
+== micro512 end 2026-11-22T06:11:49Z rc 0 load 15.20 15.70 13.71

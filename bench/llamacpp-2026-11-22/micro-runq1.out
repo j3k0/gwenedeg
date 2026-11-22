@@ -1,0 +1,37 @@
+== micro-runq1 start 2026-11-22T12:24:18Z load 7.18 12.96 14.28 avail 20.9G
+cmd: env OMP_NUM_THREADS=14 ./runq ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -c 1024 -r 0 -t 0 -n 128 -b 512 --repack -k q4-dot -i CHAPTER I
+ST. JAGO--CAPE DE VERD ISLANDS
+Porto Praya--Ribeira Grande--Atmospheric Dust with Infusoria--Habits of
+a Sea-slug and Cuttle-fish--St. Paul's Rocks, non-volcanic--Singular
+Incrustations--Insects the first Colonists of Islands--Fernando
+Noronha--Bahia--Burnished Rocks--Habits of a Diodon--Pelagic Confervae
+and Infusoria--Causes of discoloured Sea.
+AFTER having been twice driven back by heavy southwestern gales, Her
+Majesty's ship Beagle, a ten-gun brig, under the command of Captain
+Fitz Roy, R. N., sailed from Devonport on the 27th of December, 1831.
+The object of the expedition was to complete the survey of Patagonia
+and Tierra del Fuego, commenced under Captain King in 1826 to 1830,--to
+survey the shores of Chile, Peru, and of some islands in the
+Pacific--and to carry a chain of chronometrical measurements round the
+World. On the 6th of January we reached Teneriffe, but were prevented
+landing, by fears of our bringing the cholera: the next morning we saw
+the sun rise behind the rugged outline of the Grand Canary island, and
+suddenly illuminate the Peak of Teneriffe, whilst the lower parts were
+veiled in fleecy clouds.  This was the first of many delightful days
+never to be forgotten. On the 16th of January, 1832, we anchored at
+Porto Praya, in St. Jago, the chief island of the Cape de Verd
+archipelago.
+The neighbourhood of Porto Praya, viewed from the sea, wears a desolate
+aspect.  The volcanic fires of a past age, and the scorching heat of a
+tropical sun, have in most places rendered the soil unfit for
+vegetation.  The country rises in successive steps of table-land,
+interspersed with some truncate conical hills, and the horizon is
+bounded by an irregular chain of more lofty mountains.  The scene, as
+beheld through the hazy atmosphere of this climate, is one of great
+interest; if, indeed, a person, fre Summarize.
+Here is a summary of the provided text from Chapter I of *The Voyage of the Beagle*:
+**Voyage Details and Objectives**
+*   **Ship and Command:** Her Majesty’s ship *Beagle*, a ten-gun brig, commanded by Captain Fitz Roy.
+*   **Departure:** Sailed from Devonport on December 27, 1831, after being delayed by gales.
+*   **Mission:** To complete the survey of Patagonia and Tierra del Fuego, survey the coasts of Chile and Peru, explore Pacific islands, and conduct chronometrical measurements around
+== micro-runq1 end 2026-11-22T12:24:38Z rc 0 load 8.00 12.79 14.20

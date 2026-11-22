@@ -1,0 +1,29 @@
+== runq-short start 2026-11-22T06:14:27Z load 3.38 11.44 12.50 avail 19.0G
+cmd: env OMP_NUM_THREADS=14 python3 -I ./scripts/s9c_bench.py --model ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf --serve-args --ctx 98304 --draft mtp -G 6 --tau 0.5 --repack -k q4-dot --slots 6 --parallel 4 --admit bound --kv-disk runs/kv-runq-short --kv-disk-max 10 --kv-disk-free 14 -v --short --think 1,0 --label runq-short --json runs/runq-short.json
+s9c_bench runq-short: ./runq serve ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf --ctx 98304 --draft mtp -G 6 --tau 0.5 --repack -k q4-dot --slots 6 --parallel 4 --admit bound --kv-disk runs/kv-runq-short --kv-disk-max 10 --kv-disk-free 14 -v --host 127.0.0.1 --port 0 --timeout 0 (loaded in 14.4 s)
+  think 1 greedy lcb1  1 client: 16.444 tok/s, prompt 869 (7806.816 ms), 512 tokens, model {'passes': 167, 'drafted': 426, 'accepted': 262}, mtp_approx 0
+  think 1 greedy lcb2  1 client: 15.463 tok/s, prompt 782 (7760.616 ms), 512 tokens, model {'passes': 156, 'drafted': 380, 'accepted': 245}, mtp_approx 0
+  think 1 greedy code  1 client: 18.189 tok/s, prompt 2478 (24021.241 ms), 74 tokens, model {'passes': 21, 'drafted': 89, 'accepted': 52}, mtp_approx 0
+  think 1 greedy tool  1 client: 18.459 tok/s, prompt 95 (1012.594 ms), 75 tokens, model {'passes': 20, 'drafted': 91, 'accepted': 47}, mtp_approx 0
+  think 1 seeded lcb1  1 client: 15.683 tok/s, prompt 5 (182.697 ms), 512 tokens, model {'passes': 161, 'drafted': 455, 'accepted': 273}, mtp_approx 0
+  think 1 seeded lcb2  1 client: 15.373 tok/s, prompt 5 (181.115 ms), 512 tokens, model {'passes': 184, 'drafted': 355, 'accepted': 210}, mtp_approx 0
+  think 1 seeded code  1 client: 23.925 tok/s, prompt 260 (2447.735 ms), 128 tokens, model {'passes': 27, 'drafted': 136, 'accepted': 97}, mtp_approx 0
+  think 1 seeded tool  1 client: 16.224 tok/s, prompt 95 (1085.859 ms), 57 tokens, model {'passes': 17, 'drafted': 75, 'accepted': 37}, mtp_approx 0
+  think 1 greedy 4 clients: 1173 tokens in 50.9 s = 23.04 tok/s
+  think 1 seeded 4 clients: 1209 tokens in 52.6 s = 22.99 tok/s
+  think 0 greedy lcb1  1 client: 19.208 tok/s, prompt 829 (7450.907 ms), 512 tokens, model {'passes': 148, 'drafted': 552, 'accepted': 345}, mtp_approx 0
+  think 0 greedy lcb2  1 client: 24.644 tok/s, prompt 784 (7342.043 ms), 512 tokens, model {'passes': 121, 'drafted': 508, 'accepted': 378}, mtp_approx 0
+  think 0 greedy code  1 client: 22.272 tok/s, prompt 2442 (23186.085 ms), 58 tokens, model {'passes': 14, 'drafted': 63, 'accepted': 44}, mtp_approx 0
+  think 0 greedy tool  1 client: 18.209 tok/s, prompt 97 (1054.314 ms), 28 tokens, model {'passes': 7, 'drafted': 31, 'accepted': 21}, mtp_approx 0
+  think 0 seeded lcb1  1 client: 20.968 tok/s, prompt 7 (225.83 ms), 512 tokens, model {'passes': 138, 'drafted': 539, 'accepted': 345}, mtp_approx 0
+  think 0 seeded lcb2  1 client: 20.733 tok/s, prompt 7 (243.36 ms), 512 tokens, model {'passes': 139, 'drafted': 553, 'accepted': 349}, mtp_approx 0
+  think 0 seeded code  1 client: 20.888 tok/s, prompt 262 (2524.225 ms), 60 tokens, model {'passes': 14, 'drafted': 62, 'accepted': 45}, mtp_approx 0
+  think 0 seeded tool  1 client: 22.775 tok/s, prompt 97 (1057.458 ms), 58 tokens, model {'passes': 12, 'drafted': 59, 'accepted': 42}, mtp_approx 0
+  think 0 greedy 4 clients: 1110 tokens in 41.1 s = 27.02 tok/s
+  think 0 seeded 4 clients: 1142 tokens in 45.0 s = 25.36 tok/s
+s9c_bench runq-short think1: 1 client mean 17.47 tok/s (8 requests); 4 clients greedy 23.037, seeded 22.986 tok/s
+s9c_bench runq-short think0: 1 client mean 21.212 tok/s (8 requests); 4 clients greedy 27.022, seeded 25.358 tok/s
+s9c_bench runq-short: peak VmHWM 17.40 GiB, committed 4.9162 GiB; server exit 0; 0 errors; runs/runq-short.json
+  [engine] speculation: 2208 passes with guesses (12962 rows); model 5610 / 8778 guesses accepted, lookup 35 / 59; draft 0 passes, 0 rows, 0.000 s; measured / calibrated costs x1.16 (target), x1.24 (draft)
+  [engine] mtp: A 9532 passes 11500 rows 30.386 s; B 1923 passes 16025 rows 5.774 s; steps 2778 527.301 s; approx 0; gaps 0
+== runq-short end 2026-11-22T06:23:37Z rc 0 load 13.98 14.23 13.61

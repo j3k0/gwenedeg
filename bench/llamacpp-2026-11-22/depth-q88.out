@@ -1,0 +1,9 @@
+== depth-q88 start 2026-11-22T11:56:44Z load 12.08 14.22 14.78 avail 20.9G
+cmd: llama.cpp/build/bin/llama-bench -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -fa on -ctk q8_0 -ctv q8_0 -t 14 -ub 512 -lm none --repack 0 -p 512 -n 32 -d 8192 -r 1
+| model                          |       size |     params | backend    | threads | type_k | type_v |  fa |         lm | rpk |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | -----: | -----: | --: | ---------: | --: | --------------: | -------------------: |
+| qwen35 27B IQ3_S - 3.4375 bpw  |  11.28 GiB |    27.32 B | CPU        |      14 |   q8_0 |   q8_0 |   1 |       none |   0 |   pp512 @ d8192 |         17.58 ± 0.00 |
+| qwen35 27B IQ3_S - 3.4375 bpw  |  11.28 GiB |    27.32 B | CPU        |      14 |   q8_0 |   q8_0 |   1 |       none |   0 |    tg32 @ d8192 |          3.25 ± 0.00 |
+
+build: 225a534 (50)
+== depth-q88 end 2026-11-22T12:02:17Z rc 0 load 14.50 14.44 14.68

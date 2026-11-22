@@ -1,0 +1,9 @@
+== ik1-long start 2026-11-22T12:50:53Z load 10.90 13.85 14.41 avail 21.2G
+cmd: python3 -I ./scripts/s9c_bench.py --model ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf --server-cmd ik_llama.cpp/build/bin/llama-server -m {model} -c 49152 -np 1 -t 14 -fa on -ctk q8_0 -ctv q4_0 -rtr -ub 1024 -b 2048 -cram 512 --spec-type mtp:n_max=6,p_min=0.5 --ctx-checkpoints 4 --jinja --host 127.0.0.1 --port {port} --long 32768 --turns 2 --label ik1-long --json runs/ik1-long.json
+s9c_bench ik1-long: ik_llama.cpp/build/bin/llama-server -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -c 49152 -np 1 -t 14 -fa on -ctk q8_0 -ctv q4_0 -rtr -ub 1024 -b 2048 -cram 512 --spec-type mtp:n_max=6,p_min=0.5 --ctx-checkpoints 4 --jinja --host 127.0.0.1 --port 58515 (loaded in 5.4 s)
+  long 32768 turn 0: wall 511.041 s, prefill 31755 tokens 309217.86 ms (cached None), decode 512 tokens 201715.175 ms (2.538 tok/s), model None, lookup None, plain passes None, mtp_approx None
+  long 32768 turn 1: wall 284.703 s, prefill 2549 tokens 35004.418 ms (cached None), decode 512 tokens 249566.503 ms (2.052 tok/s), model None, lookup None, plain passes None, mtp_approx None
+  long 32768 turn 2: wall 273.141 s, prefill 2510 tokens 35964.146 ms (cached None), decode 512 tokens 237008.472 ms (2.16 tok/s), model None, lookup None, plain passes None, mtp_approx None
+s9c_bench ik1-long long: cold prefill 31755 tokens 309217.86 ms; turns 0: wall 511.041 s (prefill 309217.86 ms, decode 201715.175 ms); 1: wall 284.703 s (prefill 35004.418 ms, decode 249566.503 ms); 2: wall 273.141 s (prefill 35964.146 ms, decode 237008.472 ms)
+s9c_bench ik1-long: peak VmHWM 17.73 GiB, committed 0 GiB; server exit 0; 0 errors; runs/ik1-long.json
+== ik1-long end 2026-11-22T13:08:49Z rc 0 load 9.70 10.73 12.21

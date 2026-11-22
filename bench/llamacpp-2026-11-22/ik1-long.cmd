@@ -1,0 +1,1 @@
+ik_llama.cpp/build/bin/llama-server -m {model} -c 49152 -np 1 -t 14 -fa on -ctk q8_0 -ctv q4_0 -rtr -ub 1024 -b 2048 -cram 512 --spec-type mtp:n_max=6,p_min=0.5 --ctx-checkpoints 4 --jinja --host 127.0.0.1 --port {port}

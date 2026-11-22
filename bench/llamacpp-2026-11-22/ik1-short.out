@@ -1,0 +1,27 @@
+== ik1-short start 2026-11-22T12:25:27Z load 6.11 11.75 13.78 avail 20.9G
+cmd: python3 -I ./scripts/s9c_bench.py --model ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf --server-cmd ik_llama.cpp/build/bin/llama-server -m {model} -c 16384 -np 1 -t 14 -fa on -ctk q8_0 -ctv q4_0 -rtr -ub 1024 -b 2048 -cram 512 --spec-type mtp:n_max=6,p_min=0.5 --ctx-checkpoints 4 --jinja --host 127.0.0.1 --port {port} --short --think 1,0 --label ik1-short --json runs/ik1-short.json
+s9c_bench ik1-short: ik_llama.cpp/build/bin/llama-server -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -c 16384 -np 1 -t 14 -fa on -ctk q8_0 -ctv q4_0 -rtr -ub 1024 -b 2048 -cram 512 --spec-type mtp:n_max=6,p_min=0.5 --ctx-checkpoints 4 --jinja --host 127.0.0.1 --port 41403 (loaded in 4.9 s)
+  think 1 greedy lcb1  1 client: 9.319 tok/s, prompt 869 (7422.276 ms), 512 tokens, model None, mtp_approx None
+  think 1 greedy lcb2  1 client: 8.692 tok/s, prompt 824 (6585.301 ms), 512 tokens, model None, mtp_approx None
+  think 1 greedy code  1 client: 12.005 tok/s, prompt 2478 (21030.502 ms), 512 tokens, model None, mtp_approx None
+  think 1 greedy tool  1 client: 10.999 tok/s, prompt 265 (2816.124 ms), 76 tokens, model None, mtp_approx None
+  think 1 seeded lcb1  1 client: 7.867 tok/s, prompt 869 (6537.772 ms), 512 tokens, model None, mtp_approx None
+  think 1 seeded lcb2  1 client: 6.676 tok/s, prompt 824 (6629.412 ms), 512 tokens, model None, mtp_approx None
+  think 1 seeded code  1 client: 8.51 tok/s, prompt 2478 (19134.419 ms), 512 tokens, model None, mtp_approx None
+  think 1 seeded tool  1 client: 12.426 tok/s, prompt 265 (2720.71 ms), 70 tokens, model None, mtp_approx None
+  think 1 greedy 4 clients: 1612 tokens in 202.0 s = 7.98 tok/s
+  think 1 seeded 4 clients: 1606 tokens in 243.5 s = 6.59 tok/s
+  think 0 greedy lcb1  1 client: 11.74 tok/s, prompt 829 (6780.762 ms), 512 tokens, model None, mtp_approx None
+  think 0 greedy lcb2  1 client: 12.38 tok/s, prompt 784 (5896.321 ms), 512 tokens, model None, mtp_approx None
+  think 0 greedy code  1 client: 11.1 tok/s, prompt 2442 (18408.415 ms), 59 tokens, model None, mtp_approx None
+  think 0 greedy tool  1 client: 13.749 tok/s, prompt 229 (2391.28 ms), 29 tokens, model None, mtp_approx None
+  think 0 seeded lcb1  1 client: 10.939 tok/s, prompt 829 (6173.783 ms), 512 tokens, model None, mtp_approx None
+  think 0 seeded lcb2  1 client: 10.298 tok/s, prompt 784 (6180.678 ms), 512 tokens, model None, mtp_approx None
+  think 0 seeded code  1 client: 12.561 tok/s, prompt 2442 (18300.46 ms), 512 tokens, model None, mtp_approx None
+  think 0 seeded tool  1 client: 7.662 tok/s, prompt 229 (3279.836 ms), 29 tokens, model None, mtp_approx None
+  think 0 greedy 4 clients: 1112 tokens in 146.3 s = 7.60 tok/s
+  think 0 seeded 4 clients: 1565 tokens in 163.0 s = 9.60 tok/s
+s9c_bench ik1-short think1: 1 client mean 9.562 tok/s (8 requests); 4 clients greedy 7.982, seeded 6.594 tok/s
+s9c_bench ik1-short think0: 1 client mean 11.304 tok/s (8 requests); 4 clients greedy 7.598, seeded 9.598 tok/s
+s9c_bench ik1-short: peak VmHWM 17.67 GiB, committed 0 GiB; server exit 0; 0 errors; runs/ik1-short.json
+== ik1-short end 2026-11-22T12:50:38Z rc 0 load 13.90 14.55 14.64

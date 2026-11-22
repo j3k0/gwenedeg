@@ -1,0 +1,9 @@
+== lc1f16-long start 2026-11-22T12:02:25Z load 13.50 14.23 14.62 avail 21.0G
+cmd: python3 -I ./scripts/s9c_bench.py --model ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf --server-cmd llama.cpp/build/bin/llama-server -m {model} -c 49152 -np 1 -t 14 -fa on -ctk f16 -ctv f16 -ub 512 -b 2048 -lm none --no-repack --ctx-checkpoints 4 -cram 512 --jinja --host 127.0.0.1 --port {port} --long 32768 --turns 2 --label lc1f16-long --json runs/lc1f16-long.json
+s9c_bench lc1f16-long: llama.cpp/build/bin/llama-server -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -c 49152 -np 1 -t 14 -fa on -ctk f16 -ctv f16 -ub 512 -b 2048 -lm none --no-repack --ctx-checkpoints 4 -cram 512 --jinja --host 127.0.0.1 --port 57675 (loaded in 11.6 s)
+  long 32768 turn 0: wall 815.47 s, prefill 31755 tokens 681735.782 ms (cached 0), decode 512 tokens 133701.922 ms (3.829 tok/s), model None, lookup None, plain passes None, mtp_approx None
+  long 32768 turn 1: wall 218.455 s, prefill 2548 tokens 83851.795 ms (cached 31751), decode 512 tokens 134566.128 ms (3.805 tok/s), model None, lookup None, plain passes None, mtp_approx None
+  long 32768 turn 2: wall 223.52 s, prefill 2535 tokens 91518.067 ms (cached 34295), decode 512 tokens 131965.365 ms (3.88 tok/s), model None, lookup None, plain passes None, mtp_approx None
+s9c_bench lc1f16-long long: cold prefill 31755 tokens 681735.782 ms; turns 0: wall 815.47 s (prefill 681735.782 ms, decode 133701.922 ms); 1: wall 218.455 s (prefill 83851.795 ms, decode 134566.128 ms); 2: wall 223.52 s (prefill 91518.067 ms, decode 131965.365 ms)
+s9c_bench lc1f16-long: peak VmHWM 15.00 GiB, committed 0 GiB; server exit 0; 0 errors; runs/lc1f16-long.json
+== lc1f16-long end 2026-11-22T12:23:36Z rc 0 load 14.83 15.01 14.97

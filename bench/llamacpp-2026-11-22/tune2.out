@@ -1,0 +1,11 @@
+== tune2 start 2026-11-22T06:05:44Z load 17.92 17.76 13.20 avail 18.7G
+cmd: llama.cpp/build/bin/llama-bench -m ./models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf -fa on -ctk q8_0 -ctv q4_0 -t 14 -ub 2048 -p 2048 -n 64 -r 2 --repack 0,1 -v
+| model                          |       size |     params | backend    | threads | n_ubatch | type_k | type_v |  fa | rpk |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | -------: | -----: | -----: | --: | --: | --------------: | -------------------: |
+| qwen35 27B IQ3_S - 3.4375 bpw  |  11.28 GiB |    27.32 B | CPU        |      14 |     2048 |   q8_0 |   q4_0 |   1 |   0 |          pp2048 |         55.31 ± 0.67 |
+| qwen35 27B IQ3_S - 3.4375 bpw  |  11.28 GiB |    27.32 B | CPU        |      14 |     2048 |   q8_0 |   q4_0 |   1 |   0 |            tg64 |          5.00 ± 0.26 |
+| qwen35 27B IQ3_S - 3.4375 bpw  |  11.28 GiB |    27.32 B | CPU        |      14 |     2048 |   q8_0 |   q4_0 |   1 |   1 |          pp2048 |         51.91 ± 0.88 |
+| qwen35 27B IQ3_S - 3.4375 bpw  |  11.28 GiB |    27.32 B | CPU        |      14 |     2048 |   q8_0 |   q4_0 |   1 |   1 |            tg64 |          4.88 ± 0.00 |
+
+build: 225a534 (50)
+== tune2 end 2026-11-22T06:10:30Z rc 0 load 15.23 15.85 13.59

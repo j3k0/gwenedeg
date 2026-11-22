@@ -8,11 +8,14 @@ measurements are only in [History](#history-earlier-measurements) and are labell
 (The project was called cwayn when these sessions ran; the raw logs in `bench/` have the new name and
 generic paths, nothing measured was changed.)
 
-The [Qwen3.8-27B vs ik_llama.cpp section](#qwen38-27b-iq3_s-vs-ik_llamacpp-server-workloads-2026-11-21) is a
-different model, comparison and session (2026-11-21) and is not comparable with the tables above either.
+The [Qwen3.8-27B: runq vs llama.cpp vs ik_llama.cpp section](#qwen38-27b-iq3_s-runq-vs-llamacpp-vs-ik_llamacpp-server-workloads-2026-11-22)
+is a different model, comparison and session (2026-11-22) and is not comparable with the tables above either. The
+[Qwen3.8-27B vs ik_llama.cpp section](#qwen38-27b-iq3_s-vs-ik_llamacpp-server-workloads-2026-11-21) is the same model
+a day earlier, before the i-quant tiled GEMM: its runq numbers are superseded by the 2026-11-22 ones.
 
 The [i-quant tiled GEMM section](#qwen38-27b-iq3_s-prefill-with-the-i-quant-tiled-gemm-2026-11-21) is a
-before / after of one change on that model (2026-11-21, a later window), not comparable with the 0.6B tables either.
+before / after of one change on that model (2026-11-21, a later window), not comparable with the 0.6B tables either;
+its "not re-run" estimate is now measured in the 2026-11-22 section.
 
 The [all-models table](#all-model-files-on-the-epyc-vm-2026-10-26-to-2026-10-30) and the [batched-decode
 table](#batched-decode-aggregate-toks-step-10a-2026-10-26) are from other days on the same VM (dated in each) and are not
@@ -135,6 +138,89 @@ VNNI weights (~630 MB, ~55 ms to pack). mynah-slm reports a 0.14-0.15 s model lo
 - mynah-slm decode is flat from 4 threads; its Q4_K_M (0.40 GB) is no faster than Q8_0 here, so it
   is compute-bound (~13 GB/s), not bandwidth-bound.
 
+## Qwen3.8-27B (IQ3_S): runq vs llama.cpp vs ik_llama.cpp, server workloads (2026-11-22)
+
+The same model, prompts and harness as the section below, a different day: mainline **llama.cpp** added, **runq
+re-measured at current main** (the numbers below were of `13d55a5`, before the i-quant tiled GEMM), and ik_llama.cpp's
+`--short` and `--long` re-run with the same commands so all three columns come from one day. Raw data, commands and
+tuning: [bench/llamacpp-2026-11-22/](bench/llamacpp-2026-11-22/).
+
+| | |
+|---|---|
+| CPU | AMD EPYC Genoa (Zen 4), 16 vCPUs, 32 MB L3, 30 GB RAM, AVX-512 VNNI / VBMI / BF16 (the same KVM VM as below; only the daytime runq server stopped for the day, other services running: 1-min load 1-20, see Caveats) |
+| model | `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` (3.44 bpw, 12.1 GB, with its MTP block), thinking on and off |
+| runq | `50ba538` (main + the i-quant tiled GEMM), gcc 14.2.0; `runq serve --ctx 98304 --draft mtp -G 6 --tau 0.5 --repack -k q4-dot --slots 6 --parallel 4 --admit bound`, 14 threads, `--kv-disk` in a temporary directory (the production arguments) |
+| llama.cpp | `225a5345bbb0` (master of 2026-11-22 03:25Z), Release, `-DGGML_NATIVE=ON`, gcc 14.2.0 (`-march=native`; `ggml_cpu_has_avx512 / _vnni / _vbmi / _bf16` all 1); `llama-server -t 14 -fa on -ctk q8_0 -ctv q4_0 -ub 512 -b 2048 -lm none --no-repack --ctx-checkpoints 4 -cram 512 --jinja`, `-np 1` / `-np 4` at `-c 98304`, 14 threads. Tuned with `llama-bench` (threads, ubatch, repacking, mmap) and a server draft-length probe: [tune.md](bench/llamacpp-2026-11-22/tune.md) |
+| ik_llama.cpp | `ac8d544b` (2026-11-19), the build and commands of the section below: `llama-server -fa on -ctk q8_0 -ctv q4_0 -rtr -ub 1024 -b 2048 -t 14 --spec-type mtp:n_max=6,p_min=0.5 --ctx-checkpoints 4 --jinja -cram 512`, `-c 16384` (`--short`) / `-c 49152` (`--long`), 1 slot + MTP |
+| equal settings | 14 threads; KV cache 8-bit K + 4-bit V for the main tables (runq `q4-dot` = mainline / ik `q8_0` K / `q4_0` V: equal bit widths, not the same quantizer; mainline with an f16 cache also measured at 32k); greedy and seeded (T 1, top-p 0.95, top-k 20, seed 42); `scripts/s9c_bench.py` unchanged, `--server-cmd` for the other engines; 22 GB memory cap, no swap, one model process at a time, the bench lock held |
+| speculative decoding | runq: MTP, up to 6 guesses, tau 0.5. Mainline runs this file's MTP block (`--spec-type draft-mtp`, also with several slots; the drafts are accepted), but every draft length of 1-6 decoded **slower** than no drafting on this CPU, so its runs below have **no MTP**; ik: MTP as before |
+| prompts | as below: `bench/s9c/`, two LiveCodeBench-shaped prompts and two agent-shaped ones, `max_tokens` 512; a 31,755-token cold prompt + 2 follow-up turns of ~2,500 new tokens |
+
+**Short requests** (tok/s per request, mean of 8 at one client; 4 clients: aggregate tokens / the round's wall time):
+
+| | runq | llama.cpp, 1 slot | llama.cpp, 4 slots | ik_llama.cpp, 1 slot + MTP |
+|---|---|---|---|---|
+| thinking on, 1 client | **17.5** | 3.5 | 4.4 | 9.6 |
+| thinking on, 4 clients (greedy / seeded) | **23.0 / 23.0** | 2.7 / 2.7 (queued behind one slot) | 4.7 / 4.2 | 8.0 / 6.6 (queued) |
+| thinking off, 1 client | **21.2** | 3.7 | 3.7 | 11.3 |
+| thinking off, 4 clients (greedy / seeded) | **27.0 / 25.4** | 3.0 / 3.0 (queued) | 3.3 / 3.7 | 7.6 / 9.6 (queued) |
+| prefill, 0.8-2.5k-token prompts, tok/s | 101-111 | 48-58 | 49-55 | **117-125** |
+| peak RSS (GiB) | 17.4 (98k context) | 14.7 (98k) | 15.9 (98k) | 17.7 (16k) |
+
+**Long context** (the 31,755-token cold prompt, then two turns adding ~2,500 tokens each; thinking on, greedy, 512 new
+tokens):
+
+| | runq | llama.cpp, q8_0 / q4_0 cache | llama.cpp, f16 / f16 cache (`-c 49152`) | ik_llama.cpp, q8_0 / q4_0 |
+|---|---|---|---|---|
+| cold prefill (31,755 tokens) | 391 s (81 tok/s) | 5,057 s (6.3 tok/s) | 682 s (47 tok/s) | **309 s (103 tok/s)** |
+| decode, cold turn | **14.0 tok/s** | 1.56 | 3.83 | 2.54 |
+| decode, follow-up turns | **14.8 / 14.5 tok/s** | 1.52 / 1.46 | 3.81 / 3.88 | 2.05 / 2.16 |
+| prefill of a follow-up turn's ~2.5k new tokens | 37.4 / 39.4 s (the 31-34k cached prefix reused) | 924 / 1,006 s (a checkpoint restored: the same `cache_n` as runq) | 83.9 / 91.5 s | **35.0 / 36.0 s** (checkpoint restored) |
+| a follow-up turn, wall | **72 / 75 s** | 1,261 / 1,357 s | 218 / 224 s | 285 / 273 s |
+| peak RSS (GiB) | 16.0 (98k context) | 14.4 (98k) | 15.0 (49k) | 17.7 (49k) |
+
+Mainline's quantized-cache attention is its own bottleneck at depth (`llama-bench`, pp512 / tg32 at an 8k depth: q8_0 /
+q4_0 14.3 / 3.40, q8_0 / q8_0 17.6 / 3.25, f16 / f16 62.7 / 4.48 tok/s; [depth.md](bench/llamacpp-2026-11-22/depth.md)): with the equal-bit-width cache its
+2,048-token batches fall from 45 tok/s to 3 tok/s over the 32k prompt. The f16 column is therefore mainline's better
+configuration for this session, and the one the long-context ratios below use.
+
+**Quality, the same tokens and context** (the first-chunk perplexity of the 2026-11-21 protocol, 8-bit K / 4-bit V in
+all three): prose runq 9.483, mainline 9.480, ik 9.493 (2026-11-21); code runq 7.133, mainline 7.141, ik 7.145:
+mainline within 0.03-0.11% of runq, ik within 0.1-0.2% — the same quality.
+
+**`llama-bench` micro line** (pp512 / tg128, 14 threads, q8_0 K / q4_0 V, no drafting; 06:10-06:13Z): mainline 68.5 /
+4.86, ik 124.2 / 5.13. runq's equivalent is its CLI on a 524-token prompt, 128 new tokens, plain decoding (`--repack`,
+`q4-dot`, 2 runs): **107-110 / 13.8-15.1**.
+
+**Reading** (against each engine's better configuration per row): runq decodes **4.0-5.7x** faster than mainline on
+short requests at one client and **4.9-8.1x** with 4 clients (against its 4 slots; 8.4-8.9x against its 1 slot),
+**3.7-3.9x** faster than mainline's f16-cache configuration at 32-37k context, and prefills short prompts **1.8-2.4x**
+faster and the cold 32k prompt **1.7x** faster than that f16 configuration (12.9x against its equal-bit-width cache); a
+follow-up turn on the 32k session finishes 3.0x sooner (17-18x against the q8_0 / q4_0 cache). Against ik_llama.cpp,
+runs of the same day: runq decodes 1.8-1.9x faster at one client, 2.6-3.6x with 4 clients, 5.5-7.2x at 32k context,
+and a follow-up turn finishes 3.7-4.0x sooner; **ik prefills faster**, less so than before the tiled GEMM: runq's
+short-prompt prefill is **0.79-0.95x** of ik's per identical request (101-111 vs 117-125 tok/s; about 0.7x, 81-84 vs
+110-118, on 2026-11-21), its cold 32k prefill **0.79x** (391 s vs 309 s; 471 vs 319 s on 2026-11-21), a follow-up
+turn's 2.5k tokens 0.91-0.94x (37-39 s vs 35-36 s). Quality is equal.
+
+**Caveats**
+- One run per cell, a shared VM (1-min load 1-20 over the day, other users' jobs; each run's start / end load in
+  `bench/llamacpp-2026-11-22/runs.log`, the minute-by-minute log in `loadavg.txt`): differences of a few tens of
+  percent are noise, the 3-9x ones are not. runq's short decode today (17.5 / 21.2) is 6% below its 2026-11-21 number
+  (18.6 / 21.8), its short prefill up 1.24x, its cold 32k prefill down 17% (471 s to 391 s). ik's re-run moved by
+  similar amounts (short decode 7.8 / 11.2 to 9.6 / 11.3, cold 32k 319 s to 309 s).
+- runq's `--long` ran with `--turns 3` (one more follow-up than the others, 74 s wall, in its JSON); turns 0-2 are
+  compared.
+- llama.cpp and ik_llama.cpp were configured by us from their docs and tuned with `llama-bench`; their authors may know
+  better settings. Mainline's MTP slowdown is measured, not explained (a k+1-token verification pass costs about as
+  much as k+1 single-token passes here); its quantized-cache slowdown at depth shows in `llama-bench` alone.
+- Equal KV bit widths, not the same quantizer, for the main tables; the f16 column is not bit-width-equal and is the
+  one to read for mainline's best 32k result.
+- Mainline is not slower for lack of context: both its servers ran at 98,304 positions with the full model and the
+  q8_0 / q4_0 cache (peak RSS 14.7-15.9 GiB). ik could not (its OOMs of 2026-11-21); its 16k / 48k contexts do not
+  change its speed at those depths.
+- Not measured: vLLM's CPU backend, other engines, other CPUs.
+
 ## Qwen3.8-27B (IQ3_S) vs ik_llama.cpp, server workloads (2026-11-21)
 
 A different session, model and comparison from everything above: not comparable with the 0.6B tables. One engine
@@ -191,6 +277,11 @@ equal. Neither gap was profiled: ik's decode without MTP (`llama-bench` tg64, 5.
 plain decode of earlier sessions, and its MTP decode drops sharply with depth (2-2.4 tok/s at 32k); its prefill is
 the part runq could learn from.
 
+Superseded for runq: [the 2026-11-22 section](#qwen38-27b-iq3_s-runq-vs-llamacpp-vs-ik_llamacpp-server-workloads-2026-11-22)
+re-ran runq at current main (with the tiled GEMM: short-prompt prefill 101-111 tok/s here to 81-84 below), re-ran this
+section's ik commands the same day, and added mainline llama.cpp. This section stays for ik's setup, its OOMs at 98k
+context and the session-to-session spread.
+
 **Caveats**
 - One run per cell, a shared box (1-min load 0.5-6.5 over the window, from other users' jobs; the same window for both
   engines but not simultaneous): differences of a few tens of percent are noise, the 2-8x ones are not. runq's numbers
@@ -239,13 +330,16 @@ One change measured before / after on the same file as the section above: the pr
   norms are ~7% at this length, unchanged.
 - **Chunk size:** `-b` 256 / 512 / 1024 / 2048 (4,113 tokens, 14 threads): 99.9 / 103.9 / 100.1 / 95.4 tok/s.
 - **Reading:** at 14 threads runq's short-prompt prefill moves from ik_llama.cpp's 0.7x to ~0.9x on this file (CLI
-  numbers here vs the server numbers of the section above, 110-118 tok/s; not the same harness, so an estimate).
+  numbers here vs the server numbers of the section above, 110-118 tok/s; not the same harness, so an estimate; the
+  next day's server re-run gives 0.79-0.95x).
   `--repack` no longer changes prefill; it still speeds up decode.
 
 **Caveats**
 - Two runs per cell on a shared box: base's runs spread 2-9%, so the speed-ups are good to about ±5%.
-- The CLI, not the server: the server workloads above (short prompts, the 32k cold prefill) were not re-run. At 32k the
-  attention share is larger and the gain smaller.
+- The CLI, not the server. The server workloads were re-run the next day ([the 2026-11-22
+  section](#qwen38-27b-iq3_s-runq-vs-llamacpp-vs-ik_llamacpp-server-workloads-2026-11-22)): short-prompt prefill
+  101-111 tok/s against ik's 117-125 (0.79-0.95x per request), the cold 32k prompt 391 s against ik's 319 s below. At
+  32k the attention share is larger and the gain smaller.
 - The GEMM phases gained 1.32x where the 8-thread micro-benchmark predicts ~1.5x for this type mix; not yet explained
   (PP-RESULTS.md lists the likely causes).
 

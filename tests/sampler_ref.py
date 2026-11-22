@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """The sampler's top-k path (src/sampler.c, sample_topk) replayed in numpy, draw for draw (TODO P5).
 
-  tests/sampler_ref.py --runq ./runq --api-test build/api_test [--api-test build/api_test-generic] --model MODEL
+  tests/sampler_ref.py --gwenedeg ./gwenedeg --api-test build/api_test [--api-test build/api_test-generic] --model MODEL
                        [--draws N] [--tmp DIR] [-v]
 
-Recorded logits: `runq -m logits` on a short prompt (every row), plus rows with ties made from them (values
+Recorded logits: `gwenedeg -m logits` on a short prompt (every row), plus rows with ties made from them (values
 rounded to 1/2, the top 40 set equal, all equal, a masked-like row). `api_test MODEL --sample FILE T:P:K:N ...`
 samples each row N times per setting, draw j of row r with the RNG seeded 1000003 r + j + 1; this script
 computes the same draws from the same logits and seeds and requires the very same token for every draw, in
@@ -150,13 +150,16 @@ def tie_rows(lg):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--runq", required=True)
+    ap.add_argument("--gwenedeg")  # (required; --runq below: its deprecated name, before 2026-11-22)
+    ap.add_argument("--runq", dest="gwenedeg", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     ap.add_argument("--api-test", action="append", required=True)
     ap.add_argument("--model", required=True)
     ap.add_argument("--draws", type=int, default=150, help="draws per row and setting")
     ap.add_argument("--tmp", default=None)
     ap.add_argument("-v", action="store_true")
     a = ap.parse_args()
+    if not a.gwenedeg:
+        ap.error("the following arguments are required: --gwenedeg")
     fails = 0
 
     def report(ok, name, detail):
@@ -167,9 +170,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix="sampler-ref-", dir=a.tmp) as tmp:
         path = os.path.join(tmp, "rec.logits")
         env = dict(os.environ, OMP_NUM_THREADS="2")
-        p = subprocess.run([a.runq, a.model, "-m", "logits", "-i", PROMPT, "-o", path], capture_output=True, env=env)
+        p = subprocess.run([a.gwenedeg, a.model, "-m", "logits", "-i", PROMPT, "-o", path], capture_output=True, env=env)
         if p.returncode != 0:
-            report(False, "sampler/logits", f"runq -m logits: exit status {p.returncode}: {p.stderr.decode(errors='replace')[-300:]}")
+            report(False, "sampler/logits", f"gwenedeg -m logits: exit status {p.returncode}: {p.stderr.decode(errors='replace')[-300:]}")
             return 1
         _, lg = read_logits(path)
         rows = np.concatenate([lg, tie_rows(lg)])

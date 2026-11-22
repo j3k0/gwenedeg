@@ -7,9 +7,9 @@
 #                                      scripts/download_models.py family; slow, minutes; make test-models)
 #        tests/run_tests.sh --long-context   the long-context checks only (group long, tests/check_long.py: Qwen3.5
 #                                      at up to 98k positions; ~15-20 min; TMPDIR=/var/tmp where /tmp is small)
-# Env:   OMP_NUM_THREADS (default 8), RUNQ (binary to test, default ./runq, built with make),
-#        RUNQ_GENERIC (generic-kernel build to compare with, default ./runq-generic when RUNQ is
-#        not set; with RUNQ set and RUNQ_GENERIC unset the kernels test is skipped; with RUNQ set the
+# Env:   OMP_NUM_THREADS (default 8), GWENEDEG_BIN (binary to test, default ./gwenedeg, built with make),
+#        GWENEDEG_GENERIC (generic-kernel build to compare with, default ./gwenedeg-generic when GWENEDEG_BIN is
+#        not set; with GWENEDEG_BIN set and GWENEDEG_GENERIC unset the kernels test is skipped; with GWENEDEG_BIN set the
 #        api test is skipped too: it links the library objects of this tree),
 #        GGUF (GGUF Q8_0 file for the gguf tests, default models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf;
 #        skipped if missing), Q4 (GGUF Q4_K_M file for the q4 tests, default
@@ -18,6 +18,8 @@
 #        GWENEDEG_TEST_PROCS=N: at most N test processes at a time (tests/procslots.py; default: no cap,
 #        ~25 model processes at the start, ~12-16 GB); N=6 fits a 10 GB memory cap (systemd-run -p MemoryMax=10G).
 set -euo pipefail
+# (deprecated: RUNQ / RUNQ_GENERIC, the names before 2026-11-22, when the binary was runq)
+GWENEDEG_BIN="${GWENEDEG_BIN:-${RUNQ:-}}" GWENEDEG_GENERIC="${GWENEDEG_GENERIC:-${RUNQ_GENERIC:-}}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
@@ -45,12 +47,12 @@ fi
 
 API_TEST=""
 V1REF=""
-if [[ -z "${RUNQ:-}" ]]; then
-    make -s -j8 runq runq-generic api-test tools-test
+if [[ -z "$GWENEDEG_BIN" ]]; then
+    make -s -j8 gwenedeg gwenedeg-generic api-test tools-test
     if [[ "$(uname -m)" == x86_64 ]]; then make -s -j8 build/bf16dp_test build/bf16dp_test-emu; fi
     if grep -qw avx512_vnni /proc/cpuinfo 2>/dev/null; then make -s build/iq_repack_test build/iq_gemm_test; fi # (--repack's kernels, the i-quant GEMM)
-    RUNQ="$ROOT/runq"
-    RUNQ_GENERIC="${RUNQ_GENERIC:-$ROOT/runq-generic}"
+    GWENEDEG_BIN="$ROOT/gwenedeg"
+    GWENEDEG_GENERIC="${GWENEDEG_GENERIC:-$ROOT/gwenedeg-generic}"
     API_TEST="$ROOT/build/api_test"
     # (the seqfile checks against the files of a build before TODO S9c.2: its api_test, built once)
     if git -C "$ROOT" cat-file -e "${SEQFILE_V1REF_COMMIT:-915894a}^{commit}" 2>/dev/null; then
@@ -76,5 +78,5 @@ for x in "$@"; do
 done
 set -- "${ARGS[@]+"${ARGS[@]}"}"
 if [[ $LONG == 1 ]]; then make -s -j8 long-ctx; fi
-exec "${PY[@]}" tests/check.py --runq "$RUNQ" --generic "${RUNQ_GENERIC:-}" --model "$MODEL" --gguf "$GGUF" --q4 "$Q4" \
+exec "${PY[@]}" tests/check.py --gwenedeg "$GWENEDEG_BIN" --generic "${GWENEDEG_GENERIC:-}" --model "$MODEL" --gguf "$GGUF" --q4 "$Q4" \
     --api-test "$API_TEST" --v1ref-api-test "$V1REF" --q35 "$Q35" "$@"

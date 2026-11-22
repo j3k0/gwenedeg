@@ -14,27 +14,27 @@ Templates (tests/golden/templates, the chat_template of each HF repo's tokenizer
 Tokenizer: models/Qwen3-0.6B (the Qwen3 family shares tokenizer.json); models/Qwen3.5-0.8B for qwen3.5 and qwen3.8
 (the 27B GGUF's tokens and merges are the 0.8B's).
 
-For each variant, thinking mode (0 / 1) and conversation: `text` / `ids` = what runq's rq_chat_render must give
-(`runq -m render`, checked by tests/check_models.py on tokenizer-only GGUFs carrying each template), built here
-from runq's documented canonical form (src/runq.h, src/chat.c); `hf` = whether that equals HF's
+For each variant, thinking mode (0 / 1) and conversation: `text` / `ids` = what gwenedeg's rq_chat_render must give
+(`gwenedeg -m render`, checked by tests/check_models.py on tokenizer-only GGUFs carrying each template), built here
+from gwenedeg's documented canonical form (src/gwenedeg.h, src/chat.c); `hf` = whether that equals HF's
 apply_chat_template(add_generation_prompt=True, enable_thinking=thinking) (asserted for the cases marked so).
 The known differences, by design: the hybrid template with thinking off keeps the empty think block in every
 user turn and earlier replies verbatim (the CLI keeps the conversation in the KV cache as generated; HF drops
-both from earlier turns); Thinking-2507 with thinking off is not in its template (runq serve's constrained
+both from earlier turns); Thinking-2507 with thinking off is not in its template (gwenedeg serve's constrained
 replies only). Qwen3.5 renders as Thinking-2507 with thinking on and as the hybrid with it off (the same known
 difference), and trims every message text (|trim).
 Qwen3.8, per conversation thinking off and on with each reasoning effort (xhigh: the default, no reasoning_effort
 passed; medium; low): equal to HF's rendering (reasoning_effort, enable_thinking) everywhere, except one intended
-difference: an assistant text with "</think>" is runq's reasoning + answer (the CLI's replies are so), which HF's
+difference: an assistant text with "</think>" is gwenedeg's reasoning + answer (the CLI's replies are so), which HF's
 template renders as its reasoning_content + content; given the message's content alone it would put an empty think
-block in front of the whole text ("hf_reasoning_content": runq's form == HF's with the message split so). Qwen's own
+block in front of the whole text ("hf_reasoning_content": gwenedeg's form == HF's with the message split so). Qwen's own
 template (qwen3.8-hf.jinja) gives the same as Unsloth's except where Unsloth's adds features (developer role,
 several system messages: "hf_qwen" false / null for an error).
-Tool calls (runq serve with tools, src/tools.c; Qwen3.5 and Qwen3.8): the cases with a "request" (an OpenAI chat completion
+Tool calls (gwenedeg serve with tools, src/tools.c; Qwen3.5 and Qwen3.8): the cases with a "request" (an OpenAI chat completion
 body: tools, tool messages, assistant tool_calls with their arguments as a JSON string, reasoning_content, content parts)
-rendered by `runq -m render` as runq serve renders it; `text` = HF's apply_chat_template of the same conversation, the
+rendered by `gwenedeg -m render` as gwenedeg serve renders it; `text` = HF's apply_chat_template of the same conversation, the
 arguments parsed into objects first (as vLLM does), thinking per chat_template_kwargs.enable_thinking (Qwen3.8 also its
-reasoning_effort): runq's rendering must equal HF's.
+reasoning_effort): gwenedeg's rendering must equal HF's.
 """
 import json
 import os
@@ -71,8 +71,8 @@ CONVERSATIONS_38 = CONVERSATIONS + [
 EFFORTS_38 = [(0, None), (1, None), (1, "medium"), (1, "low"), (1, "high")]  # (thinking, reasoning_effort): None = default
 
 
-def runq_text_38(thinking, effort, msgs):
-    """Qwen3.8's form in runq (src/chat.c): the effort instruction + the merged leading system / developer messages,
+def gwenedeg_text_38(thinking, effort, msgs):
+    """Qwen3.8's form in gwenedeg (src/chat.c): the effort instruction + the merged leading system / developer messages,
     user turns as Qwen3.5's, every assistant text as "<think>\n" R "\n</think>\n\n" C (split at its last </think>)"""
     msgs = [(r, t.strip()) for r, t in msgs]
     ins = "" if not thinking or effort == "medium" else LOW_38 if effort == "low" else XHIGH_38
@@ -126,8 +126,8 @@ def hf_38(tok, tmpl, conv, thinking, effort, split):
         return None
 
 
-def runq_text(variant, thinking, msgs):
-    """runq's canonical rendering (src/chat.c): [system] + per user message P_i (+ the variant's generation
+def gwenedeg_text(variant, thinking, msgs):
+    """gwenedeg's canonical rendering (src/chat.c): [system] + per user message P_i (+ the variant's generation
     suffix; in an answered turn only the empty think block stays, Thinking-2507's "<think>\\n" does not), per
     assistant message its text (after the last </think>, leading newlines stripped, when the mode thinks) +
     <|im_end|>\\n"""
@@ -196,7 +196,7 @@ TOOL_CASES = [  # (name, tools, messages)
     ("tool_response_user", TOOLS, [U, {"role": "assistant", "content": "", "tool_calls": [CALL_READ]},
                                    {"role": "user", "content": "<tool_response>\nhello\n</tool_response>"}]),
 ]
-TOOL_CASES_35 = [  # (Qwen3.5 only: its split of an assistant text at </think>; runq's Qwen3.8 form differs, src/chat.c)
+TOOL_CASES_35 = [  # (Qwen3.5 only: its split of an assistant text at </think>; gwenedeg's Qwen3.8 form differs, src/chat.c)
     ("tool_think_text", TOOLS, [U, {"role": "assistant", "content": "<think>\nLet me see.\n</think>\n\nI will read it.",
                                     "tool_calls": [CALL_READ]}, {"role": "tool", "tool_call_id": "call_1", "content": "hi"}]),
 ]
@@ -260,12 +260,12 @@ def main():
                 tmpl_qwen = f.read()
             for thinking, effort in EFFORTS_38:
                 for name, conv in CONVERSATIONS_38:
-                    text = runq_text_38(thinking, effort, conv)
+                    text = gwenedeg_text_38(thinking, effort, conv)
                     hf, hf_rc, hf_q = (hf_38(tok, t, conv, thinking, effort, sp)
                                        for t, sp in ((tmpl, False), (tmpl, True), (tmpl_qwen, True)))
                     split = any(r == "assistant" and "</think>" in c for r, c in conv)
                     if text != hf_rc or (text != hf) != split:
-                        sys.exit(f"{v} thinking {thinking} {effort} {name}: runq's form != HF's\n  runq {text!r}\n  hf   {hf!r}"
+                        sys.exit(f"{v} thinking {thinking} {effort} {name}: gwenedeg's form != HF's\n  gwenedeg {text!r}\n  hf   {hf!r}"
                                  f"\n  hf (reasoning_content) {hf_rc!r}")
                     c = {"variant": v, "thinking": thinking, "name": name if effort is None else f"{name}_{effort}",
                          "messages": [{"role": r, "content": t} for r, t in conv], "text": text,
@@ -284,11 +284,11 @@ def main():
                 msgs = [{"role": r, "content": c} for r, c in conv]
                 hf = tok.apply_chat_template(msgs, chat_template=tmpl, tokenize=False, add_generation_prompt=True,
                                              enable_thinking=bool(thinking))
-                text = runq_text(v, thinking, conv)
+                text = gwenedeg_text(v, thinking, conv)
                 expect_hf = not (v in ("qwen3", "qwen3.5") and not thinking and any(r == "assistant" for r, _ in conv)) and \
                     not (v == "thinking-2507" and not thinking)
                 if expect_hf and text != hf:
-                    sys.exit(f"{v} thinking {thinking} {name}: runq's form != HF's\n  runq {text!r}\n  hf   {hf!r}")
+                    sys.exit(f"{v} thinking {thinking} {name}: gwenedeg's form != HF's\n  gwenedeg {text!r}\n  hf   {hf!r}")
                 c = {"variant": v, "thinking": thinking, "name": name, "messages": msgs, "text": text,
                      "ids": tok.encode(text, add_special_tokens=False), "hf": text == hf}
                 if text != hf:

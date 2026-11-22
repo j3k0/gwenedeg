@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""On-demand tokenizer fuzz test: runq -m tokenize vs the HF tokenizer (not in the fast suite).
+"""On-demand tokenizer fuzz test: gwenedeg -m tokenize vs the HF tokenizer (not in the fast suite).
 
 Usage: .venv/bin/python tests/fuzz_tokenizer.py [-n 5000] [--seed 1] [--jobs 8] [--show 5]
        .venv/bin/python tests/fuzz_tokenizer.py --nfc-all     (exhaustive NFC check, see below)
        .venv/bin/python tests/fuzz_tokenizer.py --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf
-                                                     (the tokenizer runq builds from GGUF metadata)
+                                                     (the tokenizer gwenedeg builds from GGUF metadata)
        .venv/bin/python tests/fuzz_tokenizer.py --model models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf \
                                                 --hf-dir models/Qwen3.5-0.8B   (Qwen3.5's tokenizer: \\p{M})
 Needs transformers (.venv) and models/Qwen3-0.6B (local files only) plus models/Qwen3-0.6B-q8.bin
@@ -25,11 +25,11 @@ Cases:
           into <= 64 KiB pieces at line ends because of the argv size limit), as they are and
           in NFD.
 Strings contain no NUL (argv). Besides the ids, the normalized text is compared directly: the
-concatenated bytes of runq's tokens must equal HF's NFC normalizer output (byte-level BPE is
+concatenated bytes of gwenedeg's tokens must equal HF's NFC normalizer output (byte-level BPE is
 lossless). Each mismatch is minimized (delta debugging on characters, as long as it still
 mismatches) and the first --show are printed. Exit status 1 if any case mismatches.
 
---nfc-all: runq's normalizer (tokens -> bytes) vs HF's NFC normalizer and vs Python's
+--nfc-all: gwenedeg's normalizer (tokens -> bytes) vs HF's NFC normalizer and vs Python's
 unicodedata.normalize('NFC') on every code point alone (all of U+0001..U+10FFFF but surrogates
 and \\n), all ordered pairs of combining marks after a base, every composition pair and the NFD
 of every decomposable character, all Hangul L+V and LV+T pairs, and random strings. Strings
@@ -226,14 +226,14 @@ class Runner:
     def text(self, ids):
         return b"".join(self.vocab[i] for i in ids)
 
-    def runq(self, s):
-        p = subprocess.run([self.a.runq, self.a.model, "-m", "tokenize", "-i", s], capture_output=True)
+    def gwenedeg(self, s):
+        p = subprocess.run([self.a.gwenedeg, self.a.model, "-m", "tokenize", "-i", s], capture_output=True)
         if p.returncode != 0:
-            raise RuntimeError(f"runq failed on {s!r}: {p.stderr.decode(errors='replace')[-300:]}")
+            raise RuntimeError(f"gwenedeg failed on {s!r}: {p.stderr.decode(errors='replace')[-300:]}")
         return [int(x) for x in p.stdout.split()]
 
     def mismatch(self, s):
-        return self.hf(s) != self.runq(s)
+        return self.hf(s) != self.gwenedeg(s)
 
     def minimize(self, s, budget=300):
         # ddmin-style: drop chunks of characters while the (NFC) string still mismatches
@@ -301,7 +301,7 @@ def nfc_all(r, a):
         if cur:
             batches.append(cur)
         with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
-            outs = list(ex.map(lambda bt: r.text(r.runq("\n".join(bt))).split(b"\n"), batches))
+            outs = list(ex.map(lambda bt: r.text(r.gwenedeg("\n".join(bt))).split(b"\n"), batches))
         n_hf = n_py = n_py_exp = 0
         for bt, out in zip(batches, outs):
             hf = r.hf_nfc("\n".join(bt)).split("\n")
@@ -310,7 +310,7 @@ def nfc_all(r, a):
                 if o != h.encode():
                     n_hf += 1
                     if n_hf <= a.show:
-                        print(f"  {name}: {s.encode('unicode_escape')} runq {o.decode(errors='replace').encode('unicode_escape')}"
+                        print(f"  {name}: {s.encode('unicode_escape')} gwenedeg {o.decode(errors='replace').encode('unicode_escape')}"
                               f" hf {h.encode('unicode_escape')}")
                 py = unicodedata.normalize("NFC", s)
                 if o != py.encode():
@@ -332,7 +332,8 @@ def main():
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--show", type=int, default=5, help="minimize and print this many mismatches")
     ap.add_argument("--no-files", action="store_true", help="skip the real-text cases")
-    ap.add_argument("--runq", default=os.path.join(ROOT, "runq"))
+    ap.add_argument("--gwenedeg", default=os.path.join(ROOT, "gwenedeg"))
+    ap.add_argument("--runq", dest="gwenedeg", default=argparse.SUPPRESS, help=argparse.SUPPRESS)  # (deprecated: the name before 2026-11-22)
     ap.add_argument("--model", default=os.path.join(ROOT, "models", "Qwen3-0.6B-q8.bin"), help=".bin or GGUF checkpoint")
     ap.add_argument("--vocab", default=None,
                     help=".bin checkpoint whose .tokenizer file gives the token bytes (default: models/Qwen3-0.6B-q8.bin; "
@@ -353,7 +354,7 @@ def main():
     if not a.no_files:
         cases += file_cases()
     with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
-        got = list(ex.map(lambda c: r.runq(c[1]), cases))
+        got = list(ex.map(lambda c: r.gwenedeg(c[1]), cases))
     bad, bad_nfc = [], []
     n_tok = n_chars = n_nonnfc = 0
     for (name, s), ids in zip(cases, got):
@@ -374,7 +375,7 @@ def main():
         m = r.minimize(s)
         print(f"\n{name}: {len(s)} chars, minimized to {m!r}")
         print(f"  hf  : {r.hf(m)}  {[r.tok.convert_ids_to_tokens(i) for i in r.hf(m)]}")
-        print(f"  runq: {r.runq(m)}  {[r.tok.convert_ids_to_tokens(i) for i in r.runq(m)]}")
+        print(f"  gwenedeg: {r.gwenedeg(m)}  {[r.tok.convert_ids_to_tokens(i) for i in r.gwenedeg(m)]}")
     print(f"\n({time.time() - t0:.1f} s)")
     return 1 if bad or bad_nfc else 0
 

@@ -11,13 +11,13 @@ Needs torch + transformers (.venv); reads models/Qwen3-0.6B only (local_files_on
 (Qwen3.5's pre-tokenizer joins \\p{M} to letter runs), ids from the Qwen3.5 tokenizer (models/Qwen3.5-0.8B).
 --q4ref writes only tests/golden/logits_q4/*.npz (~20 s): the same prompts and format, from the
 same HF model with every weight replaced by the Q4_K_M GGUF's tensors dequantized by gguf-py
-(gguf.quants.dequantize; norms F32 as stored), i.e. Q4_K_M weights with fp32 activations. runq on
+(gguf.quants.dequantize; norms F32 as stored), i.e. Q4_K_M weights with fp32 activations. gwenedeg on
 the Q4_K_M file should differ from it by its int8 activations only. Needs the `gguf` package
 (pip install gguf, 0.19.0 used; pure Python): importable, or DIR = a directory containing it
 (e.g. a scratch venv's site-packages; the .venv is not modified).
 --long writes only tests/golden/logits_long/long2.npz (~5 s): the 297-token "long2" prompt of
 tests/check.py (the logits prompts joined: all twice + en, all, code), HF logits at every 4th position
-from 248 on, i.e. mostly past runq's first attention block of 256 positions (ATT_P, see
+from 248 on, i.e. mostly past gwenedeg's first attention block of 256 positions (ATT_P, see
 src/kernels_avx512.h): the same format with a `positions` array (int32 (m,)): row j is position
 positions[j]; `ids` holds all n prompt ids.
 --model-dir DIR --out-dir OUT writes HF fp32 goldens of another Qwen3 model (e.g. models/Qwen3-1.7B ->
@@ -180,13 +180,13 @@ TOKENIZER_CASES_QWEN35 = [
     ("marks_mixed", "Ⓐ\u0301 ñ ñ ü\u0332 ß\u0301 Ω\u0301 ДА\u0301 中\u0301文"),
 ]
 
-# Known runq tokenizer limitations: reported as XFAIL, do not fail the suite.
+# Known gwenedeg tokenizer limitations: reported as XFAIL, do not fail the suite.
 # (none since Step 5: the two NFC cases above pass)
 TOKENIZER_XFAIL = {}
 
 LOGITS_PROMPTS = [
     ("en", "The quick brown fox jumps over the lazy dog. The capital of France is"),
-    # (No multi-space indentation here: written when runq's tokenizer still merged whole
+    # (No multi-space indentation here: written when gwenedeg's tokenizer still merged whole
     # whitespace runs; kept unchanged so the goldens stay byte-identical.)
     ("code", "int add(int a, int b) { return a + b; }\nint main() { return add(2,"),
     ("zh", "中国的首都是北京。法国的首都是巴黎。日本的首都是"),

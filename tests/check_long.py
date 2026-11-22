@@ -3,7 +3,7 @@
 take ~100k tokens).
 
 The text: files of this repository at a fixed commit (CORPUS_REV, read with `git show`, so the text never changes; prose,
-C and Python interleaved, no repeats), tokenized by runq, the first LONG_N = 98,304 tokens. Checks:
+C and Python interleaved, no repeats), tokenized by gwenedeg, the first LONG_N = 98,304 tokens. Checks:
   long/<tag>/ids            the token ids == the golden's (count + hash: the text and the tokenizer)
   long/<tag>/ref_p<P>       logits at sampled positions P (1k .. 96k) vs tests/ref_qwen35.py on the file's dequantized
                             weights (tests/make_long_ref.py: numpy fp32, chunked attention; golden/long/<tag>.npz holds the
@@ -17,7 +17,7 @@ C and Python interleaved, no repeats), tokenized by runq, the first LONG_N = 98,
   long/<tag>/retrieval      a fact planted ~4k tokens into a ~88k-token chat prompt, asked at its end: the greedy reply
                             (thinking off) contains it (and the decode steps at ~88k: the split / combine of decode)
 Thresholds (TH): per position cos >= 0.995 over the golden's ids and the same top-1 (or a reference margin < 0.5), pooled
-cos >= 0.999 and top-1 >= 0.85 (measured: cos 0.99988-0.99998, top-1 20/20; runq's int8 activations). Run alone: .venv/bin/python tests/check_long.py [--tags TAG,...] (56 checks, ~35 min at 8 threads with both
+cos >= 0.999 and top-1 >= 0.85 (measured: cos 0.99988-0.99998, top-1 20/20; gwenedeg's int8 activations). Run alone: .venv/bin/python tests/check_long.py [--tags TAG,...] (56 checks, ~35 min at 8 threads with both
 goldens: the 0.8B ~18 min, the 4B ~18 min); --retrieval FILE: only the retrieval check, on any qwen35 file.
 """
 import argparse
@@ -108,7 +108,7 @@ def run_tool(cmd, threads, log=None):
 
 
 def metrics(g, j, row):
-    """cos over the golden row's ids (top 64 + subset), top-1 (runq's full-vocab argmax == the reference's, or the
+    """cos over the golden row's ids (top 64 + subset), top-1 (gwenedeg's full-vocab argmax == the reference's, or the
     reference's margin between them < top1_margin), max |diff| over those ids"""
     ids = np.concatenate([g["top_ids"][j], g["subset_ids"]])
     ref = np.concatenate([g["top_logits"][j], g["subset"][j]]).astype(np.float64)
@@ -119,7 +119,7 @@ def metrics(g, j, row):
     a = int(np.argmax(row))
     t0 = int(g["top_ids"][j, 0])
     margin = None
-    if a != t0:  # the reference's logit of runq's choice, if in the golden's ids
+    if a != t0:  # the reference's logit of gwenedeg's choice, if in the golden's ids
         k = np.where(g["top_ids"][j] == a)[0]
         margin = float(g["top_logits"][j, 0] - g["top_logits"][j, k[0]]) if len(k) else float("inf")
     return cos, a == t0, margin, float(np.abs(got - ref).max())

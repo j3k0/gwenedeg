@@ -15,7 +15,7 @@ synth-q4.gguf (~165 MB): a 3-layer "model" with
   token_embd. Not a language model, but real weight statistics and every code path of those shapes.
 synth-tok-{qwen3,instruct-2507,thinking-2507}.gguf (~7.5 MB each): tokenizer-only files (the 0.6B
   tokenizer metadata, the hyperparameters, a token_embd entry of an unknown type without data) with the HF
-  chat templates of tests/golden/templates: `runq -m render` / `-m tokenize` load them.
+  chat templates of tests/golden/templates: `gwenedeg -m render` / `-m tokenize` load them.
 
 Usage: python3 tests/make_synth.py [--src Qwen3-0.6B-Q4_K_M.gguf] [--out build/synth] [--force]
 Prints the output directory; exit status 2 if the source is missing.

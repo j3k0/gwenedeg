@@ -14,7 +14,7 @@ transformers on tiny random models converted by llama.cpp's convert_hf_to_gguf.p
 weight statistics in the shapes of the bigger models' linear layers.
 bad-q35-nv.gguf, bad-q35-hadamard.gguf, bad-q35-nextn.gguf (< 1 KB): metadata only (the source's hyperparameters, no
   tokenizer, a token_embd entry without data), with 6 value heads on 4 key heads, resp. a prism.hadamard.* key
-  (Hadamard-folded weights), resp. nextn_predict_layers = block_count: runq must reject them while reading the
+  (Hadamard-folded weights), resp. nextn_predict_layers = block_count: gwenedeg must reject them while reading the
   configuration.
 
 The 27B's layout at a small scale (if the 0.8B Q4_K_M file is there, --src-q4; docs/notes/qwen38-speculative.md, file layout):
@@ -28,29 +28,29 @@ synth-q35-27b.gguf (330 MB): 8 layers (linear 0, 1, 2, 4, 5, 6, attention 3, 7: 
   attention layer's q heads 0..7 from one source layer (with its 2 kv heads) and 8..11 from another (attn_q rows,
   attn_output columns side by side), the q / k channels of key heads 0..3 and the v channels of value heads 0..11 as
   in build(); token_embd: 3 consecutive Q4_K super-blocks per row from a pool of the source's Q4_K matrices; output:
-  the source's Q6_K token_embd, its first 768 columns. The general.sampling.* keys of the 27B (runq's defaults
+  the source's Q6_K token_embd, its first 768 columns. The general.sampling.* keys of the 27B (gwenedeg's defaults
   for the options not given: the q35 group's sampling_defaults check).
 synth-q35-27b-mtp.gguf: the same + the MTP block as the 27B lays it out: block_count 9, qwen35.nextn_predict_layers 1,
   blk.8 a full-attention layer (attn_* , ffn_*, the norms) + nextn.eh_proj [2 dim -> dim] Q8_0, nextn.enorm / hnorm /
-  shared_head_norm F32, sharing token_embd / output. runq loads the main model only (its logits == synth-q35-27b.gguf's,
+  shared_head_norm F32, sharing token_embd / output. gwenedeg loads the main model only (its logits == synth-q35-27b.gguf's,
   bitwise: the q35 group's mtp_logits check).
 synth-q35-27b-f32.gguf: synth-q35-27b-mtp.gguf with the rest of the 27B file's layout: ssm_alpha / ssm_beta F32 (the
-  Q8_0 rows dequantized: the same values, applied in fp32 by runq), Qwen3.8's chat template (tests/golden/templates/
-  qwen3.8.jinja, the 27B's) and its tokenizer.ggml.bos_token_id 248044 (<|endoftext|>, what runq takes without it).
+  Q8_0 rows dequantized: the same values, applied in fp32 by gwenedeg), Qwen3.8's chat template (tests/golden/templates/
+  qwen3.8.jinja, the 27B's) and its tokenizer.ggml.bos_token_id 248044 (<|endoftext|>, what gwenedeg takes without it).
 synth-q35-iq.gguf (~200 MB): synth-q35-27b.gguf with its matrices requantized (tests/iqquant.py) to Q2_K and the
   i-quants (src/iquants.h), the types mixed within each role over the layers and within the fused phases (q / k / v,
   gate / up, qkv / z), as in Underdog Saluki 27B's file: every one of the nine types in several roles, an IQ1_M
   token_embd and an IQ3_S output (Saluki's), ssm_alpha / ssm_beta Q8_0 (Saluki's). Built from synth-q35-27b.gguf.
 synth-q35-r2-bf16.gguf, synth-q35-r2-bf16w.gguf, synth-q35-r2-bf16bad.gguf (~87 MB each; TODO S9.1): synth-q35-r2.gguf with
   ssm_alpha / ssm_beta in BF16 (its Q8_0 rows dequantized and rounded to bf16, nearest even), as the IQ3_S-mtp 27B file
-  has them, resp. the same values as F32 (the twin: runq widens BF16 at load, so their logits are equal, bitwise),
+  has them, resp. the same values as F32 (the twin: gwenedeg widens BF16 at load, so their logits are equal, bitwise),
   resp. the BF16 file with blk.0.ffn_gate in BF16 too (a role that must stay refused). Built from synth-q35-r2.gguf,
   without random numbers (the other files' bytes do not change).
 synth-q35-27b-mtpbad.gguf (TODO S9a): synth-q35-27b-mtp.gguf + an optional MTP tensor of llama.cpp's layout,
   blk.8.nextn.shared_head_head.weight (16 zero Q8_0 rows: only its presence matters), which rq_mtp_load refuses (the
   main model loads as before). Built last, from synth-q35-27b-mtp.gguf, without random numbers.
 synth-q35-ista-mtp.gguf (~220 MB; TODO S9c.1): ISTA-DASLab's Qwen3.8-27B GSQ-RCO IQ3_S-mtp file's types at the small
-  scale (docs/notes/qwen38-speculative.md; the target of runq serve --draft mtp): synth-q35-27b-mtp.gguf's tensors and order
+  scale (docs/notes/qwen38-speculative.md; the target of gwenedeg serve --draft mtp): synth-q35-27b-mtp.gguf's tensors and order
   with synth-q35-iq.gguf's trunk matrices (Q2_K and the i-quants; ISTA's trunk is an i-quant mix with some Q4_K, which
   synth-q35-27b covers), an IQ2_S token_embd (synth-q35-27b-mtp's Q4_K one requantized), a Q4_K classifier (the bytes
   of that Q4_K token_embd: real super-blocks, as if tied), BF16 ssm_alpha / ssm_beta (the Q8_0 rows rounded, as
@@ -60,7 +60,7 @@ synth-q35-ista-mtp.gguf (~220 MB; TODO S9c.1): ISTA-DASLab's Qwen3.8-27B GSQ-RCO
   template and bos). Built last, from the files above, without random numbers.
 synth-tok-qwen3.8.gguf, synth-tok-qwen3.8-hf.gguf (~8 MB): tokenizer-only files (the 0.8B's tokenizer and metadata, a
   token_embd entry of an unknown type without data) with Qwen3.8's template: the 27B GGUF's (Unsloth's) resp. Qwen's
-  own (qwen3.8-hf.jinja): `runq -m render` vs tests/golden/chat_render.json (needs the Q8_0 source only).
+  own (qwen3.8-hf.jinja): `gwenedeg -m render` vs tests/golden/chat_render.json (needs the Q8_0 source only).
 
 Usage: python3 tests/make_synth_q35.py [--src Qwen3.5-0.8B-Q8_0.gguf] [--src-q4 Qwen3.5-0.8B-Q4_K_M.gguf]
                                       [--out build/synth-q35] [--force]

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Tests of `runq serve` (src/serve.c, engine.c, http.c, constrain.c, json.c) over HTTP with Python's
+"""Tests of `gwenedeg serve` (src/serve.c, engine.c, http.c, constrain.c, json.c) over HTTP with Python's
 stdlib only (no network beyond 127.0.0.1, no LiteLLM, no numpy). Run by tests/check.py (group server)
 in the background; alone:
 
-  tests/server_test.py --runq ./runq --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf [-v] [--slow]
+  tests/server_test.py --gwenedeg ./gwenedeg --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf [-v] [--slow]
 
-Starts `runq serve` on a free port, and the `runq -m chat` reference runs in parallel; prints PASS / FAIL
+Starts `gwenedeg serve` on a free port, and the `gwenedeg -m chat` reference runs in parallel; prints PASS / FAIL
 lines (as tests/api_test.c), exit status 1 if any failed. --slow: relaxed latency bounds (sanitizer
 builds). Checks:
   basic      /health, /v1/models, /v1/models/{id}, keep-alive (several requests on one connection)
-  chat       greedy completions == `runq -m chat -t 0` for the same messages, bitwise: single turn, with
+  chat       greedy completions == `gwenedeg -m chat -t 0` for the same messages, bitwise: single turn, with
              a system prompt, a second turn (history re-sent as messages; its prompt reuses the cached
              first turn: usage.prompt_tokens_details.cached_tokens); seeded sampling (-t 0.8 -s 42; top_k 3:
              -K 3) == the CLI's; thinking (reasoning_effort): reasoning_content is the CLI's <think> text
@@ -26,7 +26,7 @@ builds). Checks:
   batch      continuous batching (the server runs --parallel 4 --chunk 16): constrained (greedy with logprobs,
              sampled, nested), free with logprobs, a stream with a stop string, seeded, 7 at once == each alone (text
              and logprobs); three requests (greedy with a system prompt, seeded, thinking) joining a running stream ==
-             runq -m chat; a client leaving mid-stream (499) while three others (greedy, seeded) run == runq -m chat; four requests sharing a new system prompt at once (the first prefills it, the others wait
+             gwenedeg -m chat; a client leaving mid-stream (499) while three others (greedy, seeded) run == gwenedeg -m chat; four requests sharing a new system prompt at once (the first prefills it, the others wait
              and copy it from its slot: cached_tokens) == the same with cache_prompt: false
   errors     malformed JSON, invalid UTF-8, missing / empty messages, bad role, n = 2, bad schema,
              json_object, out-of-range parameters, context too long (code context_length_exceeded),
@@ -40,7 +40,7 @@ builds). Checks:
 With --tools (a Qwen3.5 / Qwen3.8 model; tests/check.py's q35 group runs it on Qwen3.5-0.8B Q8_0), the tool call group
 only (src/tools.c):
   tools      the prompt of each request (tools, a round trip with assistant tool_calls, tool results and reasoning_content
-             in the history) == `runq -m render` of the request (usage.prompt_tokens); a greedy request that calls a tool:
+             in the history) == `gwenedeg -m render` of the request (usage.prompt_tokens); a greedy request that calls a tool:
              tool_calls == a reference parse (below) of the same reply's raw text (tool_choice none: the XML as content),
              arguments typed by the schema, finish_reason tool_calls, content null; streamed: the same calls as
              tool_calls deltas, finish_reason, the usage chunk; thinking (reasoning_effort): reasoning_content kept apart
@@ -55,7 +55,7 @@ first), the disk tier group only (--kv-disk; its own servers, one slot each, so 
              sequence); after a restart the files serve the next turn again (== the reference); a second server on the same
              directory refused (its lock); a corrupted file and a leftover .tmp removed at the start (the request then
              prefilled, == the reference); a budget too small for any save: none, replies unchanged. --draft mtp (TODO
-             S9c.4; tests/check_spec.py's spec group on synth-q35-ista-mtp; thinking off, RUNQ_TEST_MTP_CHECK): the view's
+             S9c.4; tests/check_spec.py's spec group on synth-q35-ista-mtp; thinking off, GWENEDEG_TEST_MTP_CHECK): the view's
              files (version 2: its kept state); disk/mtp_lockstep (each saved pair == a fresh lockstep run: api_test
              --mtp-seqcheck), disk/mtp_approx (the loaded conversations' next turns, after the restart too: 0; the view
              loaded to the prompt's prefix, ahead of a target cut back to a checkpoint), disk/mtp_invariant; with
@@ -70,13 +70,13 @@ one -c job fits, four short ones too, a -c job beside three short ones not):
              the log) and == alone; a short one behind it waits too (strict FIFO: admitted after it); nothing running: a -c
              job takes the idle slots' room (reclaimed) and is admitted at once; with --kv-disk the reclaimed slots are saved
              first and a conversation's next turn loads its file back (cached_tokens), == a fresh prefill; a -c job asking for
-             16 guesses fits (capped to what one -c job holds), == the default; the live budget (RUNQ_TEST_MEMAVAILABLE=FILE, --kv-mem
+             16 guesses fits (capped to what one -c job holds), == the default; the live budget (GWENEDEG_TEST_MEMAVAILABLE=FILE, --kv-mem
              large): /health's mem consistent, MemAvailable lowered to 0 while a stream holds a slot: a new request waits
              (/health waiting_for_memory 1), raised: admitted, mem_wait_ms > 0, == alone. --draft mtp (TODO S9c.4):
              admit/mtp_terms (the leases' KV per position == the target's + the view's, the state the target's alone),
-             admit/mtp_invariant (RUNQ_TEST_MTP_CHECK: no '[engine] bug:' line)
+             admit/mtp_invariant (GWENEDEG_TEST_MTP_CHECK: no '[engine] bug:' line)
 With --admit-chunk [--draft DRAFT] (tests/check.py's server group, the same files and drafts), the chunked leases group only
-(--admit chunk --admit-chunk 16 --kv-disk TMP; its own servers, RUNQ_TEST_MEMAVAILABLE set to 0 once the requests run, so
+(--admit chunk --admit-chunk 16 --kv-disk TMP; its own servers, GWENEDEG_TEST_MEMAVAILABLE set to 0 once the requests run, so
 that a renewal needing a new KV block is denied, and with --admit-margin 1 the live budget is then -1 GiB: the oldest's
 next block swaps out every younger job; prompts padded to just below a block):
   admit_chunk refusals (no --kv-disk; a --kv-mem the free space does not hold); the startup line, /health's parked and
@@ -88,11 +88,11 @@ next block swaps out every younger job; prompts padded to just below a block):
              swap-ins, mem_wait_ms > 0); a stream cancelled while parked, then while swapped out (keep-alives meanwhile; its
              files deleted; the oldest == alone); a swap-out that fails (the swap directory read-only: that request gets a
              500, the oldest == alone, nothing left); a restart empties the swap directory; liveness (-c 400, three requests
-             without max_tokens, RUNQ_TEST_SWAP_DELAY 0.5: the oldest, streamed, swaps the others out running, gets
+             without max_tokens, GWENEDEG_TEST_SWAP_DELAY 0.5: the oldest, streamed, swaps the others out running, gets
              keep-alives during the swap and is renewed beyond the live budget with a warning; all end at the context in
              order, == alone); a swap mid-prefill (-c 4096 --chunk 8: a ~2,400-token prompt swapped out by the oldest's
              block, the log's "prefilling: N of M", continued after the swap-in) beside a parked reply, == alone; with a
-             draft, the draft's swap save, then its load, made to fail (RUNQ_TEST_SWAP_FAIL=FILE: "draft-save" /
+             draft, the draft's swap save, then its load, made to fail (GWENEDEG_TEST_SWAP_FAIL=FILE: "draft-save" /
              "draft-load"): the draft reset (logged), outputs unchanged; --admit-yield 2 with --parallel 1: two long
              requests (greedy; seeded with speculation) take turns (their yields alternate in the log; yields, paused_ms,
              renewals; /health yielded), then the same with MemAvailable 0 once both run (the yielded one swapped out:
@@ -179,6 +179,13 @@ class T:
         sys.stdout.flush()
 
 
+
+def disk_tmp():
+    """the directory for the disk tier's files: GWENEDEG_DISK_TMP (deprecated: RUNQ_DISK_TMP), else /var/tmp
+    (usually a disk; /tmp is often a tmpfs), else tempfile's default"""
+    return (os.environ.get("GWENEDEG_DISK_TMP") or os.environ.get("RUNQ_DISK_TMP")
+            or ("/var/tmp" if os.access("/var/tmp", os.W_OK) else None))
+
 def req(port, method, path, body=None, headers=None, timeout=120, raw=None):
     """one request on a new connection: (status, parsed JSON or text, headers)"""
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
@@ -200,7 +207,7 @@ def chat(port, body, timeout=120):
 
 
 # --draft mtp: the timings of every response with timings.speculative.mtp_approx (chat, stream; the spec group's
-# mtp_approx and mtp_lockstep checks); the runq serve processes this script runs at once (now, at most: --one-server)
+# mtp_approx and mtp_lockstep checks); the gwenedeg serve processes this script runs at once (now, at most: --one-server)
 MTP_REC = []
 LIVE = {"n": 0, "max": 0}
 
@@ -212,7 +219,7 @@ def mtp_note(d):
 
 
 def live(k):
-    """a runq serve process started (k 1) or ended (-1)"""
+    """a gwenedeg serve process started (k 1) or ended (-1)"""
     LIVE["n"] += k
     LIVE["max"] = max(LIVE["max"], LIVE["n"])
 
@@ -257,7 +264,7 @@ def stream(port, body):
 
 def cli(a, args, stdin=None):
     env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
-    p = subprocess.run([a.runq, a.model, "-c", "2048", "-s", "1"] + args, input=stdin.encode() if stdin else None,
+    p = subprocess.run([a.gwenedeg, a.model, "-c", "2048", "-s", "1"] + args, input=stdin.encode() if stdin else None,
                        capture_output=True, env=env)
     return p.stdout.decode("utf-8", errors="replace")
 
@@ -337,14 +344,14 @@ def ref_parse(text, tools):
 
 
 def run_disk_watch(a, t):
-    """the disk watch (--kv-disk-free; RUNQ_TEST_DISKFREE: the free space from a file, RUNQ_TEST_KV_CHECK: its period): the
+    """the disk watch (--kv-disk-free; GWENEDEG_TEST_DISKFREE: the free space from a file, GWENEDEG_TEST_KV_CHECK: its period): the
     heartbeat (the lock's mtime at the start and at shutdown); above --kv-disk-free nothing removed; below it the unused
     directory next to ours removed (its lock free, 3 h old), not a fresh one, a locked one, one without a lock file or
     another name; our saves then fit one session's room (a warning); below the 1 GiB reserve our files removed, the
     requests served as before"""
     import fcntl
     rep = t.report
-    d = tempfile.mkdtemp(prefix="runq-kvwatch-", dir=os.environ.get("RUNQ_DISK_TMP") or ("/var/tmp" if os.access("/var/tmp", os.W_OK) else None))
+    d = tempfile.mkdtemp(prefix="gwenedeg-kvwatch-", dir=disk_tmp())
     G = 1073741824
     old = time.time() - 3 * 3600
 
@@ -364,12 +371,12 @@ def run_disk_watch(a, t):
     fcntl.flock(hf, fcntl.LOCK_EX | fcntl.LOCK_NB)  # (another server's)
     free = os.path.join(d, "free")
     open(free, "w").write(str(100 * G))
-    env = dict(os.environ, OMP_NUM_THREADS=str(a.threads), RUNQ_TEST_DISKFREE=free, RUNQ_TEST_KV_CHECK="0.2")
-    log = tempfile.NamedTemporaryFile(prefix="runq-serve-watch-", suffix=".log", delete=False)
+    env = dict(os.environ, OMP_NUM_THREADS=str(a.threads), GWENEDEG_TEST_DISKFREE=free, GWENEDEG_TEST_KV_CHECK="0.2")
+    log = tempfile.NamedTemporaryFile(prefix="gwenedeg-serve-watch-", suffix=".log", delete=False)
     args = ["--port", "0", "-c", "2048", "--parallel", "1", "--slots", "1", "-v", "--kv-disk", d, "--kv-disk-min", "64",
             "--kv-disk-free", "5"] + (["-D", a.draft] if a.draft and a.draft != "mtp" else []) + gate_mem(a)
     t0 = time.time()
-    p = subprocess.Popen([a.runq, "serve", a.model] + args, stderr=log, stdout=subprocess.DEVNULL, env=env)
+    p = subprocess.Popen([a.gwenedeg, "serve", a.model] + args, stderr=log, stdout=subprocess.DEVNULL, env=env)
     live(1)
     port = None
     for _ in range(600):
@@ -443,18 +450,18 @@ def run_disk_watch(a, t):
 def run_disk(a, t):
     """the disk tier (--kv-disk): one slot, so that each new conversation evicts the previous one; its own servers"""
     rep = t.report
-    # (RUNQ_DISK_TMP, else /var/tmp: usually a disk, where the files are written with O_DIRECT; /tmp is often a tmpfs)
-    d = tempfile.mkdtemp(prefix="runq-kvdisk-", dir=os.environ.get("RUNQ_DISK_TMP") or ("/var/tmp" if os.access("/var/tmp", os.W_OK) else None))
+    # (GWENEDEG_DISK_TMP, else /var/tmp: usually a disk, where the files are written with O_DIRECT; /tmp is often a tmpfs)
+    d = tempfile.mkdtemp(prefix="gwenedeg-kvdisk-", dir=disk_tmp())
     env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
     mtp = a.draft == "mtp"  # (--draft mtp: the view's file (version 2: its kept state), loaded to the prompt's prefix; checked at rest)
     if mtp:
-        env["RUNQ_TEST_MTP_CHECK"] = "1"
+        env["GWENEDEG_TEST_MTP_CHECK"] = "1"
     base = ["--port", "0", "-c", "2048", "--parallel", "1", "--slots", "1", "-v"] + (["-D", a.draft] if a.draft else []) + gate_mem(a)
     logs = []  # (--draft mtp: every server's log, for the invariant)
 
     def start(args, b=None):
-        log = tempfile.NamedTemporaryFile(prefix="runq-serve-disk-", suffix=".log", delete=False)
-        p = subprocess.Popen([a.runq, "serve", a.model] + (base if b is None else b) + args, stderr=log, stdout=subprocess.DEVNULL, env=env)
+        log = tempfile.NamedTemporaryFile(prefix="gwenedeg-serve-disk-", suffix=".log", delete=False)
+        p = subprocess.Popen([a.gwenedeg, "serve", a.model] + (base if b is None else b) + args, stderr=log, stdout=subprocess.DEVNULL, env=env)
         live(1)
         for _ in range(1200 if mtp else 600):
             text = open(log.name).read()
@@ -564,7 +571,7 @@ def run_disk(a, t):
             stop(q, qlg)
         else:
             os.unlink(qlg)
-        rep(qport is None and qrc != 0 and "in use by another runq serve" in qtext, "disk/lock", qtext.strip()[-120:])
+        rep(qport is None and qrc != 0 and "in use by another gwenedeg serve" in qtext, "disk/lock", qtext.strip()[-120:])
     rc, _ = stop(p, lg)
     # a corrupted file and a save cut short: removed at the start; the request served from a fresh prefill, == the reference
     fs = [f for f in files() if f.endswith(".rqseq") and ".draft" not in f]
@@ -614,7 +621,7 @@ def disk_lockstep(a, t, d, fs):
     """--disk --draft mtp: each saved pair (<id>.rqseq, <id>.draft.rqseq; saved at rest after SIGTERM and at evictions) ==
     a fresh lockstep run over the target's tokens (api_test --mtp-seqcheck: the view's KV cache bitwise, its kept state
     (version 2) and a probe row with it)"""
-    api = a.api_test or os.path.join(os.path.dirname(os.path.abspath(a.runq)), "build", "api_test")
+    api = a.api_test or os.path.join(os.path.dirname(os.path.abspath(a.gwenedeg)), "build", "api_test")
     env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
     pairs = [f[:-len(".rqseq")] for f in fs if f.endswith(".rqseq") and not f.endswith(".draft.rqseq") and
              f[:-len(".rqseq")] + ".draft.rqseq" in fs]
@@ -637,7 +644,7 @@ def disk_foreign_draft(a, t, X, Y, start, stop, ask):
     (the view: none, it follows the loaded prefix as a gap, zeros for h: mtp_approx > 0) and == the reference bitwise; the
     turn after it has no approximate row (at most 1 at a divergence); no '[engine] bug:' line"""
     rep = t.report
-    d = tempfile.mkdtemp(prefix="runq-kvforeign-", dir=os.environ.get("RUNQ_DISK_TMP") or ("/var/tmp" if os.access("/var/tmp", os.W_OK) else None))
+    d = tempfile.mkdtemp(prefix="gwenedeg-kvforeign-", dir=disk_tmp())
     disk = ["--kv-disk", d, "--kv-disk-min", "64"]
     p, port, lg = start(disk, ["--port", "0", "-c", "2048", "--parallel", "1", "--slots", "1", "-v", "-D", a.foreign_draft] + gate_mem(a))
     if not port:
@@ -678,19 +685,19 @@ def disk_foreign_draft(a, t, X, Y, start, stop, ask):
 
 def run_disk_compat(a, t):
     """the disk tier across builds (TODO S9c.2: seqfile.c's version 2 is an MTP view's only): one --kv-disk directory
-    written by a reference build (--disk-compat REF_RUNQ, e.g. 915894a's), then served by this build, then by the reference
+    written by a reference build (--disk-compat REF_GWENEDEG, e.g. 915894a's), then served by this build, then by the reference
     again, each with --draft (its .draft.rqseq files too). At each restart, before its first request, the directory's
     files (names and sizes) are those the previous server left (915894a's dk_add removes a draft file that does not check
     out without a word, so the log alone cannot show it) and no file is reported removed; its first reply has cached
     tokens and == the reference (the same request with nothing cached, on the reference build)"""
     rep = t.report
-    d = tempfile.mkdtemp(prefix="runq-kvcompat-", dir=os.environ.get("RUNQ_DISK_TMP") or ("/var/tmp" if os.access("/var/tmp", os.W_OK) else None))
+    d = tempfile.mkdtemp(prefix="gwenedeg-kvcompat-", dir=disk_tmp())
     env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
     base = ["--port", "0", "-c", "2048", "--parallel", "1", "--slots", "1", "-v", "--kv-disk", d, "--kv-disk-min", "64"] + (
         ["-D", a.draft] if a.draft else [])
 
     def start(exe):
-        log = tempfile.NamedTemporaryFile(prefix="runq-serve-compat-", suffix=".log", delete=False)
+        log = tempfile.NamedTemporaryFile(prefix="gwenedeg-serve-compat-", suffix=".log", delete=False)
         p = subprocess.Popen([exe, "serve", a.model] + base, stderr=log, stdout=subprocess.DEVNULL, env=env)
         for _ in range(600):
             m = re.search(r"listening on http://127\.0\.0\.1:(\d+)", open(log.name).read())
@@ -750,7 +757,7 @@ def run_disk_compat(a, t):
     # this build on the reference's files (X2 and Y2 loaded), and a new conversation W (saved at its stop: a slot loaded
     # from a file is not saved again unless it moves on); then the reference on this build's file (W first, then Y2's
     # from its own; W's reference: the same request with nothing cached, on the reference after it)
-    for name, exe, first, then in (("new_on_ref", a.runq, "X2", "Y2"), ("ref_on_new", a.disk_compat, "W", "Y2")):
+    for name, exe, first, then in (("new_on_ref", a.gwenedeg, "X2", "Y2"), ("ref_on_new", a.disk_compat, "W", "Y2")):
         before = files()
         p, port, lg = start(exe)
         if not port:
@@ -770,7 +777,7 @@ def run_disk_compat(a, t):
               r1["lp"] == refs[first]["lp"] and r2["lp"] == refs[then]["lp"])
         if name == "new_on_ref":  # (W's file this build's: what the reference loads next)
             ok = ok and w and saves >= 1
-        rep(ok, f"disk/v1_compat/{name}", f"{'this build' if exe == a.runq else 'the reference'} on the previous server's "
+        rep(ok, f"disk/v1_compat/{name}", f"{'this build' if exe == a.gwenedeg else 'the reference'} on the previous server's "
             f"{len(before)} files: {'unchanged at the start' if before == after else f'{before} -> {after}'}; removed: {rm or 'none'}; "
             f"{first} {r1['cached'] if r1 else '?'} of {r1['prompt'] if r1 else '?'} cached, == the reference: "
             f"{bool(r1) and bool(refs.get(first)) and r1['lp'] == refs[first]['lp']}; {then} == the reference: "
@@ -786,15 +793,15 @@ def run_admit(a, t):
     env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
     mtp = a.draft == "mtp"  # (--draft mtp: the view's KV in the terms (one attention layer, no state); checked at rest)
     if mtp:
-        env["RUNQ_TEST_MTP_CHECK"] = "1"
-    d = tempfile.mkdtemp(prefix="runq-admit-", dir=os.environ.get("RUNQ_DISK_TMP") or ("/var/tmp" if os.access("/var/tmp", os.W_OK) else None))
+        env["GWENEDEG_TEST_MTP_CHECK"] = "1"
+    d = tempfile.mkdtemp(prefix="gwenedeg-admit-", dir=disk_tmp())
     base = ["--port", "0", "-c", "4096", "--parallel", "8", "--slots", "6", "--chunk", "16", "--checkpoints", "1", "-v"] + \
         (["-D", a.draft, "--spec-calibrate", "1024"] if a.draft else [])
     bugs = []
 
     def start(args, xenv=None):
-        log = tempfile.NamedTemporaryFile(prefix="runq-serve-admit-", suffix=".log", delete=False)
-        p = subprocess.Popen([a.runq, "serve", a.model] + base + args, stderr=log, stdout=subprocess.DEVNULL, env=dict(env, **(xenv or {})))
+        log = tempfile.NamedTemporaryFile(prefix="gwenedeg-serve-admit-", suffix=".log", delete=False)
+        p = subprocess.Popen([a.gwenedeg, "serve", a.model] + base + args, stderr=log, stdout=subprocess.DEVNULL, env=dict(env, **(xenv or {})))
         live(1)
         for _ in range(1200):
             m = re.search(r"listening on http://127\.0\.0\.1:(\d+)", open(log.name).read())
@@ -865,9 +872,9 @@ def run_admit(a, t):
             f"{vkv / 1000:.2f} (blk.{sl.group(4) if sl else '?'}); state {stm.group(1) if stm else '?'} MiB = the target's")
     kvmem = ["--admit", "bound", "--kv-mem", f"{B / 1073741824.0:.6f}"]
     # refusals: one -c job must fit; a chunk of 0 tokens
-    q = subprocess.run([a.runq, "serve", a.model] + base + ["--admit", "bound", "--kv-mem", f"{0.5 * J / 1073741824.0:.6f}"],
+    q = subprocess.run([a.gwenedeg, "serve", a.model] + base + ["--admit", "bound", "--kv-mem", f"{0.5 * J / 1073741824.0:.6f}"],
                        capture_output=True, env=env, timeout=120)
-    q2 = subprocess.run([a.runq, "serve", a.model, "--admit", "chunk", "--admit-chunk", "0"], capture_output=True, env=env, timeout=60)
+    q2 = subprocess.run([a.gwenedeg, "serve", a.model, "--admit", "chunk", "--admit-chunk", "0"], capture_output=True, env=env, timeout=60)
     rep(q.returncode != 0 and b"--admit bound: a job of -c 4096" in q.stderr and q2.returncode != 0 and b"--admit-chunk" in q2.stderr,
         "admit/refused", q.stderr.decode(errors="replace").strip()[-160:])
 
@@ -971,7 +978,7 @@ def run_admit(a, t):
             rc, log = stop(p, lg)
         rep(rc == 0 and "over the memory budget" not in log, f"admit/stop_tight{tag}", f"exit {rc}")
 
-    # step 3, the live budget (RUNQ_TEST_MEMAVAILABLE: MemAvailable read from a file at each admission), --kv-mem large
+    # step 3, the live budget (GWENEDEG_TEST_MEMAVAILABLE: MemAvailable read from a file at each admission), --kv-mem large
     # (only the live budget binds): a request holds a slot (a stream), MemAvailable lowered to 0: a new one waits (/health
     # waiting_for_memory 1); raised: it is admitted, mem_wait_ms > 0, == alone
     mf = os.path.join(d, "memavailable")
@@ -987,7 +994,7 @@ def run_admit(a, t):
             time.sleep(0.05)
         return h
     setmem(1e12)
-    p, port, lg = start(["--admit", "bound", "--kv-mem", "8", "--admit-margin", "0.5"], {"RUNQ_TEST_MEMAVAILABLE": mf})
+    p, port, lg = start(["--admit", "bound", "--kv-mem", "8", "--admit-margin", "0.5"], {"GWENEDEG_TEST_MEMAVAILABLE": mf})
     if not port:
         rep(False, "admit/start_live", open(lg).read()[-500:])
         shutil.rmtree(d, ignore_errors=True)
@@ -1041,20 +1048,20 @@ def run_admit(a, t):
 
 def run_admit_chunk(a, t):
     """--admit chunk (step 4: chunked leases, parking, the swap): a request admitted on its prompt + 16 tokens, its lease
-    renewed by 16 as it grows. The live budget's test hook (RUNQ_TEST_MEMAVAILABLE, --kv-mem large, margin 0) makes the
+    renewed by 16 as it grows. The live budget's test hook (GWENEDEG_TEST_MEMAVAILABLE, --kv-mem large, margin 0) makes the
     renewals that need a new KV block (256 positions) fail: MemAvailable set to 0 once the requests run (the live budget is
     then -margin, -1 GiB), the young ones park at their next block (prompts padded to just below it); the oldest (a long
     count) never does: its new block swaps out the younger ones (--kv-disk DIR/.../swap/), the youngest first, then it is
     renewed beyond the live budget; raised: they are swapped back in, the oldest first, and finish. Every reply == the same request alone with no speculation, bitwise (logprobs)"""
     rep = t.report
-    env = dict(os.environ, OMP_NUM_THREADS=str(a.threads), RUNQ_SSE_KEEPALIVE="0.05")
-    d = tempfile.mkdtemp(prefix="runq-admitc-", dir=os.environ.get("RUNQ_DISK_TMP") or ("/var/tmp" if os.access("/var/tmp", os.W_OK) else None))
+    env = dict(os.environ, OMP_NUM_THREADS=str(a.threads), GWENEDEG_SSE_KEEPALIVE="0.05")
+    d = tempfile.mkdtemp(prefix="gwenedeg-admitc-", dir=disk_tmp())
     mf = os.path.join(d, "memavailable")
     kvd = os.path.join(d, "kv")
-    env["RUNQ_TEST_MEMAVAILABLE"] = mf
+    env["GWENEDEG_TEST_MEMAVAILABLE"] = mf
     mtp = a.draft == "mtp"  # (--draft mtp: every job's view swapped with it, its kept state in the file; checked at rest)
     if mtp:
-        env["RUNQ_TEST_MTP_CHECK"] = "1"
+        env["GWENEDEG_TEST_MTP_CHECK"] = "1"
     base = ["--port", "0", "--parallel", "5", "--slots", "7", "--chunk", "16", "--checkpoints", "1", "-v", "--admit", "chunk",
             "--admit-chunk", "16", "--kv-mem", "4", "--admit-margin", "1", "--kv-disk", kvd] + (["-D", a.draft, "--spec-calibrate", "1024"] if a.draft else []) + gate_mem(a)
 
@@ -1064,8 +1071,8 @@ def run_admit_chunk(a, t):
         os.replace(mf + ".tmp", mf)
 
     def start(args, xenv=None, b=None):
-        log = tempfile.NamedTemporaryFile(prefix="runq-serve-admitc-", suffix=".log", delete=False)
-        p = subprocess.Popen([a.runq, "serve", a.model] + (base if b is None else b) + args, stderr=log, stdout=subprocess.DEVNULL,
+        log = tempfile.NamedTemporaryFile(prefix="gwenedeg-serve-admitc-", suffix=".log", delete=False)
+        p = subprocess.Popen([a.gwenedeg, "serve", a.model] + (base if b is None else b) + args, stderr=log, stdout=subprocess.DEVNULL,
                              env=dict(env, **(xenv or {})))
         live(1)
         for _ in range(1200):
@@ -1208,9 +1215,9 @@ def run_admit_chunk(a, t):
     setmem(1e12)
     nod = [x for x in base if x not in ("--kv-disk", kvd)]
     live(1)  # (one at a time: each refused at its start)
-    q1 = subprocess.run([a.runq, "serve", a.model] + nod + ["-c", "1024"], capture_output=True, env=env, timeout=120)
-    q2 = subprocess.run([a.runq, "serve", a.model] + base + ["-c", "1024", "--kv-mem", "1000000"], capture_output=True, env=env, timeout=120)
-    q3 = subprocess.run([a.runq, "serve", a.model, "--port", "0", "-c", "1024", "--admit", "bound", "--admit-yield", "2"] + gate_mem(a),
+    q1 = subprocess.run([a.gwenedeg, "serve", a.model] + nod + ["-c", "1024"], capture_output=True, env=env, timeout=120)
+    q2 = subprocess.run([a.gwenedeg, "serve", a.model] + base + ["-c", "1024", "--kv-mem", "1000000"], capture_output=True, env=env, timeout=120)
+    q3 = subprocess.run([a.gwenedeg, "serve", a.model, "--port", "0", "-c", "1024", "--admit", "bound", "--admit-yield", "2"] + gate_mem(a),
                         capture_output=True, env=env, timeout=120)
     live(-1)
     rep(q1.returncode != 0 and b"--admit chunk needs --kv-disk" in q1.stderr and q2.returncode != 0 and b"the swap needs" in q2.stderr
@@ -1378,7 +1385,7 @@ def run_admit_chunk(a, t):
         f"exit {rc}, swap files left {swap_files()}" + "".join("; " + x for x in re.findall(r"\[engine\] (?:bug:|job \d+ could not).*", log)[:2]))
 
     # liveness: three requests without max_tokens (-c 400: they end at the context) whose growth does not fit (MemAvailable 0
-    # once they run): the oldest's new block swaps the younger ones out (the swap slowed down: RUNQ_TEST_SWAP_DELAY, the
+    # once they run): the oldest's new block swaps the younger ones out (the swap slowed down: GWENEDEG_TEST_SWAP_DELAY, the
     # oldest's stream gets keep-alives meanwhile), it ends, the next one is swapped back in (beyond the live budget: a
     # warning) and so on; all finish, the oldest first, each == alone. A restart empties DIR/.../swap/ first
     sd = glob.glob(os.path.join(kvd, "*", "swap"))
@@ -1386,7 +1393,7 @@ def run_admit_chunk(a, t):
         with open(os.path.join(sd[0], "7.rqseq"), "w") as f:
             f.write("left over")
     setmem(1e12)
-    p, port, lg = start(["-c", "400"], {"RUNQ_TEST_SWAP_DELAY": "0.5"})
+    p, port, lg = start(["-c", "400"], {"GWENEDEG_TEST_SWAP_DELAY": "0.5"})
     if not port:
         rep(False, "admit_chunk/start_liveness", open(lg).read()[-500:])
         shutil.rmtree(d, ignore_errors=True)
@@ -1429,7 +1436,7 @@ def run_admit_chunk(a, t):
     # a swap during a prefill (-c 4096, --chunk 8: a ~2,500-token prompt takes ~300 passes, the oldest's first new block
     # comes at ~236 tokens): the young ones (a reply parked at its block, the long prompt mid-prefill) are swapped out by
     # the oldest's block, back in once MemAvailable is raised; == alone. With a draft, the draft's swap I/O made to fail
-    # (RUNQ_TEST_SWAP_FAIL=FILE: "draft-save", then "draft-load"): the draft is reset, the output unchanged
+    # (GWENEDEG_TEST_SWAP_FAIL=FILE: "draft-save", then "draft-load"): the draft is reset, the output unchanged
     ff = os.path.join(d, "swapfail")
 
     def setfail(s):
@@ -1438,7 +1445,7 @@ def run_admit_chunk(a, t):
         os.replace(ff + ".tmp", ff)
     setfail("")
     setmem(1e12)
-    p, port, lg = start(["-c", "4096", "--chunk", "8"], {"RUNQ_TEST_SWAP_FAIL": ff})
+    p, port, lg = start(["-c", "4096", "--chunk", "8"], {"GWENEDEG_TEST_SWAP_FAIL": ff})
     if not port:
         rep(False, "admit_chunk/start_prefill", open(lg).read()[-500:])
         shutil.rmtree(d, ignore_errors=True)
@@ -1552,7 +1559,7 @@ def run_tools(a, t, port):
     env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
 
     def render_n(bodies):
-        p = subprocess.run([a.runq, a.model, "-m", "render", "-i", json.dumps([{"request": b} for b in bodies])], capture_output=True, env=env)
+        p = subprocess.run([a.gwenedeg, a.model, "-m", "render", "-i", json.dumps([{"request": b} for b in bodies])], capture_output=True, env=env)
         return [len(l.split()) for l in p.stdout.decode().splitlines()]
 
     def calls_of(m):
@@ -1642,7 +1649,7 @@ def run_checkpoints(a, t, port, env):
     rep = t.report
 
     def ids(body):
-        p = subprocess.run([a.runq, a.model, "-m", "render", "-i", json.dumps([{"request": body}])], capture_output=True, env=env)
+        p = subprocess.run([a.gwenedeg, a.model, "-m", "render", "-i", json.dumps([{"request": body}])], capture_output=True, env=env)
         return [int(x) for x in p.stdout.decode().split()]
 
     def msg_of(d):
@@ -1691,7 +1698,7 @@ def run_checkpoints(a, t, port, env):
         f"cached {c3} == the first prompt + its reply ({uf['prompt_tokens'] + uf['completion_tokens']}): the checkpoint at the reply's end")
     # the reply's </think>: the reply sent back with other content after the reasoning (as when a token was sampled where
     # the text's tokenization has another) rolls back to the end of the reasoning, not to the header
-    think_end = int(subprocess.run([a.runq, a.model, "-m", "tokenize", "-i", "</think>"], capture_output=True, env=env).stdout.split()[0])
+    think_end = int(subprocess.run([a.gwenedeg, a.model, "-m", "tokenize", "-i", "</think>"], capture_output=True, env=env).stdout.split()[0])
     k1 = [sysm, {"role": "user", "content": "Please read notes.txt for me."}]
     st, g1, _ = chat(port, dict(base, messages=k1, force_reply=rep1))
     k2 = k1 + [dict(msg_of(g1), role="assistant", content="Reading it now."), {"role": "tool", "tool_call_id": "c1", "content": "Buy milk."}]
@@ -1740,7 +1747,7 @@ def run_checkpoints(a, t, port, env):
     st, once, _ = chat(port, dict(body, cache_prompt=False))
     text = "".join(x["choices"][0]["delta"].get("reasoning_content") or "" for x in ev if x.get("choices"))
     rep(ka >= 1 and st == 200 and text == once["choices"][0]["message"]["reasoning_content"] and raw.endswith("data: [DONE]\n\n"),
-        "tools/stream_keepalive", f"{ka} keep-alive comment(s) (RUNQ_SSE_KEEPALIVE=0.05), the reasoning == the non-streamed one's")
+        "tools/stream_keepalive", f"{ka} keep-alive comment(s) (GWENEDEG_SSE_KEEPALIVE=0.05), the reasoning == the non-streamed one's")
     # Qwen3.5: a new user query drops the turn's reasoning (its template): the request goes back to the turn's first reply
     # (the checkpoint at its header), not further
     t1 = [sysm, {"role": "user", "content": "Check notes.txt."}]
@@ -1997,7 +2004,7 @@ def run_spec(a, t, port, has_draft, logname):
 
 
 def run_spec_mtp(a, t, port, out, quick):
-    """--spec mtp: the MTP drafter's own checks (the server: --draft mtp, RUNQ_TEST_MTP_CHECK, RUNQ_TEST_MTP_DUMP; main checks
+    """--spec mtp: the MTP drafter's own checks (the server: --draft mtp, GWENEDEG_TEST_MTP_CHECK, GWENEDEG_TEST_MTP_DUMP; main checks
     the log's invariant and the dumps after the shutdown): the next turn of a "speculative": false and of a constrained turn
     (the view followed them: its rows exact, the constrained turn's mtp_approx reported), every reply's mtp_approx 0 (a
     restart exactly at a divergence: at most 1); the copy paths (a running job's prefix, an idle slot under slot affinity:
@@ -2151,12 +2158,12 @@ class DumpPruner:
 
 
 def spec_mtp_after(a, t, logtext, dump):
-    """--spec mtp, after the shutdown: no '[engine] bug:' line (RUNQ_TEST_MTP_CHECK: every view at rest after every step);
-    the dumps (RUNQ_TEST_MTP_DUMP: the finished jobs with mtp_approx 0) one per such reply, each == a fresh lockstep run
+    """--spec mtp, after the shutdown: no '[engine] bug:' line (GWENEDEG_TEST_MTP_CHECK: every view at rest after every step);
+    the dumps (GWENEDEG_TEST_MTP_DUMP: the finished jobs with mtp_approx 0) one per such reply, each == a fresh lockstep run
     (api_test --mtp-seqcheck: the view's KV cache, its kept state, a probe row)"""
     rep = t.report
     bugs = re.findall(r"\[engine\] bug:.*", logtext)
-    rep(not bugs and "runq serve: stopped" in logtext, "spec/mtp_invariant", "; ".join(bugs[:3]) or "no '[engine] bug:' line")
+    rep(not bugs and "gwenedeg serve: stopped" in logtext, "spec/mtp_invariant", "; ".join(bugs[:3]) or "no '[engine] bug:' line")
     pairs = sorted(f[:-len(".draft.rqseq")] for f in os.listdir(dump) if f.endswith(".draft.rqseq"))
     want = sum(1 for tm in MTP_REC if tm["speculative"]["mtp_approx"] == 0)
     pr = getattr(a, "dump_pruner", None)
@@ -2166,7 +2173,7 @@ def spec_mtp_after(a, t, logtext, dump):
             shutil.rmtree(dump, ignore_errors=True)
             return
         want = len(pr.keep)
-    api = a.api_test or os.path.join(os.path.dirname(os.path.abspath(a.runq)), "build", "api_test")
+    api = a.api_test or os.path.join(os.path.dirname(os.path.abspath(a.gwenedeg)), "build", "api_test")
     env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
 
     def one(p):
@@ -2184,7 +2191,7 @@ def spec_mtp_after(a, t, logtext, dump):
 
 
 def run_mtp_g0(a, t):
-    """--mtp-g0: runq serve --draft mtp -G 0 (as the CLI's -G 0 -D mtp: the block not loaded, no draft): the startup line
+    """--mtp-g0: gwenedeg serve --draft mtp -G 0 (as the CLI's -G 0 -D mtp: the block not loaded, no draft): the startup line
     says so, a request's "speculative": {"k": 2} gets the "needs a draft" error, the replies == a server without --draft
     (run first and stopped: one server at a time)"""
     rep = t.report
@@ -2194,8 +2201,8 @@ def run_mtp_g0(a, t):
               {"messages": [{"role": "user", "content": CATS}], "temperature": 0.8, "top_p": 0.9, "seed": 42, "max_tokens": 32}]
     outs, logs = [], []
     for extra in ([], ["--draft", "mtp", "-G", "0"]):
-        log = tempfile.NamedTemporaryFile(prefix="runq-serve-g0-", suffix=".log", delete=False)
-        p = subprocess.Popen([a.runq, "serve", a.model] + base + extra, stderr=log, stdout=subprocess.DEVNULL, env=env)
+        log = tempfile.NamedTemporaryFile(prefix="gwenedeg-serve-g0-", suffix=".log", delete=False)
+        p = subprocess.Popen([a.gwenedeg, "serve", a.model] + base + extra, stderr=log, stdout=subprocess.DEVNULL, env=env)
         live(1)
         port = None
         for _ in range(1200):
@@ -2219,7 +2226,7 @@ def run_mtp_g0(a, t):
         outs.append((o, e))
     (ref, _), (got, err) = outs
     line = next((l for l in logs[1].splitlines() if "speculative decoding" in l), "")
-    ok = ref is not None and got == ref and line == "runq serve: speculative decoding off (--draft mtp with -G 0: the MTP block not loaded)"
+    ok = ref is not None and got == ref and line == "gwenedeg serve: speculative decoding off (--draft mtp with -G 0: the MTP block not loaded)"
     ok &= err is not None and err[0] == 400 and "needs a draft" in err[1].get("error", {}).get("message", "")
     rep(ok, "spec/mtp_g0", f"{line!r}; {{\"k\": 2}}: {err[0] if err else None} "
         f"{(err[1].get('error', {}).get('message', '') if err and isinstance(err[1], dict) else '')[:80]!r}; == no --draft: {got == ref}")
@@ -2228,8 +2235,8 @@ def run_mtp_g0(a, t):
 def mtp_plain(a, t, base, env):
     """--spec mtp: the plain references (spec_plain_refs) from a server on the same file without -D, stopped before the
     MTP server starts (one server at a time: two 27B servers would not fit, S9c.G); None if it does not start"""
-    log = tempfile.NamedTemporaryFile(prefix="runq-serve-plain-", suffix=".log", delete=False)
-    p = subprocess.Popen([a.runq, "serve", a.model] + base, stderr=log, stdout=subprocess.DEVNULL, env=env)
+    log = tempfile.NamedTemporaryFile(prefix="gwenedeg-serve-plain-", suffix=".log", delete=False)
+    p = subprocess.Popen([a.gwenedeg, "serve", a.model] + base, stderr=log, stdout=subprocess.DEVNULL, env=env)
     live(1)
     port, refs = None, None
     for _ in range(1200):
@@ -2260,7 +2267,8 @@ def mtp_plain(a, t, base, env):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--runq", required=True)
+    ap.add_argument("--gwenedeg")  # (required; --runq below: its deprecated name, before 2026-11-22)
+    ap.add_argument("--runq", dest="gwenedeg", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     ap.add_argument("--model", required=True)
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--slow", action="store_true", help="relaxed latency bounds (sanitizer builds)")
@@ -2272,22 +2280,24 @@ def main():
     ap.add_argument("--draft", help="with --disk / --admit / --admit-chunk: the servers with this draft model (its sequences saved too)")
     ap.add_argument("--admit", action="store_true", help="the memory admission group only (--admit bound: its own servers)")
     ap.add_argument("--admit-chunk", action="store_true", help="the chunked leases group only (--admit chunk: its own servers)")
-    ap.add_argument("--disk-compat", metavar="REF_RUNQ", help="the disk tier across builds only: one --kv-disk directory served by "
-                    "REF_RUNQ, this build, REF_RUNQ again (with --spec DRAFT or --draft: the draft's files too)")
+    ap.add_argument("--disk-compat", metavar="REF_GWENEDEG", help="the disk tier across builds only: one --kv-disk directory served by "
+                    "REF_GWENEDEG, this build, REF_GWENEDEG again (with --spec DRAFT or --draft: the draft's files too)")
     ap.add_argument("--quick", action="store_true", help="with --spec: greedy, seeded, thinking, the next turns, four at once with "
                     "auto (and with --spec mtp its own checks)")
     ap.add_argument("--mtp-accepts", action="store_true", help="with --spec mtp: a trained block (its guesses accepted: spec/mtp_accepts)")
-    ap.add_argument("--mtp-g0", action="store_true", help="runq serve --draft mtp -G 0 only (the block not loaded; == no --draft)")
+    ap.add_argument("--mtp-g0", action="store_true", help="gwenedeg serve --draft mtp -G 0 only (the block not loaded; == no --draft)")
     ap.add_argument("--api-test", help="with --spec mtp, --disk --draft mtp: tests/api_test for --mtp-seqcheck (default: build/api_test "
-                    "next to --runq)")
+                    "next to --gwenedeg)")
     ap.add_argument("--foreign-draft", metavar="FILE", help="with --disk --draft mtp: a directory written with this draft model "
                     "first, then served with --draft mtp (disk/mtp_foreign_draft)")
-    ap.add_argument("--one-server", action="store_true", help="never two runq serve processes at once (the 27B: S9c.G); with "
+    ap.add_argument("--one-server", action="store_true", help="never two gwenedeg serve processes at once (the 27B: S9c.G); with "
                     "S9_GATE_MEM set, --mem S9_GATE_MEM for every server")
     ap.add_argument("--mtp-dump-max", type=int, default=0, metavar="N", help="with --spec mtp: keep at most N dumped jobs (every 4th "
                     "one as they are written, the rest deleted at once; spec/mtp_lockstep checks those): a 27B target's dump is "
                     "~0.8 GB (S9c.G1)")
     a = ap.parse_args()
+    if not a.gwenedeg:
+        ap.error("the following arguments are required: --gwenedeg")
     a.q35_spec = False
     t = T(a)
     try:
@@ -2341,10 +2351,10 @@ def main_groups(a, t):
         print(f"server tests: {t.n - t.failed} passed, {t.failed} failed")
         return 1 if t.failed else 0
     slow = 10 if a.slow else 1
-    log = tempfile.NamedTemporaryFile(prefix="runq-serve-", suffix=".log", delete=False)
+    log = tempfile.NamedTemporaryFile(prefix="gwenedeg-serve-", suffix=".log", delete=False)
     env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
     if a.tools:  # (SSE keep-alive comments after 0.05 s without a chunk instead of 15 s: tools/stream_keepalive)
-        env["RUNQ_SSE_KEEPALIVE"] = "0.05"
+        env["GWENEDEG_SSE_KEEPALIVE"] = "0.05"
     base = ["--port", "0", "-c", "2048", "--parallel", "4", "--slots", "6", "--chunk", "16", "--queue", "4", "--max-body", "65536",
             "--name", "test-model"] + (["--checkpoints", "5"] if a.tools else []) + gate_mem(a)
     dump = None
@@ -2353,11 +2363,11 @@ def main_groups(a, t):
         a.plain = mtp_plain(a, t, base, env)
         if a.plain is None:
             return 1
-        dump = tempfile.mkdtemp(prefix="runq-mtpdump-", dir=os.environ.get("RUNQ_DISK_TMP") or ("/var/tmp" if os.access("/var/tmp", os.W_OK) else None))
-        env.update(RUNQ_TEST_MTP_CHECK="1", RUNQ_TEST_MTP_DUMP=dump)
+        dump = tempfile.mkdtemp(prefix="gwenedeg-mtpdump-", dir=disk_tmp())
+        env.update(GWENEDEG_TEST_MTP_CHECK="1", GWENEDEG_TEST_MTP_DUMP=dump)
         if a.mtp_dump_max > 0:
             a.dump_pruner = DumpPruner(dump, a.mtp_dump_max)
-    srv = subprocess.Popen([a.runq, "serve", a.model] + base +
+    srv = subprocess.Popen([a.gwenedeg, "serve", a.model] + base +
                            ((["-D", a.spec] if a.spec != "none" else ["--lookup", "4"]) + ["--spec-calibrate", "1024"] if a.spec else []),
                            stderr=log, stdout=subprocess.DEVNULL, env=env)
     live(1)
@@ -2406,7 +2416,7 @@ def main_groups(a, t):
         rc = "timeout"
     live(-1)
     logtext = open(log.name).read()
-    t.report(rc == 0 and "runq serve: stopped" in logtext, "shutdown/sigterm", f"exit status {rc}")
+    t.report(rc == 0 and "gwenedeg serve: stopped" in logtext, "shutdown/sigterm", f"exit status {rc}")
     if getattr(a, "dump_pruner", None):
         a.dump_pruner.finish()
     if dump:
@@ -2444,7 +2454,7 @@ def run_all(a, t, port, ref, slow, logname):
     c.close()
     rep(ok, "basic/keep_alive", "6 requests on one connection")
 
-    # ------------------------------------------------------------------ chat == runq -m chat
+    # ------------------------------------------------------------------ chat == gwenedeg -m chat
     st, d, _ = chat(port, {"messages": [{"role": "user", "content": AUS}], "temperature": 0, "max_tokens": 40})
     want = ref["aus"].result()
     rep(st == 200 and text_of(d) + "\n" == want, "chat/single_turn", f"{text_of(d)!r} vs {want!r}" if st == 200 and text_of(d) + "\n" != want else "")

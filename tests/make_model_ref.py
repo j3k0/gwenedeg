@@ -2,7 +2,7 @@
 """Reference logits of a Qwen3 GGUF file from its dequantized weights (tests/golden/models/<tag>/), for the models
 group of tests/check_models.py: the 4B / 8B models have no HF weights here (and their fp32 models, 16 / 33 GB,
 would not fit in memory), so the reference is the file itself: fp32 activations on its weights dequantized with
-ggml's expressions (tests/ref_forward.py, layer by layer: ~1 GB peak for 8B). runq on the file differs from it
+ggml's expressions (tests/ref_forward.py, layer by layer: ~1 GB peak for 8B). gwenedeg on the file differs from it
 by its int8 activations only (as the 0.6B Q4_K_M file vs golden/logits_q4).
 
 Usage: .venv/bin/python tests/make_model_ref.py TAG FILE.gguf     (numpy + the HF tokenizer of models/Qwen3-0.6B)

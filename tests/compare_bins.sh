@@ -1,25 +1,26 @@
 #!/usr/bin/env bash
-# Compares two builds of runq on everything that must not change in a refactoring: the outputs of
+# Compares two builds of gwenedeg on everything that must not change in a refactoring: the outputs of
 # the same command lines must be byte-identical, on every model family.
 # Qwen3 (families bin / q8 / q4: Qwen3-0.6B .bin, Q8_0, Q4_K_M):
 #   -m logits files (both builds x KV f16 / bf16 / f32 x -b 1 / 7 / 64 / 512 x a short prompt and one of
 #   > 256 tokens, i.e. past one attention block); greedy generate (short / long prompt, -b 1 / 7 / 512,
 #   default -c, a prompt longer than -c); seeded sampling (-t 0.8 -s 7, generate and chat); multi-turn
 #   chat on stdin (-r 0 with a system prompt, -r 1, context full at -c 160, -b 1 / 7) incl. the
-#   RUNQ_CHAT_DUMP files; -m tokenize; -m dequant; error cases (prompt too long, bad flags, missing file).
+#   GWENEDEG_CHAT_DUMP files; -m tokenize; -m dequant; error cases (prompt too long, bad flags, missing file).
 # Qwen3.5 (families q35-q8 / q35-q4: Qwen3.5-0.8B Q8_0, Q4_K_M; synth-r2 / synth-r3: the synthetic models
 #   with 2 / 3 value heads per key head of tests/make_synth_q35.py, built from ROOT's script into
 #   ROOT/build/synth-q35: data, the same files for both builds; q35-4b: Qwen3.5-4B Q8_0, with --q35-4b):
 #   the -m logits grid (both builds x KV f16 / bf16 x 3 / 8 threads x -b 1 / 7 / 64 / 512 x short / long
 #   prompt); greedy and seeded generate; -r 1 chats whose second turn rolls the recurrent state back to a
-#   checkpoint (-b 7, bf16 KV, seeded, context full), with the RUNQ_CHAT_DUMP files; -m tokenize.
+#   checkpoint (-b 7, bf16 KV, seeded, context full), with the GWENEDEG_CHAT_DUMP files; -m tokenize.
 # api_test --digest (the batched passes' logits hashes, tests/api_test.c) on the Qwen3.5 families, and
 #   --digest-small with api_test-generic, if both REF_DIR and NEW_DIR have them (DIR/api_test or
 #   DIR/build/api_test, and -generic; `make api-test` builds them).
 # Compared: stdout, stderr (numbers of the [timing] / [tokenize] lines masked), the exit status and the
 # output / dump files. A family whose model file is missing is skipped (noted in the summary).
 # Usage: tests/compare_bins.sh [-j JOBS] [-t THREADS] [--quick] [--q35-4b] [--no-api] REF_DIR NEW_DIR
-#   REF_DIR / NEW_DIR: directories holding runq and runq-generic (e.g. a copy of the binaries of the
+#   REF_DIR / NEW_DIR: directories holding gwenedeg and gwenedeg-generic (or runq and runq-generic: a build from
+#   before 2026-11-22, when the binary was runq; e.g. a copy of the binaries of the
 #   commit before a change, and the repo root). --quick: only the AVX-512 (native) builds, -b 1 / 64,
 #   a few jobs per Qwen3.5 family. --q35-4b: also a few jobs on Qwen3.5-4B Q8_0 (4.5 GB: run one at a
 #   time, 8 threads). --no-api: no api_test jobs. Env: CMP_CACHE=DIR keeps the REF results there (keyed
@@ -40,7 +41,7 @@ while [[ $# -gt 2 ]]; do
         *) echo "unknown option $1" >&2; exit 2 ;;
     esac
 done
-[[ $# -eq 2 ]] || { sed -n '2,29p' "$0" >&2; exit 2; }
+[[ $# -eq 2 ]] || { sed -n '2,30p' "$0" >&2; exit 2; }
 REF="$(cd "$1" && pwd)" NEW="$(cd "$2" && pwd)"
 cd "$ROOT"
 BIN=models/Qwen3-0.6B-q8.bin
@@ -50,14 +51,17 @@ Q35Q8=models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf
 Q35Q4=models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf
 Q35B4=models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q8_0.gguf
 SYN=build/synth-q35
-BUILDS="runq runq-generic"
-[[ $QUICK = 1 ]] && BUILDS="runq"
-for d in "$REF" "$NEW"; do for b in $BUILDS; do [[ -x "$d/$b" ]] || { echo "missing $d/$b" >&2; exit 2; }; done; done
+BUILDS="gwenedeg gwenedeg-generic"
+[[ $QUICK = 1 ]] && BUILDS="gwenedeg"
+bin_find() { # DIR NAME -> DIR/NAME, else the name before 2026-11-22 (runq*), else nothing
+    local p; for p in "$1/$2" "$1/${2/gwenedeg/runq}"; do [[ -x "$p" ]] && { echo "$p"; return; }; done; true
+}
+for d in "$REF" "$NEW"; do for b in $BUILDS; do [[ -n "$(bin_find "$d" $b)" ]] || { echo "missing $d/$b" >&2; exit 2; }; done; done
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/cmpbins.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
-# the executables of each side: $WORK/ref, $WORK/new (symlinks: runq, runq-generic, api_test[-generic])
+# the executables of each side: $WORK/ref, $WORK/new (symlinks: gwenedeg, gwenedeg-generic, api_test[-generic])
 NOTES=()
 api_find() { # DIR NAME -> path or nothing
     local p; for p in "$1/$2" "$1/build/$2"; do [[ -x "$p" ]] && { echo "$p"; return; }; done; true
@@ -65,7 +69,7 @@ api_find() { # DIR NAME -> path or nothing
 for side in ref new; do
     mkdir -p "$WORK/$side"
     d="$REF"; [[ $side = new ]] && d="$NEW"
-    for b in $BUILDS; do ln -s "$d/$b" "$WORK/$side/$b"; done
+    for b in $BUILDS; do ln -s "$(bin_find "$d" $b)" "$WORK/$side/$b"; done
 done
 APIS=""
 if [[ $API = 1 ]]; then
@@ -120,7 +124,7 @@ printf 'What is 12 + 30?\nAnd times two?\n' > "$WORK/turns2.txt"
 printf 'Name a fruit.\nName a colour.\nName an animal.\nName a country.\nName a planet.\nName a metal.\n' > "$WORK/turns6.txt"
 : > "$WORK/empty.txt"
 
-# job list, one line per job: name (build/family/...), stdin file, env flags (DUMP=1: RUNQ_CHAT_DUMP;
+# job list, one line per job: name (build/family/...), stdin file, env flags (DUMP=1: GWENEDEG_CHAT_DUMP;
 # T=n: n threads instead of -t; HEAVY=1: run one at a time), then the executable and its arguments;
 # fields separated by \x1e, each argument terminated by \x1f (empty ones survive)
 JL="$WORK/jobs.txt"
@@ -181,7 +185,7 @@ done
 # Qwen3.5: the recurrent state (DeltaNet) of the linear-attention layers, its checkpoints and rollback.
 # A -r 1 chat's second turn diverges right after turn 1's assistant header (the history drops the reasoning
 # block), so the cache goes back to the checkpoint taken there and the rest is prefilled again; the
-# RUNQ_CHAT_DUMP files hold every sampled logits vector and the final cache's ids
+# GWENEDEG_CHAT_DUMP files hold every sampled logits vector and the final cache's ids
 q35_jobs() { # family model
     local f="$1" M="$2" b k t c
     for b in $BUILDS; do
@@ -233,12 +237,12 @@ q35_jobs() { # family model
 for f in q35-q8 q35-q4 synth-r2 synth-r3; do if has $f; then q35_jobs $f "${FM[$f]}"; fi; done
 if [[ $Q4B = 1 ]] && has q35-4b; then # one at a time (4.5 GB each), 8 threads
     M=$Q35B4 E="HEAVY=1 T=8"
-    job "runq/q35-4b/logits/kf16/b64/short" empty.txt "$E" runq "$M" -c 1024 -m logits -b 64 -i "$SHORT" -o OUT
-    job "runq/q35-4b/logits/kf16/b64/long" empty.txt "$E" runq "$M" -c 1024 -m logits -b 64 -i "$LONG" -o OUT
-    if [[ $QUICK = 0 ]]; then job "runq/q35-4b/logits/kbf16/b1/long" empty.txt "$E" runq "$M" -c 1024 -k bf16 -m logits -b 1 -i "$LONG" -o OUT; fi
-    job "runq/q35-4b/gen/long" empty.txt "$E" runq "$M" -c 1024 -t 0 -n 24 -m generate -i "$LONG"
-    if [[ $QUICK = 0 ]]; then job "runq/q35-4b/seeded/gen" empty.txt "$E" runq "$M" -c 1024 -t 0.8 -s 7 -n 32 -m generate -i "$SHORT"; fi
-    job "runq/q35-4b/chat/think" turns2.txt "DUMP=1 $E" runq "$M" -c 1024 -t 0 -n 32 -r 1
+    job "gwenedeg/q35-4b/logits/kf16/b64/short" empty.txt "$E" gwenedeg "$M" -c 1024 -m logits -b 64 -i "$SHORT" -o OUT
+    job "gwenedeg/q35-4b/logits/kf16/b64/long" empty.txt "$E" gwenedeg "$M" -c 1024 -m logits -b 64 -i "$LONG" -o OUT
+    if [[ $QUICK = 0 ]]; then job "gwenedeg/q35-4b/logits/kbf16/b1/long" empty.txt "$E" gwenedeg "$M" -c 1024 -k bf16 -m logits -b 1 -i "$LONG" -o OUT; fi
+    job "gwenedeg/q35-4b/gen/long" empty.txt "$E" gwenedeg "$M" -c 1024 -t 0 -n 24 -m generate -i "$LONG"
+    if [[ $QUICK = 0 ]]; then job "gwenedeg/q35-4b/seeded/gen" empty.txt "$E" gwenedeg "$M" -c 1024 -t 0.8 -s 7 -n 32 -m generate -i "$SHORT"; fi
+    job "gwenedeg/q35-4b/chat/think" turns2.txt "DUMP=1 $E" gwenedeg "$M" -c 1024 -t 0 -n 32 -r 1
     if [[ " $APIS " = *" api_test "* && $QUICK = 0 ]]; then
         job "api_test/q35-4b/digest_small" empty.txt "$E" api_test "$M" --digest-small
     fi
@@ -256,7 +260,7 @@ run_one() { # DIR line -> "name <hashes>"
     local th="$THREADS"
     [[ "$env" =~ (^|\ )T=([0-9]+) ]] && th="${BASH_REMATCH[2]}"
     local -a e=(OMP_NUM_THREADS="$th")
-    [[ "$env" == *DUMP=1* ]] && e+=(RUNQ_CHAT_DUMP="$t/dump")
+    [[ "$env" == *DUMP=1* ]] && e+=(GWENEDEG_CHAT_DUMP="$t/dump")
     local rc=0
     env "${e[@]}" "$exe" "${a[@]}" < "$WORK/$in" > "$t/stdout" 2> "$t/stderr" || rc=$?
     sed -E '/^\[(timing|tokenize|profile)\]/ s/[0-9]+(\.[0-9]+)?/N/g' "$t/stderr" > "$t/stderr.n"

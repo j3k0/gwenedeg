@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Compares two builds of runq on the CLI's MTP drafter (-D mtp; TODO S9c.1, CMP-MTP), which tests/compare_bins.sh does not
+"""Compares two builds of gwenedeg on the CLI's MTP drafter (-D mtp; TODO S9c.1, CMP-MTP), which tests/compare_bins.sh does not
 run: tests/check_spec.py's MTP_CASES x MTP_K (imported, not copied) on build/synth-q35's synth-q35-27b-mtp.gguf and
 synth-q35-ista-mtp.gguf (built here as check_models does, cached) and the trained Qwen3.5-0.8B-mtp (if present), each run
-with both binaries. Compared: the exit status, stdout and the RUNQ_CHAT_DUMP files (the cache's ids, every sampled logits
+with both binaries. Compared: the exit status, stdout and the GWENEDEG_CHAT_DUMP files (the cache's ids, every sampled logits
 vector) byte for byte, stderr line by line with the [timing] lines' times masked: the speculative line keeps its counts
 (passes, drafted, accepted, tok/pass, draft steps, "| mtp rows N (approx M)") but its seconds; with --spec auto (its
 choices follow the costs calibrated at the start: they vary run to run) every number of it but the approximate rows;
 the prompt and spec-auto costs lines without numbers. Not part of the suite (a refactoring's check, as compare_bins).
 
-Usage: .venv/bin/python -I tests/compare_mtp.py --ref REF_RUNQ --new NEW_RUNQ [-j 3] [--threads 4] [--q35 Q8_0.gguf]
+Usage: .venv/bin/python -I tests/compare_mtp.py --ref REF_GWENEDEG --new NEW_GWENEDEG [-j 3] [--threads 4] [--q35 Q8_0.gguf]
                                                [--mtp08 FILE]
 Prints each difference and "N of N identical" (per file and in all); exit status 0 if every run is identical, 1 if
 not, 2 on a setup error (a missing binary or source file).
@@ -59,7 +59,7 @@ def compare(ref, new, auto):
         i = next((j for j, (x, y) in enumerate(zip(b, a)) if x != y), min(len(a), len(b)))
         why.append(f"stderr line {i}: {(b[i] if i < len(b) else '')[:160]!r} vs {(a[i] if i < len(a) else '')[:160]!r}")
     if ref[3] != new[3]:
-        why.append("RUNQ_CHAT_DUMP " + ("ids" if ref[3] is None or new[3] is None or ref[3][0] != new[3][0] else "logits") + " differ")
+        why.append("GWENEDEG_CHAT_DUMP " + ("ids" if ref[3] is None or new[3] is None or ref[3][0] != new[3][0] else "logits") + " differ")
     return why
 
 
@@ -72,8 +72,8 @@ def job(ref, new, model, case, k, tmp, tag, threads):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--ref", required=True, help="the reference runq")
-    ap.add_argument("--new", required=True, help="the runq to compare")
+    ap.add_argument("--ref", required=True, help="the reference gwenedeg")
+    ap.add_argument("--new", required=True, help="the gwenedeg to compare")
     ap.add_argument("-j", type=int, default=3, help="jobs at once (each runs both binaries in turn)")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--q35", default=Q35, help="the Qwen3.5-0.8B Q8_0 file (the synthetic files' source)")

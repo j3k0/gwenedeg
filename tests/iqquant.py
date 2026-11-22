@@ -1,7 +1,7 @@
 """A simple quantizer to Q2_K and the i-quants (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS), numpy only:
 the synthetic test models' weights (tests/make_synth_q35.py: synth-q35-iq.gguf). Not llama.cpp's quantizers (no
 importance matrix, no search over scales): every block it writes is a valid block of its format (ggml's layouts,
-ggml-common.h), dequantized by tests/ggufmini.py and runq exactly as llama.cpp would; the values are close enough to the
+ggml-common.h), dequantized by tests/ggufmini.py and gwenedeg exactly as llama.cpp would; the values are close enough to the
 source weights to keep a forward pass's statistics realistic (relative RMS error ~0.1 .. 0.6 depending on the type).
 
 Per group of values the scale maps the largest magnitude to the largest code; each value is rounded to the nearest value

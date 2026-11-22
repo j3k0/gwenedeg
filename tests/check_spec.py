@@ -3,15 +3,15 @@
   api        tests/api_test --spec on the Qwen3-0.6B pair (target Q8_0, draft Q4_K_M; every case and draft setting),
              the generic build's api_test --spec --quick, and Qwen3.5-0.8B Q8_0 + its Q4_K_M as the draft (--quick:
              the hybrid rollbacks, every one on its checkpoint); the vocabulary check refuses the other family
-  cli        runq -D DRAFT -G k [--tau], --lookup N (the prompt lookup alone, no -D), both combined and --spec auto (G7) vs the same
+  cli        gwenedeg -D DRAFT -G k [--tau], --lookup N (the prompt lookup alone, no -D), both combined and --spec auto (G7) vs the same
              command without them: stdout byte for byte, stderr but the [timing] lines, the exit status, and in chat
-             mode the RUNQ_CHAT_DUMP files (the cache's ids and every sampled logits vector, bitwise): generate and
+             mode the GWENEDEG_CHAT_DUMP files (the cache's ids and every sampled logits vector, bitwise): generate and
              chat, greedy and seeded (top-p, top-k), thinking off / on, -n inside a verify pass, -n 1 / 2, the
              context's end (generate, and chat turns dropped at -c 160), -b 1, piped multi-turn chats, a generation
              that copies its prompt (lookup: >= 3 tokens per pass); -G 0 with -D is plain decoding byte for byte
              (stderr included); a draft of another vocabulary, -G without -D and a bad --lookup / --lookup-min are
              refused; one generate and one chat case on the generic build
-  server     runq serve with speculation (tests/server_test.py --spec: the Qwen3-0.6B pair, Qwen3.5-0.8B Q8_0 + Q4_K_M, the
+  server     gwenedeg serve with speculation (tests/server_test.py --spec: the Qwen3-0.6B pair, Qwen3.5-0.8B Q8_0 + Q4_K_M, the
              0.8B with the prompt lookup alone): every request with "speculative": false and with fixed settings / auto,
              outputs identical (content, reasoning, tool calls, finish, usage, logprobs; streamed and not; concurrent
              requests; a conversation's next turn reuses what plain decoding's would)
@@ -19,10 +19,10 @@
              q35_synth_build, cached; needs the Qwen3.5-0.8B files): api_test --spec FILE mtp (every case, setting and hook
              pattern, mtp_lockstep after each case), the generic build's --quick, synth-q35-27b-f32.gguf --quick; the CLI
              cases with -D mtp (MTP_CASES) == plain as above; -G 0 -D mtp == plain byte for byte; -D mtp on a file without
-             a block refused, --mem prints the MTP's estimate; runq serve --draft mtp (TODO S9c.3; tests/server_test.py --spec
+             a block refused, --mem prints the MTP's estimate; gwenedeg serve --draft mtp (TODO S9c.3; tests/server_test.py --spec
              mtp): == a server without -D and == "speculative": false, the view's checks (mtp_approx 0, the copy paths, a
-             cancel, the at-rest invariant RUNQ_TEST_MTP_CHECK, every finished job's view == a fresh lockstep run:
-             RUNQ_TEST_MTP_DUMP + api_test --mtp-seqcheck) on synth-q35-ista-mtp (whole; the generic build quick),
+             cancel, the at-rest invariant GWENEDEG_TEST_MTP_CHECK, every finished job's view == a fresh lockstep run:
+             GWENEDEG_TEST_MTP_DUMP + api_test --mtp-seqcheck) on synth-q35-ista-mtp (whole; the generic build quick),
              synth-q35-27b-mtp and the trained Qwen3.5-0.8B-mtp block (quick; its guesses accepted) if present; the
              chunked leases' swap with the view (--admit-chunk --draft mtp); -G 0 (the block not loaded); a file without a
              block and --mtp-vocab -3 refused
@@ -34,7 +34,7 @@ import sys
 
 import procslots  # (GWENEDEG_TEST_PROCS; tests/ is on sys.path: imported by check.py)
 
-SPEC_THREADS = 4  # per runq / api_test process (the runs go 3 at a time, in the background from the start)
+SPEC_THREADS = 4  # per gwenedeg / api_test process (the runs go 3 at a time, in the background from the start)
 GEN_THREADS = 3
 
 GEN_PROMPT = "def quicksort(arr):"
@@ -93,12 +93,12 @@ def no_timing(err):
     return "\n".join(l for l in err.decode(errors="replace").split("\n") if not l.startswith("[timing]"))
 
 
-def cli_run(runq, model, args, users, tmp, tag, draft=None, k=(), threads=SPEC_THREADS):
-    """one runq run: (exit status, stdout, stderr, dump ids + logits bytes or None, spec stats line)"""
+def cli_run(gwenedeg, model, args, users, tmp, tag, draft=None, k=(), threads=SPEC_THREADS):
+    """one gwenedeg run: (exit status, stdout, stderr, dump ids + logits bytes or None, spec stats line)"""
     prefix = os.path.join(tmp, f"spec_{tag}")
     stdin = ("\n".join(users) + "\n").encode() if users is not None else None
-    cmd = [runq, model] + ([] if "-c" in args else ["-c", "4096"]) + list(args) + (["-D", draft] if draft else []) + list(k)
-    p = run(cmd, threads, stdin, {"RUNQ_CHAT_DUMP": prefix})
+    cmd = [gwenedeg, model] + ([] if "-c" in args else ["-c", "4096"]) + list(args) + (["-D", draft] if draft else []) + list(k)
+    p = run(cmd, threads, stdin, {"GWENEDEG_CHAT_DUMP": prefix})
     dump = None
     if os.path.exists(prefix + ".ids"):
         with open(prefix + ".ids", "rb") as f, open(prefix + ".logits", "rb") as g:
@@ -120,7 +120,7 @@ def compare(ref, got, what, timing_ok=True):
     if (no_timing(got[2]) if timing_ok else got[2]) != (no_timing(ref[2]) if timing_ok else ref[2]):
         why.append("stderr differs" + (" (without the [timing] lines)" if timing_ok else ""))
     if got[3] != ref[3]:
-        why.append("RUNQ_CHAT_DUMP " + ("ids" if got[3] is None or ref[3] is None or got[3][0] != ref[3][0] else "logits") + " differ")
+        why.append("GWENEDEG_CHAT_DUMP " + ("ids" if got[3] is None or ref[3] is None or got[3][0] != ref[3][0] else "logits") + " differ")
     return not why, "; ".join(why)
 
 
@@ -139,16 +139,16 @@ def tok_per_pass(stats):
     return float(f[f.index("tok/pass") - 1]) if "tok/pass" in f else 0.0
 
 
-def cli_case(runq, model, draft, case, tmp, tag, ks=None, suffix=""):
+def cli_case(gwenedeg, model, draft, case, tmp, tag, ks=None, suffix=""):
     name, args, users, kset, chk = case
     name += suffix
-    ref = cli_run(runq, model, args, users, tmp, f"{tag}_ref")
+    ref = cli_run(gwenedeg, model, args, users, tmp, f"{tag}_ref")
     out = []
     if ref[0] != 0:
         return [(False, name, f"reference run failed: {ref[2].decode(errors='replace')[-300:]}")]
     detail, ok = [], True
     for k in (ks or kset):
-        got = cli_run(runq, model, args, users, tmp, f"{tag}_{'_'.join(k)}", draft if "-G" in k else None, k)
+        got = cli_run(gwenedeg, model, args, users, tmp, f"{tag}_{'_'.join(k)}", draft if "-G" in k else None, k)
         o, why = compare(ref, got, " ".join(k))
         o &= len(got[4]) == (len(users) if users is not None and "-i" not in args else 1)
         if chk.get("copy") and o and tok_per_pass(got[4]) < 3.0:
@@ -186,12 +186,12 @@ def mtp_start(a, d, ex):
             futs.append(("api", "spec_api/mtp_synth_f32", ex.submit(run, [a.api_test, "--spec", f32, "mtp", "--quick"], SPEC_THREADS)))
     for name in MTP_CASES:
         case = next(c for c in CLI_CASES if c[0] == name)
-        futs.append(("cli", "spec_mtp", ex.submit(cli_case, a.runq, mtp, "mtp", case, d, f"m{name}", MTP_K)))
+        futs.append(("cli", "spec_mtp", ex.submit(cli_case, a.gwenedeg, mtp, "mtp", case, d, f"m{name}", MTP_K)))
 
     def g0():  # -G 0 -D mtp: plain decoding, byte for byte (nothing loaded, nothing printed)
         args = ["-m", "generate", "-t", "1", "-s", "2", "-n", "20", "-i", STORY]
-        ref = cli_run(a.runq, mtp, args, None, d, "mg0_ref")
-        got = cli_run(a.runq, mtp, args, None, d, "mg0", "mtp", ["-G", "0"])
+        ref = cli_run(a.gwenedeg, mtp, args, None, d, "mg0_ref")
+        got = cli_run(a.gwenedeg, mtp, args, None, d, "mg0", "mtp", ["-G", "0"])
         ok, why = compare(ref, got, "-G 0", timing_ok=True)
         strip = lambda e: bytes(x for x in e if not chr(x).isdigit())  # noqa: E731  (the timing line's numbers vary)
         ok &= strip(got[2]) == strip(ref[2])
@@ -201,21 +201,21 @@ def mtp_start(a, d, ex):
     def refused():
         out = []
         if os.path.exists(base):
-            p = run([a.runq, base, "-m", "generate", "-n", "4", "-i", "hi", "-D", "mtp"], 2)
+            p = run([a.gwenedeg, base, "-m", "generate", "-n", "4", "-i", "hi", "-D", "mtp"], 2)
             e = p.stderr.decode(errors="replace")
             out.append((p.returncode == 1 and not p.stdout and f"-D mtp: {base} has no MTP block" in e, "refused_no_block",
                         f"-D mtp on synth-q35-27b.gguf (no block): exit status {p.returncode}, {e.strip()[-150:]!r}"))
-        p = run([a.runq, mtp, "-m", "generate", "-n", "4", "-t", "0", "-i", "hi", "-D", "mtp", "--mem", "64", "--mtp-vocab", "1000"], 2)
+        p = run([a.gwenedeg, mtp, "-m", "generate", "-n", "4", "-t", "0", "-i", "hi", "-D", "mtp", "--mem", "64", "--mtp-vocab", "1000"], 2)
         e = p.stderr.decode(errors="replace")
         ok = p.returncode == 0 and "[memory] mtp estimate" in e and "--mem 64.00 GiB" in e and "vocab 1000)" in e
         out.append((ok, "mem_line", f"--mem with -D mtp: the MTP's estimate line (exit status {p.returncode}): "
                     + (next((l for l in e.splitlines() if l.startswith("[memory] mtp")), "none")[:160])))
-        p = run([a.runq, mtp, "-m", "generate", "-n", "4", "-i", "hi", "-D", "mtp", "--mtp-vocab", "-3"], 2)
+        p = run([a.gwenedeg, mtp, "-m", "generate", "-n", "4", "-i", "hi", "-D", "mtp", "--mtp-vocab", "-3"], 2)
         out.append((p.returncode == 1 and b"Usage:" in p.stderr, "bad_mtp_vocab", f"--mtp-vocab -3: exit status {p.returncode}"))
         return out
     futs.append(("cli", "spec_mtp", ex.submit(refused)))
 
-    # runq serve --draft mtp (TODO S9c.3; tests/server_test.py --spec mtp: == a plain server, the MTP checks): the ISTA-shaped
+    # gwenedeg serve --draft mtp (TODO S9c.3; tests/server_test.py --spec mtp: == a plain server, the MTP checks): the ISTA-shaped
     # file (Q6_K block and eh_proj, Q4_K classifier) whole, the 27B-shaped one and the trained 0.8B block quick (its guesses
     # accepted: B after them), the generic build quick; the chunked leases' swap with the view (--admit-yield included);
     # --admit bound and the disk tier with the view (S9c.4); -G 0; the refusals
@@ -224,34 +224,34 @@ def mtp_start(a, d, ex):
     srv = [sys.executable, "-I", os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_test.py"), "--threads", str(SPEC_THREADS)]
     srv += ["--api-test", a.api_test] if a.api_test else []
     if os.path.exists(ista):
-        futs.append(("api", "spec_server/mtp_ista", ex.submit(run, srv + ["--runq", a.runq, "--model", ista, "--spec", "mtp"], SPEC_THREADS)))
+        futs.append(("api", "spec_server/mtp_ista", ex.submit(run, srv + ["--gwenedeg", a.gwenedeg, "--model", ista, "--spec", "mtp"], SPEC_THREADS)))
         if a.generic:
-            futs.append(("api", "spec_server/mtp_generic", ex.submit(run, srv + ["--runq", a.generic, "--model", ista, "--spec", "mtp", "--quick"],
+            futs.append(("api", "spec_server/mtp_generic", ex.submit(run, srv + ["--gwenedeg", a.generic, "--model", ista, "--spec", "mtp", "--quick"],
                                                                       SPEC_THREADS)))
-        futs.append(("api", "spec_server/mtp_g0", ex.submit(run, srv + ["--runq", a.runq, "--model", ista, "--mtp-g0"], SPEC_THREADS)))
-    futs.append(("api", "spec_server/mtp_synth", ex.submit(run, srv + ["--runq", a.runq, "--model", mtp, "--spec", "mtp", "--quick"], SPEC_THREADS)))
+        futs.append(("api", "spec_server/mtp_g0", ex.submit(run, srv + ["--gwenedeg", a.gwenedeg, "--model", ista, "--mtp-g0"], SPEC_THREADS)))
+    futs.append(("api", "spec_server/mtp_synth", ex.submit(run, srv + ["--gwenedeg", a.gwenedeg, "--model", mtp, "--spec", "mtp", "--quick"], SPEC_THREADS)))
     if os.path.exists(mtp08):
-        futs.append(("api", "spec_server/mtp_trained", ex.submit(run, srv + ["--runq", a.runq, "--model", mtp08, "--spec", "mtp", "--quick",
+        futs.append(("api", "spec_server/mtp_trained", ex.submit(run, srv + ["--gwenedeg", a.gwenedeg, "--model", mtp08, "--spec", "mtp", "--quick",
                                                                          "--mtp-accepts"], SPEC_THREADS)))
     if os.path.exists(ista):
-        futs.append(("api", "spec_server/mtp_admit_chunk", ex.submit(run, srv + ["--runq", a.runq, "--model", ista, "--admit-chunk", "--draft",
+        futs.append(("api", "spec_server/mtp_admit_chunk", ex.submit(run, srv + ["--gwenedeg", a.gwenedeg, "--model", ista, "--admit-chunk", "--draft",
                                                                                  "mtp"], SPEC_THREADS)))
         # (TODO S9c.4) the leases with the view's terms; the disk tier with the view's files (loaded to the prompt's prefix, its
         # kept state), and a directory of the 0.8B draft's files served with --draft mtp (S9c.D's switch: those removed)
-        futs.append(("api", "spec_server/mtp_admit", ex.submit(run, srv + ["--runq", a.runq, "--model", ista, "--admit", "--draft", "mtp"],
+        futs.append(("api", "spec_server/mtp_admit", ex.submit(run, srv + ["--gwenedeg", a.gwenedeg, "--model", ista, "--admit", "--draft", "mtp"],
                                                                SPEC_THREADS)))
         q35d = os.path.join(os.path.dirname(a.q35), "Qwen3.5-0.8B-Q4_K_M.gguf")
-        futs.append(("api", "spec_server/mtp_disk", ex.submit(run, srv + ["--runq", a.runq, "--model", ista, "--disk", "--draft", "mtp",
+        futs.append(("api", "spec_server/mtp_disk", ex.submit(run, srv + ["--gwenedeg", a.gwenedeg, "--model", ista, "--disk", "--draft", "mtp",
                                                                           "--foreign-draft", q35d], SPEC_THREADS)))
 
     def server_refused():  # a file without a block; --mtp-vocab negative
         out = []
         if os.path.exists(base):
-            p = run([a.runq, "serve", base, "--draft", "mtp", "--port", "0"], 2)
+            p = run([a.gwenedeg, "serve", base, "--draft", "mtp", "--port", "0"], 2)
             e = p.stderr.decode(errors="replace")
-            out.append((p.returncode == 1 and f"runq serve: --draft mtp: {base} has no MTP block" in e, "mtp_no_block",
-                        f"runq serve FILE --draft mtp (no block): exit status {p.returncode}, {e.strip()[-120:]!r}"))
-        p = run([a.runq, "serve", mtp, "--draft", "mtp", "--mtp-vocab", "-3", "--port", "0"], 2)
+            out.append((p.returncode == 1 and f"gwenedeg serve: --draft mtp: {base} has no MTP block" in e, "mtp_no_block",
+                        f"gwenedeg serve FILE --draft mtp (no block): exit status {p.returncode}, {e.strip()[-120:]!r}"))
+        p = run([a.gwenedeg, "serve", mtp, "--draft", "mtp", "--mtp-vocab", "-3", "--port", "0"], 2)
         out.append((p.returncode == 1 and b"Usage:" in p.stderr, "mtp_bad_vocab", f"--mtp-vocab -3: exit status {p.returncode}"))
         return out
     futs.append(("cli", "spec_server", ex.submit(server_refused)))
@@ -277,8 +277,8 @@ def spec_start(a, tmp, ex):
         if a.q35 and os.path.exists(q35d):
             futs.append(("api", "spec_api/qwen35", ex.submit(run, [a.api_test, "--spec", a.q35, q35d, "--quick", "--other", a.gguf],
                                                              SPEC_THREADS)))
-    # runq serve with speculation (server_test.py --spec): the Qwen3 pair, the Qwen3.5 pair, the lookup alone
-    srv = [sys.executable, "-I", os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_test.py"), "--runq", a.runq,
+    # gwenedeg serve with speculation (server_test.py --spec): the Qwen3 pair, the Qwen3.5 pair, the lookup alone
+    srv = [sys.executable, "-I", os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_test.py"), "--gwenedeg", a.gwenedeg,
            "--threads", str(SPEC_THREADS)]
     futs.append(("api", "spec_server/qwen3", ex.submit(run, srv + ["--model", a.gguf, "--spec", a.q4], SPEC_THREADS)))
     if a.q35 and os.path.exists(q35d):
@@ -286,19 +286,19 @@ def spec_start(a, tmp, ex):
     if a.q35:
         futs.append(("api", "spec_server/lookup", ex.submit(run, srv + ["--model", a.q35, "--spec", "none"], SPEC_THREADS)))
     for i, case in enumerate(CLI_CASES):
-        futs.append(("cli", "spec_cli", ex.submit(cli_case, a.runq, a.gguf, a.q4, case, d, f"c{i}")))
+        futs.append(("cli", "spec_cli", ex.submit(cli_case, a.gwenedeg, a.gguf, a.q4, case, d, f"c{i}")))
     if a.generic:
         for name, k in GENERIC_CASES:
             case = next(c for c in CLI_CASES if c[0] == name)
             futs.append(("cli", "spec_cli", ex.submit(cli_case, a.generic, a.gguf, a.q4, case, d, f"g{name}", [k], "_generic")))
     if a.q35 and os.path.exists(q35d):
         for i, case in enumerate(Q35_CASES):
-            futs.append(("cli", "spec_cli", ex.submit(cli_case, a.runq, a.q35, q35d, case, d, f"q{i}")))
+            futs.append(("cli", "spec_cli", ex.submit(cli_case, a.gwenedeg, a.q35, q35d, case, d, f"q{i}")))
     # -G 0 with -D: plain decoding, byte for byte (stderr included: nothing loaded, nothing printed)
     def g0():
         args = ["-m", "generate", "-t", "1", "-s", "2", "-n", "20", "-i", STORY]
-        ref = cli_run(a.runq, a.gguf, args, None, d, "g0_ref")
-        got = cli_run(a.runq, a.gguf, args, None, d, "g0", a.q4, ["-G", "0"])
+        ref = cli_run(a.gwenedeg, a.gguf, args, None, d, "g0_ref")
+        got = cli_run(a.gwenedeg, a.gguf, args, None, d, "g0", a.q4, ["-G", "0"])
         ok, why = compare(ref, got, "-G 0", timing_ok=True)
         # (the timing lines' numbers vary run to run: compared without their numbers)
         strip = lambda e: b"".join(c for c in [bytes([x]) for x in e] if not c.isdigit())
@@ -309,20 +309,20 @@ def spec_start(a, tmp, ex):
     def refused():
         out = []
         if a.q35:
-            p = run([a.runq, a.gguf, "-m", "generate", "-n", "4", "-i", "hi", "-D", a.q35], 2)
+            p = run([a.gwenedeg, a.gguf, "-m", "generate", "-n", "4", "-i", "hi", "-D", a.q35], 2)
             e = p.stderr.decode(errors="replace")
             out.append((p.returncode == 1 and not p.stdout and "not usable as a draft" in e, "refused_vocab",
                         f"-D Qwen3.5 for Qwen3: exit status {p.returncode}, {e.strip()[-150:]!r}"))
-        p = run([a.runq, a.gguf, "-m", "generate", "-n", "4", "-i", "hi", "-G", "3"], 2)
+        p = run([a.gwenedeg, a.gguf, "-m", "generate", "-n", "4", "-i", "hi", "-G", "3"], 2)
         e = p.stderr.decode(errors="replace")
         out.append((p.returncode == 1 and "needs a draft model" in e, "refused_no_draft", f"-G 3 without -D: exit status {p.returncode}"))
-        p = run([a.runq, a.gguf, "-m", "generate", "-n", "4", "-i", "hi", "-D", a.q4, "--tau", "2"], 2)
+        p = run([a.gwenedeg, a.gguf, "-m", "generate", "-n", "4", "-i", "hi", "-D", a.q4, "--tau", "2"], 2)
         out.append((p.returncode == 1 and b"Usage:" in p.stderr, "bad_tau", f"--tau 2: exit status {p.returncode}"))
         bad = [["--lookup", "31"], ["--lookup", "-1"], ["--lookup", "4", "--lookup-min", "1"], ["--lookup", "x"], ["--spec", "maybe"]]
-        codes = [run([a.runq, a.gguf, "-m", "generate", "-n", "4", "-i", "hi"] + b, 2) for b in bad]
+        codes = [run([a.gwenedeg, a.gguf, "-m", "generate", "-n", "4", "-i", "hi"] + b, 2) for b in bad]
         out.append((all(p.returncode == 1 and b"Usage:" in p.stderr for p in codes), "bad_lookup",
                     "; ".join(f"{' '.join(b)}: exit status {p.returncode}" for b, p in zip(bad, codes))))
-        p = run([a.runq, a.gguf, "-m", "generate", "-n", "4", "-i", "hi", "--lookup", "4", "-G", "3"], 2)
+        p = run([a.gwenedeg, a.gguf, "-m", "generate", "-n", "4", "-i", "hi", "--lookup", "4", "-G", "3"], 2)
         e = p.stderr.decode(errors="replace")
         out.append((p.returncode == 1 and "needs a draft model" in e, "refused_lookup_g", f"--lookup 4 -G 3 without -D: exit status {p.returncode}"))
         return out

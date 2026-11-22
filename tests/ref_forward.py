@@ -1,8 +1,8 @@
 """A numpy reference forward pass of a Qwen3 GGUF file (any of the family's shapes): fp32 activations on the
-file's weights dequantized with ggml's expressions (tests/ggufmini.py), i.e. what runq computes minus its
+file's weights dequantized with ggml's expressions (tests/ggufmini.py), i.e. what gwenedeg computes minus its
 int8 activations (and its attention / KV cache arithmetic). The same model as HF's Qwen3ForCausalLM (QK-norm,
 GQA, NeoX RoPE with the file's theta, SwiGLU, RMSNorm eps 1e-6, tied or untied classifier), written from the
-architecture, not from runq's code.
+architecture, not from gwenedeg's code.
 
 Memory: one layer's weights in fp32 at a time (8B: ~0.75 GB), the prompts' activations, the classifier in row
 chunks; so 4B / 8B references fit where their fp32 models (16 / 33 GB) would not.

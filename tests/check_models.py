@@ -16,18 +16,18 @@ q35     (default suite, if models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf is th
         types at a small scale, 330 MB): logits vs tests/ref_qwen35.py, bitwise invariants, api_test; the 0.8B file and
         the r = 3 model in one process (api_test --two: interleaved == each alone); files that must be refused (bad
         metadata); the 27B-shaped model with its MTP block (logits == without it, bitwise), with F32 alpha / beta and
-        Qwen3.8's template (the checks above, a CLI chat, runq serve's prompts), with ISTA's IQ3_S-mtp types (i-quant
+        Qwen3.8's template (the checks above, a CLI chat, gwenedeg serve's prompts), with ISTA's IQ3_S-mtp types (i-quant
         trunk, IQ2_S embedding, Q4_K classifier, BF16 alpha / beta, a Q6_K MTP block: the checks above and the MTP
         view's vs the reference and on every path), Qwen3.8's renderings (tokenizer-only
-        files with its two templates vs tests/golden/chat_render.json, incl. requests with tools); runq serve's tool
+        files with its two templates vs tests/golden/chat_render.json, incl. requests with tools); gwenedeg serve's tool
         calls on the 0.8B (tests/server_test.py --tools)
 models  (opt-in: tests/run_tests.sh --models, make test-models) every downloaded family model
         (scripts/download_models.py family; missing files are skipped; Qwen3.8-27B (BIG) also when MemAvailable does
         not cover it): logits vs HF fp32 (Qwen3-1.7B) and vs
         the dequantized-weights reference (tests/golden/models, tests/make_model_ref.py), bitwise invariants
         (batched vs sequential, threads, generic, api_test: batched decode rows), greedy goldens, the chat
-        template variant and its renderings, runq serve (greedy == the CLI, a constrained reply); the trained
-        Qwen3.5-0.8B-mtp block (3.5-0.8b-mtp): the MTP checks only, and runq serve --draft mtp on it (server_spec/*)
+        template variant and its renderings, gwenedeg serve (greedy == the CLI, a constrained reply); the trained
+        Qwen3.5-0.8B-mtp block (3.5-0.8b-mtp): the MTP checks only, and gwenedeg serve --draft mtp on it (server_spec/*)
 """
 import argparse
 import concurrent.futures as cf
@@ -53,7 +53,7 @@ import ref_forward as R  # noqa: E402
 SYNTH_THREADS = 4         # the synth runs (in the background from the start, next to the rest of the suite)
 SYNTH_GEN_THREADS = 3     # its generic-build runs
 SYNTH_REF = ["en", "code", "long2"]   # logits vs the numpy reference (-b 64)
-# vs the reference: runq's int8 activations on a model with odd statistics (cut-out weights; long2: 297 tokens)
+# vs the reference: gwenedeg's int8 activations on a model with odd statistics (cut-out weights; long2: 297 tokens)
 # measured 1 - cos mean 0.7e-3 (en) .. 4.3e-3 (long2), position min 0.962, top-1 0.83..1; a RoPE theta of 1e6
 # instead of 5e6 gives 0.98 / 0.61 (mean) and top-1 0.06 on long2, an embedding read as Q8_0 NaN
 TH_SYNTH = dict(cos_mean=0.99, cos_pos=0.90, top1=0.6)
@@ -75,10 +75,10 @@ def read_logits(path):
         np.fromfile(path, dtype=np.float32, offset=4 * (2 + n)).reshape(n, int(raw[1]))
 
 
-def logits_run(runq, model, text, path, chunk, threads, extra=()):
-    p = run([runq, model, "-c", "4096", "-m", "logits", "-b", str(chunk), "-i", text, "-o", path] + list(extra), threads)
+def logits_run(gwenedeg, model, text, path, chunk, threads, extra=()):
+    p = run([gwenedeg, model, "-c", "4096", "-m", "logits", "-b", str(chunk), "-i", text, "-o", path] + list(extra), threads)
     if p.returncode != 0:
-        raise RuntimeError(f"runq -m logits failed: {p.stderr.decode(errors='replace')[-400:]}")
+        raise RuntimeError(f"gwenedeg -m logits failed: {p.stderr.decode(errors='replace')[-400:]}")
     return path
 
 
@@ -100,14 +100,14 @@ def cos_rows(a, b):
 
 # ------------------------------------------------------------------------------------------ chat rendering
 
-def render_cases(runq, model, variant, res, prefix, jobs=None):
-    """runq -m render on model (tokenizer only, one process for all cases) for the golden cases of its variant"""
+def render_cases(gwenedeg, model, variant, res, prefix, jobs=None):
+    """gwenedeg -m render on model (tokenizer only, one process for all cases) for the golden cases of its variant"""
     with open(os.path.join(GOLDEN, "chat_render.json"), encoding="utf-8") as f:
         cases = [c for c in json.load(f)["cases"] if c["variant"] == variant]
-    conv = [{"request": c["request"]} if "request" in c else  # (tool calls: a chat completion body as runq serve renders it)
+    conv = [{"request": c["request"]} if "request" in c else  # (tool calls: a chat completion body as gwenedeg serve renders it)
             dict({"messages": c["messages"], "thinking": c["thinking"]},
                  **({"reasoning_effort": c["reasoning_effort"]} if "reasoning_effort" in c else {})) for c in cases]
-    p = run([runq, model, "-m", "render", "-i", json.dumps(conv)], 1)
+    p = run([gwenedeg, model, "-m", "render", "-i", json.dumps(conv)], 1)
     lines = p.stdout.decode().splitlines() if p.returncode == 0 else []
     errs = p.stderr.decode(errors="replace").splitlines()
     if len(lines) != len(cases):
@@ -117,17 +117,17 @@ def render_cases(runq, model, variant, res, prefix, jobs=None):
         ids = [int(x) for x in line.split()]
         det = f"[{variant}] -r {c['thinking']}" + (f" -e {c['reasoning_effort']}" if "reasoning_effort" in c else "") + \
             f": {len(c['ids'])} tokens" + (" (request with tools)" if "request" in c else "") + (", = HF's apply_chat_template" if c["hf"] else ", = HF's with reasoning_content"
-                                          if c.get("hf_reasoning_content") else " (runq's documented form, not HF's)")
+                                          if c.get("hf_reasoning_content") else " (gwenedeg's documented form, not HF's)")
         ok = ids == c["ids"] and f"chat template {variant}," in err
         if not ok:
             det += f"  <- got {len(ids)} tokens, {err!r}"
         res.report(ok, f"{prefix}/r{c['thinking']}_{c['name']}", det)
 
 
-def render_run(runq, model, variant, prefix):
+def render_run(gwenedeg, model, variant, prefix):
     """render_cases in the background: [(ok, name, detail)]"""
     rec = Recorded()
-    render_cases(runq, model, variant, rec, prefix)
+    render_cases(gwenedeg, model, variant, rec, prefix)
     return [(ok, n, d) for ok, n, d, _ in rec.reports]
 
 
@@ -154,11 +154,11 @@ def synth_start(a, tmp, ex, gx, texts):
     nd = int(os.environ.get("OMP_NUM_THREADS", "8"))
     S = {"dir": d, "model": m, "tmp": t, "files": {}, "api": None, "api_gen": None}
 
-    def lf(name, chunk, threads=SYNTH_THREADS, runq=None, gen=False):
+    def lf(name, chunk, threads=SYNTH_THREADS, gwenedeg=None, gen=False):
         key = (name, chunk, threads, gen)
         if key not in S["files"]:
             path = os.path.join(t, f"{name}_b{chunk}_t{threads}{'_gen' if gen else ''}.bin")
-            S["files"][key] = (gx if gen else ex).submit(logits_run, runq or a.runq, m, texts[name], path, chunk, threads)
+            S["files"][key] = (gx if gen else ex).submit(logits_run, gwenedeg or a.gwenedeg, m, texts[name], path, chunk, threads)
         return S["files"][key]
     S["lf"] = lf
     if a.api_test:
@@ -178,11 +178,11 @@ def synth_start(a, tmp, ex, gx, texts):
 
     def chat():
         prefix = os.path.join(t, "chat")
-        p = run([a.runq, m, "-t", "0", "-c", "1024", "-n", "1", "-r", "1", "-y", "Be brief.", "-i", "Hi there"], 2,
-                env={"RUNQ_CHAT_DUMP": prefix})
-        info = run([a.runq, m, "-t", "0", "-n", "1"], 2, stdin=subprocess.DEVNULL)
+        p = run([a.gwenedeg, m, "-t", "0", "-c", "1024", "-n", "1", "-r", "1", "-y", "Be brief.", "-i", "Hi there"], 2,
+                env={"GWENEDEG_CHAT_DUMP": prefix})
+        info = run([a.gwenedeg, m, "-t", "0", "-n", "1"], 2, stdin=subprocess.DEVNULL)
         msgs = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi there"}]
-        r = run([a.runq, m, "-m", "render", "-i", json.dumps(msgs)], 1)
+        r = run([a.gwenedeg, m, "-m", "render", "-i", json.dumps(msgs)], 1)
         ids = open(prefix + ".ids").read().split() if p.returncode == 0 else []
         return p, info, r, ids
     S["chat"] = ex.submit(chat)
@@ -260,21 +260,21 @@ def test_synth(a, res, S, texts):
                        f"{len(common)} batched passes == {SYNTH_THREADS} threads" + (f"; differ: {', '.join(diff)}" if diff else ""))
     # chat template variants: tokenizer-only files with the three HF templates
     for v in ("qwen3", "instruct-2507", "thinking-2507"):
-        render_cases(a.runq, os.path.join(S["dir"], f"synth-tok-{v}.gguf"), v, res, f"synth/render_{v}")
+        render_cases(a.gwenedeg, os.path.join(S["dir"], f"synth-tok-{v}.gguf"), v, res, f"synth/render_{v}")
 
 
 # ------------------------------------------------------------------------------------------ models (slow)
 
-def dequant_check(runq, model, golden, res, prefix):
-    """runq -m dequant of the golden's rows (blocks and repacked layout) == gguf-py's float32, bitwise"""
+def dequant_check(gwenedeg, model, golden, res, prefix):
+    """gwenedeg -m dequant of the golden's rows (blocks and repacked layout) == gguf-py's float32, bitwise"""
     g = np.load(os.path.join(GOLDEN, "dequant", golden))
     for i, name in enumerate(g["names"]):
         name, rows, r0 = str(name), g[f"rows{i}"], int(g["row0"][i])
         d = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"dequant-{os.getpid()}-{i}.bin")
-        p = run([runq, model, "-c", "64", "-m", "dequant", "-i", f"{name}:{r0}:{rows.shape[0]}", "-o", d], 2)
+        p = run([gwenedeg, model, "-c", "64", "-m", "dequant", "-i", f"{name}:{r0}:{rows.shape[0]}", "-o", d], 2)
         what = f"{str(g[f'type{i}'])} rows {r0}..{r0 + rows.shape[0] - 1} x {rows.shape[1]}"
         if p.returncode != 0:
-            res.report(False, f"{prefix}/{name}", f"runq -m dequant failed: {p.stderr.decode(errors='replace')[-300:]}")
+            res.report(False, f"{prefix}/{name}", f"gwenedeg -m dequant failed: {p.stderr.decode(errors='replace')[-300:]}")
             continue
         h = np.fromfile(d, dtype=np.int32, count=3)
         got = np.fromfile(d, dtype=np.float32, offset=12).reshape(1 + int(h[2]), int(h[0]), int(h[1]))
@@ -288,9 +288,9 @@ def dequant_check(runq, model, golden, res, prefix):
         res.report(ok, f"{prefix}/{name}", f"{what}: " + ", ".join(detail) + " (gguf-py)")
 
 
-def dequant_vs_mini(runq, model, cases, prefix, flags=()):
-    """runq -m dequant of rows (blocks and repacked layout) == tests/ggufmini.py's dequantization of the file's blocks,
-    bitwise (ggufmini: == gguf-py, iq_mini_check): [(ok, name, detail)]; cases: (tensor, first row, rows); flags: runq's
+def dequant_vs_mini(gwenedeg, model, cases, prefix, flags=()):
+    """gwenedeg -m dequant of rows (blocks and repacked layout) == tests/ggufmini.py's dequantization of the file's blocks,
+    bitwise (ggufmini: == gguf-py, iq_mini_check): [(ok, name, detail)]; cases: (tensor, first row, rows); flags: gwenedeg's
     (--repack: the repacked layout is its 4-bit codes)"""
     f = G.GgufFile(model)
     out = []
@@ -298,10 +298,10 @@ def dequant_vs_mini(runq, model, cases, prefix, flags=()):
         ne, ty, _ = f.tensors[name]
         want = G.dequant(ty, f.tensor_bytes(name)[r0:r0 + n], n, int(ne[0]))
         d = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"dequant-{os.getpid()}-{abs(hash((model, name, r0)))}.bin")
-        p = run([runq, model, *flags, "-c", "64", "-m", "dequant", "-i", f"{name}:{r0}:{n}", "-o", d], 2)
+        p = run([gwenedeg, model, *flags, "-c", "64", "-m", "dequant", "-i", f"{name}:{r0}:{n}", "-o", d], 2)
         what = f"{G.TYPE_NAME.get(ty, ty)} rows {r0}..{r0 + n - 1} x {int(ne[0])}"
         if p.returncode != 0:
-            out.append((False, f"{prefix}/{name}", f"runq -m dequant failed: {p.stderr.decode(errors='replace')[-300:]}"))
+            out.append((False, f"{prefix}/{name}", f"gwenedeg -m dequant failed: {p.stderr.decode(errors='replace')[-300:]}"))
             continue
         h = np.fromfile(d, dtype=np.int32, count=3)
         got = np.fromfile(d, dtype=np.float32, offset=12).reshape(1 + int(h[2]), int(h[0]), int(h[1]))
@@ -342,8 +342,8 @@ def iq_types_cases(model):
 
 
 def iq_synth_run(a, sd, tmp, texts):
-    """synth-q35-iq.gguf: ggufmini == gguf-py (iq_mini_check); runq's dequantization == ggufmini for every type (and
-    with --repack: IQ3_XXS / IQ3_S as 4-bit codes); the AVX-512 gather decode (RUNQ_IQ_GATHER=1, the decode of CPUs
+    """synth-q35-iq.gguf: ggufmini == gguf-py (iq_mini_check); gwenedeg's dequantization == ggufmini for every type (and
+    with --repack: IQ3_XXS / IQ3_S as 4-bit codes); the AVX-512 gather decode (GWENEDEG_IQ_GATHER=1, the decode of CPUs
     without VBMI) and --repack / --repack=IQ3_S give the same logits as the default; synth-q35-ista-mtp.gguf: -D mtp's
     greedy text with --repack == without (the target and the MTP view repacked)"""
     import hashlib
@@ -368,17 +368,17 @@ def iq_synth_run(a, sd, tmp, texts):
     if not os.path.exists(model):
         return out
     cases = iq_types_cases(model)
-    out += dequant_vs_mini(a.runq, model, cases, "q35/synth-q35-iq/dequant")
+    out += dequant_vs_mini(a.gwenedeg, model, cases, "q35/synth-q35-iq/dequant")
     f = G.GgufFile(model)
-    out += dequant_vs_mini(a.runq, model, [c for c in cases if G.TYPE_NAME.get(f.tensors[c[0]][1]) in ("IQ3_S", "IQ3_XXS")],
+    out += dequant_vs_mini(a.gwenedeg, model, [c for c in cases if G.TYPE_NAME.get(f.tensors[c[0]][1]) in ("IQ3_S", "IQ3_XXS")],
                            "q35/synth-q35-iq/repack-dequant", ["--repack"])
-    variants = [("gather", [], {"RUNQ_IQ_GATHER": "1"}, "RUNQ_IQ_GATHER=1"), ("repack", ["--repack"], {}, "--repack"),
+    variants = [("gather", [], {"GWENEDEG_IQ_GATHER": "1"}, "GWENEDEG_IQ_GATHER=1"), ("repack", ["--repack"], {}, "--repack"),
                 ("repack-iq3s", ["--repack=IQ3_S"], {}, "--repack=IQ3_S")]
     for name, chunk in (("en", 7), ("long2", 64)):
         hs = []
         for i, (_, flags, env, _) in enumerate([("", [], {}, "")] + variants):
             path = os.path.join(tmp, f"iq_variant_{name}_{i}.bin")
-            p = run([a.runq, model, *flags, "-c", "4096", "-m", "logits", "-b", str(chunk), "-i", texts[name], "-o", path], 4, env)
+            p = run([a.gwenedeg, model, *flags, "-c", "4096", "-m", "logits", "-b", str(chunk), "-i", texts[name], "-o", path], 4, env)
             hs.append(hashlib.sha256(open(path, "rb").read()).hexdigest() if p.returncode == 0 else f"exit {p.returncode}")
             if os.path.exists(path):
                 os.remove(path)
@@ -390,7 +390,7 @@ def iq_synth_run(a, sd, tmp, texts):
     if os.path.exists(mtp):
         txt = []
         for flags in ([], ["--repack"]):
-            p = run([a.runq, mtp, *flags, "-c", "1024", "-m", "generate", "-D", "mtp", "-G", "3", "-t", "0", "-n", "48",
+            p = run([a.gwenedeg, mtp, *flags, "-c", "1024", "-m", "generate", "-D", "mtp", "-G", "3", "-t", "0", "-n", "48",
                      "-i", texts["en"]], 4)
             txt.append(p.stdout.decode(errors="replace") if p.returncode == 0 else f"exit {p.returncode}")
         same = txt[0] == txt[1] and not txt[0].startswith("exit")
@@ -439,22 +439,22 @@ FAMILY = [
     ("saluki-27b", "Underdog-Saluki-27B-1.0-GGUF/Underdog-Saluki-27B-1.0-IQ2-mix.gguf", "qwen3.8", [("saluki-27b", "ref")]),
     # Qwen3.5-0.8B with its MTP block kept (scripts/make_mtp_08b.sh, TODO S9.0b; docs/notes/qwen38-speculative.md): the MTP
     # drafter's checks only (MTP_ONLY: the block vs tests/ref_qwen35.py's mtp_forward, its teacher-forced top-1, the CLI's
-    # loop, runq serve --draft mtp: tests/server_test.py --spec mtp whole; its main model is the Q8_0 file's but 7 ssm_a
+    # loop, gwenedeg serve --draft mtp: tests/server_test.py --spec mtp whole; its main model is the Q8_0 file's but 7 ssm_a
     # ulps, covered by 3.5-0.8b-q8)
     ("3.5-0.8b-mtp", "Qwen3.5-0.8B-MTP-GGUF/Qwen3.5-0.8B-mtp-Q8_0.gguf", "qwen3.5", []),
 ]
 # FAMILY tags with only the MTP checks (mtp_ref_run; their thresholds: MTP_TH)
 MTP_ONLY = {"3.5-0.8b-mtp"}
-# files checked against MemAvailable first (runq's own estimate at the default context, api_test's, + BIG_MARGIN GiB
+# files checked against MemAvailable first (gwenedeg's own estimate at the default context, api_test's, + BIG_MARGIN GiB
 # for the logits files in TMPDIR and the server's slots): skipped with a note if it does not fit. Their runs go one
 # at a time (the models group runs its files in turn); GWENEDEG_TEST_MEM (GiB) stands in for MemAvailable
 BIG = {"3.8-27b-q4km", "3.8-27b-q3km", "saluki-27b"}
 BIG_MARGIN = 1.5
 # dequantized rows vs gguf-py (tests/golden/dequant, tests/make_dequant_golden.py --q5 / --q3), bitwise, per FAMILY tag:
-# from the file's blocks and from the repacked layouts (`runq -m dequant`)
+# from the file's blocks and from the repacked layouts (`gwenedeg -m dequant`)
 DEQUANT = {"3.5-0.8b-q4km": "q5_k.npz", "3.5-0.8b-q3km": "q3_k.npz"}
-# files with Q2_K / i-quant tensors: one tensor of every such type, `runq -m dequant` vs tests/ggufmini.py (== gguf-py:
-# iq_mini_check), bitwise; and the AVX-512 gather decode (RUNQ_IQ_GATHER=1) == the default one (en, -b 7)
+# files with Q2_K / i-quant tensors: one tensor of every such type, `gwenedeg -m dequant` vs tests/ggufmini.py (== gguf-py:
+# iq_mini_check), bitwise; and the AVX-512 gather decode (GWENEDEG_IQ_GATHER=1) == the default one (en, -b 7)
 IQ_MINI = {"saluki-27b"}
 # more kernel checks for the files with a new kernel type (Q5_K, Q3_K) or code path (4B: value heads != key heads): AVX-512 vs
 # generic logits at -b 64 (the GEMM tiles of every Q5_K matrix: 15 rows = 6 + 6 + 3; the batched DeltaNet items), and
@@ -477,7 +477,7 @@ Q35_CHAT_CASES = [
      {"dropped": True}),
 ]
 # thresholds (per prompt: cos mean / every position >= 1 / position 0, top-1 fraction; pooled cos), measured in
-# Step 11 (docs/DEVELOPMENT.md, History): vs the dequantized-weights reference only runq's int8 activations differ (as Q8_0 vs HF
+# Step 11 (docs/DEVELOPMENT.md, History): vs the dequantized-weights reference only gwenedeg's int8 activations differ (as Q8_0 vs HF
 # for 0.6B); Q8_0 vs HF fp32 as 0.6B's Q8_0 thresholds; Q4_K_M vs HF fp32 is the 4-bit weights' own error,
 # which the reference has too: the 1.7B Q4_K_M reference vs HF fp32 (golden vs golden) has cos means 0.890 (en:
 # position 8, cos -0.137, the whole logit vector shifted, top-1 still right) / 0.997 / 0.992 / 0.977 (code, chat,
@@ -493,11 +493,11 @@ TH = {
     # Qwen3.5-0.8B Unsloth Q4_K_M vs HF fp32 (Step 13): the 4-bit weights' own error is much smaller than the Qwen3
     # Q4_K_M files' (measured: cos means 0.9924 / 0.9959 / 0.9958 / 0.9925 (chat, code, en, long2), min 0.9677,
     # pos0 0.9855-0.9957, top-1 14/15, 25/25, 11/15, 7/7, pooled 0.9946); vs its own dequantized-weights reference
-    # (the "ref" goldens) runq is at cos 0.9999, top-1 62/62. Bounds ~2x the error
+    # (the "ref" goldens) gwenedeg is at cos 0.9999, top-1 62/62. Bounds ~2x the error
     "q35q4_hf": dict(cos_mean=0.985, cos_pos=0.93, cos_pos0=0.95, top1=0.6, cos_all=0.985),
     # Qwen3.5-0.8B Unsloth Q3_K_M vs HF fp32 (TODO G3): ~3.5x the Q4_K_M file's error (measured: cos means 0.9701 /
     # 0.9864 / 0.9815 / 0.9822 (chat, code, en, long2), min 0.8577 (chat), pos0 0.9379-0.9918, top-1 12/15, 24/25, 11/15,
-    # 7/7, pooled 0.98089); vs its own dequantized-weights reference runq is at pooled cos 0.99984, top-1 62/62 (the
+    # 7/7, pooled 0.98089); vs its own dequantized-weights reference gwenedeg is at pooled cos 0.99984, top-1 62/62 (the
     # Q4_K_M file: 0.99986), i.e. all of it is the 3-bit weights' own error. Bounds ~2x the error
     "q35q3_hf": dict(cos_mean=0.94, cos_pos=0.72, cos_pos0=0.87, top1=0.6, cos_all=0.96),
 }
@@ -521,9 +521,9 @@ def model_metrics(g, logits):
     return pos, np.array(cos), np.array(top1)
 
 
-def server_smoke(runq, model, variant, greedy_text, port_file):
-    """runq serve on the model: /v1/models, a greedy chat completion (== the CLI's text), a constrained reply"""
-    proc = subprocess.Popen([runq, "serve", model, "--port", "0", "-c", "2048", "--parallel", "2", "--slots", "2",
+def server_smoke(gwenedeg, model, variant, greedy_text, port_file):
+    """gwenedeg serve on the model: /v1/models, a greedy chat completion (== the CLI's text), a constrained reply"""
+    proc = subprocess.Popen([gwenedeg, "serve", model, "--port", "0", "-c", "2048", "--parallel", "2", "--slots", "2",
                              "--threads", "4"], stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
     out = []
     try:
@@ -576,12 +576,12 @@ def server_smoke(runq, model, variant, greedy_text, port_file):
     return out
 
 
-def mem_skip(runq, model):
-    """None if the file fits in MemAvailable (runq's load estimate at the default context + BIG_MARGIN), else why not"""
-    p = run([runq, model, "--mem", "0.01", "-n", "1", "-i", "x"], 1, stdin=subprocess.DEVNULL)
+def mem_skip(gwenedeg, model):
+    """None if the file fits in MemAvailable (gwenedeg's load estimate at the default context + BIG_MARGIN), else why not"""
+    p = run([gwenedeg, model, "--mem", "0.01", "-n", "1", "-i", "x"], 1, stdin=subprocess.DEVNULL)
     err = p.stderr.decode(errors="replace")
     if "needs ~" not in err:
-        return f"no memory estimate from runq: {err.strip()[-200:]!r}"
+        return f"no memory estimate from gwenedeg: {err.strip()[-200:]!r}"
     need = float(err.split("needs ~", 1)[1].split()[0]) + BIG_MARGIN
     have = os.environ.get("GWENEDEG_TEST_MEM")
     if have is None:
@@ -589,7 +589,7 @@ def mem_skip(runq, model):
             have = next((int(l.split()[1]) / 1048576 for l in f if l.startswith("MemAvailable:")), None)
     if have is None or float(have) >= need:
         return None
-    return f"needs ~{need:.1f} GiB (runq's estimate + {BIG_MARGIN}), MemAvailable {float(have):.1f} GiB"
+    return f"needs ~{need:.1f} GiB (gwenedeg's estimate + {BIG_MARGIN}), MemAvailable {float(have):.1f} GiB"
 
 
 def greedy_text(stdout):
@@ -613,7 +613,7 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
             print(f"      {tag}: skipped (models/{f} not downloaded: scripts/download_models.py)")
     nd = MODEL_THREADS
     for tag, model, variant, goldens in present:
-        why = mem_skip(a.runq, model) if tag in BIG else None
+        why = mem_skip(a.gwenedeg, model) if tag in BIG else None
         if why:
             print(f"      {tag}: skipped (not enough memory: {why})")
             continue
@@ -635,10 +635,10 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
                 res.report(l.startswith("PASS "), f"{prefix}/{tag}/spec/{n.strip()}", det.strip())
             if p.returncode not in (0, 1) or not lines:
                 res.report(False, f"{prefix}/{tag}/spec/run", f"exit status {p.returncode}: {p.stderr.decode(errors='replace')[-300:]}")
-            # runq serve --draft mtp with the trained block (TODO S9c.5): server_test.py --spec mtp whole (the spec group runs
+            # gwenedeg serve --draft mtp with the trained block (TODO S9c.5): server_test.py --spec mtp whole (the spec group runs
             # it --quick): every case == a plain server's and == "speculative": false, the MTP checks (mtp_lockstep on the
             # dumps: B after accepted guesses), spec/mtp_accepts; the acceptance in the details ("N/M guesses accepted")
-            p = run([sys.executable, "-I", os.path.join(HERE, "server_test.py"), "--runq", a.runq, "--model", model, "--spec", "mtp",
+            p = run([sys.executable, "-I", os.path.join(HERE, "server_test.py"), "--gwenedeg", a.gwenedeg, "--model", model, "--spec", "mtp",
                      "--mtp-accepts", "--threads", "4", "--api-test", a.api_test], 4)
             lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
             for l in lines:
@@ -649,30 +649,30 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
             print(f"      ({tag}: {time.time() - t0:.1f} s)")
             continue
 
-        def lf(name, chunk, threads=nd, runq=a.runq, sfx=""):
+        def lf(name, chunk, threads=nd, gwenedeg=a.gwenedeg, sfx=""):
             path = os.path.join(d, f"{name}_b{chunk}_t{threads}{sfx}.bin")
             if not os.path.exists(path):
-                logits_run(runq, model, texts[name], path, chunk, threads, extra)
+                logits_run(gwenedeg, model, texts[name], path, chunk, threads, extra)
             return path
         # template variant and renderings (tokenizer only)
         if not lean:
-            render_cases(a.runq, model, variant, res, f"{prefix}/{tag}/render")
+            render_cases(a.gwenedeg, model, variant, res, f"{prefix}/{tag}/render")
         # dequantization vs gguf-py
         if tag in DEQUANT:
-            dequant_check(a.runq, model, DEQUANT[tag], res, f"{prefix}/{tag}/dequant")
+            dequant_check(a.gwenedeg, model, DEQUANT[tag], res, f"{prefix}/{tag}/dequant")
         if tag in IQ_MINI:
-            for ok, name, det in dequant_vs_mini(a.runq, model, iq_types_cases(model), f"{prefix}/{tag}/dequant"):
+            for ok, name, det in dequant_vs_mini(a.gwenedeg, model, iq_types_cases(model), f"{prefix}/{tag}/dequant"):
                 res.report(ok, name, det)
             gpath_ = os.path.join(d, "en_b7_gather.bin")
-            p = run([a.runq, model, "-c", "4096", "-m", "logits", "-b", "7", "-i", texts["en"], "-o", gpath_] + extra, nd,
-                    {"RUNQ_IQ_GATHER": "1"})
+            p = run([a.gwenedeg, model, "-c", "4096", "-m", "logits", "-b", "7", "-i", texts["en"], "-o", gpath_] + extra, nd,
+                    {"GWENEDEG_IQ_GATHER": "1"})
             ok, det = same(lf("en", 7), gpath_) if p.returncode == 0 else (False, p.stderr.decode(errors="replace")[-200:])
-            res.report(ok, f"{prefix}/{tag}/gather/en_b7", f"RUNQ_IQ_GATHER=1 vs the default decode: {det}")
+            res.report(ok, f"{prefix}/{tag}/gather/en_b7", f"GWENEDEG_IQ_GATHER=1 vs the default decode: {det}")
         # greedy golden
         gpath = os.path.join(gdir, "greedy", f"{tag}.txt")
         want = open(gpath, encoding="utf-8").read().rstrip("\n") if os.path.exists(gpath) else None
         if not lean:
-            p = run([a.runq, model] + GREEDY, nd)
+            p = run([a.gwenedeg, model] + GREEDY, nd)
             txt = greedy_text(p.stdout)
             if update:
                 os.makedirs(os.path.dirname(gpath), exist_ok=True)
@@ -748,7 +748,7 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
             res.report(p.returncode == 0 and lines and not bad, f"{prefix}/{tag}/api",
                        f"api_test (batched decode rows == alone, mixed passes, ...): {len(lines) - len(bad)}/{len(lines)} passed"
                        + (f"; failed: {', '.join(bad)}" if bad else ""))
-        for ok, name, det in server_smoke(a.runq, model, variant, want, None) if not lean else ():
+        for ok, name, det in server_smoke(a.gwenedeg, model, variant, want, None) if not lean else ():
             res.report(ok, f"{prefix}/{tag}/server/{name}", det)
         for fn in os.listdir(d):
             os.remove(os.path.join(d, fn))
@@ -764,14 +764,14 @@ def test_models(a, res, tmp, texts, update=False, tags=None, prefix="models", pa
 # threads, AVX-512 vs generic, api_test (batched decode rows == alone, checkpoints) and its digests across builds
 # synth-q35-27b.gguf (if the 0.8B Q4_K_M file is next to the Q8_0 one): the 27B's layout (GQA 6, r = 3, dim 768, untied
 # Q4_K embedding + Q6_K classifier, Q4_K / Q5_K / Q6_K matrices as in its Q4_K_M file): measured cos mean 0.9984 / 0.9979 /
-# 0.9966 (en, code, long2), min 0.9803, top-1 281/338 (runq's int8 activations on cut-out K-quant weights, as the synth
+# 0.9966 (en, code, long2), min 0.9803, top-1 281/338 (gwenedeg's int8 activations on cut-out K-quant weights, as the synth
 # group's 0.9993-0.9958); with the q heads on kv head h % 2 instead of h // 6 0.31-0.40, value heads grouped 0.25-0.38
 # synth-q35-27b-f32.gguf: the same with F32 alpha / beta (fp32 activations there, f32_rows), the MTP block, Qwen3.8's
 # template: measured cos mean 0.9984 / 0.9976 / 0.9966, min 0.9791, top-1 290/338
 # synth-q35-iq.gguf: synth-q35-27b requantized to Q2_K and the i-quants (all nine, mixed as in Underdog Saluki 27B's file,
 # an IQ1_M embedding, an IQ3_S classifier: src/iquants.h): measured cos mean 0.9973 / 0.9982 / 0.9966, min 0.9874, top-1
 # 280/338 (the int8 activations on 1.5- to 4-bit weights, as synth-q35-27b); bitwise: the gather and VBMI AVX-512 decodes
-# and the generic kernel give the same logits (RUNQ_IQ_GATHER=1: iq_synth_run, with the dequantization checks)
+# and the generic kernel give the same logits (GWENEDEG_IQ_GATHER=1: iq_synth_run, with the dequantization checks)
 # synth-q35-r2-bf16.gguf: synth-q35-r2 with BF16 alpha / beta (TODO S9.1: widened to F32 at load, fp32 activations
 # there): measured cos mean 0.99964 / 0.99980 / 0.99963, min 0.99690, top-1 325/338 (synth-q35-r2's Q8_0 ones 0.99967 /
 # 0.99981 / 0.99962, 0.99711, 321/338); bitwise as synth-q35-r2, and its logits == its F32 twin's (q35_bf16_run)
@@ -814,7 +814,7 @@ def q35_bad_run(a, d):
     for fn, name, msg in Q35_BAD:
         if not os.path.exists(os.path.join(d, fn)):
             continue
-        p = run([a.runq, os.path.join(d, fn), "-n", "1", "-i", "hi"], 1)
+        p = run([a.gwenedeg, os.path.join(d, fn), "-n", "1", "-i", "hi"], 1)
         err = p.stderr.decode(errors="replace").strip()
         out.append((p.returncode == 1 and msg in err, f"q35/synth/reject_{name}", f"exit status {p.returncode}: {err[-200:]!r}"))
     return out
@@ -832,7 +832,7 @@ def q35_mtp_run(a, d, tmp, texts):
     mtp, base, f32 = (os.path.join(d, f) for f in ("synth-q35-27b-mtp.gguf", "synth-q35-27b.gguf", "synth-q35-27b-f32.gguf"))
     if not (os.path.exists(mtp) and os.path.exists(base)):
         return out
-    for exe, b, th in [(a.runq, 64, SYNTH_THREADS), (a.runq, 1, SYNTH_THREADS)] + ([(a.generic, 7, 3)] if a.generic else []):
+    for exe, b, th in [(a.gwenedeg, 64, SYNTH_THREADS), (a.gwenedeg, 1, SYNTH_THREADS)] + ([(a.generic, 7, 3)] if a.generic else []):
         hs = []
         for m in (base, mtp):
             path = os.path.join(tmp, f"mtp_{os.path.basename(m)}_{b}_{th}.bin")
@@ -843,18 +843,18 @@ def q35_mtp_run(a, d, tmp, texts):
         out.append((hs[0] == hs[1], f"q35/synth/mtp_logits/b{b}{'_gen' if exe == a.generic else ''}",
                     f"synth-q35-27b-mtp.gguf (MTP block) vs synth-q35-27b.gguf, -b {b}"
                     f"{' (generic build)' if exe == a.generic else ''}: " + ("bit-identical" if hs[0] == hs[1] else "DIFFER")))
-    p = run([a.runq, mtp, "-m", "tokenize", "-i", "hello world"], 1)
+    p = run([a.gwenedeg, mtp, "-m", "tokenize", "-i", "hello world"], 1)
     ids = p.stdout.decode(errors="replace").split()
     out.append((p.returncode == 0 and ids == ["14556", "1814"], "q35/synth/mtp_tokenizer_only",
                 f"-m tokenize (no weights): exit status {p.returncode}, ids {ids}"))
     if not os.path.exists(f32):
         return out
     prefix = os.path.join(tmp, "chat38")
-    p = run([a.runq, f32, "-t", "0", "-c", "1024", "-n", "6", "-e", "low", "-y", "Be brief."], 2, env={"RUNQ_CHAT_DUMP": prefix},
+    p = run([a.gwenedeg, f32, "-t", "0", "-c", "1024", "-n", "6", "-e", "low", "-y", "Be brief."], 2, env={"GWENEDEG_CHAT_DUMP": prefix},
             input=b"Hi there\nAnd now?\n")
     msgs = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi there"}]
-    r = run([a.runq, f32, "-m", "render", "-e", "low", "-i", json.dumps(msgs)], 1)
-    t = run([a.runq, f32, "-m", "tokenize", "-i", "<|im_end|>\n<|im_start|>user\nAnd now?<|im_end|>\n<|im_start|>assistant\n<think>\n"], 1)
+    r = run([a.gwenedeg, f32, "-m", "render", "-e", "low", "-i", json.dumps(msgs)], 1)
+    t = run([a.gwenedeg, f32, "-m", "tokenize", "-i", "<|im_end|>\n<|im_start|>user\nAnd now?<|im_end|>\n<|im_start|>assistant\n<think>\n"], 1)
     ids = open(prefix + ".ids").read().split() if p.returncode == 0 else []
     want, turn2 = r.stdout.decode().split(), t.stdout.decode().split()
     err = p.stderr.decode(errors="replace")
@@ -888,16 +888,16 @@ def q35_bf16_run(a, d, tmp, texts):
         os.remove(path)
         return x
     for b in (1, 64):
-        ok = h(a.runq, bf, b, SYNTH_THREADS) == h(a.runq, wide, b, SYNTH_THREADS)
+        ok = h(a.gwenedeg, bf, b, SYNTH_THREADS) == h(a.gwenedeg, wide, b, SYNTH_THREADS)
         out.append((ok, f"{pre}/logits_eq_b{b}", f"-m logits -b {b}: BF16 file == its F32 twin: " + ("bit-identical" if ok else "DIFFER")))
     if a.generic:
-        hs = [h(a.generic, bf, 7, 3), h(a.generic, wide, 7, 3), h(a.runq, bf, 7, 3)]
+        hs = [h(a.generic, bf, 7, 3), h(a.generic, wide, 7, 3), h(a.gwenedeg, bf, 7, 3)]
         ok = hs[0] == hs[1] == hs[2]
         out.append((ok, f"{pre}/logits_eq_generic", "-m logits -b 7, generic build: BF16 file == its F32 twin == the AVX-512 "
                     "build's: " + ("bit-identical" if ok else f"DIFFER (twin {hs[0] == hs[1]}, AVX-512 {hs[0] == hs[2]})")))
-    out += dequant_vs_mini(a.runq, bf, [("blk.0.ssm_alpha.weight", 0, 8), ("blk.5.ssm_beta.weight", 3, 5)], f"{pre}/dequant")
+    out += dequant_vs_mini(a.gwenedeg, bf, [("blk.0.ssm_alpha.weight", 0, 8), ("blk.5.ssm_beta.weight", 3, 5)], f"{pre}/dequant")
     if os.path.exists(bad):
-        p = run([a.runq, bad, "-n", "1", "-i", "hi"], 1)
+        p = run([a.gwenedeg, bad, "-n", "1", "-i", "hi"], 1)
         err = p.stderr.decode(errors="replace").strip()
         ok = p.returncode == 1 and "tensor blk.0.ffn_gate.weight has ggml type 30, need Q8_0 (8)" in err and "BF16" not in err
         out.append((ok, "q35/synth/bad_bf16_role", f"BF16 ffn_gate refused (BF16 only for ssm_alpha / ssm_beta): exit status "
@@ -924,7 +924,7 @@ MTP_TH = {"3.5-0.8b-mtp": (TH_MTP_08B, MTP_TOP1)}  # (MTP_ONLY's: thresholds, to
 
 
 def mtp_dump(api_test, model, text, path, threads, chunk=64):
-    """api_test --mtp-dump: the MTP view's logits teacher-forced on text (runq -m logits' format) into path"""
+    """api_test --mtp-dump: the MTP view's logits teacher-forced on text (gwenedeg -m logits' format) into path"""
     tp = path + ".txt"
     with open(tp, "w", encoding="utf-8") as fh:
         fh.write(text)
@@ -1018,7 +1018,7 @@ def q35_seqfile_v1(a, d, tmp, fn="synth-q35-ista-mtp.gguf"):
     """seqfile.c's version 2 (TODO S9c.2) against 915894a's api_test (check.py --v1ref-api-test; tests/make_seqfile_v1ref.sh):
     `api_test --seqfile-out` of both builds on fn; v1_same: the target's file and the view's without a kept state byte for
     byte 915894a's, and this build's view file with the kept state version 2 (one page longer); v2_on_v1_reader: 915894a's
-    reads this build's version 1 files (whole, the same lengths) and refuses the version 2 one (RQ_ERR_MISMATCH: runq
+    reads this build's version 1 files (whole, the same lengths) and refuses the version 2 one (RQ_ERR_MISMATCH: gwenedeg
     serve's dk_add then removes that draft file only). [(ok, name, detail)]"""
     import filecmp
     import re
@@ -1045,7 +1045,7 @@ def q35_seqfile_v1(a, d, tmp, fn="synth-q35-ista-mtp.gguf"):
         p = run([a.v1ref_api_test, "--seqfile-load", model, f("new", n)] + (["--view"] if view else []), SYNTH_THREADS)
         m = re.search(r"^seqfile-load: info (-?\d+) load (-?\d+) len (-?\d+)", p.stdout.decode(errors="replace"), re.M)
         got.append((n, tuple(int(x) for x in m.groups()) if p.returncode == 0 and m else None))
-    MISMATCH = -7  # RQ_ERR_MISMATCH (src/runq.h)
+    MISMATCH = -7  # RQ_ERR_MISMATCH (src/gwenedeg.h)
     ok = got[0][1] == (0, 0, 300) and got[1][1] == (0, 0, 300) and got[2][1] is not None and got[2][1][:2] == (MISMATCH, MISMATCH)
     out.append((ok, f"{pre}/v2_on_v1_reader", "915894a's api_test on this build's files: " + ", ".join(
         f"{n}: " + (f"info {g[0]} load {g[1]} len {g[2]}" if g else "failed") for n, g in got) + f" (0: RQ_OK, {MISMATCH}: RQ_ERR_MISMATCH)"))
@@ -1053,7 +1053,7 @@ def q35_seqfile_v1(a, d, tmp, fn="synth-q35-ista-mtp.gguf"):
 
 
 def q35_server38(a, d):
-    """runq serve on synth-q35-27b-f32.gguf (Qwen3.8's template): the prompt of each request == `-m render` of its
+    """gwenedeg serve on synth-q35-27b-f32.gguf (Qwen3.8's template): the prompt of each request == `-m render` of its
     messages with the request's thinking / effort (usage.prompt_tokens; and a greedy reply == the CLI's): thinking
     on by default (xhigh), reasoning_effort low / medium / none and chat_template_kwargs.reasoning_effort, system +
     developer messages merged, an assistant message's reasoning_content kept in the history; a system message after
@@ -1076,11 +1076,11 @@ def q35_server38(a, d):
              ("system_developer", {}, two, 1, None), ("reasoning_content", {}, hist, 1, None)]
     conv = [dict({"messages": r, "thinking": t}, **({"reasoning_effort": e} if e else {})) for _, _, m, t, e in cases
             for r in [hist_r if m is hist else m]]
-    p = run([a.runq, model, "-m", "render", "-i", json.dumps(conv)], 1)
+    p = run([a.gwenedeg, model, "-m", "render", "-i", json.dumps(conv)], 1)
     want = [len(l.split()) for l in p.stdout.decode().splitlines()]
-    cli = run([a.runq, model, "-t", "0", "-c", "2048", "-n", "6", "-y", "Be brief.", "-i", "Hi there"], 4)
+    cli = run([a.gwenedeg, model, "-t", "0", "-c", "2048", "-n", "6", "-y", "Be brief.", "-i", "Hi there"], 4)
     cli_text = cli.stdout.decode(errors="replace").split("<think>\n", 1)[-1].strip()
-    proc = subprocess.Popen([a.runq, "serve", model, "--port", "0", "-c", "2048", "--parallel", "2", "--slots", "2",
+    proc = subprocess.Popen([a.gwenedeg, "serve", model, "--port", "0", "-c", "2048", "--parallel", "2", "--slots", "2",
                              "--threads", "4"], stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
     out = []
     try:
@@ -1129,7 +1129,7 @@ def q35_server38(a, d):
 
 
 def q35_serve_slots(a):
-    """runq serve's slot budget on the 0.8B (engine.c): a slot counts its KV cache, its recurrent state and the state's
+    """gwenedeg serve's slot budget on the 0.8B (engine.c): a slot counts its KV cache, its recurrent state and the state's
     checkpoints (--checkpoints, default 4), as computed here from the file's metadata; --kv-mem 0.25 GiB at -c 2048
     holds 2 slots of ~121 MiB (the KV cache alone, 24 MiB, would allow 10): [(ok, name, detail)]"""
     import re
@@ -1145,7 +1145,7 @@ def q35_serve_slots(a):
     state = pg((L - n_attn) * (((conv - 1) * conv_dim + 15) // 16 * 16 + nv * dk * dv) * 4)
     per = kv_b + 5 * state
     want = int(budget // per)
-    p = subprocess.Popen([a.runq, "serve", a.q35, "--port", "0", "-c", str(ctx), "--slots", "8", "--parallel", "2", "--kv-mem", "0.25",
+    p = subprocess.Popen([a.gwenedeg, "serve", a.q35, "--port", "0", "-c", str(ctx), "--slots", "8", "--parallel", "2", "--kv-mem", "0.25",
                           "--threads", "2"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     lines, t0 = [], time.time()
     try:
@@ -1169,9 +1169,9 @@ def q35_serve_slots(a):
 
 
 def q35_server_tools(a):
-    """tests/server_test.py --tools on the 0.8B (runq serve's tool calls: prompts == -m render, calls parsed and typed,
+    """tests/server_test.py --tools on the 0.8B (gwenedeg serve's tool calls: prompts == -m render, calls parsed and typed,
     streamed, with thinking, a round trip, errors): [(ok, name, detail)]"""
-    p = run([sys.executable, "-I", os.path.join(HERE, "server_test.py"), "--runq", a.runq, "--model", a.q35, "--tools",
+    p = run([sys.executable, "-I", os.path.join(HERE, "server_test.py"), "--gwenedeg", a.gwenedeg, "--model", a.q35, "--tools",
              "--threads", "2"], 2)
     lines = [l for l in p.stdout.decode(errors="replace").splitlines() if l.startswith(("PASS ", "FAIL "))]
     out = [(l.startswith("PASS "), f"q35/server/{l[5:].partition('  ')[0].strip()}", l[5:].partition("  ")[2].strip()) for l in lines]
@@ -1236,7 +1236,7 @@ def q35_synth_run(a, tmp, model, texts, full_api, kv=""):
             gen = len(key) > 2 and key[2] == "gen"
             th = 3 if len(key) > 2 else SYNTH_THREADS
             path = os.path.join(tmp, f"{tag}{kv}_{name}_b{chunk}_{th}{'_gen' if gen else ''}.bin")
-            logits_run(a.generic if gen else a.runq, model, texts[name], path, chunk, th, extra)
+            logits_run(a.generic if gen else a.gwenedeg, model, texts[name], path, chunk, th, extra)
             with open(path, "rb") as fh:
                 h = hashlib.sha256(fh.read()).hexdigest()
             ids, lg = read_logits(path)
@@ -1279,7 +1279,7 @@ def q35_synth_run(a, tmp, model, texts, full_api, kv=""):
     # == with -p 0.95 -K 20 (stdout, stderr without the numbers), != with the CLI's own defaults -p 0.9 -K 0
     if tag == "synth-q35-27b" and not kv:
         import re
-        base = [a.runq, model, "-c", "256", "-t", "0.8", "-s", "7", "-n", "24", "-m", "generate", "-i", texts["en"][:60]]
+        base = [a.gwenedeg, model, "-c", "256", "-t", "0.8", "-s", "7", "-n", "24", "-m", "generate", "-i", texts["en"][:60]]
         ps = [run(base + x, SYNTH_THREADS) for x in ([], ["-p", "0.95", "-K", "20"], ["-p", "0.9", "-K", "0"])]
         err = [re.sub(rb"[0-9.]+", b"N", p.stderr) for p in ps]
         ok = all(p.returncode == 0 for p in ps) and ps[0].stdout == ps[1].stdout and err[0] == err[1] and ps[0].stdout != ps[2].stdout
@@ -1346,12 +1346,12 @@ def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
         [ex.submit(mtp_ref_run, a, os.path.join(sd, fn), os.path.join(t, "synth"), texts, f"q35/{fn[:-5]}", th)
          for fn, th in (("synth-q35-27b-mtp.gguf", TH_MTP_SYNTH), ("synth-q35-27b-f32.gguf", TH_MTP_SYNTH),
                         ("synth-q35-ista-mtp.gguf", TH_MTP_ISTA)) if a.api_test and os.path.exists(os.path.join(sd, fn))] + \
-        [ex.submit(render_run, a.runq, os.path.join(sd, fn), "qwen3.8", f"q35/synth/render_{fn[10:-5]}")
+        [ex.submit(render_run, a.gwenedeg, os.path.join(sd, fn), "qwen3.8", f"q35/synth/render_{fn[10:-5]}")
          for fn in ("synth-tok-qwen3.8.gguf", "synth-tok-qwen3.8-hf.gguf")] + \
         ([ex.submit(q35_two_run, a, sd)] if a.api_test else []) if sd else []
     synth.append(ex.submit(q35_serve_slots, a))
     synth.append(ex.submit(q35_server_tools, a))
-    if sd:  # Q2_K and the i-quants: dequantization (ggufmini vs gguf-py, runq vs ggufmini), the gather decode
+    if sd:  # Q2_K and the i-quants: dequantization (ggufmini vs gguf-py, gwenedeg vs ggufmini), the gather decode
         synth.append(ex.submit(iq_synth_run, a, sd, os.path.join(t, "synth"), texts))
     # the bf16 dot-product attention (KV bf16-dot, TODO G4 (b)): synth-q35-27b (the 27B's attention shape) and every API
     # path on the 0.8B (the logits / bitwise checks of the 0.8B: test_models below, prefix q35_dot)

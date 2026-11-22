@@ -1,5 +1,5 @@
-"""A numpy reference forward pass of a Qwen3.5 (GGUF architecture `qwen35`) text model: the spec for runq's hybrid
-layers, written from the architecture (HF's modeling_qwen3_5.py, transformers 5.x), not from runq's code.
+"""A numpy reference forward pass of a Qwen3.5 (GGUF architecture `qwen35`) text model: the spec for gwenedeg's hybrid
+layers, written from the architecture (HF's modeling_qwen3_5.py, transformers 5.x), not from gwenedeg's code.
 
 Qwen3.5 (0.8B: 24 layers, dim 1024, FFN 3584, vocab 248,320, tied classifier) stacks blocks of the usual
 pre-norm shape (x += mixer(rmsnorm(x)); x += ffn(rmsnorm(x)), SwiGLU), where the mixer is, per layer:
@@ -51,7 +51,7 @@ mtp_forward(w, prompts, xs, rows=None) -> the same for the MTP block, xs: forwar
 forward_long(w, ids, positions) -> float32 (len(positions), vocab): one long prompt (tens of thousands of tokens),
 memory-frugal (rows in chunks, attention in query blocks with an exact softmax), the logits at some rows only
 (tests/make_long_ref.py, TODO G2).
-The recurrence runs token by token (the form of a decode step), in fp32 as runq does; HF's prefill uses the
+The recurrence runs token by token (the form of a decode step), in fp32 as gwenedeg does; HF's prefill uses the
 chunked form, equal up to rounding.
 """
 import json

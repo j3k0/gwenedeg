@@ -133,7 +133,7 @@ def raw_kv(typ, value):
 
 def write_gguf(path, kvs, tensors, alignment=32):
     """kvs: [(key, raw value bytes)]; tensors: [(name, ne, type, bytes or None)]. A tensor of an unknown type
-    with None data gets offset 0 and no data (runq's tokenizer-only loads accept it)."""
+    with None data gets offset 0 and no data (gwenedeg's tokenizer-only loads accept it)."""
     head = [b"GGUF", struct.pack("<IQQ", 3, len(tensors), len(kvs))]
     for k, raw in kvs:
         kb = k.encode()

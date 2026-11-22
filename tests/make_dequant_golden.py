@@ -5,18 +5,18 @@ A few rows of Q4_K and Q6_K tensors of Qwen3-0.6B-Q4_K_M.gguf (q4_k_m.npz), of Q
 Q4_K / Q6_K one) of the Unsloth Qwen3.5-0.8B-Q4_K_M.gguf (q5_k.npz, `--q5`) and of Q3_K tensors (and a
 Q4_K / Q5_K / Q6_K one) of the Unsloth Qwen3.5-0.8B-Q3_K_M.gguf (q3_k.npz, `--q3`), dequantized to float32
 by gguf-py (gguf.quants.dequantize, the numpy port of ggml's dequantize_row_q3_K / _q4_K / _q5_K / _q6_K).
-check.py compares runq's `-m dequant` output (rows from the file's blocks, as for the embedding lookup,
+check.py compares gwenedeg's `-m dequant` output (rows from the file's blocks, as for the embedding lookup,
 and from the repacked Q3P / Q4P / Q5P / Q6P layouts the matmul kernels read) with these bit for bit.
 
 Needs the `gguf` package (pip install gguf; written with gguf 0.19.0) and numpy, e.g. in a scratch
 venv:  python3 -m venv /tmp/g && /tmp/g/bin/pip install gguf && /tmp/g/bin/python tests/make_dequant_golden.py
-The runq tests themselves only need numpy.
+The gwenedeg tests themselves only need numpy.
 
 --iq: tests/golden/dequant/iq_blocks.npz, for Q2_K and the i-quants (src/iquants.h): per type the raw blocks and gguf-py's
 float32 of (a) the first 1024 values of row 17 of the first tensor of that type in Underdog Saluki 27B's file
 (--model, default models/Underdog-Saluki-27B-1.0-GGUF/...: all nine types) and (b) 4 x 256 random block bytes (seed 7;
 finite fp16 scales): every bit pattern of the formats. tests/check_models.py checks tests/ggufmini.py's numpy
-dequantization against these, bitwise (runq is checked against ggufmini on the files: iq_synth_run, the models group).
+dequantization against these, bitwise (gwenedeg is checked against ggufmini on the files: iq_synth_run, the models group).
 """
 import argparse
 import os

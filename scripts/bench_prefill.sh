@@ -10,11 +10,11 @@
 # so runs are reproducible. Column "out" checks that each run's generated text equals that of
 # the first chunk size in the list (batched prefill must not change the output).
 # Defaults take ~2.5 min, mostly the -b 1 runs at 1,500 tokens; -r 1 -b "1 512" ~30 s.
-# Env: RUNQ=binary (default ./runq); ALL=1 adds a column with every run's prefill/decode t/s
+# Env: GWENEDEG_BIN=binary (default ./gwenedeg); ALL=1 adds a column with every run's prefill/decode t/s
 # (run-to-run spread). Check /proc/loadavg first: the machine may be shared.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RUNQ="${RUNQ:-$ROOT/runq}"
+GWENEDEG_BIN="${GWENEDEG_BIN:-${RUNQ:-$ROOT/gwenedeg}}"  # (RUNQ: its deprecated name, before 2026-11-22)
 MODEL="$ROOT/models/Qwen3-0.6B-q8.bin"
 LENS="450 1500"; CHUNKS="1 64 256 512"; THREADS="8"; REPS=3; PRINT=""
 while getopts "l:b:t:r:m:P:h" o; do
@@ -23,7 +23,7 @@ while getopts "l:b:t:r:m:P:h" o; do
     *) sed -n '2,13p' "$0"; exit 1 ;;
   esac
 done
-[ -x "$RUNQ" ] || make -C "$ROOT" -s runq
+[ -x "$GWENEDEG_BIN" ] || make -C "$ROOT" -s gwenedeg
 ERR=$(mktemp); trap 'rm -f "$ERR"' EXIT
 
 PARA="The history of the printing press begins long before Gutenberg. Carved wooden blocks were \
@@ -42,12 +42,12 @@ NW=${#WORDS[@]}
 
 ntok() {  # tokens of the chat-rendered prompt = raw tokens + template (measured once)
   local n
-  n=$("$RUNQ" "$MODEL" -c 64 -m tokenize -i "$1" 2>/dev/null | wc -w)
+  n=$("$GWENEDEG_BIN" "$MODEL" -c 64 -m tokenize -i "$1" 2>/dev/null | wc -w)
   echo $((n + TEMPLATE))
 }
 words() { local out="" i; for ((i = 0; i < $1; i++)); do out+="${WORDS[i % NW]} "; done; echo "${out% }"; }
 # template overhead: [timing] prompt count of a 1-word chat prompt minus its raw token count
-t_line=$(OMP_NUM_THREADS=1 "$RUNQ" "$MODEL" -c 64 -t 0 -n 1 -b 1 -i "Hello" 2>&1 >/dev/null | grep '\[timing\]')
+t_line=$(OMP_NUM_THREADS=1 "$GWENEDEG_BIN" "$MODEL" -c 64 -t 0 -n 1 -b 1 -i "Hello" 2>&1 >/dev/null | grep '\[timing\]')
 TEMPLATE=$(( $(sed -E 's/.*prompt: ([0-9]+) tok.*/\1/' <<<"$t_line") - 1 ))
 
 make_prompt() {  # shortest word prefix with >= target tokens (binary search on the word count)
@@ -71,7 +71,7 @@ for len in $LENS; do
     for b in $CHUNKS; do
       best_p=0; best_d=0; same=yes; n=0; all=""
       for _ in $(seq "$REPS"); do
-        out=$(OMP_NUM_THREADS=$t "$RUNQ" "$MODEL" -c 4096 -t 0 -n 16 -b "$b" -i "$prompt" 2>"$ERR") || { cat "$ERR" >&2; exit 1; }
+        out=$(OMP_NUM_THREADS=$t "$GWENEDEG_BIN" "$MODEL" -c 4096 -t 0 -n 16 -b "$b" -i "$prompt" 2>"$ERR") || { cat "$ERR" >&2; exit 1; }
         line=$(grep '\[timing\]' "$ERR")
         n=$(sed -E 's/.*prompt: ([0-9]+) tok.*/\1/' <<<"$line")
         p=$(sed -E 's/.*prompt: [0-9]+ tok in [0-9.]+ s \(([0-9.]+) tok\/s\).*/\1/' <<<"$line")

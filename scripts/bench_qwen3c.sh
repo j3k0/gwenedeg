@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
-# Benchmark ./runq (src/*.c) decode/prefill speed across thread counts.
+# Benchmark ./gwenedeg (src/*.c) decode/prefill speed across thread counts.
 # Usage: scripts/bench_qwen3c.sh [model.bin] [threads...]
 #   default model: models/Qwen3-0.6B-q8.bin, default threads: 1 2 4 8 12
 #   (16 threads on the 16-vCPU VM: no collapse since Step 7a, but not faster than 12-14 with other load)
-# Env: N=new tokens per run (256), REPS=runs per thread count, best kept (3), RUNQ=binary,
+# Env: N=new tokens per run (256), REPS=runs per thread count, best kept (3), GWENEDEG_BIN=binary,
 #      ALL=1 adds a column with every run's prefill/decode t/s (run-to-run spread)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RUNQ="${RUNQ:-$ROOT/runq}"
+GWENEDEG_BIN="${GWENEDEG_BIN:-${RUNQ:-$ROOT/gwenedeg}}"  # (RUNQ: its deprecated name, before 2026-11-22)
 MODEL="${1:-$ROOT/models/Qwen3-0.6B-q8.bin}"; shift || true
 THREADS=("${@:-1 2 4 8 12}"); THREADS=(${THREADS[@]})
 N="${N:-256}"; REPS="${REPS:-3}"
 PROMPT="Write a detailed, multi-paragraph essay about the history of the printing press and its impact on Europe."
 
-[ -x "$RUNQ" ] || make -C "$ROOT" >/dev/null
+[ -x "$GWENEDEG_BIN" ] || make -C "$ROOT" >/dev/null
 cat "$MODEL" > /dev/null   # warm the page cache
 
 printf "%-8s %12s %12s\n" threads "prefill t/s" "decode t/s"
 for t in "${THREADS[@]}"; do
   best_d=0; best_p=0; all=""
   for _ in $(seq "$REPS"); do
-    line=$(OMP_NUM_THREADS=$t "$RUNQ" "$MODEL" -c 4096 -t 0 -n "$N" -i "$PROMPT" 2>&1 >/dev/null | grep '\[timing\]')
+    line=$(OMP_NUM_THREADS=$t "$GWENEDEG_BIN" "$MODEL" -c 4096 -t 0 -n "$N" -i "$PROMPT" 2>&1 >/dev/null | grep '\[timing\]')
     p=$(sed -E 's/.*prompt: [0-9]+ tok in [0-9.]+ s \(([0-9.]+) tok\/s\).*/\1/' <<<"$line")
     d=$(sed -E 's/.*generated: [0-9]+ tok in [0-9.]+ s \(([0-9.]+) tok\/s\).*/\1/' <<<"$line")
     best_d=$(awk -v a="$best_d" -v b="$d" 'BEGIN{print (b>a)?b:a}')

@@ -73,10 +73,10 @@ ADMIT="${ADMIT_MODE:-$ADMIT}"
 # slots: bound / chunk keep 2 idle ones as prefix caches (reclaimed when memory is needed); worst sizes every slot
 if [ "$ADMIT" = worst ]; then SLOTS=$PARALLEL; else SLOTS=$((PARALLEL + 2)); fi
 
-# /runq serve $MODEL -c 98304 -k bf16-dot --draft $DRAFT_MODEL --slots 2 --parallel 2 --checkpoints 3 --spec-calibrate 32768 --timeout 0 --port $BIND_PORT --host $BIND_HOST --name qwen3.8-27b
+# /gwenedeg serve $MODEL -c 98304 -k bf16-dot --draft $DRAFT_MODEL --slots 2 --parallel 2 --checkpoints 3 --spec-calibrate 32768 --timeout 0 --port $BIND_PORT --host $BIND_HOST --name qwen3.8-27b
 
 mkdir -p "$KV_DISK"
-./runq serve "$MODEL" \
+./gwenedeg serve "$MODEL" \
   --ctx "$CONTEXT" \
   --timeout 0 \
   $SPEC_ARGS $EXTRA_ARGS \

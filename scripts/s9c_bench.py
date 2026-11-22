@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The server benchmark of TODO S9c (PLAN-S9c-server.md S9c.G): one `runq serve` and the requests of one configuration.
+"""The server benchmark of TODO S9c (PLAN-S9c-server.md S9c.G): one `gwenedeg serve` and the requests of one configuration.
 
   scripts/s9c_bench.py --model MODEL --serve-args "ARGS" [--short [--think 1,0]] [--long L --turns T] [--label X] [--json PATH]
   scripts/s9c_bench.py --model MODEL --server-cmd "llama-server -m {model} ... --port {port}" [--short] [--long L ...]
@@ -9,7 +9,7 @@
   scripts/s9c_bench.py --compare A.json B.json ...      (the output hashes of the runs: equal per request and
                                                         every request in every run, exit 0; else 1)
 
-The server: `runq serve MODEL ARGS [--mem $S9_GATE_MEM] --host 127.0.0.1 --port 0 --timeout 0` (S9_GATE_MEM: exported by
+The server: `gwenedeg serve MODEL ARGS [--mem $S9_GATE_MEM] --host 127.0.0.1 --port 0 --timeout 0` (S9_GATE_MEM: exported by
 scripts/s9_gate.sh's server mode; the server's threads, draft, pool and -v come with ARGS). Its startup lines, its
 shutdown lines (-v: the [engine] summary, mtp: A / B / steps) and every second /health's mem and the server's VmRSS /
 VmHWM (/proc/PID/status) are kept. Per request: prompt_n, prompt_ms, cache_n, predicted_n / predicted_ms (tok/s), the
@@ -22,7 +22,7 @@ wall time and a hash of the output (content + reasoning + finish_reason).
             --think mode (1: thinking on, Qwen3.8's default; 0: chat_template_kwargs.enable_thinking false). The metric
             (S9c.G2): per mode the mean of the 8 one-client tok/s, and the 4 clients' aggregate tok/s (their tokens / the
             round's wall time)
-  --long L  one prompt of ~L tokens (long-32k.txt cut at a line to ~L tokens by the model's tokenizer, runq -m tokenize,
+  --long L  one prompt of ~L tokens (long-32k.txt cut at a line to ~L tokens by the model's tokenizer, gwenedeg -m tokenize,
             + task-long.txt; its cold prefill reported alone), then --turns T pi-shaped turns: the reply kept, ~2,500 new
             tokens each (the next slice of the same source: the rest of long-32k.txt, then long-more.txt) and a question;
             greedy, max_tokens 512, auto (the server's default); per turn the wall, prefill and decode times
@@ -68,25 +68,25 @@ def short_prompts():
             ("tool", [{"role": "system", "content": agent}, {"role": "user", "content": text("task-tool.txt").strip()}])]
 
 
-def ntokens(runq, model, s):
-    """the token count of s by the model's tokenizer (runq -m tokenize: the header and the tokenizer only)"""
-    p = subprocess.run([runq, model, "-m", "tokenize", "-i", s], capture_output=True)
+def ntokens(gwenedeg, model, s):
+    """the token count of s by the model's tokenizer (gwenedeg -m tokenize: the header and the tokenizer only)"""
+    p = subprocess.run([gwenedeg, model, "-m", "tokenize", "-i", s], capture_output=True)
     m = re.search(rb"\[tokenize\] \d+ bytes -> (\d+) tokens", p.stderr)
     if p.returncode != 0 or not m:
-        sys.exit(f"s9c_bench: runq -m tokenize failed: {p.stderr.decode(errors='replace')[-300:]}")
+        sys.exit(f"s9c_bench: gwenedeg -m tokenize failed: {p.stderr.decode(errors='replace')[-300:]}")
     return int(m.group(1))
 
 
-def cut(runq, model, s, want):
+def cut(gwenedeg, model, s, want):
     """s cut at a line to ~want tokens of the model's tokenizer (within 2%, at most 4 tokenizer runs): (head, rest)"""
     b = s.encode()
-    n = ntokens(runq, model, s)
+    n = ntokens(gwenedeg, model, s)
     if want >= n:
         return s, ""
     pos, i = len(b) * want // n, 0
     for _ in range(4):
         i = b.rfind(b"\n", 0, min(pos, len(b))) + 1 or min(pos, len(b))
-        k = ntokens(runq, model, b[:i].decode(errors="ignore"))
+        k = ntokens(gwenedeg, model, b[:i].decode(errors="ignore"))
         if abs(k - want) <= want // 50 or k == 0:
             break
         pos = i * want // k
@@ -94,7 +94,7 @@ def cut(runq, model, s, want):
 
 
 class Server:
-    """runq serve MODEL ARGS on 127.0.0.1, an ephemeral port; its log in a file; a sampler of /health and /proc/PID/status"""
+    """gwenedeg serve MODEL ARGS on 127.0.0.1, an ephemeral port; its log in a file; a sampler of /health and /proc/PID/status"""
 
     def __init__(self, a, logpath):
         self.ext = bool(a.server_cmd)
@@ -105,7 +105,7 @@ class Server:
             so.close()
             cmd = shlex.split(a.server_cmd.format(port=fport, model=a.model))
         else:
-            cmd = [a.runq, "serve", a.model] + shlex.split(a.serve_args)
+            cmd = [a.gwenedeg, "serve", a.model] + shlex.split(a.serve_args)
             if os.environ.get("S9_GATE_MEM"):
                 cmd += ["--mem", os.environ["S9_GATE_MEM"]]
             cmd += ["--host", "127.0.0.1", "--port", "0", "--timeout", "0"]
@@ -203,7 +203,7 @@ class Server:
         self.log.close()
         with open(self.logpath) as f:
             log = f.read()
-        head = log.split("runq serve: listening", 1)[0].splitlines()
+        head = log.split("gwenedeg serve: listening", 1)[0].splitlines()
         return head, log[self.stop_at:].splitlines()
 
 
@@ -267,7 +267,7 @@ def run_short(srv, a, recs):
 def run_long(srv, a, recs):
     """--long L --turns T: the cold prompt, then T turns of ~2,500 new tokens each"""
     src, task, more = text("long-32k.txt"), text("task-long.txt"), text("long-more.txt")
-    head, rest = cut(a.runq, a.model, src, a.long)
+    head, rest = cut(a.gwenedeg, a.model, src, a.long)
     rest += more
     t = a.think[0]
     msgs = [{"role": "user", "content": head + task}]
@@ -283,7 +283,7 @@ def run_long(srv, a, recs):
               f"lookup {r.get('lookup')}, plain passes {r.get('plain_passes')}, mtp_approx {r.get('mtp_approx')}", flush=True)
         if r["status"] != 200 or i == a.turns:
             break
-        piece, _ = cut(a.runq, a.model, rest[:16 * TURN_TOKENS], TURN_TOKENS)  # (the next ~2,500 tokens)
+        piece, _ = cut(a.gwenedeg, a.model, rest[:16 * TURN_TOKENS], TURN_TOKENS)  # (the next ~2,500 tokens)
         rest = rest[len(piece):]
         if not piece:
             print("  (the source is used up)")
@@ -324,9 +324,10 @@ def compare(paths):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--model")
-    ap.add_argument("--serve-args", default="", help="runq serve's arguments (threads, draft, pool, -v, ...)")
-    ap.add_argument("--runq", default=os.path.join(ROOT, "runq"), help="runq (its -m tokenize cuts --long's prompts, any engine)")
-    ap.add_argument("--server-cmd", default="", help="another engine's server instead of runq serve: a command line with {model} / {port}")
+    ap.add_argument("--serve-args", default="", help="gwenedeg serve's arguments (threads, draft, pool, -v, ...)")
+    ap.add_argument("--gwenedeg", default=os.path.join(ROOT, "gwenedeg"), help="gwenedeg (its -m tokenize cuts --long's prompts, any engine)")
+    ap.add_argument("--runq", dest="gwenedeg", default=argparse.SUPPRESS, help=argparse.SUPPRESS)  # (deprecated: the name before 2026-11-22)
+    ap.add_argument("--server-cmd", default="", help="another engine's server instead of gwenedeg serve: a command line with {model} / {port}")
     ap.add_argument("--short", action="store_true")
     ap.add_argument("--think", default="1", help="1, 0 or 1,0 (thinking on / off)")
     ap.add_argument("--long", type=int, default=0, metavar="L")

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # The Qwen3.8-27B measurements of PP-RESULTS.md (the i-quants' tiled prefill GEMM): needs a measurement window (the 27B
 # takes ~12.5 GB of RAM with --repack; stop the live server first). Builds everything it runs in a temporary directory
-# (the base commit and this tree, plain, -DRUNQ_PROFILE and -DRQ_BATCH_MAX=2048), then:
+# (the base commit and this tree, plain, -DGWENEDEG_PROFILE and -DRQ_BATCH_MAX=2048), then:
 #   1. bit-identity on the 27B: -m logits of a ~300-token prompt, base -b 512 == new -b 512 == new -b 1 == new -b 77
 #      (3 threads) == new --repack -b 512 (sha256 of the logits files)
 #   2. prefill tok/s, base vs new, a ~2,500-token prompt, -b 512, --repack, 8 / 14 / 16 threads (best of REPS); new
 #      without --repack at 14 threads
-#   3. the phase split (-DRUNQ_PROFILE), base vs new, 14 threads, --repack
+#   3. the phase split (-DGWENEDEG_PROFILE), base vs new, 14 threads, --repack
 #   4. -b 256 / 512 / 1024 / 2048 (the RQ_BATCH_MAX=2048 build), ~4,100-token prompt, 14 threads, --repack
 # Usage: scripts/pp_window.sh [MODEL [BASE_COMMIT]]   (env REPS, default 2; JOBS: make -j, default 8;
 #        TH: step 2's thread counts, default "8 14 16"; TP: the other steps' threads, default 14; SKIP="1 4": skip those steps)
-# Duration ~20-25 min on the 16-vCPU Genoa box; peak RSS ~13 GB (one runq at a time). Output: bench/pp-window-DATE/.
+# Duration ~20-25 min on the 16-vCPU Genoa box; peak RSS ~13 GB (one gwenedeg at a time). Output: bench/pp-window-DATE/.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 M="${1:-/opt/projects/tools/gwenedeg/models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf}"
@@ -33,11 +33,13 @@ mkdir -p "$W/base" "$W/new"
 git -C "$ROOT" archive "$BASE" | tar -x -C "$W/base"
 (cd "$ROOT" && git ls-files -z | xargs -0 tar -c) | tar -x -C "$W/new"
 for t in base new; do
-    make -C "$W/$t" -s -j$JOBS runq >/dev/null && mv "$W/$t/runq" "$W/$t/runq-plain"
-    make -C "$W/$t" -s -j$JOBS runq B=build/prof CFLAGS="-Ofast -fopenmp -march=native -DRUNQ_PROFILE" >/dev/null && mv "$W/$t/runq" "$W/$t/runq-prof"
+    # (a base from before 2026-11-22: the target was runq, the macro RUNQ_PROFILE)
+    T=gwenedeg; P=GWENEDEG_PROFILE; grep -q '^gwenedeg:' "$W/$t/Makefile" || { T=runq; P=RUNQ_PROFILE; }
+    make -C "$W/$t" -s -j$JOBS $T >/dev/null && mv "$W/$t/$T" "$W/$t/gwenedeg-plain"
+    make -C "$W/$t" -s -j$JOBS $T B=build/prof CFLAGS="-Ofast -fopenmp -march=native -D$P" >/dev/null && mv "$W/$t/$T" "$W/$t/gwenedeg-prof"
 done
-make -C "$W/new" -s -j$JOBS runq B=build/b2048 CFLAGS="-Ofast -fopenmp -march=native -DRQ_BATCH_MAX=2048" >/dev/null && mv "$W/new/runq" "$W/new/runq-b2048"
-B0="$W/base/runq-plain" B1="$W/new/runq-plain"
+make -C "$W/new" -s -j$JOBS gwenedeg B=build/b2048 CFLAGS="-Ofast -fopenmp -march=native -DRQ_BATCH_MAX=2048" >/dev/null && mv "$W/new/gwenedeg" "$W/new/gwenedeg-b2048"
+B0="$W/base/gwenedeg-plain" B1="$W/new/gwenedeg-plain"
 
 # prompts: the bench paragraph (scripts/bench_prefill.sh) cut to a word count (~1.19 tokens per word + the template)
 PARA=$(sed -n '/^PARA="/,/^read /p' "$ROOT/scripts/bench_prefill.sh" | sed '1s/^PARA="//; $d' | sed '$s/"$//' | tr -d '\\' | tr '\n' ' ')
@@ -79,7 +81,7 @@ fi
 if [[ "$SKIP" != *" 3 "* ]]; then
     say "== 3. phase split, $TP threads, --repack, ~2,500 tokens (load $(load))"
     for t in base new; do
-        OMP_NUM_THREADS=$TP "$W/$t/runq-prof" "$M" -c 8192 -t 0 -n 1 --repack -b 512 -i "$(cat "$W/p2500.txt")" 2>"$W/err.txt" >/dev/null
+        OMP_NUM_THREADS=$TP "$W/$t/gwenedeg-prof" "$M" -c 8192 -t 0 -n 1 --repack -b 512 -i "$(cat "$W/p2500.txt")" 2>"$W/err.txt" >/dev/null
         say "-- $t"; grep -E '\[timing\]|\[profile\]' "$W/err.txt" | tee -a "$LOG"
     done
 fi
@@ -87,7 +89,7 @@ fi
 if [[ "$SKIP" != *" 4 "* ]]; then
     say "== 4. -b, ~4,100 tokens, $TP threads, --repack, the RQ_BATCH_MAX=2048 build (load $(load))"
     for b in 256 512 1024 2048; do
-        say "  -b $b: $(pf $TP "$W/new/runq-b2048" --repack -b "$b" -i "$(cat "$W/p4100.txt")")"
+        say "  -b $b: $(pf $TP "$W/new/gwenedeg-b2048" --repack -b "$b" -i "$(cat "$W/p4100.txt")")"
     done
 fi
 say "== done $(date -Is) (load $(load)); $OUT"

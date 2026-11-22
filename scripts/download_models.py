@@ -7,7 +7,7 @@ Interrupted downloads resume from the partial .part file.
 
 Usage:
     scripts/download_models.py                 # default sets: hf q4km q8gguf
-    scripts/download_models.py q8gguf          # pick sets explicitly (runq loads this GGUF directly)
+    scripts/download_models.py q8gguf          # pick sets explicitly (gwenedeg loads this GGUF directly)
     scripts/download_models.py family          # a group: the bigger Qwen3 models of Step 11 (~21 GB)
     scripts/download_models.py --list
 
@@ -49,7 +49,7 @@ SETS = {
     "q5km": ("unsloth/Qwen3-0.6B-GGUF", "50968a4468ef4233ed78cd7c3de230dd1d61a56b", "Qwen3-0.6B-GGUF", [
         ("Qwen3-0.6B-Q5_K_M.gguf", 444415680, "sha256", "03c6e2127d155b89c21a512954010486b1e00e1a9eebdfad650d03b53ab4c74a"),
     ]),
-    # Q8_0 GGUF from the same repo: runq loads it directly (no export step); also used by the tests
+    # Q8_0 GGUF from the same repo: gwenedeg loads it directly (no export step); also used by the tests
     # and for comparisons with GGUF-based engines.
     "q8gguf": ("unsloth/Qwen3-0.6B-GGUF", "50968a4468ef4233ed78cd7c3de230dd1d61a56b", "Qwen3-0.6B-GGUF", [
         ("Qwen3-0.6B-Q8_0.gguf", 639447744, "sha256", "e150ed544dfe6016930c026a93913a5e3184181ebfe6ab2223ae01dd0491784c"),
@@ -100,7 +100,7 @@ SETS = {
     ]),
 
     # Qwen3.5-0.8B: the hybrid architecture (GGUF qwen35: Gated DeltaNet + gated attention, partial RoPE), not
-    # supported by runq yet: docs/qwen35.md. 24 layers, dim 1024, vocab 248,320, tied. The HF checkpoint
+    # supported by gwenedeg yet: docs/qwen35.md. 24 layers, dim 1024, vocab 248,320, tied. The HF checkpoint
     # (bf16, with the vision tower and the MTP head) is the input of the goldens (.venv-hf5: transformers 5.x).
     "3.5-0.8b-hf": ("Qwen/Qwen3.5-0.8B", "2fc06364715b967f1860aea9cf38778875588b17", "Qwen3.5-0.8B", [
         ("LICENSE", 11544, "blob", "f938136e3adacfd92be087f6e113b5d6d97f678f"),
@@ -148,7 +148,7 @@ SETS = {
         ("Qwen3.5-4B-Q8_0.gguf", 4482403488, "sha256", "10cc391b403021dd11c614679d2fd92f611c3681d29e29651b717316965d61e1"),
     ]),
     # Qwen3.8-27B (qwen35, 64 layers + an MTP block, r = 3, untied; docs/notes/qwen38-speculative.md): Unsloth's Q4_K_M
-    # (Q4_K / Q5_K / Q6_K / Q8_0, F32 ssm_alpha / ssm_beta), ~19 GB of RAM in runq; not main's UD-Q4_K_M (IQ types)
+    # (Q4_K / Q5_K / Q6_K / Q8_0, F32 ssm_alpha / ssm_beta), ~19 GB of RAM in gwenedeg; not main's UD-Q4_K_M (IQ types)
     "3.8-27b-q4km": ("unsloth/Qwen3.8-27B-GGUF", "4a03c640833598c0fb5ddd11e846135e906eb764", "Qwen3.8-27B-GGUF", [
         ("Qwen3.8-27B-Q4_K_M.gguf", 17106775008, "sha256", "7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169"),
     ]),

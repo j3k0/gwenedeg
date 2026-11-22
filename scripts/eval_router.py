@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Judge-quality evaluation of runq serve as LiteLLM's complexity-router classifier (not part of make test).
+"""Judge-quality evaluation of gwenedeg serve as LiteLLM's complexity-router classifier (not part of make test).
 
 Runs the labeled prompts of scripts/router_eval.jsonl (80: 20 per tier, labels following LiteLLM's tier
 definitions of the legacy rubric; incl. hard prompts that look short and easy ones that look long)
-through runq serve with the exact request LiteLLM's classifier sends: the system prompt from
+through gwenedeg serve with the exact request LiteLLM's classifier sends: the system prompt from
 classification_system_prompt(0, rubric), the user message from ComplexityRouter._build_classifier_user_payload,
 response_format from type_to_response_format_param(TierClassification), temperature 0 (LiteLLM's own code
 is imported from its venv, read-only; scripts/litellm_e2e.sh checks that it is what the proxy sends;
@@ -14,7 +14,7 @@ over the allowed tokens, from the logprobs: every allowed token is a prefix of o
 
 Usage (with the Python of a venv that has LiteLLM installed, tested with 1.105.0; see scripts/litellm_e2e.sh):
   $LITELLM_VENV/bin/python -I scripts/eval_router.py [--models a.gguf,b.gguf] [--rubrics legacy,chat]
-      [--threads 8] [--out /tmp/eval.json] [--check-log /tmp/gwenedeg-e2e/runq.log] [--show-probs]
+      [--threads 8] [--out /tmp/eval.json] [--check-log /tmp/gwenedeg-e2e/gwenedeg.log] [--show-probs]
 """
 import argparse
 import json
@@ -44,9 +44,9 @@ def litellm_request(rubric, prompt):
             "temperature": 0}
 
 
-def start_server(runq, model, threads):
+def start_server(gwenedeg, model, threads):
     log = tempfile.NamedTemporaryFile(prefix="eval-serve-", suffix=".log", delete=False)
-    p = subprocess.Popen([runq, "serve", model, "--port", "0", "-c", "4096", "--slots", "2"], stderr=log,
+    p = subprocess.Popen([gwenedeg, "serve", model, "--port", "0", "-c", "4096", "--slots", "2"], stderr=log,
                          stdout=subprocess.DEVNULL, env=dict(os.environ, OMP_NUM_THREADS=str(threads)))
     for _ in range(600):
         m = re.search(r"listening on http://127\.0\.0\.1:(\d+)", open(log.name).read())
@@ -109,13 +109,14 @@ def report(name, rows, show_probs):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--runq", default=os.path.join(ROOT, "runq"))
+    ap.add_argument("--gwenedeg", default=os.path.join(ROOT, "gwenedeg"))
+    ap.add_argument("--runq", dest="gwenedeg", default=argparse.SUPPRESS, help=argparse.SUPPRESS)  # (deprecated: the name before 2026-11-22)
     ap.add_argument("--models", default=",".join(DEFAULT_MODELS))
     ap.add_argument("--rubrics", default="legacy,chat,agentic,business")
     ap.add_argument("--data", default=os.path.join(ROOT, "scripts", "router_eval.jsonl"))
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--out", default="")
-    ap.add_argument("--check-log", default="", help="a runq serve --verbose log of LiteLLM's classifier calls (litellm_e2e.sh)")
+    ap.add_argument("--check-log", default="", help="a gwenedeg serve --verbose log of LiteLLM's classifier calls (litellm_e2e.sh)")
     ap.add_argument("--show-probs", action="store_true", help="per prompt: the label probabilities")
     a = ap.parse_args()
     try:
@@ -141,7 +142,7 @@ def main():
         if not os.path.exists(path):
             print(f"\n(skipped: {model} not found)")
             continue
-        srv, port, log = start_server(a.runq, path, a.threads)
+        srv, port, log = start_server(a.gwenedeg, path, a.threads)
         try:
             for rubric in a.rubrics.split(","):
                 rows = []

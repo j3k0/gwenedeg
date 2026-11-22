@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Replay benchmark of agentic sessions (TODO G0 (a), G5): pi's recorded sessions replayed against `runq serve`,
+"""Replay benchmark of agentic sessions (TODO G0 (a), G5): pi's recorded sessions replayed against `gwenedeg serve`,
 request by request, as pi would send them; per request the reused prefix, the tokens prefilled, rollbacks and the
 timings. Local data only: the sessions (~/.pi/agent/sessions/*/*.jsonl) are read, never copied; the outputs (numbers
-only, no content) go under --out (default /var/tmp/runq-replay; logs/ is git-ignored too).
+only, no content) go under --out (default /var/tmp/gwenedeg-replay; logs/ is git-ignored too).
 
   scripts/replay_sessions.py --model models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf --ctx 98304 --pick 3
   scripts/replay_sessions.py --model ... --ctx 32768 --session FILE [--session FILE ...] [--mode live]
-  scripts/replay_sessions.py --report /var/tmp/runq-replay/RUN.jsonl      (the table of an earlier run)
+  scripts/replay_sessions.py --report /var/tmp/gwenedeg-replay/RUN.jsonl      (the table of an earlier run)
 
 How (scripts/replay_pi.mjs, run with node): pi's own code builds each request (pi-coding-agent's session context,
 pi-ai's openai-completions provider: the same body, the same SSE parsing), with the server's context as pi's model
 window (pi's compaction triggers there: its summary requests are replayed too). --mode force (default): every reply is
-forced to the recorded one (runq serve's force_reply: the recorded message rendered as the template renders it, fed as
+forced to the recorded one (gwenedeg serve's force_reply: the recorded message rendered as the template renders it, fed as
 if generated; the next request carries the server's parse of it, through pi), so the cache sees what a model writing
 in the template's format would have generated; --mode live: the model generates (up to --live-tokens) and its own
 reply goes on in the history.
@@ -84,7 +84,7 @@ def pick(n, min_replies, max_bytes, need_thinking):
 
 
 def start_server(a, log):
-    cmd = [a.runq, "serve", a.model, "--port", "0", "-c", str(a.ctx), "--slots", str(a.slots), "--parallel", str(a.parallel)]
+    cmd = [a.gwenedeg, "serve", a.model, "--port", "0", "-c", str(a.ctx), "--slots", str(a.slots), "--parallel", str(a.parallel)]
     cmd += a.server_arg
     if a.server_verbose:
         cmd.append("-v")
@@ -97,7 +97,7 @@ def start_server(a, log):
             return p, int(m.group(1))
         if p.poll() is not None:
             break
-    sys.exit("runq serve did not start:\n" + open(log, errors="replace").read()[-2000:])
+    sys.exit("gwenedeg serve did not start:\n" + open(log, errors="replace").read()[-2000:])
 
 
 def table(recs, out=sys.stdout, per_request=False):
@@ -197,13 +197,14 @@ def table(recs, out=sys.stdout, per_request=False):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--runq", default=os.path.join(ROOT, "runq"))
+    ap.add_argument("--gwenedeg", default=os.path.join(ROOT, "gwenedeg"))
+    ap.add_argument("--runq", dest="gwenedeg", default=argparse.SUPPRESS, help=argparse.SUPPRESS)  # (deprecated: the name before 2026-11-22)
     ap.add_argument("--model")
     ap.add_argument("--ctx", type=int, default=32768)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--slots", type=int, default=3)
     ap.add_argument("--parallel", type=int, default=2)
-    ap.add_argument("--server-arg", action="append", default=[], help="an extra `runq serve` argument (repeatable)")
+    ap.add_argument("--server-arg", action="append", default=[], help="an extra `gwenedeg serve` argument (repeatable)")
     ap.add_argument("--server-verbose", action="store_true", help="run the server with -v; its [engine] lines (where a "
                     "prompt left the cached tokens, with the tokens around) are kept next to the results")
     ap.add_argument("--session", action="append", default=[], help="a session file (repeatable)")
@@ -220,7 +221,7 @@ def main():
     ap.add_argument("--reserve", type=int, help="pi's compaction.reserveTokens (default min(16384, ctx / 4))")
     ap.add_argument("--keep", type=int, help="pi's compaction.keepRecentTokens (default min(20000, ctx / 4))")
     ap.add_argument("--pi", help="pi's install directory (default: the newest ~/.pi/agent/install/releases/*)")
-    ap.add_argument("--out", default="/var/tmp/runq-replay")
+    ap.add_argument("--out", default="/var/tmp/gwenedeg-replay")
     ap.add_argument("--tag", default=time.strftime("%Y%m%d-%H%M%S"))
     ap.add_argument("--per-request", action="store_true", help="the table per request too")
     ap.add_argument("--report", help="print the table of an earlier run's JSON lines and exit")
@@ -251,7 +252,7 @@ def main():
                 name = f"{sid} ({info['replies']} replies, {info['thinking']} with reasoning, {info['bytes'] // 1024} KB)"
                 print(f"session {name} ...", file=sys.stderr, flush=True)
                 cmd = ["node", os.path.join(ROOT, "scripts", "replay_pi.mjs"), "--pi", pdir, "--session", f,
-                       "--url", f"http://127.0.0.1:{port}/v1", "--model", "runq", "--ctx", str(a.ctx), "--mode", a.mode,
+                       "--url", f"http://127.0.0.1:{port}/v1", "--model", "gwenedeg", "--ctx", str(a.ctx), "--mode", a.mode,
                        "--live-tokens", str(a.live_tokens), "--max-requests", str(a.max_requests),
                        "--probe-every", str(a.probe_every), "--probe-tokens", str(a.probe_tokens)]
                 if a.reserve is not None:
@@ -280,7 +281,7 @@ def main():
     if a.server_verbose:  # (only the engine's lines: the request bodies are the sessions' content)
         with open(log, errors="replace") as fi, open(log + ".engine", "w") as fo:
             for line in fi:
-                if line.startswith("[engine]") or line.startswith("runq serve:"):
+                if line.startswith("[engine]") or line.startswith("gwenedeg serve:"):
                     fo.write(line)
         os.replace(log + ".engine", log)
     table(recs, per_request=a.per_request)

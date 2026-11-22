@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""KL divergence of runq's next-token distributions from the fp32 model, per KV cache type: the measurement behind the
+"""KL divergence of gwenedeg's next-token distributions from the fp32 model, per KV cache type: the measurement behind the
 16-bit KV types (Step 7b: f16 +0.2%, bf16 +2.6%) and the bf16 dot-product attention (TODO G4 (b): -k bf16-dot /
 f16-dot). Teacher-forced on pieces of real text, every position scored:
-  KL(ref || runq) = sum_v p_ref(v) (log p_ref(v) - log p_runq(v)), float64, per position, averaged per piece and over
+  KL(ref || gwenedeg) = sum_v p_ref(v) (log p_ref(v) - log p_gwenedeg(v)), float64, per position, averaged per piece and over
   all positions; also the top-1 agreement with the reference and the mean NLL of the text's next tokens.
 The reference: the model's HF checkpoint in fp32, run by the repository's numpy forward passes (tests/ref_forward.py's
 Qwen3 architecture, tests/ref_qwen35.py's Qwen3.5: one layer's weights at a time, so a 4B fits in ~4 GB where
 transformers' fp32 model needs ~17 GB); --check-hf compares it with transformers on the first piece (the 0.6B / 0.8B).
 The text: bench/ppl_beagle_ch1.txt (prose), then tests/check_long.py's corpus (this repository's files at a fixed commit:
 docs, C, Python), cut at line ends into pieces of at most --tokens tokens, each its own sequence from position 0; a piece
-tokenized by HF's tokenizer; runq gets the ids (build/long_ctx -A: every row's logits, streamed per 512-row chunk).
+tokenized by HF's tokenizer; gwenedeg gets the ids (build/long_ctx -A: every row's logits, streamed per 512-row chunk).
 
 Usage: .venv/bin/python scripts/kl_kv.py --hf DIR --gguf FILE [--kv f32,f16,bf16,bf16-dot,f16-dot] [--pieces 13]
                                           [--tokens 3500] [-t 8] [--check-hf] [--out FILE.json]
   (make long-ctx; Qwen3.5 checkpoints: .venv-hf5, for the tokenizer and --check-hf's transformers 5.x; the numpy
-  reference needs numpy only.) Files: the reference's logits of one piece and one runq run's at a time under $TMPDIR
-  (float32: 3,500 x 248k = 3.5 GB each). Memory: the reference ~3.5 GB for the 4B, runq the model + a 512-row chunk.
+  reference needs numpy only.) Files: the reference's logits of one piece and one gwenedeg run's at a time under $TMPDIR
+  (float32: 3,500 x 248k = 3.5 GB each). Memory: the reference ~3.5 GB for the 4B, gwenedeg the model + a 512-row chunk.
 Prints per piece and KV type the mean KL and the top-1 agreement, then the totals and each type's KL relative to the
 first one's (and how many pieces are higher / lower: the noise of such a comparison).
 """
@@ -241,11 +241,11 @@ def compare(ref, got, ids, chunk=256):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--hf", required=True, help="the HF checkpoint directory (the fp32 reference, and the tokenizer)")
-    ap.add_argument("--gguf", required=True, help="the GGUF file runq runs")
+    ap.add_argument("--gguf", required=True, help="the GGUF file gwenedeg runs")
     ap.add_argument("--kv", default="f32,f16,bf16,bf16-dot,f16-dot", help="KV cache types (-k), the first the baseline")
     ap.add_argument("--pieces", type=int, default=13)
     ap.add_argument("--tokens", type=int, default=3500)
-    ap.add_argument("-t", type=int, default=8, help="threads (runq; numpy's BLAS: OPENBLAS_NUM_THREADS)")
+    ap.add_argument("-t", type=int, default=8, help="threads (gwenedeg; numpy's BLAS: OPENBLAS_NUM_THREADS)")
     ap.add_argument("--long-ctx", default=os.path.join(ROOT, "build", "long_ctx"))
     ap.add_argument("--check-hf", action="store_true", help="transformers' fp32 logits vs the numpy reference, piece 1")
     ap.add_argument("--out", default="", help="the per-piece results as JSON")
@@ -263,7 +263,7 @@ def main():
     print(f"# {os.path.basename(a.gguf)} vs {a.hf} (fp32, numpy): {len(texts)} pieces of <= {a.tokens} tokens, KV {', '.join(kvs)}",
           flush=True)
     with tempfile.TemporaryDirectory(prefix="kl_kv-", dir=os.environ.get("TMPDIR", "/var/tmp")) as tmp:
-        rf, gf, idf = os.path.join(tmp, "ref.bin"), os.path.join(tmp, "runq.bin"), os.path.join(tmp, "piece.ids")
+        rf, gf, idf = os.path.join(tmp, "ref.bin"), os.path.join(tmp, "gwenedeg.bin"), os.path.join(tmp, "piece.ids")
         for i, text in enumerate(texts):
             ids = tok(text)
             t0 = time.time()

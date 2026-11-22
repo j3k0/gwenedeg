@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tok/s of plain decoding, the model draft, the prompt lookup and both combined (TODO G6, docs/notes/qwen38-speculative.md,
 "Prompt lookup") on code-editing prompts (the reply rewrites code of the prompt with a change) and one chat prompt
-(little to copy): `runq -m chat -t 0 -n N` per prompt and setting, the settings rotated within each rep, the generated
+(little to copy): `gwenedeg -m chat -t 0 -n N` per prompt and setting, the settings rotated within each rep, the generated
 tok/s and the speculative counters parsed from stderr; every speculative run's stdout checked against plain's.
 
   .venv/bin/python -I scripts/bench_lookup.py TARGET.gguf [--draft DRAFT.gguf] [-n 384] [-r 2] [--threads 8]
@@ -84,7 +84,7 @@ SETTINGS = "plain;-G 3;--lookup 3;--lookup 8;-G 3 --lookup 8 --lookup-min 4"
 
 def run(a, prompt, setting):
     args = [] if setting == "plain" else setting.split()
-    cmd = [a.runq, a.target, "-m", "chat", "-t", "0", "-n", str(a.n), "-c", "4096", "-i", PROMPTS[prompt]] + args
+    cmd = [a.gwenedeg, a.target, "-m", "chat", "-t", "0", "-n", str(a.n), "-c", "4096", "-i", PROMPTS[prompt]] + args
     if "-G" in args:
         cmd += ["-D", a.draft]
     p = subprocess.run(cmd, capture_output=True, env=dict(os.environ, OMP_NUM_THREADS=str(a.threads)))
@@ -106,7 +106,8 @@ def main():
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--settings", default=SETTINGS)
     ap.add_argument("--prompts", default="edit_py,edit_c,chat")
-    ap.add_argument("--runq", default=os.path.join(ROOT, "runq"))
+    ap.add_argument("--gwenedeg", default=os.path.join(ROOT, "gwenedeg"))
+    ap.add_argument("--runq", dest="gwenedeg", default=argparse.SUPPRESS, help=argparse.SUPPRESS)  # (deprecated: the name before 2026-11-22)
     a = ap.parse_args()
     settings = [s.strip() for s in a.settings.split(";")]
     if not a.draft:

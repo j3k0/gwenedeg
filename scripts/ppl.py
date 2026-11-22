@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Perplexity of a text under HF fp32, runq (Q8_0) and mynah-slm (GGUF), same token ids.
+"""Perplexity of a text under HF fp32, gwenedeg (Q8_0) and mynah-slm (GGUF), same token ids.
 
-Usage: .venv/bin/python scripts/ppl.py TEXT [--hf] [--runq] [--runq-model M ...] [--mynah GGUF ...] [-w 512] [-t 8]
-  (no engine flag = all: --hf --runq and mynah-slm on the Q8_0 and Q4_K_M GGUFs if built)
-  --runq-model: checkpoints for runq (.bin or GGUF; repeatable; default the Q8_0 .bin), implies --runq
+Usage: .venv/bin/python scripts/ppl.py TEXT [--hf] [--gwenedeg] [--gwenedeg-model M ...] [--mynah GGUF ...] [-w 512] [-t 8]
+  (no engine flag = all: --hf --gwenedeg and mynah-slm on the Q8_0 and Q4_K_M GGUFs if built)
+  --gwenedeg-model: checkpoints for gwenedeg (.bin or GGUF; repeatable; default the Q8_0 .bin), implies --gwenedeg
   --hf-dir: the HF model (tokenizer, --hf; default models/Qwen3-0.6B; Qwen3.5: models/Qwen3.5-0.8B with
   .venv-hf5's transformers 5.x)
 
@@ -12,9 +12,9 @@ Two protocols, both teacher-forced, raw text (no chat template, no BOS: Qwen3 ha
          This is exactly what `mynah-slm ppl -f TEXT` does (one token at a time, f32 KV).
   win<W> non-overlapping windows of W token ids (the tail shorter than W is dropped), each from
          position 0, W-1 predictions per window; pooled NLL over all windows.
-For runq and mynah-slm each window is passed as text (the HF decode of its ids) and the engine's
+For gwenedeg and mynah-slm each window is passed as text (the HF decode of its ids) and the engine's
 own tokenization is checked to give exactly the same ids (else the window is reported and
-skipped). runq: `-m logits` (batched prefill, -b 512) on the whole sequence; mynah-slm:
+skipped). gwenedeg: `-m logits` (batched prefill, -b 512) on the whole sequence; mynah-slm:
 `ppl -f` per window file. PPL = exp(mean NLL); nats per token.
 Takes ~6-10 min with everything on a ~4,000-token text (mostly mynah-slm, token by token).
 Temp files go to a fresh directory under $TMPDIR (removed at the end).
@@ -56,7 +56,7 @@ def hf_engine(threads, hf_dir):
     return score
 
 
-def runq_engine(tmp, threads, binary, model):
+def gwenedeg_engine(tmp, threads, binary, model):
     env = dict(os.environ, OMP_NUM_THREADS=str(threads))
 
     def score(ids, text):
@@ -103,19 +103,22 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("text")
     ap.add_argument("--hf", action="store_true")
-    ap.add_argument("--runq", action="store_true")
-    ap.add_argument("--runq-model", action="append", metavar="M", help="runq checkpoint (.bin or GGUF), repeatable")
+    ap.add_argument("--gwenedeg", action="store_true")
+    ap.add_argument("--runq", dest="gwenedeg", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)  # (deprecated: the name before 2026-11-22)
+    ap.add_argument("--gwenedeg-model", action="append", metavar="M", help="gwenedeg checkpoint (.bin or GGUF), repeatable")
+    ap.add_argument("--runq-model", dest="gwenedeg_model", action="append", default=argparse.SUPPRESS, help=argparse.SUPPRESS)  # (deprecated: the name before 2026-11-22)
     ap.add_argument("--mynah", nargs="*", metavar="GGUF")
     ap.add_argument("-w", "--window", type=int, default=512)
     ap.add_argument("-t", "--threads", type=int, default=8)
-    ap.add_argument("--runq-bin", default=os.path.join(ROOT, "runq"))
+    ap.add_argument("--gwenedeg-bin", default=os.path.join(ROOT, "gwenedeg"))
+    ap.add_argument("--runq-bin", dest="gwenedeg_bin", default=argparse.SUPPRESS, help=argparse.SUPPRESS)  # (deprecated: the name before 2026-11-22)
     ap.add_argument("--no-full", action="store_true", help="only the windowed protocol")
     ap.add_argument("--hf-dir", default=HF_DIR, help="HF model directory (tokenizer; --hf)")
     a = ap.parse_args()
-    if a.runq_model:
-        a.runq = True
-    if not (a.hf or a.runq or a.mynah is not None):
-        a.hf = a.runq = True
+    if a.gwenedeg_model:
+        a.gwenedeg = True
+    if not (a.hf or a.gwenedeg or a.mynah is not None):
+        a.hf = a.gwenedeg = True
         a.mynah = [] if os.access(MYNAH, os.X_OK) else None
     if a.mynah == []:
         a.mynah = [os.path.join(GGUF_DIR, f) for f in ("Qwen3-0.6B-Q8_0.gguf", "Qwen3-0.6B-Q4_K_M.gguf")]
@@ -133,8 +136,8 @@ def main():
     engines = []
     if a.hf:
         engines.append(("HF fp32", "hf", hf_engine(a.threads, a.hf_dir)))
-    for m in (a.runq_model or [Q8BIN]) if a.runq else []:
-        engines.append((f"runq {os.path.basename(m)}", "runq", runq_engine(tmp, a.threads, a.runq_bin, m)))
+    for m in (a.gwenedeg_model or [Q8BIN]) if a.gwenedeg else []:
+        engines.append((f"gwenedeg {os.path.basename(m)}", "gwenedeg", gwenedeg_engine(tmp, a.threads, a.gwenedeg_bin, m)))
     for g in a.mynah or []:
         engines.append((f"mynah-slm {os.path.basename(g)}", "mynah", mynah_engine(tmp, a.threads, g)))
     try:

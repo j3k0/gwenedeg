@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Throughput / latency benchmark of runq serve under concurrent clients (Step 10b; not part of make test).
+"""Throughput / latency benchmark of gwenedeg serve under concurrent clients (Step 10b; not part of make test).
 Python stdlib only; each client is a thread with its own HTTP connection.
 
-Two loads, each against a fresh `runq serve` started here (on a free port, `-c 4096`):
+Two loads, each against a fresh `gwenedeg serve` started here (on a free port, `-c 4096`):
   gen    N concurrent clients (--clients, default 1,2,4,8,16,32), each sending streamed chat completions
          with a short distinct prompt and a 128-token reply (--max-tokens; temperature 0): aggregate completion
          tok/s (all tokens / wall time), per-request latency p50 / p95, time to first token (the first content
@@ -21,7 +21,7 @@ Two loads, each against a fresh `runq serve` started here (on a free port, `-c 4
 Prints one table row per configuration (and --json FILE: all numbers).
 
 Usage:
-  scripts/bench_serve.py --runq ./runq --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf [--threads 12]
+  scripts/bench_serve.py --gwenedeg ./gwenedeg --model models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf [--threads 12]
       [--only gen,judge] [--clients 1,2,4,8,16,32] [--judge-clients 1,4,8,16] [--serve-args "--parallel 16"]
       [--label after] [--json /tmp/x.json]
 For a before / after comparison run it with the other binary (e.g. a build of an older commit in a scratch
@@ -58,7 +58,7 @@ def pct(v, p):
 
 def start_server(a, log):
     env = dict(os.environ, OMP_NUM_THREADS=str(a.threads))
-    cmd = [a.runq, "serve", a.model, "--port", "0", "-c", str(a.ctx)] + shlex.split(a.serve_args)
+    cmd = [a.gwenedeg, "serve", a.model, "--port", "0", "-c", str(a.ctx)] + shlex.split(a.serve_args)
     p = subprocess.Popen(cmd, stderr=log, stdout=subprocess.DEVNULL, env=env)
     for _ in range(600):
         m = re.search(r"listening on http://127\.0\.0\.1:(\d+)", open(log.name).read())
@@ -67,7 +67,7 @@ def start_server(a, log):
         if p.poll() is not None:
             break
         time.sleep(0.05)
-    raise SystemExit("runq serve did not start:\n" + open(log.name).read()[-2000:])
+    raise SystemExit("gwenedeg serve did not start:\n" + open(log.name).read()[-2000:])
 
 
 def stream_req(port, body, times=None):
@@ -268,7 +268,8 @@ def bench_mix(a, port, res):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--runq", default=os.path.join(ROOT, "runq"))
+    ap.add_argument("--gwenedeg", default=os.path.join(ROOT, "gwenedeg"))
+    ap.add_argument("--runq", dest="gwenedeg", default=argparse.SUPPRESS, help=argparse.SUPPRESS)  # (deprecated: the name before 2026-11-22)
     ap.add_argument("--model", default=os.path.join(ROOT, "models", "Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_K_M.gguf"))
     ap.add_argument("--threads", type=int, default=12)
     ap.add_argument("--ctx", type=int, default=4096)
@@ -282,14 +283,14 @@ def main():
     ap.add_argument("--mix-streams", type=int, default=8)
     ap.add_argument("--mix-tokens", type=int, default=256)
     ap.add_argument("--mix-long", type=int, default=4)
-    ap.add_argument("--serve-args", default="", help="extra runq serve flags")
+    ap.add_argument("--serve-args", default="", help="extra gwenedeg serve flags")
     ap.add_argument("--label", default="")
     ap.add_argument("--json", default="")
     a = ap.parse_args()
     a.clients = [int(x) for x in a.clients.split(",") if x]
     a.judge_clients = [int(x) for x in a.judge_clients.split(",") if x]
-    a.label = a.label or os.path.basename(os.path.dirname(os.path.abspath(a.runq)))
-    res = {"runq": a.runq, "model": a.model, "threads": a.threads, "serve_args": a.serve_args, "load": open("/proc/loadavg").read().split()[:3]}
+    a.label = a.label or os.path.basename(os.path.dirname(os.path.abspath(a.gwenedeg)))
+    res = {"gwenedeg": a.gwenedeg, "model": a.model, "threads": a.threads, "serve_args": a.serve_args, "load": open("/proc/loadavg").read().split()[:3]}
     for what, fn in [("gen", bench_gen), ("judge", bench_judge), ("mix", bench_mix)]:
         if what not in a.only.split(","):
             continue

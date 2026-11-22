@@ -1,19 +1,19 @@
 #!/bin/bash
-# The 27B gate (TODO S9d, PLAN-S9-mtp.md 4.4): runs one memory-heavy runq / spec_sweep job only when it fits next to
+# The 27B gate (TODO S9d, PLAN-S9-mtp.md 4.4): runs one memory-heavy gwenedeg / spec_sweep job only when it fits next to
 # what else may need the RAM, and caps it so that it cannot push anything else out.
 #
-#   scripts/s9_gate.sh [--dry] [--until TIME] [options] -- COMMAND ARGS...      (COMMAND: runq or build/spec_sweep;
+#   scripts/s9_gate.sh [--dry] [--until TIME] [options] -- COMMAND ARGS...      (COMMAND: gwenedeg or build/spec_sweep;
 #                                                                                 without --mem: the gate gives it)
 # 1. The bench lock (flock /tmp/cwayn-bench.lock, held for the whole run; --lock-wait S: wait up to S seconds).
 # 2. MemAvailable, SwapFree (/proc/meminfo).
-# 3. The servers: every running `runq serve` (its --host / --port) and the endpoints of --health (default the
+# 3. The servers: every running `gwenedeg serve` (its --host / --port) and the endpoints of --health (default the
 #    launch-server ports, 8418 saluki and 8417): GET /health must answer with a mem object (--admit bound / chunk) and
 #    running 0; the margin is, per server, max(0, mem.budget - mem.committed) (what it may still commit) + --server-floor
 #    (default 1 GiB) + its swapped-out memory (VmSwap: comes back into RAM when it runs). A server process whose
 #    /health does not answer (still loading) closes the gate.
 # 4. The servers to come: the timers of --timer (default runq-day.timer, which restores saluki in the morning, and
 #    lcb-bench.timer, the nightly benchmark that starts servers): one whose service runs closes the gate (unless it is
-#    a runq serve that answered in 3: counted there; a oneshot job is "activating" while it runs); one with a
+#    a gwenedeg serve that answered in 3: counted there; a oneshot job is "activating" while it runs); one with a
 #    next start closes it unless --until (a date(1) time) ends the run at least --guard minutes (default 5) before
 #    that start. The job is killed at --until (the watchdog), so it never overlaps the start.
 # 5. The scope: a probe `systemd-run --user --scope -p MemorySwapMax=0` must read memory.swap.max 0 in its cgroup.
@@ -22,8 +22,8 @@
 #    of N positions: ...recurrent state S MiB ..."); + the MTP view if the job uses it (-D mtp, spec_sweep's mtp
 #    settings): its block's bytes in the file (tests/ggufmini.py) x 1.10 (repacked) + its norms + R (the view's
 #    context: not more than the model's runtime) + its KV cache of N positions; + the speculative loop's
-#    checkpoints, S x (kmax + 2); + a draft model's estimate (runq DRAFT --mem 0.01) and its S x (kmax + 2).
-#    spec_sweep --list gives its settings' kmax / mtp / draft; for runq: -c, -k, -D, -G, --lookup.
+#    checkpoints, S x (kmax + 2); + a draft model's estimate (gwenedeg DRAFT --mem 0.01) and its S x (kmax + 2).
+#    spec_sweep --list gives its settings' kmax / mtp / draft; for gwenedeg: -c, -k, -D, -G, --lookup.
 #    cap = the estimate + 1 GiB; budget = MemAvailable - the servers' margin - --reserve (default 3 GiB).
 # 7. Closed (exit 3, the numbers printed) if budget <= 0, budget < cap or SwapFree < --swap-min (default 4 GiB), or
 #    by any check above. --dry: the numbers and the decision only (exit 0 open, 3 closed).
@@ -38,15 +38,15 @@
 # python3 with numpy (.venv/bin/python if present).
 #
 # The server mode (TODO S9c.5): --server MODEL --server-ctx N --server-kv TYPE --server-kv-mem G [--server-draft mtp|FILE]
-# -- COMMAND ARGS... (any command, e.g. tests/server_test.py or scripts/s9c_bench.py, that starts `runq serve MODEL --ctx N
+# -- COMMAND ARGS... (any command, e.g. tests/server_test.py or scripts/s9c_bench.py, that starts `gwenedeg serve MODEL --ctx N
 # -k TYPE --admit bound --kv-mem G [--draft mtp|FILE]` with --mem $S9_GATE_MEM; one server at a time). The estimate: the
-# target's probe (runq MODEL -c N -k TYPE --mem 0.01) without its one sequence (KV cache and recurrent state: the pool's)
+# target's probe (gwenedeg MODEL -c N -k TYPE --mem 0.01) without its one sequence (KV cache and recurrent state: the pool's)
 # + G (the pool: the leases' KV and states, the draft's sequences included) + the drafter: the MTP view's block bytes x
 # 1.10 + norms + R (its KV is in the pool), or a draft model's probe without its sequence. No checkpoint term (in the
 # pool). The command gets no --mem: the gate exports S9_GATE_MEM=<budget> to it instead (the driver and its server run
 # in the capped scope). Fixtures for testing the gate itself (not for a 27B job): --meminfo FILE (MemAvailable and
 # SwapFree read from FILE, a /proc/meminfo copy, for the decision; the watchdog reads /proc/meminfo), --no-procs (the
-# runq serve processes not looked for: only the --health endpoints count).
+# gwenedeg serve processes not looked for: only the --health endpoints count).
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PY=$ROOT/.venv/bin/python
@@ -82,7 +82,7 @@ done
 if [ -n "$SRV" ]; then  # (the server mode: any command; none only with --dry)
     [ $# -ge 1 ] || [ "$DRY" = 1 ] || die "no command (s9_gate.sh --server MODEL ... -- COMMAND ARGS...)"
 else
-    [ $# -ge 2 ] || die "no command (s9_gate.sh [options] -- runq|spec_sweep MODEL ...)"
+    [ $# -ge 2 ] || die "no command (s9_gate.sh [options] -- gwenedeg|spec_sweep MODEL ...)"
 fi
 CMD=("$@")
 for a in "${CMD[@]}"; do [ "$a" = --mem ] && die "the command must not have --mem: the gate computes it"; done
@@ -124,10 +124,11 @@ mem_gib() { awk -v k="$1:" '$1 == k { printf "%.2f", $2 / 1048576 }' "$MEMINFO";
 AVAIL=$(mem_gib MemAvailable)
 SWAPFREE=$(mem_gib SwapFree)
 
-# 3. the servers: runq serve processes and the --health endpoints
+# 3. the servers: gwenedeg serve processes and the --health endpoints
 declare -A URLS=() SWAPS=() PIDS=()
-ANSWERED=" "  # (the pids of the runq serve processes whose /health answered with a mem object)
-for pid in $([ "$PROCS" = 1 ] && { pgrep -x runq; pgrep -x runq-generic; }); do
+ANSWERED=" "  # (the pids of the gwenedeg serve processes whose /health answered with a mem object)
+# (runq, runq-generic: the binaries' names before 2026-11-22, still running somewhere maybe)
+for pid in $([ "$PROCS" = 1 ] && { pgrep -x gwenedeg; pgrep -x gwenedeg-generic; pgrep -x runq; pgrep -x runq-generic; }); do
     mapfile -d '' -t av < "/proc/$pid/cmdline" 2>/dev/null || continue
     [ "${av[1]:-}" = serve ] || continue
     host=127.0.0.1 port=8080
@@ -145,7 +146,7 @@ MARGIN=0 SERVERS=()
 for u in "${!URLS[@]}"; do
     body=$(curl -s -m 3 "$u")
     if [ -z "$body" ]; then
-        if [ -n "${URLS[$u]}" ]; then close "runq serve (${URLS[$u]}): $u does not answer (still loading?)"; fi
+        if [ -n "${URLS[$u]}" ]; then close "gwenedeg serve (${URLS[$u]}): $u does not answer (still loading?)"; fi
         continue
     fi
     r=$("$PY" -I -c '
@@ -182,7 +183,7 @@ for t in "${TIMERS[@]}"; do
     svc=$(systemctl --user show "$t" -p Triggers --value 2>/dev/null)
     svc=${svc%% *}
     if [ -n "$svc" ]; then
-        # its service running: a server up and counted above (a runq serve of its cgroup answered /health) is fine; else
+        # its service running: a server up and counted above (a gwenedeg serve of its cgroup answered /health) is fine; else
         # (starting, a oneshot job such as the nightly benchmark: "activating", a server not answering) closed
         sa=$(systemctl --user is-active "$svc" 2>/dev/null)
         case "$sa" in
@@ -267,7 +268,7 @@ print("%.3f" % ((mats * 1.10 + norms + kv) / 2**30 + float(sys.argv[5])))' "$ROO
 KMAX=0 USE_MTP=0 DRAFT="" KV=f16 T_STATE=0 MTP_EST=0 CK_EST=0 D_EST=0 D_CK=0
 if [ -n "$SRV" ]; then
     # the server mode: the target without its sequence + the pool + the drafter (the probe and the header only)
-    out=$(probe "$ROOT/runq" "$SRV" -c "$SRV_CTX" -k "$SRV_KV" -m generate -i x --mem 0.01)
+    out=$(probe "$ROOT/gwenedeg" "$SRV" -c "$SRV_CTX" -k "$SRV_KV" -m generate -i x --mem 0.01)
     read -r T_EST T_RT NPOS <<< "$(echo "$out" | seqless)"
     if [ -z "${T_EST:-}" ]; then
         close "the model's estimate: no 'needs ~X GiB' in the probe's output"
@@ -280,9 +281,9 @@ if [ -n "$SRV" ]; then
         [[ "$D_EST" =~ ^[0-9.]+$ ]] || { close "the MTP view's estimate: $D_EST"; D_EST=0; }
         DWHAT="the MTP view (block x 1.10 + norms + runtime $T_RT)"
     elif [ -n "$SRV_DRAFT" ]; then
-        dout=$(probe "$ROOT/runq" "$SRV_DRAFT" -c "$SRV_CTX" -k "$SRV_KV" -m generate -i x --mem 0.01)
+        dout=$(probe "$ROOT/gwenedeg" "$SRV_DRAFT" -c "$SRV_CTX" -k "$SRV_KV" -m generate -i x --mem 0.01)
         read -r D_EST _ _ <<< "$(echo "$dout" | seqless)"
-        if [ -z "${D_EST:-}" ]; then close "the draft's estimate: no 'needs ~X GiB' from $ROOT/runq $SRV_DRAFT"; D_EST=0; fi
+        if [ -z "${D_EST:-}" ]; then close "the draft's estimate: no 'needs ~X GiB' from $ROOT/gwenedeg $SRV_DRAFT"; D_EST=0; fi
         DWHAT="$(basename "$SRV_DRAFT") without its sequence"
     fi
     EST=$(calc "$T_EST + $SRV_KVMEM + $D_EST")
@@ -295,7 +296,7 @@ else
             [ -n "$plan" ] || close "spec_sweep --list gave no plan"
             read -r _ CTXA _ KV _ KMAX _ USE_MTP _ _ _ DRAFT _ _ <<< "$plan"
             [ "$DRAFT" = - ] && DRAFT="" ;;
-        runq*)
+        gwenedeg*)
             G=-1 D="" mode=chat lk=0
             for ((i = 2; i + 1 < ${#CMD[@]}; i++)); do
                 case "${CMD[i]}" in
@@ -304,17 +305,17 @@ else
                 esac
             done
             if [ "$mode" = generate ] || [ "$mode" = chat ]; then
-                [ -n "$D" ] && [ "$G" -lt 0 ] && G=3  # (runq's default -G with -D)
+                [ -n "$D" ] && [ "$G" -lt 0 ] && G=3  # (gwenedeg's default -G with -D)
                 if [ -n "$D" ] && [ "$G" -gt 0 ]; then
                     KMAX=$G
                     if [ "$D" = mtp ]; then USE_MTP=1; else DRAFT=$D; fi
                 fi
                 [ "$lk" -gt "$KMAX" ] && KMAX=$lk
             fi ;;
-        *) close "unknown command $BIN (runq or spec_sweep)" ;;
+        *) close "unknown command $BIN (gwenedeg or spec_sweep)" ;;
     esac
     out=""
-    [[ "$BIN" == runq* || "$BIN" == spec_sweep* ]] && out=$(probe "${CMD[@]}" --mem 0.01) # (nothing else is run)
+    [[ "$BIN" == gwenedeg* || "$BIN" == spec_sweep* ]] && out=$(probe "${CMD[@]}" --mem 0.01) # (nothing else is run)
     read -r T_EST T_RT NPOS T_STATE <<< "$(echo "$out" | parse_needs)"
     if [ -z "${T_EST:-}" ]; then
         close "the model's estimate: no 'needs ~X GiB' in the probe's output"
@@ -328,9 +329,9 @@ else
     fi
     [ "$KMAX" -gt 0 ] && CK_EST=$(calc "${T_STATE:-0} * ($KMAX + 2) / 1024")
     if [ -n "$DRAFT" ]; then
-        dout=$(probe "$ROOT/runq" "$DRAFT" -c "$NPOS" -k "$KV" -m generate -i x --mem 0.01)
+        dout=$(probe "$ROOT/gwenedeg" "$DRAFT" -c "$NPOS" -k "$KV" -m generate -i x --mem 0.01)
         read -r D_EST _ _ D_STATE <<< "$(echo "$dout" | parse_needs)"
-        if [ -z "${D_EST:-}" ]; then close "the draft's estimate: no 'needs ~X GiB' from $ROOT/runq $DRAFT"; D_EST=0 D_STATE=0; fi
+        if [ -z "${D_EST:-}" ]; then close "the draft's estimate: no 'needs ~X GiB' from $ROOT/gwenedeg $DRAFT"; D_EST=0 D_STATE=0; fi
         D_CK=$(calc "${D_STATE:-0} * ($KMAX + 2) / 1024")
     fi
     EST=$(calc "$T_EST + $MTP_EST + $CK_EST + $D_EST + $D_CK")
@@ -352,7 +353,7 @@ for s in "${TIMES[@]}"; do say "scheduled: $s"; done
 [ -n "$UNTIL_S" ] && say "--until $(date -u -d @"$UNTIL_S" +%FT%TZ) (the job is killed then)"
 say "scope probe: memory.swap.max $SWAPMAX"
 if [ -n "$SRV" ]; then
-    say "server mode: runq serve $SRV --ctx $SRV_CTX -k $SRV_KV --kv-mem $SRV_KVMEM${SRV_DRAFT:+ --draft $SRV_DRAFT}"
+    say "server mode: gwenedeg serve $SRV --ctx $SRV_CTX -k $SRV_KV --kv-mem $SRV_KVMEM${SRV_DRAFT:+ --draft $SRV_DRAFT}"
     say "estimate $EST GiB = model $T_EST without its sequence (runtime $T_RT, $NPOS positions, KV $SRV_KV) + the pool" \
         "$SRV_KVMEM + the drafter $D_EST ($DWHAT)"
 else
@@ -379,7 +380,7 @@ echo "[gate] scope ${cg##*/}: memory.max $mx, memory.swap.max $sw, oom_score_adj
 if [ "$sw" != 0 ] || [ "$mx" != "$S9_GATE_MAX" ]; then echo "[gate] the scope is not as set: not run" >&2; exit 3; fi
 exec "$@"'
 MEMARG=(--mem "$BUDGET")
-if [ -n "$SRV" ]; then MEMARG=(); export S9_GATE_MEM=$BUDGET; fi  # (the server mode: the command passes it to runq serve)
+if [ -n "$SRV" ]; then MEMARG=(); export S9_GATE_MEM=$BUDGET; fi  # (the server mode: the command passes it to gwenedeg serve)
 S9_GATE_MAX=$((CAP_MIB * 1048576)) systemd-run --user --scope -q --unit="$UNIT" -p MemoryMax="${CAP_MIB}M" -p MemorySwapMax=0 \
     -- choom -n 1000 -- nice -n "$NICE" bash -c "$WRAP" s9gate "${CMD[@]}" "${MEMARG[@]}" &
 JOB=$!

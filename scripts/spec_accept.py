@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Draft acceptance for speculative decoding (docs/notes/qwen38-speculative.md, "Draft acceptance"): the target's answers
-from an OpenAI-compatible API, teacher-forced through a draft GGUF with runq, and the loop simulated on the result.
+from an OpenAI-compatible API, teacher-forced through a draft GGUF with gwenedeg, and the loop simulated on the result.
 
   gen      query the target model (temperature 0 or seeded sampling) for answers to the built-in prompts; saves the
            token ids (logprobs with return_tokens_as_token_ids), the text, the reasoning and the API's prompt length.
-  measure  teacher-force each saved answer through a draft GGUF (`runq -m logits`) with the target's exact chat
+  measure  teacher-force each saved answer through a draft GGUF (`gwenedeg -m logits`) with the target's exact chat
            rendering (Qwen3.8: thinking on adds the reasoning-effort system line; the prompt length is checked against
            the API's); saves per answer token the target id, the draft's argmax, its top-1 probability and the
            probability it gave the target's token.
@@ -16,7 +16,7 @@ Usage:
   .venv/bin/python -I scripts/spec_accept.py gen OUT.json [--think] [--temp 0] [--max 400] [--set base|long]
       [--key-file hetzner.key] [--endpoint URL] [--model NAME] [-j 2]
   .venv/bin/python -I scripts/spec_accept.py measure GEN.json DRAFT.gguf [-o MEAS.json] [--think|--no-think]
-      [--effort xhigh] [--template tmpl_38.jinja] [--threads 8] [--runq ./runq] [--tmp /var/tmp]
+      [--effort xhigh] [--template tmpl_38.jinja] [--threads 8] [--gwenedeg ./gwenedeg] [--tmp /var/tmp]
   .venv/bin/python -I scripts/spec_accept.py report MEAS.json ... [--step-ms 120] [--draft-ms 6]
       [--verify 1.03,...] [--by-kind] [--tau 0.3,0.5 --kmax 4,8]
 
@@ -207,13 +207,13 @@ def cmd_gen(a):
 
 # --- measure --------------------------------------------------------------------------------------------------------
 
-def runq_env(threads):
+def gwenedeg_env(threads):
     return dict(os.environ, OMP_NUM_THREADS=str(threads))
 
 
 def tokenize(a, text):
-    o = subprocess.run([a.runq, a.draft, "-m", "tokenize", "-i", text], capture_output=True, text=True,
-                       env=runq_env(a.threads), check=True).stdout
+    o = subprocess.run([a.gwenedeg, a.draft, "-m", "tokenize", "-i", text], capture_output=True, text=True,
+                       env=gwenedeg_env(a.threads), check=True).stdout
     return [int(x) for x in o.split()]
 
 
@@ -223,8 +223,8 @@ def draft_rows(a, text, n_ctx, first):
     import numpy as np
     with tempfile.TemporaryDirectory(dir=a.tmp, prefix="spec_accept-") as td:
         lf = os.path.join(td, "logits.bin")
-        subprocess.run([a.runq, a.draft, "-m", "logits", "-c", str(n_ctx), "-i", text, "-o", lf],
-                       capture_output=True, env=runq_env(a.threads), check=True)
+        subprocess.run([a.gwenedeg, a.draft, "-m", "logits", "-c", str(n_ctx), "-i", text, "-o", lf],
+                       capture_output=True, env=gwenedeg_env(a.threads), check=True)
         with open(lf, "rb") as f:
             n, v = struct.unpack("ii", f.read(8))
             ids = np.frombuffer(f.read(4 * n), dtype=np.int32).copy()
@@ -396,7 +396,8 @@ def main():
     m.add_argument("--effort", choices=sorted(EFFORT_LINE), default="xhigh")
     m.add_argument("--template", help="a chat template (jinja) to check the built-in rendering against")
     m.add_argument("--threads", type=int, default=8)
-    m.add_argument("--runq", default=os.path.join(ROOT, "runq"))
+    m.add_argument("--gwenedeg", default=os.path.join(ROOT, "gwenedeg"))
+    m.add_argument("--runq", dest="gwenedeg", default=argparse.SUPPRESS, help=argparse.SUPPRESS)  # (deprecated: the name before 2026-11-22)
     m.add_argument("--tmp", default="/var/tmp", help="directory for the logits files (not a tmpfs)")
     r = sub.add_parser("report", help="the acceptance table and the cost model")
     r.add_argument("meas", nargs="+")

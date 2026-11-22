@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """KL divergence between two GGUF files of one model on agentic text (TODO G3: Qwen3.8-27B Q3_K_M vs Q4_K_M):
-KL(ref || test) per position, teacher-forced on pi's recorded sessions rendered as runq serve renders Qwen3.8
+KL(ref || test) per position, teacher-forced on pi's recorded sessions rendered as gwenedeg serve renders Qwen3.8
 (scripts/lookup_accept.py sessions: local data, nothing of it is written here but aggregate numbers).
 
 Each model runs alone (one big process at a time: build/long_ctx -A, every row's logits streamed through a FIFO, so

@@ -4,10 +4,10 @@ lookup"): teacher-forced, would an n-gram lookup in the context (the prompt + th
 next tokens, alone and combined with a draft model?
 
   sessions  pi's recorded sessions (~/.pi/agent/sessions/*/*.jsonl; local data: the output file stays local, only
-            aggregate numbers are reported) rendered as Qwen3.8's template renders them for runq serve (system + the
+            aggregate numbers are reported) rendered as Qwen3.8's template renders them for gwenedeg serve (system + the
             tools' instructions, user / tool turns, every assistant message with its reasoning, tool calls in the XML
             form: string arguments as they are, others as JSON, e.g. edit's `edits` array) and tokenized with the
-            Qwen3.5 tokenizer (models/Qwen3.5-0.8B/tokenizer.json, = runq's); each session's main branch is one token
+            Qwen3.5 tokenizer (models/Qwen3.5-0.8B/tokenizer.json, = gwenedeg's); each session's main branch is one token
             stream (a compaction or a changed system prompt starts another), each assistant message a reply span whose
             tokens are labeled by kind: think (reasoning), prose (text), syntax (the template's and the XML's tokens),
             args (tool-call arguments), old / new (an edit's oldText / newText), write (write's content).
@@ -162,7 +162,7 @@ def text_parts(content):
 
 
 def call_args(x):
-    if isinstance(x, str):  # (a JSON string: as runq serve parses it)
+    if isinstance(x, str):  # (a JSON string: as gwenedeg serve parses it)
         try:
             x = json.loads(x)
         except ValueError:

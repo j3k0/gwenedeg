@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Replays one recorded pi session (~/.pi/agent/sessions/*/*.jsonl) against an OpenAI-compatible server (`runq serve`)
+// Replays one recorded pi session (~/.pi/agent/sessions/*/*.jsonl) against an OpenAI-compatible server (`gwenedeg serve`)
 // with pi's own code: the session's entries go through pi-coding-agent's context building (buildSessionContext,
 // convertToLlm) and pi-ai's openai-completions provider (streamSimple: the request body, the SSE parsing into an
 // assistant message), so each request is the one pi would send. Run by scripts/replay_sessions.py (the server, the
@@ -10,10 +10,10 @@
 //        [--probe-every N] [--probe-tokens 256]
 //
 // PI_DIR: pi's install (the directory holding node_modules/@earendil-works/...). Per request, one JSON line on stdout:
-// kind (turn / summary / turn_prefix), the session entry, usage, the server's timings (runq: prefilled, cached, the
+// kind (turn / summary / turn_prefix), the session entry, usage, the server's timings (gwenedeg: prefilled, cached, the
 // slot's length and common prefix), finish reason, wall time.
 //
-// The replies. --mode force (default): every reply is forced to the recorded one (runq's force_reply: the recorded
+// The replies. --mode force (default): every reply is forced to the recorded one (gwenedeg's force_reply: the recorded
 // assistant message rendered as the template renders it, fed as if generated), and the next request carries what the
 // server returned for it, parsed by pi (reasoning_content, content, tool_calls): the cache holds exactly what a model
 // writing in the template's format would have generated, and the round trip (the server's parse -> pi's message ->
@@ -55,7 +55,7 @@ const settings = {
 
 const mod = (p) => import(pathToFileURL(`${args.pi}/node_modules/@earendil-works/${p}`).href);
 // pi's HTTP idle timeout (settings httpIdleTimeoutMs, default 300 s: a prefill longer than that without a byte ends
-// the request); --http-timeout MS, default 0: none (runq serve sends SSE keep-alive comments, older builds do not)
+// the request); --http-timeout MS, default 0: none (gwenedeg serve sends SSE keep-alive comments, older builds do not)
 {
     const undici = await import(pathToFileURL(`${args.pi}/node_modules/undici/index.js`).href);
     const ms = parseInt(args["http-timeout"] || "0", 10);
@@ -69,7 +69,7 @@ const { streamSimple } = await mod("pi-ai/dist/api/openai-completions.js");
 const { getCurrentSystemMessage } = await mod("pi-ai/dist/utils/transcript.js");
 
 const model = {
-    id: args.model, name: args.model, api: "openai-completions", provider: "runq", baseUrl: args.url, reasoning: true,
+    id: args.model, name: args.model, api: "openai-completions", provider: "gwenedeg", baseUrl: args.url, reasoning: true,
     input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: ctx,
     maxTokens: mode === "live" ? liveTokens : ctx,
     // docs/server.md's provider entry
@@ -90,7 +90,7 @@ const summaries = entries.filter((e) => e.type === "compaction" && e.summary).ma
 const textOf = (content) => (typeof content === "string" ? content : (content || []).filter((b) => b.type === "text").map((b) => b.text).join(""));
 
 function forcedReply(msg) {
-    // a recorded assistant message as an OpenAI message (what the model would have written: runq renders it)
+    // a recorded assistant message as an OpenAI message (what the model would have written: gwenedeg renders it)
     const thinking = msg.content.filter((b) => b.type === "thinking" && !b.redacted).map((b) => b.thinking).join("\n");
     const calls = msg.content.filter((b) => b.type === "toolCall").map((b) => ({
         type: "function", function: { name: b.name, arguments: JSON.stringify(b.arguments ?? {}) } }));

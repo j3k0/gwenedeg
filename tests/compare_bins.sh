@@ -19,9 +19,9 @@
 # Compared: stdout, stderr (numbers of the [timing] / [tokenize] lines masked), the exit status and the
 # output / dump files. A family whose model file is missing is skipped (noted in the summary).
 # Usage: tests/compare_bins.sh [-j JOBS] [-t THREADS] [--quick] [--q35-4b] [--no-api] REF_DIR NEW_DIR
-#   REF_DIR / NEW_DIR: directories holding gwenedeg and gwenedeg-generic (or runq and runq-generic: a build from
-#   before 2026-11-22, when the binary was runq; e.g. a copy of the binaries of the
-#   commit before a change, and the repo root). --quick: only the AVX-512 (native) builds, -b 1 / 64,
+#   REF_DIR / NEW_DIR: directories holding gwenedeg and gwenedeg-generic (e.g. a copy of the binaries of the
+#   commit before a change, and the repo root); a directory from a build before 2026-11-22 holds runq /
+#   runq-generic, found by their old names. --quick: only the AVX-512 (native) builds, -b 1 / 64,
 #   a few jobs per Qwen3.5 family. --q35-4b: also a few jobs on Qwen3.5-4B Q8_0 (4.5 GB: run one at a
 #   time, 8 threads). --no-api: no api_test jobs. Env: CMP_CACHE=DIR keeps the REF results there (keyed
 #   by the binaries', the synthetic models' and this job list's sha256), so repeated comparisons against
@@ -59,7 +59,7 @@ bin_find() { # DIR NAME -> DIR/NAME, else the name before 2026-11-22 (runq*), el
 for d in "$REF" "$NEW"; do for b in $BUILDS; do [[ -n "$(bin_find "$d" $b)" ]] || { echo "missing $d/$b" >&2; exit 2; }; done; done
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/cmpbins.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+trap '[[ -n "${KEEP_WORK:-}" ]] || rm -rf "$WORK"; [[ -z "${KEEP_WORK:-}" ]] || echo "WORK=$WORK" >&2' EXIT
 
 # the executables of each side: $WORK/ref, $WORK/new (symlinks: gwenedeg, gwenedeg-generic, api_test[-generic])
 NOTES=()
@@ -260,7 +260,7 @@ run_one() { # DIR line -> "name <hashes>"
     local th="$THREADS"
     [[ "$env" =~ (^|\ )T=([0-9]+) ]] && th="${BASH_REMATCH[2]}"
     local -a e=(OMP_NUM_THREADS="$th")
-    [[ "$env" == *DUMP=1* ]] && e+=(GWENEDEG_CHAT_DUMP="$t/dump")
+    [[ "$env" == *DUMP=1* ]] && e+=(GWENEDEG_CHAT_DUMP="$t/dump" RUNQ_CHAT_DUMP="$t/dump")  # (both: a ref from before the rename reads RUNQ_*)
     local rc=0
     env "${e[@]}" "$exe" "${a[@]}" < "$WORK/$in" > "$t/stdout" 2> "$t/stderr" || rc=$?
     sed -E '/^\[(timing|tokenize|profile)\]/ s/[0-9]+(\.[0-9]+)?/N/g' "$t/stderr" > "$t/stderr.n"

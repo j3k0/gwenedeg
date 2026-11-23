@@ -33,7 +33,7 @@ The [Apple M1 Pro section](#apple-m1-pro-macos-neon) is a different machine and 
 | CPU | AMD EPYC Genoa (Zen 4), 16 vCPUs (KVM VM, 1 thread per core, 32 MB L3), 30 GB RAM |
 | sharing | the VM runs other users' services; 1-min load 2-6 before each block, up to ~19 during some (see Methodology) |
 | memory read bandwidth, this session | 1 / 4 / 8 / 12 threads: 33-35 / 49-71 / 60-73 / 86-115 GB/s (min-max of 3-4 runs at the start and end; `bench/bw.c`) |
-| compiler | gcc 14.2.0 (Debian 14.2.0-19), `-Ofast -fopenmp -march=native -D_FILE_OFFSET_BITS=64 -lm` (`make`) |
+| compiler | gcc 14.2.0 (Debian 14.2.0-19), `-Ofast -fopenmp -march=native -D_FILE_OFFSET_BITS=64 -lm` (`make`; since 2026-11-23 `make` has no `-fopenmp`: only `omp_set_num_threads` in `threads.c` used it, and every object file but that one is byte-identical, so these numbers stand) |
 | gwenedeg | `d76e4cc` (`src/runq.c` + `src/kernels_avx512.h`); defaults: `-b 512`, threads min(12, nproc - nproc/4) = 12 |
 | qwen3.c | upstream engine = `src/runq.c` at `87e08aa` (upstream `55643ff` + only the `-n` / `[timing]` patch), same flags |
 | mynah-slm | `cde1599` (`scripts/fetch_mynah.sh`, its own Makefile) |

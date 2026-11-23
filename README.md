@@ -1,11 +1,12 @@
 # Gwenedeg
 
 Gwenedeg runs dense Qwen3, Qwen3.5 and Qwen3.8 language models on the CPU, in plain C with no third-party libraries
-(libc, libm, pthreads). It is a small inference library (`src/gwenedeg.h`), a command line, and an OpenAI-compatible HTTP
-server. **The binary is called `gwenedeg`**, the library `gwenedeg.h` (its API keeps the short `rq_` prefix); the
-project grew from [qwen3.c](https://github.com/adriancable/qwen3.c). The binary was called `runq` until 2026-11-22 (after
-qwen3.c's `runq.c`, where it started); older raw data and logs use that name. It loads GGUF files (Q8_0, the
-K-quants, Q2_K and the i-quants IQ1_S .. IQ4_XS) directly, weights, tokenizer and hyperparameters from the file.
+(only the system C library: libc, libm, pthreads; on Linux, `ldd gwenedeg` also lists libmvec, glibc's vector math).
+It is a small inference library (`src/gwenedeg.h`), a command line, and an OpenAI-compatible HTTP server. **The binary
+is called `gwenedeg`**, the library `gwenedeg.h` (its API keeps the short `rq_` prefix); the project grew from
+[qwen3.c](https://github.com/adriancable/qwen3.c). The binary was called `runq` until 2026-11-22 (after qwen3.c's
+`runq.c`, where it started); older raw data and logs use that name. It loads GGUF files (Q8_0, the K-quants, Q2_K and
+the i-quants IQ1_S .. IQ4_XS) directly, weights, tokenizer and hyperparameters from the file.
 
 ## What is different
 

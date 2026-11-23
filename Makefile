@@ -13,9 +13,11 @@ CFLAGS  ?= -O3 -ffast-math -ffp-contract=on -Wno-overriding-option -mcpu=native
 DBGFLAGS ?= -g -O0
 else
 CC      = gcc
-# Same flags as upstream qwen3.c's `openmp` target.
-CFLAGS  ?= -Ofast -fopenmp -march=native
-DBGFLAGS ?= -g -O0 -fopenmp
+# Upstream qwen3.c's `openmp` target without -fopenmp: threads.h's pthread pool runs the parallel regions, OpenMP
+# is only used with -DGWENEDEG_NO_POOL (build that with CFLAGS="-Ofast -fopenmp -march=native -DGWENEDEG_NO_POOL"),
+# so the binaries need only glibc (libc, libm and its libmvec), not libgomp
+CFLAGS  ?= -Ofast -march=native
+DBGFLAGS ?= -g -O0
 endif
 CPPFLAGS += -D_FILE_OFFSET_BITS=64
 LDLIBS  += -lm -lpthread
@@ -169,7 +171,7 @@ iq-repack-test: tests/kernels/iq_repack_test.c src/kernels_avx512.h src/iquants.
 # blocks: bit-identical (tests/kernels/iq_gemm_test -b [TYPES [NB [D [K]]]]: the micro-benchmark, OMP_NUM_THREADS threads)
 $(B)/iq_gemm_test: tests/kernels/iq_gemm_test.c src/kernels_avx512.h src/iquants.h src/iq_grids.h src/kquants.h
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $< -o $@
+	$(CC) $(CFLAGS) -fopenmp $< -o $@
 iq-gemm-test: $(B)/iq_gemm_test
 	$(B)/iq_gemm_test
 

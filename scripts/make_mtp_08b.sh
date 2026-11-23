@@ -8,7 +8,7 @@
 # Needs ~2.6 GB of disk while it runs (1.75 GB download + 0.81 GB output); /tmp is a RAM tmpfs, so /var/tmp is used.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-LLAMA_CPP="${LLAMA_CPP:-/home/jeko/JC/llama.cpp}"
+LLAMA_CPP="${LLAMA_CPP:?set LLAMA_CPP to a llama.cpp checkout at cf34d31}"
 REV=2fc06364715b967f1860aea9cf38778875588b17      # Qwen/Qwen3.5-0.8B, 2026-03-02 ("Update README.md")
 WORK="${WORK:-/var/tmp/s9-hf}"
 HF="$WORK/Qwen3.5-0.8B"

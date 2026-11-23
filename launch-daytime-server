@@ -1,6 +1,6 @@
 #!/bin/bash
-# The daytime server: the one place that says which gwenedeg config devbox3 serves by day.
-# Started as the systemd user unit runq-day (lcb_timebox/nightly.sh restores it after the nightly benchmark;
+# The daytime server: the one place that says which gwenedeg config our dev machine serves by day.
+# Started as the systemd user unit runq-day (the nightly benchmark restores it after its run;
 # by hand: systemd-run --user --unit=runq-day --working-directory=$PWD --property=Restart=on-failure ./launch-daytime-server).
 #   ./launch-daytime-server          start it (exec launch-server with the settings below)
 #   ./launch-daytime-server --print  print "<config> <kv>" (for scripts)

@@ -135,7 +135,7 @@ Steps:
   - **Acceptance measured (2026-11-08, llama.cpp cf34d31 `--spec-type draft-mtp` vs `draft-simple -md` the 0.8B
     Q4_K_M; k 3, thinking on, T 0.6 / top_p 0.95 / top_k 20, 12 threads, CPU):** MTP 410 / 765 drafted tokens accepted
     (54%) vs the 0.8B 233 / 714 (33%), MTP ahead on each of the 4 prompts (38-70% vs 25-42%; LCB medium + 2 coding
-    prompts, 96-192 tokens). Small sample; details `/home/jeko/JC/lcb_timebox/mtp/results.md`. llama.cpp's speed there
+    prompts, 96-192 tokens). Small sample (the details are in our benchmark harness's notes, not in this repo). llama.cpp's speed there
     is no guide (plain 3.5 tok/s vs gwenedeg's 11 on the same IQ3_S; its verify batch costs ~k steps, so no draft helped).
     Published, GPU: Qwopus3.8-27B-Flash-V2 card 80.7% (MTP) vs 66.1% base; Qwen3.5-27B n 1/2/3 -> 49/66/74%.
   - **Expected here (costs measured at S9w, 2026-11-08, on full-width synthetic files, 8 threads; the acceptance:
@@ -153,13 +153,13 @@ Steps:
     58fd8267...; downloaded). Its `blk.64` (15 tensors: attn q/k/v/output, ffn gate/up/down, `nextn.eh_proj` all Q6_K;
     norms incl. `nextn.enorm` / `hnorm` / `shared_head_norm` F32) is a full block with its own FFN. Its trunk's
     `ssm_alpha` / `ssm_beta` are **BF16**, which `gguf_matrix` refuses: either rewrite the file with
-    `/home/jeko/JC/lcb_timebox/tools/gguf_bf16_to_f32.py IN OUT` (exact, streaming; done for the non-MTP IQ3_S as
+    a BF16-to-F32 GGUF rewriter (exact, streaming; a local tool, not in this repo; done for the non-MTP IQ3_S as
     `...IQ3_S-f32ssm.gguf`, launch-server config `ista-iq3s`) or accept BF16 there (widened to F32 at load). Also
     with MTP blocks: Unsloth's `Qwen3.8-27B-Q4_K_M.gguf` (already here, the S7 target), Qwopus
     (`models/Qwopus3.8-27B-Flash-V2-GGUF/...-MTP-Q4_K_M.gguf`, launch-server `qwopus`) and the Saluki MTP variant below.
-  - **Reference implementation:** llama.cpp built at `/home/jeko/JC/llama.cpp` (`common/speculative.cpp`, the MTP
+  - **Reference implementation:** llama.cpp at cf34d31 (`common/speculative.cpp`, the MTP
     draft context; merged in PR #22673). End-to-end check: a LiveCodeBench time-boxed night
-    (`/home/jeko/JC/lcb_timebox/nightly.sh`, tok/s and solved per hour against the 0.8B draft).
+    (our nightly benchmark harness, not in this repo: tok/s and solved per hour against the 0.8B draft).
 - [ ] **S10. Seed-coupled drafting at temperature > 0.** The draft samples its guess with the target's next uniform
   draw u_j (known from a copy of the target's RNG: `rq_seq_rng` + `rq_rng_f32`) and the same settings, instead of its
   argmax: more accepted guesses (up to sum min(p, q)), output unchanged. Measure first with the API's `top_logprobs`

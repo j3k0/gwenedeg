@@ -6,8 +6,8 @@
 #                                                                                 without --mem: the gate gives it)
 # 1. The bench lock (flock /tmp/cwayn-bench.lock, held for the whole run; --lock-wait S: wait up to S seconds).
 # 2. MemAvailable, SwapFree (/proc/meminfo).
-# 3. The servers: every running `gwenedeg serve` (its --host / --port) and the endpoints of --health (default the
-#    launch-server ports, 8418 saluki and 8417): GET /health must answer with a mem object (--admit bound / chunk) and
+# 3. The servers: every running `gwenedeg serve` (its --host / --port) and the endpoints of --health URL (repeatable;
+#    default: $S9_GATE_HEALTH, space-separated): GET /health must answer with a mem object (--admit bound / chunk) and
 #    running 0; the margin is, per server, max(0, mem.budget - mem.committed) (what it may still commit) + --server-floor
 #    (default 1 GiB) + its swapped-out memory (VmSwap: comes back into RAM when it runs). A server process whose
 #    /health does not answer (still loading) closes the gate.
@@ -96,7 +96,7 @@ elif [ -n "$SRV_CTX$SRV_KV$SRV_KVMEM$SRV_DRAFT" ]; then
     die "--server-ctx / --server-kv / --server-kv-mem / --server-draft need --server MODEL"
 fi
 [ -r "$MEMINFO" ] || die "--meminfo: cannot read $MEMINFO"
-[ ${#HEALTH[@]} -gt 0 ] || HEALTH=(http://100.67.84.55:8418/health http://100.67.84.55:8417/health)
+[ ${#HEALTH[@]} -gt 0 ] || read -r -a HEALTH <<< "${S9_GATE_HEALTH:-}"  # (the running gwenedeg serve processes: step 3 finds them)
 [ ${#TIMERS[@]} -gt 0 ] || TIMERS=(runq-day.timer lcb-bench.timer)
 for v in "$RESERVE" "$FLOOR" "$SWAP_MIN" "$WATCH" "$GUARD" "$LOCK_WAIT"; do
     [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "not a number: $v"

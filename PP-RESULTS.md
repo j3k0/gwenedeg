@@ -271,8 +271,8 @@ ik's 309 s the same day (0.79x). The short-prompt estimate above was about right
 One command, from the worktree, with the live server stopped (≈ 13 GB free RAM needed):
 
 ```sh
-cd /opt/projects/tools/gwenedeg-pp && scripts/pp_window.sh
-# = scripts/pp_window.sh /opt/projects/tools/gwenedeg/models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf fbe8c51
+scripts/pp_window.sh   # from the branch's checkout
+# = scripts/pp_window.sh models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf fbe8c51
 ```
 
 - **What it does.** It builds base (the branch point with main, `fbe8c51`) and this tree in a temp dir (plain, `-DGWENEDEG_PROFILE`,

@@ -13,7 +13,7 @@
 # Duration ~20-25 min on the 16-vCPU Genoa box; peak RSS ~13 GB (one gwenedeg at a time). Output: bench/pp-window-DATE/.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-M="${1:-/opt/projects/tools/gwenedeg/models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf}"
+M="${1:-$ROOT/models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf}"
 BASE="${2:-$(git -C "$ROOT" merge-base HEAD main)}"  # (the branch point: base and new differ by this branch only)
 REPS="${REPS:-2}"
 JOBS="${JOBS:-8}"

@@ -1772,7 +1772,7 @@ removed at the start (logged, the targets kept), their conversations' views then
 **S9c.G's commands** (PLAN-S9c-server.md 7; a window the user opens: saluki down, outside 22:00-06:00Z, every
 `--until` <= 21:45Z; `--dry` first; each job one server, its references first under `--one-server`):
 ```
-cd /opt/projects/tools/gwenedeg-s9; export TMPDIR=/var/tmp
+cd gwenedeg; export TMPDIR=/var/tmp   # (the S9 branch's worktree)
 S=models/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
 D8=models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf
 KM=8      # 7, then 6, if the gate is closed at 8 (both configurations alike; recorded)

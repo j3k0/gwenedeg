@@ -151,6 +151,8 @@ in `/var/tmp`.
 
 ## Credits and license
 
+Built by [Fovea](https://fovea.cc/).
+
 Gwenedeg is MIT-licensed ([LICENSE](LICENSE)). The engine started from [qwen3.c](https://github.com/adriancable/qwen3.c)
 by Adrian Cable (MIT), itself based on Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama2.c) (MIT); an
 unmodified copy of qwen3.c is kept in [third_party/qwen3.c](third_party/qwen3.c). The GGUF format and the quantization

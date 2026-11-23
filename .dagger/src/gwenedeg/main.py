@@ -124,11 +124,13 @@ class Gwenedeg:
         return await (
             self.builder()
             .with_mounted_directory("/src/models", self.models)
-            # scratch on tmpfs, not in the cached snapshot: the logits files and the synth group's ~1.5 GB of
-            # synthetic models (tests/make_synth*.py, rebuilt in ~seconds); only the report is kept
+            # scratch on tmpfs, not in the cached snapshot: the logits files (GWENEDEG_DISK_TMP: check.py would
+            # put them in /var/tmp) and the synth group's ~1.5 GB of synthetic models (tests/make_synth*.py,
+            # rebuilt in ~seconds); only the report is kept
             .with_mounted_temp("/tmp")
             .with_mounted_temp("/src/build/synth")
             .with_mounted_temp("/src/build/synth-q35")
+            .with_env_variable("GWENEDEG_DISK_TMP", "/tmp")
             .with_env_variable("OMP_NUM_THREADS", str(threads))
             .with_exec(args)
             .stdout()

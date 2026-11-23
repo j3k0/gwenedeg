@@ -31,14 +31,14 @@ skipped with a note if it is missing, `GGUF=` to skip), the `q4` group and the `
 other two: no measurable cost, 937 checks in ~185 s at load ~25, as 910 without it; all 44 with `--models`).
 `tests/run_tests.sh --models --model-tags 3.5-4b-q8` runs the models group on some FAMILY tags only. Qwen3.8-27B
 (`3.8-27b-q4km`, ~17 GB of RAM; its Q3_K_M `3.8-27b-q3km`, ~14 GB; Underdog Saluki 27B `saluki-27b`, ~8.6 GB) runs only when MemAvailable covers Gwenedeg's estimate + 1.5 GiB (else skipped with a
-note; `GWENEDEG_TEST_MEM=GiB` stands in for MemAvailable); give it `TMPDIR=/var/tmp` where `/tmp` is a RAM tmpfs (its
-logits files, ~1 GB).
+note; `GWENEDEG_TEST_MEM=GiB` stands in for MemAvailable); its logits files (~1 GB) go
+to `/var/tmp`, as all of the suite's (Free memory, below).
 Torch is only needed to regenerate the HF goldens, the `gguf` package (`pip install gguf`, e.g. in a
 scratch venv) only for the Q4_K_M / Q5_K / Q3_K / i-quant dequantization goldens.
 
 ```sh
 tests/run_tests.sh                    # all tests, OMP_NUM_THREADS=8 unless set
-GWENEDEG_TEST_PROCS=4 tests/run_tests.sh   # at most 4 test processes at a time (tests/procslots.py): fits a 10 GB memory cap (default: ~25 at the start, ~12-16 GB; S9a: 6 peaked at 9.8 GB incl. page cache); the same checks, slower
+GWENEDEG_TEST_PROCS=4 tests/run_tests.sh   # at most 4 test processes at a time (tests/procslots.py): fits a 10 GB memory cap (0: no cap, ~25 at the start, ~12-16 GB; S9a: 6 peaked at 9.8 GB incl. page cache; default: from MemAvailable, below); the same checks, slower
 tests/run_tests.sh -v                 # + per-position logits metrics and a summary table
 tests/run_tests.sh --only logits      # subset: tokenizer,logits,batched,threads,kernels,greedy,chat,gguf,q4,kv,api,server,synth,q35
 tests/run_tests.sh --models           # the bigger Qwen3 models (group models, not in make test; = make test-models, ~4.5 min + 7 min for the 27B)
@@ -115,8 +115,25 @@ scripts/bench_serve.py --gwenedeg ./gwenedeg --model MODEL [--only gen,judge,mix
 scripts/replay_sessions.py --model MODEL --ctx 98304 --pick 3   # pi's recorded sessions replayed against gwenedeg serve (G0 (a), not a test; docs/server.md)
 ```
 
-Exit status is non-zero if any test fails. XFAIL = known engine bug, reported but not failing;
-XPASS = an XFAIL case now passes (remove its mark in `make_golden.py`).
+Exit status is 1 if any test fails, 3 if none failed but some could not run for lack of free memory (SKIP, below).
+XFAIL = known engine bug, reported but not failing; XPASS = an XFAIL case now passes (remove its mark in `make_golden.py`).
+
+**Free memory.** Each test process loads a model (~0.7-0.9 GB of RSS for the 0.6B / 0.8B files; the loader's estimate,
+which it checks against MemAvailable before reading a weight, is ~1.0-1.1 GiB at `-c 4096`), so the suite fits the
+number of processes running at once to the memory that is free when it starts (`tests/procslots.py`: one per 0.7 GiB
+of MemAvailable beyond 2 GiB, no cap from ~19 GiB; the first line of the output says how many; `GWENEDEG_TEST_PROCS`
+sets it). Other processes can still take the memory mid-run (a shared machine, a server): a run whose load the memory
+check refuses for lack of free memory ("more than MemAvailable (X GiB): not loaded") waits and runs again, every few
+seconds, for up to `GWENEDEG_TEST_MEM_WAIT` seconds (default 120; 10 once one wait has run out); only then are its
+checks (or the rest of its group) reported as `SKIP (not enough free memory)`, and the run as NOT COMPLETE (exit status
+3), not as failures. `api_test` loads its models without the check (its estimate counts a whole sequence of 40,960
+positions, ~5 GiB for the 0.6B files, which it never fills). The loader also warns on stderr when its estimate is over
+3/4 of MemAvailable; the spec group's stderr comparisons leave that warning out (`check_spec.py`: `no_mem_warning`). The suite's own files (the `-m logits`
+outputs, ~10 GB at the peak with the Qwen3.5-0.8B files) go to `/var/tmp` (`GWENEDEG_DISK_TMP` sets another directory),
+not to TMPDIR's default: `/tmp` is a tmpfs on many systems, i.e. RAM that MemAvailable does not count as free. Learned
+2026-11-23 on the shared VM, whose /tmp is a tmpfs: 6-24 of ~770 checks failed per run (`GWENEDEG_TEST_PROCS=4`), all
+loads the memory check refused, plus one `stderr differs` that the warning explains; a later run's 9.6 GB of logits files
+in /tmp, next to a 27B server, ran the machine out of memory and swap, and the server was OOM-killed.
 
 ## Engine hooks (`src/cli.c`)
 

@@ -30,6 +30,7 @@
 import check_models  # (q35_synth_build: the synthetic MTP files)
 import concurrent.futures as cf
 import os
+import re
 import sys
 
 import procslots  # (GWENEDEG_TEST_PROCS; tests/ is on sys.path: imported by check.py)
@@ -89,8 +90,18 @@ def run(cmd, threads, stdin=None, env=None):
     return procslots.run(cmd, env=e, capture_output=True, input=stdin)
 
 
+# the loader's memory warning (src/model.c: mem_warn), printed when its estimate is over 3/4 of MemAvailable: it depends on
+# the free memory at the load, not on the run (a draft's: "warning: draft: memory: ...")
+MEM_WARN = re.compile(rb"(?:; )?memory: needs ~[0-9.]+ GiB, [0-9]+% of MemAvailable [0-9.]+ GiB")
+
+
+def no_mem_warning(err):
+    lines = [MEM_WARN.sub(b"", l) if l.startswith(b"warning: ") else l for l in err.split(b"\n")]
+    return b"\n".join(l for l in lines if l not in (b"warning: ", b"warning: draft: "))
+
+
 def no_timing(err):
-    return "\n".join(l for l in err.decode(errors="replace").split("\n") if not l.startswith("[timing]"))
+    return "\n".join(l for l in no_mem_warning(err).decode(errors="replace").split("\n") if not l.startswith("[timing]"))
 
 
 def cli_run(gwenedeg, model, args, users, tmp, tag, draft=None, k=(), threads=SPEC_THREADS):
@@ -193,7 +204,7 @@ def mtp_start(a, d, ex):
         ref = cli_run(a.gwenedeg, mtp, args, None, d, "mg0_ref")
         got = cli_run(a.gwenedeg, mtp, args, None, d, "mg0", "mtp", ["-G", "0"])
         ok, why = compare(ref, got, "-G 0", timing_ok=True)
-        strip = lambda e: bytes(x for x in e if not chr(x).isdigit())  # noqa: E731  (the timing line's numbers vary)
+        strip = lambda e: bytes(x for x in no_mem_warning(e) if not chr(x).isdigit())  # noqa: E731  (the timing line's numbers vary)
         ok &= strip(got[2]) == strip(ref[2])
         return [(ok, "g0", "-G 0 -D mtp == no -D: stdout, stderr (the [timing] line's numbers aside)" + (f"; {why}" if why else ""))]
     futs.append(("cli", "spec_mtp", ex.submit(g0)))
@@ -301,7 +312,7 @@ def spec_start(a, tmp, ex):
         got = cli_run(a.gwenedeg, a.gguf, args, None, d, "g0", a.q4, ["-G", "0"])
         ok, why = compare(ref, got, "-G 0", timing_ok=True)
         # (the timing lines' numbers vary run to run: compared without their numbers)
-        strip = lambda e: b"".join(c for c in [bytes([x]) for x in e] if not c.isdigit())
+        strip = lambda e: b"".join(c for c in [bytes([x]) for x in no_mem_warning(e)] if not c.isdigit())
         ok &= strip(got[2]) == strip(ref[2])
         return [(ok, "g0", "-G 0 -D DRAFT == no -D: stdout, stderr (the [timing] line's numbers aside)" + (f"; {why}" if why else ""))]
     futs.append(("cli", "spec_cli", ex.submit(g0)))
@@ -309,7 +320,7 @@ def spec_start(a, tmp, ex):
     def refused():
         out = []
         if a.q35:
-            p = run([a.gwenedeg, a.gguf, "-m", "generate", "-n", "4", "-i", "hi", "-D", a.q35], 2)
+            p = run([a.gwenedeg, a.gguf, "-c", "4096", "-m", "generate", "-n", "4", "-i", "hi", "-D", a.q35], 2)
             e = p.stderr.decode(errors="replace")
             out.append((p.returncode == 1 and not p.stdout and "not usable as a draft" in e, "refused_vocab",
                         f"-D Qwen3.5 for Qwen3: exit status {p.returncode}, {e.strip()[-150:]!r}"))

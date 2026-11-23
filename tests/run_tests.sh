@@ -15,8 +15,10 @@
 #        skipped if missing), Q4 (GGUF Q4_K_M file for the q4 tests, default
 #        models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf; skipped if missing). SEQFILE_V1REF_COMMIT (default 915894a): the
 #        build whose api_test (tests/make_seqfile_v1ref.sh, build/seqfile-v1ref) writes the reference seqfile files.
-#        GWENEDEG_TEST_PROCS=N: at most N test processes at a time (tests/procslots.py; default: no cap,
-#        ~25 model processes at the start, ~12-16 GB); N=6 fits a 10 GB memory cap (systemd-run -p MemoryMax=10G).
+#        GWENEDEG_TEST_PROCS=N: at most N test processes at a time (tests/procslots.py; 0: no cap, ~25 model processes
+#        at the start, ~12-16 GB; default: as many as MemAvailable holds at the start, no cap from ~19 GiB); N=6 fits a
+#        10 GB memory cap (systemd-run -p MemoryMax=10G). GWENEDEG_TEST_MEM_WAIT=S: how long a load the memory check
+#        refused for lack of free memory is retried (default 120 s), before its checks are skipped (exit status 3).
 set -euo pipefail
 # (deprecated: RUNQ / RUNQ_GENERIC, the names before 2026-11-22, when the binary was runq)
 GWENEDEG_BIN="${GWENEDEG_BIN:-${RUNQ:-}}" GWENEDEG_GENERIC="${GWENEDEG_GENERIC:-${RUNQ_GENERIC:-}}"

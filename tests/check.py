@@ -261,10 +261,19 @@ LONG_SYSTEM = LONG_SYSTEM + " " + LONG_SYSTEM  # 374 tokens
 
 class Results:
     def __init__(self):
-        self.passed, self.failed, self.xfailed, self.xpassed = [], [], [], []
+        self.passed, self.failed, self.xfailed, self.xpassed, self.skipped = [], [], [], [], []
+
+    def skip(self, name, why):
+        """a check that could not run: the loader refused a load for lack of free memory (procslots.py)"""
+        self.skipped.append(name)
+        print(f"SKIP  {name}  (not enough free memory: {why})")
+        sys.stdout.flush()
 
     def report(self, ok, name, detail="", xfail=None):
-        if xfail:
+        m = None if ok or xfail else procslots.REFUSED.search(detail)
+        if m:  # (not a wrong result: a refusal that outlasted procslots.run's waits, or a server that could not start)
+            self.skip(name, detail[:m.end()][-230:].strip())
+        elif xfail:
             if ok:
                 self.xpassed.append(name)
                 print(f"XPASS {name}  (marked xfail: {xfail}; remove the mark?)")
@@ -1356,10 +1365,14 @@ def main():
 
     t0 = time.time()
     res = Results()
+    print(procslots.describe())
     only = set(a.only.split(","))
     if a.update_greedy:
         only = {"greedy", "chat"}
-    with tempfile.TemporaryDirectory(prefix="gwenedeg-test-") as tmp, \
+    # the logits files (~10 GB at the peak) go to a disk: GWENEDEG_DISK_TMP, else /var/tmp (as server_test.py's disk tier),
+    # not TMPDIR's default: /tmp is often a tmpfs, RAM that MemAvailable does not count as free (tests/README.md, Free memory)
+    tmp_dir = os.environ.get("GWENEDEG_DISK_TMP") or ("/var/tmp" if os.access("/var/tmp", os.W_OK) else None)
+    with tempfile.TemporaryDirectory(prefix="gwenedeg-test-", dir=tmp_dir) as tmp, \
             cf.ThreadPoolExecutor(max_workers=PREFETCH_JOBS) as fg, cf.ThreadPoolExecutor(max_workers=2) as bg, \
             cf.ThreadPoolExecutor(max_workers=2) as ax, cf.ThreadPoolExecutor(max_workers=1) as sx, \
             cf.ThreadPoolExecutor(max_workers=1) as gx, cf.ThreadPoolExecutor(max_workers=3) as cx, \
@@ -1408,17 +1421,29 @@ def main():
                 try:
                     fn()
                 except Exception as e:  # a crashing gwenedeg is a failure, not a traceback
-                    res.report(False, f"{name}/error", f"{type(e).__name__}: {e}")
+                    if procslots.REFUSED.search(str(e)):
+                        res.skip(f"{name} (the rest of the group)", str(e)[-230:])
+                    else:
+                        res.report(False, f"{name}/error", f"{type(e).__name__}: {e}")
                 print(f"   ({time.time() - t:.1f} s)")
         for f in PENDING.values():  # (runs nobody waited for, e.g. after a group that errored)
             f.cancel()
     dt = time.time() - t0
     print(f"\nSummary: {len(res.passed)} passed, {len(res.failed)} failed, "
-          f"{len(res.xfailed)} xfail, {len(res.xpassed)} xpass, {dt:.1f} s "
-          f"(OMP_NUM_THREADS={os.environ['OMP_NUM_THREADS']})")
+          f"{len(res.xfailed)} xfail, {len(res.xpassed)} xpass, "
+          + (f"{len(res.skipped)} skipped (not enough free memory), " if res.skipped else "")
+          + f"{dt:.1f} s (OMP_NUM_THREADS={os.environ['OMP_NUM_THREADS']})")
     for n in res.failed:
         print(f"  FAILED: {n}")
-    return 1 if res.failed else 0
+    if res.skipped:  # (exit status 3: the run is incomplete, which is not a failure)
+        m = procslots.mem_available()
+        print(f"NOT COMPLETE: {len(res.skipped)} checks did not run: the loader refused a load for lack of free memory"
+              + (f" (MemAvailable {m:.1f} GiB now)" if m is not None else "") + ", and the wait for it ran out. Nothing "
+              f"failed. Run again when more memory is free, or with fewer test processes at a time (GWENEDEG_TEST_PROCS; "
+              f"this run: {procslots.N or 'no cap'}).")
+        for n in res.skipped:
+            print(f"  SKIPPED: {n}")
+    return 1 if res.failed else 3 if res.skipped else 0
 
 
 if __name__ == "__main__":

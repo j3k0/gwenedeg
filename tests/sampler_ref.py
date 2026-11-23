@@ -170,7 +170,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="sampler-ref-", dir=a.tmp) as tmp:
         path = os.path.join(tmp, "rec.logits")
         env = dict(os.environ, OMP_NUM_THREADS="2")
-        p = subprocess.run([a.gwenedeg, a.model, "-m", "logits", "-i", PROMPT, "-o", path], capture_output=True, env=env)
+        p = subprocess.run([a.gwenedeg, a.model, "-c", "4096", "-m", "logits", "-i", PROMPT, "-o", path], capture_output=True, env=env)
         if p.returncode != 0:
             report(False, "sampler/logits", f"gwenedeg -m logits: exit status {p.returncode}: {p.stderr.decode(errors='replace')[-300:]}")
             return 1

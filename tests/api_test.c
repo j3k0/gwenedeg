@@ -90,6 +90,12 @@ static void report(int ok, const char *name, const char *detail) {
 static RqModel *M;
 static RqModelInfo I;
 static int V;
+// the models load without the memory check (RqModelOpts.mem < 0), as the MTP views here (RqMtpOpts.mem -1): its estimate
+// counts a sequence of the whole context (40,960 positions: 4.4 GiB of KV cache for Qwen3-0.6B), which these tests never
+// fill (~0.7-1.7 GB of RSS), so it refused them whenever MemAvailable was under ~5 GiB. The check itself: gguf_mem/*
+// (tests/check.py), mtp_load here. (Not in the seqfile-out block: 915894a's api_test gets it as it is, and its loads are
+// of Qwen3.5-0.8B, ~1.5 GiB)
+static const RqModelOpts NOCHECK = { 0, 0, 0, -1 };
 
 static void die(const char *what, int e) {
     printf("FAIL setup  %s: %s\n", what, rq_strerror(e));
@@ -344,7 +350,7 @@ static int sample_main(int argc, char **argv) {
     (void)argc;
     char err[512];
     rq_threads_init(1);
-    if (!(M = rq_model_load(argv[1], NULL, err, sizeof(err)))) { printf("FAIL setup  %s\n", err); return 1; }
+    if (!(M = rq_model_load(argv[1], &NOCHECK, err, sizeof(err)))) { printf("FAIL setup  %s\n", err); return 1; }
     rq_model_info(M, &I);
     V = I.vocab_size;
     FILE *f = fopen(argv[3], "rb");
@@ -520,7 +526,7 @@ int main(int argc, char **argv) {
     rq_threads_init(0);
     RqModel *bad = rq_model_load("models/no-such-file.gguf", NULL, err, sizeof(err));
     report(!bad && strstr(err, "Couldn't open checkpoint"), "load_error", err);
-    M = rq_model_load(argv[1], NULL, err, sizeof(err));
+    M = rq_model_load(argv[1], &NOCHECK, err, sizeof(err));
     if (!M) {
         printf("FAIL setup  %s\n", err);
         return 1;
@@ -1556,7 +1562,7 @@ static int tw_load(TwoM *w, const char *path, char *err, size_t errlen) {
     // the model, a context (64 rows per pass), 4 sequences of 512 positions and the prompts; 0 on failure (err)
     int e = RQ_OK;
     memset(w, 0, sizeof(*w));
-    if (!(w->m = rq_model_load(path, NULL, err, errlen))) return 0;
+    if (!(w->m = rq_model_load(path, &NOCHECK, err, errlen))) return 0;
     rq_model_info(w->m, &w->info);
     if (!(w->c = rq_ctx_new(w->m, 64, 512, &e))) goto fail;
     for (int j = 0; j < 4; j++)
@@ -1729,7 +1735,7 @@ static int tw_alone_proc(const char *path, uint64_t *h, char *err, size_t errlen
 static int tw_gs_refused(const char *path, char *d, size_t dn) {
     // loading path (another activation group size than the loaded models') fails with the group size error
     char err[512];
-    RqModelOpts o = { 0, 0, 1 };
+    RqModelOpts o = { 0, 0, 1, -1 };
     RqModel *g = rq_model_load(path, &o, err, sizeof(err));
     if (g) {
         RqModelInfo gi;
@@ -1843,7 +1849,7 @@ static int two_main(int argc, char **argv) {
     tw_free(&w[1]);
     // nothing loaded: the other group size loads now, and runs
     if (pg) {
-        RqModelOpts o = { 0, 0, 1 };
+        RqModelOpts o = { 0, 0, 1, -1 };
         RqModel *g = rq_model_load(pg, &o, err, sizeof(err));
         RqModelInfo gi = { 0 };
         int e = RQ_ERR_LOAD;
@@ -2223,8 +2229,8 @@ static int spec_main(int argc, char **argv) {
     char err[512], d[4096];
     RqMtpOpts mo = { 0, -1 };
     SD_MTP = !strcmp(path[1], "mtp"); // (the target's own MTP block: rq_mtp_load)
-    if (!(M = rq_model_load(path[0], NULL, err, sizeof(err))) ||
-        !(SD = SD_MTP ? rq_mtp_load(M, &mo, err, sizeof(err)) : rq_model_load(path[1], NULL, err, sizeof(err)))) {
+    if (!(M = rq_model_load(path[0], &NOCHECK, err, sizeof(err))) ||
+        !(SD = SD_MTP ? rq_mtp_load(M, &mo, err, sizeof(err)) : rq_model_load(path[1], &NOCHECK, err, sizeof(err)))) {
         printf("FAIL setup  %s\n", err);
         return 1;
     }
@@ -2468,7 +2474,7 @@ static int spec_main(int argc, char **argv) {
         // the MTP block of another model (a second load of the target file): refused before any pass
         if (!quick) {
             ok = 1;
-            RqModel *M2 = rq_model_load(path[0], NULL, err, sizeof(err));
+            RqModel *M2 = rq_model_load(path[0], &NOCHECK, err, sizeof(err));
             RqModel *v2 = M2 ? rq_mtp_load(M2, &mo, err, sizeof(err)) : NULL;
             RqSeq *x = v2 ? rq_seq_new(v2, 0, RQ_KV_DEFAULT, &e) : NULL;
             RqCtx *xc = v2 ? rq_ctx_new(v2, 8, 0, &e) : NULL;
@@ -3034,7 +3040,7 @@ static int mtp_seqcheck_main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     rq_threads_init(0);
     char err[512], d[512];
-    if (!(M = rq_model_load(argv[2], NULL, err, sizeof(err)))) { printf("FAIL mtp_seqcheck  %s\n", err); return 1; }
+    if (!(M = rq_model_load(argv[2], &NOCHECK, err, sizeof(err)))) { printf("FAIL mtp_seqcheck  %s\n", err); return 1; }
     rq_model_info(M, &I);
     V = I.vocab_size;
     D = I.dim;
@@ -3063,7 +3069,7 @@ static int mtp_main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     rq_threads_init(0);
     char err[512], d[1024];
-    if (!(M = rq_model_load(path, NULL, err, sizeof(err)))) { printf("FAIL setup  %s\n", err); return 1; }
+    if (!(M = rq_model_load(path, &NOCHECK, err, sizeof(err)))) { printf("FAIL setup  %s\n", err); return 1; }
     rq_model_info(M, &I);
     V = I.vocab_size;
     D = I.dim;
@@ -3228,7 +3234,7 @@ static int mtp_main(int argc, char **argv) {
         ok = 1;
         d[0] = 0;
         if (plain) {
-            RqModel *x = rq_model_load(plain, NULL, err, sizeof(err));
+            RqModel *x = rq_model_load(plain, &NOCHECK, err, sizeof(err));
             RqModel *y = x ? rq_mtp_load(x, NULL, err, sizeof(err)) : NULL;
             ok &= x && !y && strstr(err, "no MTP block");
             snprintf(d, sizeof(d), "%s; ", err);
@@ -3236,7 +3242,7 @@ static int mtp_main(int argc, char **argv) {
             rq_model_free(x);
         }
         if (optional) {
-            RqModel *x = rq_model_load(optional, NULL, err, sizeof(err));
+            RqModel *x = rq_model_load(optional, &NOCHECK, err, sizeof(err));
             RqModel *y = x ? rq_mtp_load(x, NULL, err, sizeof(err)) : NULL;
             ok &= x && !y && strstr(err, "optional MTP tensors (nextn.embed_tokens / shared_head_head) not supported");
             size_t dl = strlen(d);
@@ -3312,7 +3318,7 @@ static int mtp_dump_main(int argc, char **argv) {
     }
     rq_threads_init(0);
     char err[512];
-    if (!(M = rq_model_load(path[0], NULL, err, sizeof(err)))) { fprintf(stderr, "%s\n", err); return 1; }
+    if (!(M = rq_model_load(path[0], &NOCHECK, err, sizeof(err)))) { fprintf(stderr, "%s\n", err); return 1; }
     rq_model_info(M, &I);
     V = I.vocab_size;
     D = I.dim;

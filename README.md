@@ -133,10 +133,20 @@ The full list is in [docs/usage.md](docs/usage.md#limitations) and [docs/server.
 
 ## Testing
 
+```sh
+make models     # once: Qwen3-0.6B (~2.6 GB download), converted in a Python venv it makes (scripts/setup_venv.sh)
+make test       # the regression suite
+```
+
 `make test` builds the binaries and runs the regression suite (tokenizer ids and logits against Hugging Face, batched
 against sequential, thread-count and SIMD-against-generic bit-identity, the KV cache types, speculative decoding against
-plain decoding, the server over HTTP, synthetic models with the bigger models' shapes); it needs the Qwen3-0.6B files
-and numpy. `make test-models` runs every downloaded bigger model. Counts, timings and the other test groups:
+plain decoding, the server over HTTP, synthetic models with the bigger models' shapes). `make models` needs Python 3.11
+or newer with `venv`; its `.venv` (1.1 GB) holds a CPU-only torch, transformers and numpy
+(`PYTHON=python3.12 make models` picks the interpreter). qwen3.c's exporter is memory-hungry: 11 GB of RAM plus swap
+were in use when it ran under a 4 GB cap. Groups whose model files are missing (Qwen3.5's, among others) are skipped
+with a note. The suite runs as many test processes at once as the free memory allows, and keeps its temporary files in
+`/var/tmp`.
+`make test-models` runs every downloaded bigger model. Counts, timings, memory and the other test groups:
 [tests/README.md](tests/README.md); CI with Dagger and the benchmark scripts: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## Credits and license

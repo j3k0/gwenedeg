@@ -194,7 +194,8 @@ bench: gwenedeg
 bench-prefill: gwenedeg
 	scripts/bench_prefill.sh
 
-# Downloads ~2 GB and runs the Python exporter; only if the Q8_0 model is missing.
+# Makes .venv if it is missing (scripts/setup_venv.sh: CPU-only torch, transformers, numpy), downloads ~2.6 GB
+# (Qwen3-0.6B: the HF weights, the Q8_0 and Q4_K_M GGUF files) and runs qwen3.c's exporter; only if the Q8_0 model is missing.
 models:
 	@if [ -f $(Q8) ]; then echo "$(Q8) present, nothing to do"; \
-	else scripts/download_models.py && scripts/export_q8.sh; fi
+	else { [ -x .venv/bin/python ] || scripts/setup_venv.sh; } && scripts/download_models.py && scripts/export_q8.sh; fi

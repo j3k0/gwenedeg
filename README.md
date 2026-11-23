@@ -121,7 +121,7 @@ chat templates and what is not supported (MoE, images, RoPE scaling, other GGUF 
 
 - Linux (gcc) is the main platform. macOS on Apple Silicon (Apple clang) builds and runs with the NEON kernels (tested on macOS only; the
   tests that compare generated text with goldens recorded on x86 need an arm64 baseline: [docs/usage.md](docs/usage.md#limitations)). The
-  Windows code paths inherited from qwen3.c are kept but untested, and the server is POSIX only.
+  Windows code paths inherited from qwen3.c (OpenMP threads: build with `-fopenmp`) are kept but untested, and the server is POSIX only.
 - Fast paths: x86-64 with AVX-512 VNNI (selected at compile time with `-march=native`) and AArch64 with the dot-product
   extension. Other CPUs, including x86 without AVX-512 VNNI, use the generic C kernels: the same results, but for the
   K-quant files ~10x slower prefill and ~3-4x slower decode. CPU only; one model per process (and its draft).
@@ -144,8 +144,8 @@ plain decoding, the server over HTTP, synthetic models with the bigger models' s
 or newer with `venv`; its `.venv` (1.1 GB) holds a CPU-only torch, transformers and numpy
 (`PYTHON=python3.12 make models` picks the interpreter). qwen3.c's exporter is memory-hungry: 11 GB of RAM plus swap
 were in use when it ran under a 4 GB cap. Groups whose model files are missing (Qwen3.5's, among others) are skipped
-with a note. The suite runs as many test processes at once as the free memory allows, and keeps its temporary files in
-`/var/tmp`.
+with a note. The suite runs as many test processes at once as the free memory allows, and keeps its temporary files (~10 GB at the peak)
+in `/var/tmp`.
 `make test-models` runs every downloaded bigger model. Counts, timings, memory and the other test groups:
 [tests/README.md](tests/README.md); CI with Dagger and the benchmark scripts: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 

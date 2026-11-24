@@ -166,6 +166,13 @@ SETS = {
         ("NOTICE", 590, "blob", "01ef7a81fcc94549b2ae466de36c5d42e6958fb1"),
         ("Underdog-Saluki-27B-1.0-IQ2-mix.gguf", 7898369152, "sha256", "4a673518b11b1c4445f9b9a9d3c40356f5ba39f6a6260dcb25f3fbfd475d9efb"),
     ]),
+    # NariQ v1 3.0 bpw (nari-labs, 2026-11-20): Qwen3.8-27B trellis-coded (QTIP bitshift trellis, exllamav3's integer
+    # grid; TRL2 .. TRL6 matrices with Hadamard sides, the classifier in 16 frequency bands, a 2-bit embedding), calibrated
+    # on coding-agent traces; no MTP block; Apache-2.0. 10.1 GB, 9.4 GiB of weights in RAM (src/trellis.h, docs/nariq.md).
+    # The 2.5 / 2.0 bpw files and the BF16 vision projector of the same repo: not used
+    "nariq-27b": ("nari-labs/Qwen3.8-27B-NariQ-GGUF", "17886395feb8a752b5ca5f02ad0c25543950915e", "Qwen3.8-27B-NariQ-GGUF", [
+        ("Qwen3.8-27B-NariQ-3.0bpw.gguf", 10123626592, "sha256", "1eaad934aa05579b8eba47ed9b26450392f9875fc2354efe8cfa8b29be8f4419"),
+    ]),
 }
 DEFAULT_SETS = ["hf", "q4km", "q8gguf"]
 # names that stand for several sets

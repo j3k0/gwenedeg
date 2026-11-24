@@ -45,7 +45,9 @@ static int gguf_type_bytes(uint32_t type, uint64_t n, uint64_t ne0, uint64_t *by
         { 0, 1, 4 }, { 1, 1, 2 }, { 30, 1, 2 }, { 2, 32, 18 }, { 3, 32, 20 }, { 6, 32, 22 }, { 7, 32, 24 },
         { 8, 32, 34 }, { 10, 256, 84 }, { 11, 256, 110 }, { 12, 256, 144 }, { 13, 256, 176 }, { 14, 256, 210 },
         { 16, 256, 66 }, { 17, 256, 74 }, { 18, 256, 98 }, { 19, 256, 50 }, { 21, 256, 110 }, { 22, 256, 82 },
-        { 23, 256, 136 }, { 29, 256, 56 } }; // (Q2_K and the i-quants: iquants.h)
+        { 23, 256, 136 }, { 29, 256, 56 }, { 26, 1, 4 },
+        // NariQ's TRL1 .. TRL6 (trellis.h; their ids only mean that with trellis.version = 1, model.c): 16 values per 2 bits bytes
+        { 44, 16, 2 }, { 45, 16, 4 }, { 46, 16, 6 }, { 47, 16, 8 }, { 48, 16, 10 }, { 49, 16, 12 } }; // (Q2_K and the i-quants: iquants.h; I32)
     for (size_t i = 0; i < sizeof(tt) / sizeof(tt[0]); i++)
         if (tt[i].type == type) {
             if (ne0 % tt[i].blk) return 0;
@@ -329,7 +331,8 @@ void gguf_config(const Gguf *g, Config *c, float *rope_theta, int *rope_dim, Hyb
     c->seq_len = (int)v[5];
     c->head_dim = (int)v[6];
     c->vocab_size = (int)emb->ne[1];
-    c->shared_classifier = gguf_tensor(g, "output.weight") == NULL; // absent: tied to token_embd
+    // absent: tied to token_embd (a NariQ file's classifier in frequency bands has no output.weight either)
+    c->shared_classifier = gguf_tensor(g, "output.weight") == NULL && !gguf_find(g, "trellis.lm_head_bands");
     c->group_size = 32; // activation groups: Q8_0 blocks, Q4_K / Q5_K sub-blocks, 2 Q6_K sub-blocks
     *rope_theta = theta;
     *rope_dim = (int)rd;

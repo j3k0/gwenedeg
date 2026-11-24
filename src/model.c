@@ -115,13 +115,200 @@ static void bin_map_weights(RqModel *m, const char *path, LoadErr *e) {
 
 static int fp_type(int type) { return type == GGML_F32 || type == GGML_BF16; } // (stored as F32 rows: QuantizedTensor.f)
 
-static void gguf_matrix(const Gguf *g, QuantizedTensor *res, const char *name, int d, int k, int f32) {
+typedef struct { QuantizedTensor *t; int n, d, k; } PrepMat; // a role of prepare_weights: n matrices (d, k)
+#define PREP_MAX 80 // roles of prep_mats at most (13 + a banded classifier's bands, <= 64)
+static int prep_mats(const RqModel *m, PrepMat *mt);
+
+// ---------------------------------------------------------------------------- NariQ coded matrices (trellis.h)
+
+static int trl_count(const Gguf *g) {
+    // the coded tensors in the directory (the capacity of RqModel.trl_mats)
+    int n = 0;
+    for (uint64_t i = 0; i < g->n_t; i++)
+        n += trl_type((int)g->t[i].type);
+    return n;
+}
+
+static int pow2(int64_t v) { return v > 0 && (v & (v - 1)) == 0; }
+
+static void trl_matrix(RqModel *m, QuantizedTensor *res, const char *name, int d, int k, int embed) {
+    // a coded matrix (d, k) from the tensor directory and the metadata (no tensor data read): its codes and side
+    // tensors in the mapping, its descriptor trellis.desc.<name without .weight> (nariq/FORMAT.md): the layouts this
+    // file version uses (blockwise Hadamards or none, one part, no whole-slice transforms) are taken, the others refused;
+    // embed: the token embedding (rows unrotated, no gathers: trl_embed_row)
+    const Gguf *g = &m->gguf;
+    const GgufTensor *gt = gguf_tensor(g, name);
+    int64_t ver = 0;
+    if (!gguf_get_int(g, "trellis.version", &ver) || ver != 1)
+        gguf_fail(g, "tensor %s is NariQ-coded (TRL types 44-49), but the file has no trellis.version = 1", name);
+    if (m->trl_n >= m->trl_cap) gguf_fail(g, "tensor %s: more coded tensors than in the directory", name);
+    res->b = gguf_weight(g, name, gt->type, k, d);
+    res->type = (int)gt->type;
+    if (d % 16 || k % 32) gguf_fail(g, "coded tensor %s: shape not supported (rows a multiple of 16, columns of 32)", name);
+    TrlMat *t = &m->trl_mats[m->trl_n++];
+    memset(t, 0, sizeof(*t));
+    t->bits = trl_bits(res->type);
+    t->d = d;
+    t->k = k;
+    t->file = res->b;
+    char base[96], key[128], side[128];
+    size_t bl = strlen(name);
+    if (bl < 8 || bl - 7 >= sizeof(base) || strcmp(name + bl - 7, ".weight")) gguf_fail(g, "coded tensor %s: name not <x>.weight", name);
+    memcpy(base, name, bl - 7);
+    base[bl - 7] = 0;
+    snprintf(key, sizeof(key), "trellis.desc.%s", base);
+    const GgufKV *kv = gguf_get_array(g, key, GV_I32);
+    if (!kv) gguf_fail(g, "coded tensor %s: no trellis.desc metadata", name);
+    int32_t a[8];
+    if (kv->n != 8) gguf_fail(g, "coded tensor %s: a descriptor with several parts is not supported", name);
+    memcpy(a, g->map + kv->off, sizeof(a));
+    // [rows_kind, rows_block, rows_shards, cols_kind, cols_block, cols_shards, nparts, part_0]
+    if (a[2] != 1 || a[5] != 1 || a[6] != 1 || a[7] != d || (a[0] != 0 && a[0] != 1) || (a[3] != 0 && a[3] != 1) ||
+        (a[0] == 1 && (!pow2(a[1]) || a[1] < 16 || d % a[1])) || (a[3] == 1 && (!pow2(a[4]) || a[4] < 32 || a[4] > 4096 || k % a[4])) ||
+        (embed && a[0] != 0))
+        gguf_fail(g, "coded tensor %s: side transforms not supported (whole-slice Hadamards, parts, shapes)", name);
+    t->rblk = a[0] ? a[1] : 0;
+    t->cblk = a[3] ? a[4] : 0;
+    snprintf(side, sizeof(side), "%s.trellis_s16", base);
+    t->f_s16 = gguf_weight(g, side, GGML_F16, k / 16, 0);
+    snprintf(side, sizeof(side), "%s.trellis_pre", base);
+    t->f_pre = gguf_weight(g, side, GGML_F32, k, 0);
+    snprintf(side, sizeof(side), "%s.trellis_post", base);
+    t->f_post = gguf_weight(g, side, GGML_F32, d, 0);
+    snprintf(side, sizeof(side), "%s.trellis_pin", base);
+    if (gguf_tensor(g, side)) t->f_pin = gguf_weight(g, side, GGML_I32, k, 0);
+    snprintf(side, sizeof(side), "%s.trellis_pout", base);
+    if (gguf_tensor(g, side)) t->f_pout = gguf_weight(g, side, GGML_I32, d, 0);
+    if (embed && (t->f_pin || t->f_pout)) gguf_fail(g, "coded embedding %s: gathers not supported", name);
+    res->trl = t;
+    res->ntrl = 1;
+    m->trl = 1;
+}
+
+static void trl_bands(RqModel *m, int nb) {
+    // a classifier in nb frequency bands (output.bandNN.weight, output.vocab_gather; trellis.lm_head_bands): the bands
+    // as coded matrices (consecutive in trl_mats), the classifier wcls their container
+    const Gguf *g = &m->gguf;
+    TransformerWeights *w = &m->weights;
+    int V = m->config.vocab_size, dim = m->config.dim, rows = 0;
+    if (nb < 1 || nb > 64) gguf_fail(g, "trellis.lm_head_bands: %s bands (need 1 .. 64)", nb < 1 ? "too few" : "too many");
+    m->cls_bands = calloc(nb, sizeof(QuantizedTensor));
+    w->wcls = calloc(1, sizeof(QuantizedTensor));
+    if (!m->cls_bands || !w->wcls) load_fail(g->err, "malloc failed!");
+    m->n_bands = nb;
+    for (int b = 0; b < nb; b++) {
+        char name[64];
+        snprintf(name, sizeof(name), "output.band%02d.weight", b);
+        const GgufTensor *t = gguf_tensor(g, name);
+        if (!t || !trl_type((int)t->type) || t->n_dims != 2 || t->ne[1] > (uint64_t)V) gguf_fail(g, "banded classifier: %s missing or not coded", name);
+        trl_matrix(m, &m->cls_bands[b], name, (int)t->ne[1], dim, 0);
+        rows += (int)t->ne[1];
+        if (m->cls_bands[b].trl->f_pout) gguf_fail(g, "banded classifier: %s has an output gather", name);
+    }
+    if (rows != V) gguf_fail(g, "banded classifier: the bands do not hold the vocabulary%s", "");
+    m->trl_vg = (const int32_t *)gguf_weight(g, "output.vocab_gather", GGML_I32, V, 0);
+    *w->wcls = m->cls_bands[0];
+    w->wcls->trl = m->cls_bands[0].trl;
+    w->wcls->ntrl = nb;
+}
+
+static int32_t *trl_perm(RqModel *m, const void *src, int n, uint8_t *seen, const char *what) {
+    // a permutation of 0 .. n-1 from the file (untrusted: checked), copied; NULL if src is NULL
+    if (!src) return NULL;
+    int32_t *p = malloc((size_t)n * sizeof(int32_t));
+    if (!p) load_fail(m->gguf.err, "malloc failed!");
+    memcpy(p, src, (size_t)n * sizeof(int32_t));
+    memset(seen, 0, n);
+    for (int i = 0; i < n; i++) {
+        if (p[i] < 0 || p[i] >= n || seen[p[i]]) {
+            free(p);
+            gguf_fail(&m->gguf, "Corrupt checkpoint: a NariQ gather of %s is not a permutation", what);
+        }
+        seen[p[i]] = 1;
+    }
+    return p;
+}
+
+static void trl_load_sides(RqModel *m) {
+    // the side vectors of every coded matrix, after the memory check: s16 widened, pre / post copied (finite), the
+    // gathers checked; the output gather inverted into the scatter (a band's: composed with the vocab gather)
+    if (!m->trl) return;
+    size_t n = 0;
+    for (int i = 0; i < m->trl_n; i++) {
+        TrlMat *t = &m->trl_mats[i];
+        n += (size_t)t->k / 16 + t->k + t->d + (t->f_pin ? t->k : 0) + (t->f_pout || m->n_bands ? t->d : 0);
+    }
+    float *f = m->trl_side = malloc(n * sizeof(float) + 64);
+    int V = m->config.vocab_size, kmax = V;
+    for (int i = 0; i < m->trl_n; i++)
+        if (m->trl_mats[i].k > kmax) kmax = m->trl_mats[i].k;
+    uint8_t *seen = malloc(kmax);
+    int32_t *inv = m->n_bands ? malloc((size_t)V * sizeof(int32_t)) : NULL;
+    if (!f || !seen || (m->n_bands && !inv)) { free(seen); free(inv); load_fail(m->gguf.err, "malloc failed!"); }
+    if (inv) { // the vocab gather (logit t = banded row vg[t]) inverted: banded row r -> logit inv[r]
+        int32_t *vg = trl_perm(m, m->trl_vg, V, seen, "output.vocab_gather");
+        for (int t = 0; t < V; t++) inv[vg[t]] = t;
+        free(vg);
+    }
+    int bad = 0, band0 = m->n_bands ? (int)(m->cls_bands[0].trl - m->trl_mats) : -1, boff = 0;
+    for (int i = 0; i < m->trl_n; i++) {
+        TrlMat *t = &m->trl_mats[i];
+        float *s16 = f, *pre = s16 + t->k / 16, *post = pre + t->k;
+        f = post + t->d;
+        const uint16_t *h = t->f_s16;
+        for (int j = 0; j < t->k / 16; j++) {
+            uint16_t x;
+            memcpy(&x, h + j, 2);
+            s16[j] = fp16_to_f32(x);
+        }
+        memcpy(pre, t->f_pre, (size_t)t->k * sizeof(float));
+        memcpy(post, t->f_post, (size_t)t->d * sizeof(float));
+        for (int j = 0; j < t->k / 16; j++) bad |= !isfinite(s16[j]);
+        for (int j = 0; j < t->k; j++) bad |= !isfinite(pre[j]);
+        for (int j = 0; j < t->d; j++) bad |= !isfinite(post[j]);
+        t->s16 = s16;
+        t->pre = pre;
+        t->post = post;
+        if (t->f_pin) {
+            int32_t *p = trl_perm(m, t->f_pin, t->k, seen, "an input");
+            memcpy(f, p, (size_t)t->k * 4);
+            free(p);
+            t->pin = (const int32_t *)f;
+            f += t->k;
+        }
+        int band = band0 >= 0 && i >= band0 && i < band0 + m->n_bands;
+        if (t->f_pout || band) {
+            int32_t *sc = (int32_t *)f;
+            f += t->d;
+            if (band) { // banded row boff + r -> its logit
+                for (int r = 0; r < t->d; r++) sc[r] = inv[boff + r];
+                boff += t->d;
+            } else { // the file's y_final[r] = y[pout[r]]: scatter y[pout[r]] -> r
+                int32_t *p = trl_perm(m, t->f_pout, t->d, seen, "an output");
+                for (int r = 0; r < t->d; r++) sc[p[r]] = r;
+                free(p);
+            }
+            t->scat = sc;
+        }
+    }
+    free(seen);
+    free(inv);
+    if (bad) gguf_fail(&m->gguf, "Corrupt checkpoint: a NariQ side vector is inf or NaN%s", "");
+}
+
+static void gguf_matrix(RqModel *m, QuantizedTensor *res, const char *name, int d, int k, int f32) {
     // one matrix (d, k): Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, Q2_K or an i-quant (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
     // IQ3_S, IQ4_XS: iquants.h; dispatch per tensor: Q4_K_M or an IQ mix combines them within a role), or F32 / BF16 if
     // f32 (only where forward.c's fp32 path takes it: ssm_alpha / ssm_beta; BF16 is widened to F32 at load, exact: the
-    // IQ3_S-mtp 27B file's), its data in the mapping (q / s / p / kp / f are set by prepare_weights)
+    // IQ3_S-mtp 27B file's), its data in the mapping (q / s / p / kp / f are set by prepare_weights); or NariQ-coded
+    // (TRL1 .. TRL6: trl_matrix)
+    const Gguf *g = &m->gguf;
     const GgufTensor *t = gguf_tensor(g, name);
     uint32_t type = t ? t->type : GGML_Q8_0; // (missing: gguf_weight reports it)
+    if (trl_type((int)type)) {
+        trl_matrix(m, res, name, d, k, 0);
+        return;
+    }
     if (type != GGML_Q8_0 && type != GGML_Q3_K && type != GGML_Q4_K && type != GGML_Q5_K && type != GGML_Q6_K &&
         !iq_type((int)type) && !(f32 && fp_type((int)type))) {
         char msg[260];
@@ -151,7 +338,7 @@ static void gguf_matrices(RqModel *m, QuantizedTensor **dst, int L, const int *s
         int l = sel ? sel[l0] : l0;
         char name[96];
         snprintf(name, sizeof(name), fmt, l0);
-        gguf_matrix(g, &res[l], name, d, k, f32);
+        gguf_matrix(m, &res[l], name, d, k, f32);
         if (res[l].type != GGML_Q8_0 && !fp_type(res[l].type))
             m->kq = 1;
     }
@@ -182,7 +369,7 @@ static void gguf_map_mtp(RqModel *m) {
     char name[96];
     for (size_t i = 0; i < sizeof(mt) / sizeof(mt[0]); i++) {
         snprintf(name, sizeof(name), "blk.%d.%s.weight", b, mt[i].role);
-        gguf_matrix(g, mt[i].t, name, mt[i].d, mt[i].k, 0);
+        gguf_matrix(m, mt[i].t, name, mt[i].d, mt[i].k, 0);
     }
     for (size_t i = 0; i < sizeof(nv) / sizeof(nv[0]); i++) {
         snprintf(name, sizeof(name), "blk.%d.%s.weight", b, nv[i].role);
@@ -275,7 +462,15 @@ static void gguf_map_weights(RqModel *m) {
     TransformerWeights *w = &m->weights;
     const Hybrid *hy = &m->hy;
     int L = p->n_layers, dim = p->dim, hd = p->head_dim, qd = p->n_heads * hd, kvd = p->n_kv_heads * hd, NL = hy->n_lin;
-    gguf_matrices(m, &w->q_tokens, 1, NULL, "token_embd.weight", p->vocab_size, dim, 0);
+    const Gguf *g = &m->gguf;
+    if ((m->trl_cap = trl_count(g)) > 0 && !(m->trl_mats = calloc(m->trl_cap, sizeof(TrlMat)))) load_fail(g->err, "malloc failed!");
+    const GgufTensor *te = gguf_tensor(g, "token_embd.weight");
+    if (te && trl_type((int)te->type)) {
+        // a coded embedding: its rows decoded at lookup from the mapping (embed_row)
+        if (!(w->q_tokens = calloc(1, sizeof(QuantizedTensor)))) load_fail(g->err, "malloc failed!");
+        trl_matrix(m, w->q_tokens, "token_embd.weight", p->vocab_size, dim, 1);
+    } else
+        gguf_matrices(m, &w->q_tokens, 1, NULL, "token_embd.weight", p->vocab_size, dim, 0);
     gguf_matrices(m, &w->wq, L, m->kv_layer, "blk.%d.attn_q.weight", p->n_heads * m->qh, dim, 0);
     gguf_matrices(m, &w->wk, L, m->kv_layer, "blk.%d.attn_k.weight", kvd, dim, 0);
     gguf_matrices(m, &w->wv, L, m->kv_layer, "blk.%d.attn_v.weight", kvd, dim, 0);
@@ -290,12 +485,23 @@ static void gguf_map_weights(RqModel *m) {
         gguf_matrices(m, &w->wb, L, m->lin_layer, "blk.%d.ssm_beta.weight", hy->nv, dim, 1);
         gguf_matrices(m, &w->wso, L, m->lin_layer, "blk.%d.ssm_out.weight", dim, hy->vdim, 0);
     }
-    if (p->shared_classifier)
+    int64_t nbands = 0;
+    if (gguf_get_int(g, "trellis.lm_head_bands", &nbands) && nbands != 0)
+        trl_bands(m, (int)nbands);
+    else if (p->shared_classifier)
         w->wcls = w->q_tokens;
     else
         gguf_matrices(m, &w->wcls, 1, NULL, "output.weight", p->vocab_size, dim, 0);
     if (hy->nextn)
         gguf_map_mtp(m);
+    if (m->trl) { // NariQ: every matmul weight coded (forward.c runs them as coded linears only), the embedding too or not
+        PrepMat mt[PREP_MAX];
+        int nm = prep_mats(m, mt);
+        for (int i = 0; i < nm; i++)
+            for (int l = 0; l < mt[i].n; l++)
+                if (!mt[i].t[l].trl) gguf_fail(g, "a NariQ file with uncoded matrices is not supported%s", "");
+        if (hy->nextn) gguf_fail(g, "a NariQ file with an MTP block is not supported%s", "");
+    }
 }
 
 // ---------------------------------------------------------------------------- weight conversion
@@ -332,7 +538,6 @@ static void drop_cached(int fd, const void *base, const void *mapped, size_t n) 
 #endif
 }
 
-typedef struct { QuantizedTensor *t; int n, d, k; } PrepMat; // a role of prepare_weights: n matrices (d, k)
 
 static int prep_mats(const RqModel *m, PrepMat *mt) {
     // the matmul weights prepare_weights converts (7 per layer, the classifier, Qwen3.5's linear layers): mt[13]
@@ -354,7 +559,13 @@ static int prep_mats(const RqModel *m, PrepMat *mt) {
         { w->wqkv, NL, hy->conv_dim, dim }, { w->wz, NL, hy->vdim, dim }, { w->wa, NL, hy->nv, dim },
         { w->wb, NL, hy->nv, dim }, { w->wso, NL, dim, hy->vdim } };
     memcpy(mt, t, sizeof(t));
-    return sizeof(t) / sizeof(t[0]);
+    int n = sizeof(t) / sizeof(t[0]);
+    if (m->n_bands) { // a banded classifier: its bands instead of wcls (the container converts nothing)
+        mt[7] = mt[--n];
+        for (int b = 0; b < m->n_bands; b++)
+            mt[n++] = (PrepMat) { &m->cls_bands[b], 1, m->cls_bands[b].trl->d, dim };
+    }
+    return n;
 }
 
 static int repack_type(int mask, int type) {
@@ -368,7 +579,7 @@ static int repack_types(RqModel *m) {
     // AVX-512 builds), before the memory estimate and prepare_weights; how many. (A tied classifier's embedding rows still
     // come from the file's blocks: iq_dequant_row reads them as the base type)
     if (m->repack <= 0 || !m->is_gguf) return 0;
-    PrepMat mt[16];
+    PrepMat mt[PREP_MAX];
     int nm = prep_mats(m, mt), n = 0;
     for (int i = 0; i < nm; i++)
         for (int l = 0; l < mt[i].n; l++) {
@@ -403,7 +614,9 @@ static int prep_pack(const PrepMat *mt, int nm, char *warning, size_t wlen) {
 static size_t prep_bytes(const QuantizedTensor *t, int d, int k, int pack) {
     // a matrix's place in the packed buffer (64-byte multiples)
     size_t sz = (size_t)d * k + (size_t)d * (k / GS) * sizeof(float); // (generic kernels on GGUF Q8_0: q / s arrays)
-    if (fp_type(t->type)) // (the rows as in the file; BF16 widened)
+    if (t->trl) // NariQ: the codes as in the file, TRL_PAD readable bytes after
+        sz = trl_code_bytes(t->trl->bits, d, k) + TRL_PAD;
+    else if (fp_type(t->type)) // (the rows as in the file; BF16 widened)
         sz = (size_t)d * k * sizeof(float);
     else if (t->type != GGML_Q8_0) // Q2_K .. Q6_K, the i-quants (GGUF; d % 16 == 0, k % 256 == 0 checked)
         sz = lq_size(t->type, d, k);
@@ -431,7 +644,9 @@ static void prep_item_done(PrepJob *P, int j) {
     if (!P->left || __atomic_sub_fetch(&P->left[j], 1, __ATOMIC_ACQ_REL) != 0) return;
     const PrepItem *it = &P->job[j];
     const QuantizedTensor *t = it->t;
-    if (t->b) {
+    if (t->trl)
+        drop_cached(P->fd, P->base, t->b, trl_code_bytes(t->trl->bits, it->d, it->k));
+    else if (t->b) {
         drop_cached(P->fd, P->base, t->b, t->type == GGML_F32 ? (size_t)it->d * it->k * sizeof(float)
                                           : t->type == GGML_BF16 ? (size_t)it->d * it->k * sizeof(uint16_t)
                                           : t->type != GGML_Q8_0 ? (size_t)it->d * (it->k / QK_K) * lq_block_bytes(t->type)
@@ -478,6 +693,12 @@ static void prepare_worker(void *arg, int tid, int nt) {
         int nb = nblk - rb0 < job[jj].bpi ? nblk - rb0 : job[jj].bpi;
         size_t r0 = (size_t)rb0 * 16, nr = (size_t)nb * 16;
         if (r0 + nr > (size_t)job[jj].d) nr = job[jj].d - r0;
+        if (t->trl) { // NariQ: the tile rows as they are (any bits are valid codes)
+            size_t bb = trl_block_bytes(t->trl);
+            read_at(fd, P->base, t->trl->codes + (size_t)rb0 * bb, (size_t)nb * bb, t->b + (size_t)rb0 * bb);
+            prep_item_done(P, jj);
+            continue;
+        }
         if (t->f) { // F32: the rows as they are; a value inf / NaN is a corrupt file (as a Q8_0 scale)
             float *dst = t->f + r0 * k;
             if (t->type == GGML_BF16) { // BF16: read into the upper half of dst, widened in place (u16 << 16: exact;
@@ -553,7 +774,7 @@ static int prepare_weights(RqModel *m, int fd, int drop, LoadErr *e, char *warni
     // ~25 ms (12 threads). drop: the page cache of each matrix is dropped once it is converted (drop_cached).
     // Returns 1 if the weights were converted (0: a .bin on the generic kernels, which run from the mapping)
     TransformerWeights *w = &m->weights;
-    PrepMat mt[16];
+    PrepMat mt[PREP_MAX];
     int nm = prep_mats(m, mt);
     int gguf = w->wq[0].b != NULL, pack = prep_pack(mt, nm, warning, wlen);
     if (!pack && !gguf)
@@ -597,7 +818,10 @@ static int prepare_weights(RqModel *m, int fd, int drop, LoadErr *e, char *warni
     for (j = 0; j < nt; j++) {
         QuantizedTensor *t = job[j].t;
         size_t nq = (size_t)job[j].d * job[j].k;
-        if (fp_type(t->type))
+        if (t->trl) {
+            t->trl->codes = w->packed + job[j].off;
+            memset(t->trl->codes + trl_code_bytes(t->trl->bits, job[j].d, job[j].k), 0, TRL_PAD); // (read, never used)
+        } else if (fp_type(t->type))
             t->f = (float *)(w->packed + job[j].off);
         else if (t->type != GGML_Q8_0)
             t->kp = w->packed + job[j].off;
@@ -660,6 +884,7 @@ static size_t ctx_mem(const RqModel *m, int nb, int max_ctx, int nt) {
     if (m->kq) row += 4 * ng + 4 * (xs / 16 + hid / 16);
     size_t att_nb = ((size_t)max_ctx + ATT_P - 1) / ATT_P, blk = (size_t)(ATT_P + ATT_PSTRIDE(hd)) * sizeof(float);
     size_t n = row + 12 * V + (size_t)nt * 2 * ATT_P * hd * sizeof(float) + (size_t)p->n_heads * att_nb * blk;
+    if (m->trl) n += trl_ctx_bytes(m, nb > 1 ? nb : 1, nt); // (NariQ: trl_pass's scratch)
     if (nb > 1) {
         size_t vr = (size_t)m->att_rows * m->kv_mul; // (per thread: the scores, the partial results)
         n += (size_t)nb * row + (size_t)nt * (att_scores_floats(vr, att_nb) + vr * att_nb * ATT_PSTRIDE(hd)) * sizeof(float);
@@ -674,7 +899,7 @@ static size_t ctx_mem(const RqModel *m, int nb, int max_ctx, int nt) {
 static void model_mem(RqModel *m, int kv_type, int ck) {
     // the estimates (rq_model_mem) from the shapes and the tensor directory (no tensor data read)
     RqModelMem *o = &m->mem;
-    PrepMat mt[16];
+    PrepMat mt[PREP_MAX];
     int nm = prep_mats(m, mt), pack = prep_pack(mt, nm, NULL, 0);
     size_t wb = 0;
     if (!pack && !m->is_gguf) // (the generic kernels on a .bin: the weights are the file's mapping)
@@ -688,7 +913,7 @@ static void model_mem(RqModel *m, int kv_type, int ck) {
     if (m->mtp_of) { // (a view's pass also reads the target's classifier rows it computes and one token_embd row)
         const RqModel *t = m->mtp_of;
         const QuantizedTensor *e = t->weights.q_tokens;
-        PrepMat tm[16];
+        PrepMat tm[PREP_MAX];
         int tp = prep_pack(tm, prep_mats(t, tm), NULL, 0), dim = m->config.dim, nv = m->config.vocab_size;
         int rows = m->cls_n[1] ? m->cls_n[0] + m->cls_n[1] : nv;
         o->read += (size_t)((double)prep_bytes(t->weights.wcls, nv, dim, tp) * rows / nv);
@@ -995,11 +1220,15 @@ static void load_model(RqModel *m, const char *path, const RqModelOpts *o, Loade
         gguf_map_weights(m);
     else
         bin_map_weights(m, path, e);
+    if (m->trl)
+        trl_tab_init();
     m->repack = o->repack > 0 ? o->repack : 0;
     repack_types(m); // (before the check: it counts the repacked sizes)
     mem_check(m, o, path, e); // (nothing of the tensor data read yet)
-    if (m->is_gguf)
+    if (m->is_gguf) {
         gguf_copy_norms(m);
+        trl_load_sides(m);
+    }
     int drop = drop_page_cache(m, o);
     if (prepare_weights(m, fileno(file), drop, e, warning, wlen) && drop)
         drop_cached(fileno(file), map, map, 0); // (the rest: partial pages, readahead; mapped pages stay)
@@ -1107,6 +1336,9 @@ void rq_model_free(RqModel *m) {
         if (w->wcls != w->q_tokens) free(w->wcls);
         free_big(w->packed, w->packed_size);
         free(w->norms);
+        free(m->trl_mats);
+        free(m->trl_side);
+        free(m->cls_bands);
     }
     free(m->gguf.kv);
     free(m->gguf.t);
@@ -1408,7 +1640,7 @@ int rq_repack_info(const RqModel *m, RqRepackInfo *ri) {
     ri->weights = m->mem.weights;
     static const int types[RQ_REPACK_TYPES] = { GGML_IQ3_S, GGML_IQ3_XXS, GGML_IQ1_S, GGML_IQ1_M };
     static const int bits[RQ_REPACK_TYPES] = { RQ_REPACK_IQ3_S, RQ_REPACK_IQ3_XXS, 0, 0 };
-    PrepMat mt[16];
+    PrepMat mt[PREP_MAX];
     int nm = m->is_gguf ? prep_mats(m, mt) : 0;
     double all = 0;
     for (int i = 0; i < nm; i++)

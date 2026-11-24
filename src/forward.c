@@ -24,6 +24,12 @@ static const char *pf_name[PF_N] = { "norm+quant+resid", "gemm qkv", "qk-norm+ro
 #endif
 
 static void smb_config(RqCtx *c); // (GWENEDEG_SMB, GWENEDEG_BD: below)
+// NariQ (below): trl_pass's limits, its scratch, the classifier's phases
+#define TRL_JOBS 64  // (a banded classifier's bands)
+#define TRL_CLS 8    // rows per classifier pass (its scratch: TRL_CLS x the bands' inputs, TRL_CLS x vocab_size outputs)
+#define TRL_CHMAX 4096 // inputs per activation-side item at most (trl_chunk: max(cblk, 1024); cblk <= 4096 at load)
+static void trl_scratch(const RqModel *m, int nb, size_t *ks, size_t *ds);
+static inline int trl_cls_phases(const RqModel *m, int nsel);
 
 // rows b0..b0+n-1 of a batched pass: seq's positions pos0..; the segment's logits mode, its hidden rows' output and its
 // MTP view's h input rows (RqSegment.hidden / h_in, NULL: none / zeros)
@@ -98,6 +104,14 @@ struct RqCtx {
     int smb_max[5], smb_pf, bd_max, bd_epi, bd_split, bd_seg;
     float *att_sp; size_t att_sp_n; // split attention: per (row, query head, block) partial results
     int *row_it0;       // batch_decode_worker: attention items of row blocks 0..u-1 (per kv head)
+    // NariQ coded linears (trl_pass): per pass the jobs' activation rows (fp32 side, int8, group scales and sums) and
+    // their raw outputs, for up to trl_nb rows
+    float *trl_u, *trl_s, *trl_y; // (u: per thread TRL_CHMAX floats, an activation-side item's)
+    int8_t *trl_q;
+    int32_t *trl_sum, *trl_q4; // (q4: AVX-512 builds, trl_rows)
+    uint8_t *trl_w;     // AVX-512: per thread trl_wb bytes, the GEMM's decoded block (trl_rows' W)
+    size_t trl_wb;
+    int trl_nb;
     void *probindex;    // sampler scratch (sampler.c: vocab_size candidates)
     void *probindex_t;  // the same per thread (rq_sample_batch), allocated at its first use
     int probindex_nt;
@@ -650,6 +664,25 @@ RqCtx *rq_ctx_new(const RqModel *mc, int nb_max, int max_ctx, int *err) {
     c->nt = rq_threads_fix(); // (every later job has at most this many threads: the per-thread scratch below)
     c->nb_max = nb_max < 0 ? 0 : nb_max > B_MAX ? B_MAX : nb_max;
     smb_config(c);
+    if (m->trl) { // the coded linears' scratch (trl_pass) for trl_nb rows
+        size_t ks, ds;
+        c->trl_nb = c->nb_max > 1 ? c->nb_max : 1;
+        trl_scratch(m, c->trl_nb, &ks, &ds);
+        c->trl_u = malloc((size_t)c->nt * TRL_CHMAX * sizeof(float));
+        c->trl_q = malloc(ks);
+        c->trl_s = malloc(ks / 32 * sizeof(float) + 64);
+        c->trl_sum = malloc(ks / 32 * sizeof(int32_t) + 64);
+        c->trl_y = malloc(ds * sizeof(float));
+        if (!c->trl_u || !c->trl_q || !c->trl_s || !c->trl_sum || !c->trl_y) goto fail;
+#ifdef GWENEDEG_TRLX
+        if (!(c->trl_q4 = aligned_alloc(64, (ks * sizeof(int32_t) + 63) / 64 * 64))) goto fail;
+        int kmax = 0;
+        for (int i = 0; i < m->trl_n; i++)
+            if (m->trl_mats[i].k > kmax) kmax = m->trl_mats[i].k;
+        c->trl_wb = (size_t)16 * kmax;
+        if (c->trl_nb > 1 && !(c->trl_w = aligned_alloc(64, c->trl_wb * c->nt))) goto fail;
+#endif
+    }
     if (max_ctx <= 0 || max_ctx > p->seq_len) max_ctx = p->seq_len;
     if (c->nb_max > 1) {
         size_t nb = c->nb_max;
@@ -744,7 +777,7 @@ RqCtx *rq_ctx_new(const RqModel *mc, int nb_max, int max_ctx, int *err) {
         ncnt = 2 * p->n_kv_heads + c->pf_nrb + c->nb_max * (1 + p->n_kv_heads);
     if (m->hy.on && ncnt < 1 + 2 * m->hy.nv) ncnt = 1 + 2 * m->hy.nv; // (the linear layers of batch_decode_worker)
     int dcnt = 2 * p->n_layers * p->n_kv_heads + dn_counters(m); // (decode_worker)
-    if (rq_sync_init(&c->sync, 10 * p->n_layers + 8, dcnt > p->n_layers * ncnt + 64 ? dcnt : p->n_layers * ncnt + 64) != 0) goto fail;
+    if (rq_sync_init(&c->sync, 10 * p->n_layers + 8 + (m->trl ? 12 * p->n_layers + 8 + trl_cls_phases(m, c->nb_max > 1 ? c->nb_max : 1) : 0), dcnt > p->n_layers * ncnt + 64 ? dcnt : p->n_layers * ncnt + 64) != 0) goto fail;
     if (err) *err = RQ_OK;
     return c;
 fail:
@@ -755,7 +788,7 @@ fail:
 
 void rq_ctx_free(RqCtx *c) {
     if (!c) return;
-    void *bufs[] = { c->lin, c->lin_b, c->x, c->xb, c->hb, c->hb2, c->xq.q, c->xq.s, c->hq.q, c->hq.s, c->q, c->xq_corr, c->hq_corr,
+    void *bufs[] = { c->trl_u, c->trl_q, c->trl_s, c->trl_sum, c->trl_y, c->trl_q4, c->trl_w, c->lin, c->lin_b, c->x, c->xb, c->hb, c->hb2, c->xq.q, c->xq.s, c->hq.q, c->hq.s, c->q, c->xq_corr, c->hq_corr,
                      c->xq_xf, c->hq_xf, c->xq_c16, c->hq_c16, c->aq.q, c->aq.s, c->aq_corr, c->aq_xf, c->aq_c16, c->k,
                      c->v, c->logits, c->rope, c->att, c->att_part, c->att_b, c->att_pb, c->att_conv, c->x_b, c->xb_b,
                      c->q_b, c->k_b, c->v_b, c->hb_b, c->hb2_b, c->xq_b.q, c->xq_b.s, c->hq_b.q, c->hq_b.s, c->rope_b,
@@ -842,6 +875,10 @@ void embed_row(float *x, const QuantizedTensor *t, int token, int dim) {
     // as the whole dequantized table upstream kept in memory. GGUF: from its blocks, the same
     // expression with the fp16 scale as a float (dim % 32 == 0, checked at load)
     size_t e0 = (size_t)token * dim;
+    if (t->trl) { // NariQ: the row decoded from the mapping (trellis.h)
+        trl_embed_row(t->trl, t->b, token, x);
+        return;
+    }
     if (t->b && t->type == GGML_F32) { // (F32 alpha / beta: rq_dequant_rows)
         memcpy(x, t->b + e0 * sizeof(float), (size_t)dim * sizeof(float));
         return;
@@ -983,6 +1020,7 @@ static inline void matvec_prep(int32_t *corr, float *xf, int32_t *c16, Quantized
 static inline void matvec_rows(float *xout, QuantizedTensor *x, const int32_t *corr, const float *xf, const int32_t *c16,
                                QuantizedTensor *w, int n, int i0, int i1) {
     // xout[i] = W (d,n) row i . x (n,) for i0 <= i < i1 (multiples of 16, as the VNNI blocks)
+    if (w->trl) return; // (NariQ: computed whole before the phase, trl_pass)
     if (w->kp && iq_type(w->type)) { // Q2_K, i-quants (iquants.h: AVX-512 or generic; c16 read by the AVX-512 kernels)
         iq_rows(w->type, xout, 0, x->q, 0, x->s, c16, 1, w->kp, n, i0 / KQ_ROWS, i1 / KQ_ROWS);
         return;
@@ -1189,6 +1227,7 @@ NO_FP_CONTRACT static void gemm_item(const Gemm *g, int it, uint8_t *scr, const 
     const MatJob *jb = &g->job[j];
     QuantizedTensor *w = jb->w, *x = g->x;
     int i = it - g->it0[j], k = g->k, ldx = g->ldx, nb = g->nb;
+    if (w->trl) return; // (NariQ: trl_pass)
     if (w->f) { // F32: MB_ROWS rows over all activation rows, on the fp32 rows
         int i0 = i * MB_ROWS, i1 = i0 + MB_ROWS < jb->d ? i0 + MB_ROWS : jb->d;
         for (int b = 0; b < nb; b++)
@@ -2548,6 +2587,200 @@ static void hidden_row(RqCtx *c, int b) {
     rmsnorm(h, x, m->weights.rms_final_weight, dim);
 }
 
+// --------------------------------------------------------------------------- NariQ coded linears (trellis.h)
+
+#ifdef GWENEDEG_TRLX
+TrlTab trl_tab[6];
+static int trl_tab_ready;
+void trl_tab_init(void) {
+    // the AVX-512 kernel's tables (from the format's definition, as trl_value)
+    if (__atomic_load_n(&trl_tab_ready, __ATOMIC_ACQUIRE)) return;
+    for (int bits = 1; bits <= 6; bits++) {
+        TrlTab *tb = &trl_tab[bits - 1];
+        int total = 256 * bits, nw = 8 * bits;
+        for (int c = 0; c < 16; c++) {
+            tb->hm[c] = tb->lm[c] = 0;
+            for (int r = 0; r < 16; r++) {
+                int p = trl_ring(r, c), start = ((p + 1) * bits - 16 + total) % total;
+                int w = start >> 5, sh = 48 - (start & 31), hw = w, lw = w, cnt = sh - 32;
+                if (sh < 32) { lw = (w + 1) % nw; cnt = sh; }
+                tb->h[c][r] = hw;
+                tb->l[c][r] = lw;
+                tb->cnt[c][r] = cnt;
+                tb->hm[c] |= (uint16_t)((hw >= 32) << r);
+                tb->lm[c] |= (uint16_t)((lw >= 32) << r);
+            }
+        }
+        for (int g = 0; g < 4; g++) { // quads (trellis.h TRL_QUAD): the 32-bit window from s = (p + 1) bits - 16 of column 2g
+            tb->qhm[g] = tb->qlm[g] = 0;
+            for (int r = 0; r < 16; r++) {
+                int p = trl_ring(r, 2 * g), st = ((p + 1) * bits - 16 + total) % total, w = st >> 5, w1 = (w + 1) % nw;
+                tb->qh[g][r] = w;
+                tb->ql[g][r] = w1;
+                tb->qo[g][r] = st & 31;
+                tb->qhm[g] |= (uint16_t)((w >= 32) << r);
+                tb->qlm[g] |= (uint16_t)((w1 >= 32) << r);
+            }
+        }
+    }
+    __atomic_store_n(&trl_tab_ready, 1, __ATOMIC_RELEASE);
+}
+#else
+void trl_tab_init(void) {}
+#endif
+
+// A coded linear of a pass: nb rows of fp32 input x (row b at x + (rows ? rows[b] : b) * ldx) -> nb rows of out (stride
+// ldo), out = W x whole
+typedef struct { const TrlMat *t; const float *x; size_t ldx; float *out; size_t ldo; const int *rows; } TrlJob;
+
+typedef struct {
+    int nj, nb;
+    TrlJob job[TRL_JOBS];
+    int a0[TRL_JOBS + 1], b0[TRL_JOBS + 1], c0[TRL_JOBS + 1]; // the items of job j in phases A, B, C: x0[j] .. x0[j + 1] - 1
+    size_t ko[TRL_JOBS], yo[TRL_JOBS];                         // its scratch: activations (k values per row), outputs
+} TrlPlan;
+
+static inline int trl_chunk(const TrlMat *t) {
+    // inputs per activation-side item: whole Hadamard blocks, about 1,024 values (k % 32 == 0, cblk divides k)
+    int c = t->cblk > 1024 ? t->cblk : 1024;
+    while (t->k % c) c /= 2;
+    return c;
+}
+
+static void trl_plan(TrlPlan *P, const TrlJob *jobs, int nj, int nb) {
+    // (computed by every thread of the job: the same plan everywhere)
+    int a = 0, b = 0, cc = 0;
+    size_t ko = 0, yo = 0;
+    P->nj = nj;
+    P->nb = nb;
+    for (int j = 0; j < nj; j++) {
+        const TrlMat *t = jobs[j].t;
+        P->job[j] = jobs[j];
+        P->a0[j] = a;
+        a += nb * (t->k / trl_chunk(t));
+        P->b0[j] = b;
+        b += t->d / 16;
+        P->c0[j] = cc;
+        cc += nb * (t->rblk ? t->d / t->rblk : 1);
+        P->ko[j] = ko;
+        ko += (size_t)nb * t->k;
+        P->yo[j] = yo;
+        yo += (size_t)nb * t->d;
+    }
+    P->a0[nj] = a;
+    P->b0[nj] = b;
+    P->c0[nj] = cc;
+}
+
+static inline int trl_find(const int *x0, int it) {
+    int j = 0;
+    while (it >= x0[j + 1]) j++;
+    return j;
+}
+
+static void trl_pass(RqCtx *c, int tid, int *pk, const TrlJob *jobs, int nj, int nb) {
+    // The coded linears of jobs (sharing nothing but the pass), whole, in three phases of the running job (decode_worker
+    // and the batched workers: *pk its phase counter): A the activation side of each row (gather, pre, T_cols, s16;
+    // quantize; group sums), B the GEMV / GEMM of 16-row blocks (per-thread ranges: contiguous runs of codes), C the
+    // output side (T_rows, post, scatter) into the jobs' outputs. The phase after it reads those (matvec_rows and the
+    // GEMMs skip coded weights). trellis.h has the arithmetic: the results do not depend on the threads or the build
+    RqSync *S = &c->sync;
+    int k_ = *pk;
+    TrlPlan P;
+    trl_plan(&P, jobs, nj, nb);
+    PH_BEGIN(P.a0[nj], 1)
+    for (int it = lo; it < hi; it++) {
+        int j = trl_find(P.a0, it), r = it - P.a0[j];
+        const TrlMat *t = P.job[j].t;
+        int ch = trl_chunk(t), nc = t->k / ch, b = r / nc, c0 = (r % nc) * ch;
+        size_t o = P.ko[j] + (size_t)b * t->k;
+        float *u = c->trl_u + (size_t)tid * TRL_CHMAX - c0; // (this thread's: values c0 .. c0 + ch - 1)
+        trl_act_side(t, P.job[j].x + (size_t)(P.job[j].rows ? P.job[j].rows[b] : b) * P.job[j].ldx, u, c0, c0 + ch);
+        QuantizedTensor qv = { .q = c->trl_q + o + c0, .s = c->trl_s + o / 32 + c0 / 32 };
+        quantize(&qv, u + c0, ch);
+        int32_t *sm = c->trl_sum + o / 32 + c0 / 32;
+        for (int g = 0; g < ch / 32; g++) {
+            int32_t a = 0;
+            for (int i = 0; i < 32; i++)
+                a += qv.q[32 * g + i];
+            sm[g] = a;
+        }
+#ifdef GWENEDEG_TRLX
+        int32_t *q4 = c->trl_q4 + o + c0;
+        for (int i = 0; i < ch; i++)
+            q4[i] = (int32_t)((uint32_t)(uint8_t)qv.q[i] * 0x01010101u);
+#endif
+    }
+    PH_END_NOEPI
+    PH_BEGIN(P.b0[nj], 1)
+    for (int it = lo; it < hi;) {
+        int j = trl_find(P.b0, it), e = P.b0[j + 1] < hi ? P.b0[j + 1] : hi;
+        const TrlMat *t = P.job[j].t;
+        trl_rows(t, c->trl_y + P.yo[j], t->d, c->trl_q + P.ko[j], c->trl_q4 ? c->trl_q4 + P.ko[j] : NULL, c->trl_s + P.ko[j] / 32,
+                 c->trl_sum + P.ko[j] / 32, t->k, nb, it - P.b0[j], e - P.b0[j], c->trl_w ? c->trl_w + (size_t)tid * c->trl_wb : NULL);
+        it = e;
+    }
+    PH_END_NOEPI
+    PH_BEGIN(P.c0[nj], 1)
+    for (int it = lo; it < hi; it++) {
+        int j = trl_find(P.c0, it), r = it - P.c0[j];
+        const TrlMat *t = P.job[j].t;
+        int blk = t->rblk ? t->rblk : t->d, nob = t->d / blk, b = r / nob, r0 = (r % nob) * blk;
+        trl_out_side(t, c->trl_y + P.yo[j] + (size_t)b * t->d, P.job[j].out + (size_t)b * P.job[j].ldo, r0, r0 + blk);
+    }
+    PH_END_NOEPI
+    *pk = k_;
+}
+
+
+static int trl_cls_jobs(const RqModel *m, TrlJob *tj, const float *x, size_t ldx, float *out, size_t ldo, const int *rows) {
+    // the classifier's coded linears (a banded one: its bands, each scattering into the logits)
+    const QuantizedTensor *wc = m->weights.wcls;
+    for (int b = 0; b < wc->ntrl; b++)
+        tj[b] = (TrlJob) { wc->trl + b, x, ldx, out, ldo, rows };
+    return wc->ntrl;
+}
+
+static void trl_cls_pass(RqCtx *c, int tid, int *pk, const float *x, size_t ldx, const int *rows, float *out, size_t ldo, int n) {
+    // the classifier on n rows (row j's input at x + rows[j] * ldx, rows NULL: j), TRL_CLS rows per trl_pass
+    TrlJob tj[TRL_JOBS];
+    for (int j0 = 0; j0 < n; j0 += TRL_CLS) {
+        int nr = n - j0 < TRL_CLS ? n - j0 : TRL_CLS, nj;
+        if (rows)
+            nj = trl_cls_jobs(c->m, tj, x, ldx, out + (size_t)j0 * ldo, ldo, rows + j0);
+        else
+            nj = trl_cls_jobs(c->m, tj, x + (size_t)j0 * ldx, ldx, out + (size_t)j0 * ldo, ldo, NULL);
+        trl_pass(c, tid, pk, tj, nj, nr);
+    }
+}
+
+size_t trl_ctx_bytes(const RqModel *m, int nb, int nt) {
+    size_t ks, ds;
+    trl_scratch(m, nb, &ks, &ds);
+    return ks * (1 + 4) + ks / 32 * 8 + ds * sizeof(float) + (size_t)nt * (TRL_CHMAX * sizeof(float) + 16 * 17408) + 256;
+}
+
+static inline int trl_cls_phases(const RqModel *m, int nsel) { return m->trl ? 3 * ((nsel + TRL_CLS - 1) / TRL_CLS) : 0; }
+
+static void trl_scratch(const RqModel *m, int nb, size_t *ks, size_t *ds) {
+    // trl_pass's scratch for passes of up to nb rows: activation values (ks) and outputs (ds), the largest pass's (the
+    // layers' passes nb rows, the classifier's TRL_CLS: trl_cls_pass)
+    const Config *p = &m->config;
+    const Hybrid *hy = &m->hy;
+    size_t dim = p->dim, k = 4 * dim, d = 2 * (size_t)p->hidden_dim, ncls = nb < TRL_CLS ? nb : TRL_CLS;
+    size_t mix = m->all_heads_dim > hy->vdim ? m->all_heads_dim : hy->vdim;
+    if (k < (size_t)p->hidden_dim) k = p->hidden_dim;
+    if (k < mix) k = mix;
+    size_t qkv = (size_t)p->n_heads * m->qh + 2 * (size_t)m->kv_dim, lin = hy->on ? (size_t)lin_width(hy) : 0;
+    if (d < qkv) d = qkv;
+    if (d < lin) d = lin;
+    k *= nb;
+    d *= nb;
+    size_t kc = ncls * dim * m->weights.wcls->ntrl, dc = ncls * (size_t)p->vocab_size;
+    *ks = k > kc ? k : kc;
+    *ds = d > dc ? d : dc;
+}
+
 // ---------------------------------------------------------------------------------------- decode
 
 typedef struct { RqCtx *c; RqSeq *s; int pos; float *logits, *hidden; } DecodeJob;
@@ -2555,7 +2788,9 @@ typedef struct { RqCtx *c; RqSeq *s; int pos; float *logits, *hidden; } DecodeJo
 // phases of a decode job: per layer 4 (qkv + attention, wo, w1 + w3, w2), the classifier, the KV
 // tile pre-fault every ATT_T positions (an MTP view: + its eh_proj GEMV); dependency counters: per (layer, kv head) its
 // qkv items done, and its attention blocks done
-static int decode_phases(const RqModel *m) { return 4 * m->config.n_layers + 2 + (m->mtp_of != NULL); }
+static int decode_phases(const RqModel *m) {
+    return 4 * m->config.n_layers + 2 + (m->mtp_of != NULL) + (m->trl ? 3 * (4 * m->config.n_layers + 1) : 0); // (NariQ: trl_pass)
+}
 static int decode_counters(const RqModel *m) { return 2 * m->config.n_layers * m->config.n_kv_heads + dn_counters(m); }
 
 static void decode_norm(RqCtx *c, const Config *p, const TransformerWeights *w, int l, int resid) {
@@ -2614,6 +2849,22 @@ static void decode_worker(void *arg, int tid, int nt) {
     // forward all the layers (layer 0's attention rmsnorm + quantize: done by decode_step, an MTP view's above)
     for (int l = 0; l < p->n_layers; l++) {
         int al = m->kv_layer[l], li = m->lin_layer[l];
+        if (m->trl) { // NariQ: the layer's input projections, whole (trl_pass), read by the phase below
+            TrlJob tj[4];
+            int nj = 0;
+            if (li >= 0) {
+                float *ab = c->lin + hy->conv_dim + hy->vdim;
+                tj[nj++] = (TrlJob) { w->wqkv[li].trl, c->xb, 0, c->lin, 0 };
+                tj[nj++] = (TrlJob) { w->wz[li].trl, c->xb, 0, c->lin + hy->conv_dim, 0 };
+                tj[nj++] = (TrlJob) { w->wa[li].trl, c->xb, 0, ab, 0 };
+                tj[nj++] = (TrlJob) { w->wb[li].trl, c->xb, 0, ab + hy->nv, 0 };
+            } else {
+                tj[nj++] = (TrlJob) { w->wq[al].trl, c->xb, 0, c->q, 0 };
+                tj[nj++] = (TrlJob) { w->wk[al].trl, c->xb, 0, c->k, 0 };
+                tj[nj++] = (TrlJob) { w->wv[al].trl, c->xb, 0, c->v, 0 };
+            }
+            trl_pass(c, tid, &k_, tj, nj, 1);
+        }
         if (li >= 0) {
             // Qwen3.5's linear attention, in one phase (dependency counters dc .. dc + 2 nv): item 0 the alpha / beta
             // rows (counter dc); then per value head its v / z rows (and if h < nk key head h's q / k rows) and dn_prep
@@ -2733,6 +2984,10 @@ static void decode_worker(void *arg, int tid, int nt) {
 
         // final matmul to get the output of the attention (16-row blocks; Qwen3.5's linear layers: ssm_out);
         // epilogue: residual connection back into x, ffn rmsnorm, quantize
+        if (m->trl) { // (NariQ: into xb, from the attention's fp32 output there)
+            TrlJob tj = { (li >= 0 ? w->wso[li] : w->wo[al]).trl, c->xb, 0, c->xb, 0 };
+            trl_pass(c, tid, &k_, &tj, 1, 1);
+        }
         PH_BEGIN(dim / 16, 1)
             if (li >= 0)
                 matvec_rows(c->xb, &c->aq, c->aq_corr, c->aq_xf, c->aq_c16, w->wso + li, hy->vdim, lo * 16, hi * 16);
@@ -2748,6 +3003,10 @@ static void decode_worker(void *arg, int tid, int nt) {
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x)): per item,
         // ff rows of self.w1(x) and self.w3(x), the SwiGLU non-linearity and their quantization
+        if (m->trl) {
+            TrlJob tj[2] = { { w->w1[l].trl, c->xb, 0, c->hb, 0 }, { w->w3[l].trl, c->xb, 0, c->hb2, 0 } };
+            trl_pass(c, tid, &k_, tj, 2, 1);
+        }
         PH_BEGIN(hidden / ff, 1)
         for (int i0 = lo * ff; i0 < hi * ff; i0 += ff) {
             matvec_rows(c->hb, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->w1 + l, dim, i0, i0 + ff);
@@ -2761,6 +3020,10 @@ static void decode_worker(void *arg, int tid, int nt) {
 
         // final matmul to get the output of the ffn; epilogue: its residual, then the next layer's
         // attention rmsnorm + quantize (or the final rmsnorm for the classifier and the hidden state; none without)
+        if (m->trl) {
+            TrlJob tj = { w->w2[l].trl, c->hb, 0, c->xb, 0 };
+            trl_pass(c, tid, &k_, &tj, 1, 1);
+        }
         PH_BEGIN(dim / 16, 1)
             matvec_rows(c->xb, &c->hq, c->hq_corr, c->hq_xf, c->hq_c16, w->w2 + l, hidden, lo * 16, hi * 16);
         PH_EPILOGUE
@@ -2771,7 +3034,9 @@ static void decode_worker(void *arg, int tid, int nt) {
         PH_END
     }
 
-    if (job->logits && m->cls_n[1]) { // an MTP view's classifier subset
+    if (job->logits && m->trl) { // NariQ: the classifier's coded linears, scattering into the logits
+        trl_cls_pass(c, tid, &k_, c->x, 0, NULL, job->logits, 0, 1);
+    } else if (job->logits && m->cls_n[1]) { // an MTP view's classifier subset
         PH_BEGIN(cls_blocks(m), 8)
             cls_sub_rows(c, job->logits, 0, &c->xq, 0, c->xq_corr, c->xq_xf, c->xq_c16, 1, lo, hi);
         PH_END_NOEPI
@@ -2874,7 +3139,9 @@ typedef struct {
 } PrefillJob;
 
 // (a linear layer: 10 with its 3 recurrence phases; the hidden rows without logits: 1; an MTP view's input: 2)
-static int prefill_phases(const RqModel *m, int nhid) { return 10 * m->config.n_layers + 4 + (nhid > 0) + 2 * (m->mtp_of != NULL); }
+static int prefill_phases(const RqModel *m, int nhid, int nsel) {
+    return 10 * m->config.n_layers + 4 + (nhid > 0) + 2 * (m->mtp_of != NULL) + (m->trl ? 12 * m->config.n_layers + trl_cls_phases(m, nsel > 0 ? nsel : 1) : 0);
+}
 
 #ifdef GWENEDEG_PROFILE
 #define PPROF(i) do { if (tid == 0) PROF(c, i); } while (0)
@@ -2997,6 +3264,12 @@ static void prefill_worker(void *arg, int tid, int nt) {
             MatJob lj[4] = { { c->lin_b, lw, w->wqkv + li, hy->conv_dim }, { c->lin_b + hy->conv_dim, lw, w->wz + li, hy->vdim },
                              { c->lin_b + hy->conv_dim + hy->vdim, lw, w->wa + li, hy->nv },
                              { c->lin_b + hy->conv_dim + hy->vdim + hy->nv, lw, w->wb + li, hy->nv } };
+            if (m->trl) { // NariQ: the coded linears, whole (trl_pass)
+                TrlJob tj[4] = { { w->wqkv[li].trl, c->xb_b, xs, lb, lw, NULL }, { w->wz[li].trl, c->xb_b, xs, lb + hy->conv_dim, lw, NULL },
+                                 { w->wa[li].trl, c->xb_b, xs, lb + hy->conv_dim + hy->vdim, lw, NULL },
+                                 { w->wb[li].trl, c->xb_b, xs, lb + hy->conv_dim + hy->vdim + hy->nv, lw, NULL } };
+                trl_pass(c, tid, &k_, tj, 4, n);
+            } else {
             gemm_plan(c, &G, 4, lj, &c->xq_b, xs, n, dim, c->bq_corr, c->bq_xf, c->bq_c16, nt);
             G.xa = c->xb_b; // (F32 alpha / beta: the rmsnorm'd rows)
             G.ldxa = xs;
@@ -3006,6 +3279,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
                 for (int it = lo; it < hi; it++)
                     gemm_item(&G, it, scr, &last);
                 PH_END_NOEPI
+            }
             }
             PPROF(PF_QKV);
             int npi = dn_prep_items(hy);
@@ -3047,6 +3321,10 @@ static void prefill_worker(void *arg, int tid, int nt) {
             PH_END_NOEPI
             PPROF(PF_DNOUT);
             MatJob so = { c->xb_b, xs, w->wso + li, dim };
+            if (m->trl) {
+                TrlJob tj = { w->wso[li].trl, c->xb_b, xs, c->xb_b, xs, NULL };
+                trl_pass(c, tid, &k_, &tj, 1, n);
+            } else {
             gemm_plan(c, &G, 1, &so, &c->xq_b, xs, n, hy->vdim, c->bq_corr, c->bq_xf, c->bq_c16, nt);
             {
                 const void *last = NULL;
@@ -3055,11 +3333,17 @@ static void prefill_worker(void *arg, int tid, int nt) {
                     gemm_item(&G, it, scr, &last);
                 PH_END_NOEPI
             }
+            }
             PPROF(PF_WO);
         } else {
         // qkv GEMMs (one phase)
         MatJob qkv[3] = { { c->q_b, qd, w->wq + al, qd }, { c->k_b, kv_dim, w->wk + al, kv_dim },
                           { c->v_b, kv_dim, w->wv + al, kv_dim } };
+        if (m->trl) {
+            TrlJob tj[3] = { { w->wq[al].trl, c->xb_b, xs, c->q_b, qd, NULL }, { w->wk[al].trl, c->xb_b, xs, c->k_b, kv_dim, NULL },
+                             { w->wv[al].trl, c->xb_b, xs, c->v_b, kv_dim, NULL } };
+            trl_pass(c, tid, &k_, tj, 3, n);
+        } else {
         gemm_plan(c, &G, 3, qkv, &c->xq_b, xs, n, dim, c->bq_corr, c->bq_xf, c->bq_c16, nt);
         {
             const void *last = NULL;
@@ -3067,6 +3351,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
             for (int it = lo; it < hi; it++)
                 gemm_item(&G, it, scr, &last);
             PH_END_NOEPI
+        }
         }
         PPROF(PF_QKV);
 
@@ -3157,6 +3442,10 @@ static void prefill_worker(void *arg, int tid, int nt) {
         PPROF(PF_ATT);
 
         MatJob wo = { c->xb_b, xs, w->wo + al, dim };
+        if (m->trl) {
+            TrlJob tj = { w->wo[al].trl, c->xb_b, xs, c->xb_b, xs, NULL };
+            trl_pass(c, tid, &k_, &tj, 1, n);
+        } else {
         gemm_plan(c, &G, 1, &wo, &c->xq_b, xs, n, all_heads_dim, c->bq_corr, c->bq_xf, c->bq_c16, nt);
         {
             const void *last = NULL;
@@ -3164,6 +3453,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
             for (int it = lo; it < hi; it++)
                 gemm_item(&G, it, scr, &last);
             PH_END_NOEPI
+        }
         }
         PPROF(PF_WO);
         }
@@ -3183,6 +3473,10 @@ static void prefill_worker(void *arg, int tid, int nt) {
         PPROF(PF_NORM);
 
         MatJob w13[2] = { { c->hb_b, hidden, w->w1 + l, hidden }, { c->hb2_b, hidden, w->w3 + l, hidden } };
+        if (m->trl) {
+            TrlJob tj[2] = { { w->w1[l].trl, c->xb_b, xs, c->hb_b, hidden, NULL }, { w->w3[l].trl, c->xb_b, xs, c->hb2_b, hidden, NULL } };
+            trl_pass(c, tid, &k_, tj, 2, n);
+        } else {
         gemm_plan(c, &G, 2, w13, &c->xq_b, xs, n, dim, c->bq_corr, c->bq_xf, c->bq_c16, nt);
         {
             const void *last = NULL;
@@ -3190,6 +3484,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
             for (int it = lo; it < hi; it++)
                 gemm_item(&G, it, scr, &last);
             PH_END_NOEPI
+        }
         }
         PPROF(PF_FFN13);
 
@@ -3204,6 +3499,10 @@ static void prefill_worker(void *arg, int tid, int nt) {
         PPROF(PF_SWIGLU);
 
         MatJob w2 = { c->xb_b, xs, w->w2 + l, dim };
+        if (m->trl) {
+            TrlJob tj = { w->w2[l].trl, c->hb_b, hidden, c->xb_b, xs, NULL };
+            trl_pass(c, tid, &k_, &tj, 1, n);
+        } else {
         gemm_plan(c, &G, 1, &w2, &c->hq_b, hidden, n, hidden, c->bh_corr, c->bh_xf, c->bh_c16, nt);
         {
             const void *last = NULL;
@@ -3211,6 +3510,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
             for (int it = lo; it < hi; it++)
                 gemm_item(&G, it, scr, &last);
             PH_END_NOEPI
+        }
         }
         PPROF(PF_FFN2);
         // (its residual add is done in the next layer's first phase, or below)
@@ -3237,6 +3537,9 @@ static void prefill_worker(void *arg, int tid, int nt) {
             matvec_prep(c->xq_corr, c->xq_xf, c->xq_c16, &c->xq, 0, dim);
         PH_END_NOEPI
         int nblk = m->cls_n[1] ? cls_blocks(m) : (p->vocab_size + 15) / 16, cc = nblk / (8 * nt) > 1 ? nblk / (8 * nt) : 1;
+        if (m->trl) // NariQ: the classifier's coded linears
+            trl_cls_pass(c, tid, &k_, c->x, 0, NULL, job->out, 0, 1);
+        else {
         PH_BEGIN(nblk, cc)
             if (m->cls_n[1]) // (an MTP view's classifier subset)
                 cls_sub_rows(c, job->out, 0, &c->xq, 0, c->xq_corr, c->xq_xf, c->xq_c16, 1, lo, hi);
@@ -3244,6 +3547,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
                 matvec_rows(job->out, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->wcls, dim, lo * 16,
                             hi * 16 < p->vocab_size ? hi * 16 : p->vocab_size);
         PH_END_NOEPI
+        }
         PPROF(PF_CLS);
     } else if (job->nsel > 0) {
         // the selected rows (sel_row[j] -> logits row j): residual, final rmsnorm, quantize into
@@ -3268,6 +3572,9 @@ static void prefill_worker(void *arg, int tid, int nt) {
         if (m->cls_n[1]) // an MTP view's classifier subset: its two ranges' matrices
             for (ncj = 0; ncj < 2; ncj++)
                 cls[ncj] = (MatJob) { job->out + m->cls_lo[ncj], p->vocab_size, (QuantizedTensor *)&m->cls_part[ncj], m->cls_n[ncj] };
+        if (m->trl) // NariQ: the selected rows' normed fp32 rows are xb_b rows sel_row[j]
+            trl_cls_pass(c, tid, &k_, c->xb_b, xs, c->sel_row, job->out, p->vocab_size, nsel);
+        else {
         gemm_plan(c, &G, ncj, cls, &c->xq_b, xs, nsel, dim, c->bq_corr, c->bq_xf, c->bq_c16, nt);
         {
             const void *last = NULL;
@@ -3275,6 +3582,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
             for (int it = lo; it < hi; it++)
                 gemm_item(&G, it, scr, &last);
             PH_END_NOEPI
+        }
         }
         PPROF(PF_CLS);
     }
@@ -3327,6 +3635,7 @@ static void rows_mm(const RqCtx *c, QuantizedTensor *w, float *out, int ldo, Qua
     // out[b * ldo + i] = W row i . x row b for i0 <= i < i1 (multiples of 16), b < nb (x row b at x->q +
     // b * ldx; the activation prep of act_prep_row): the small-batch kernel (c: its prefetch distance), else the
     // decode GEMV per row. Either way each output is the GEMV's (bit-identical). Q2_K, i-quants: iq_rows
+    if (w->trl) return; // (NariQ: trl_pass)
     if (w->kp && iq_type(w->type)) {
         iq_rows(w->type, out, ldo, x->q, ldx, x->s, c16, nb, w->kp, k, i0 / 16, i1 / 16);
         return;
@@ -3361,7 +3670,10 @@ typedef struct {
 } BatchDecJob;
 
 // (+ Qwen3.5's quantization; an MTP view's input: + 2)
-static int bd_phases(const RqModel *m, int epi) { return ((epi ? 4 : 6) + m->hy.on) * m->config.n_layers + 4 + 2 * (m->mtp_of != NULL); }
+static int bd_phases(const RqModel *m, int epi, int nsel) {
+    return ((epi ? 4 : 6) + m->hy.on) * m->config.n_layers + 4 + 2 * (m->mtp_of != NULL) +
+           (m->trl ? 12 * m->config.n_layers + trl_cls_phases(m, nsel) : 0);
+}
 // per layer: per kv head its q / k / v items done, its QK-norm + RoPE + stores done; per row block its kv heads'
 // attention done; per (row block, kv head) its blocks done (split attention); (row blocks <= rows n)
 static int bd_counters(int nkv, int n, int nv) { // (nv: Qwen3.5's value heads: a linear layer needs 1 + 2 nv)
@@ -3493,6 +3805,21 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
         int al = m->kv_layer[l], li = m->lin_layer[l];
         uint64_t loff = al * (uint64_t)kv_dim; // (times the sequence's kv_len)
         int cb = l * ncl;                     // this layer's dependency counters
+        if (m->trl) { // NariQ: the layer's input projections over all rows, whole (trl_pass), read by the phase below
+            TrlJob tj[4];
+            int nj = 0;
+            if (li >= 0) {
+                tj[nj++] = (TrlJob) { w->wqkv[li].trl, c->xb_b, xs, c->lin_b, lw, NULL };
+                tj[nj++] = (TrlJob) { w->wz[li].trl, c->xb_b, xs, c->lin_b + hy->conv_dim, lw, NULL };
+                tj[nj++] = (TrlJob) { w->wa[li].trl, c->xb_b, xs, c->lin_b + hy->conv_dim + hy->vdim, lw, NULL };
+                tj[nj++] = (TrlJob) { w->wb[li].trl, c->xb_b, xs, c->lin_b + hy->conv_dim + hy->vdim + hy->nv, lw, NULL };
+            } else {
+                tj[nj++] = (TrlJob) { w->wq[al].trl, c->xb_b, xs, c->q_b, qd, NULL };
+                tj[nj++] = (TrlJob) { w->wk[al].trl, c->xb_b, xs, c->k_b, kv_dim, NULL };
+                tj[nj++] = (TrlJob) { w->wv[al].trl, c->xb_b, xs, c->v_b, kv_dim, NULL };
+            }
+            trl_pass(c, tid, &k_, tj, nj, n);
+        }
 
         if (li >= 0) {
             // Qwen3.5's linear attention over all rows, as decode_worker's: item 0 alpha / beta (counter cb), then per
@@ -3655,6 +3982,10 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
             }
             PH_END_NOEPI
         }
+        if (m->trl) { // (NariQ: from the fp32 rows, into xb_b; rows_mm below skips it)
+            TrlJob tj = { wout->trl, c->xb_b, xs, c->xb_b, xs, NULL };
+            trl_pass(c, tid, &k_, &tj, 1, n);
+        }
         if (job->epi) {
             PH_BEGIN(dim / 16, 1)
                 rows_mm(c, wout, c->xb_b, xs, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, kin, lo * 16, hi * 16);
@@ -3676,6 +4007,10 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
         }
 
         // w1 + w3 + SwiGLU + quantize per ff hidden rows, all rows
+        if (m->trl) {
+            TrlJob tj[2] = { { w->w1[l].trl, c->xb_b, xs, c->hb_b, hidden, NULL }, { w->w3[l].trl, c->xb_b, xs, c->hb2_b, hidden, NULL } };
+            trl_pass(c, tid, &k_, tj, 2, n);
+        }
         PH_BEGIN(hidden / ff, 1)
         for (int i0 = lo * ff; i0 < hi * ff; i0 += ff) {
             rows_mm(c, w->w1 + l, c->hb_b, hidden, &c->xq_b, xs, c->bq_corr, c->bq_xf, c->bq_c16, n, dim, i0, i0 + ff);
@@ -3695,6 +4030,10 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
         // w2; its residual + the next layer's attention rmsnorm (the last layer: the final rmsnorm of the
         // rows with logits, into xq_b rows 0..nsel-1, and the hidden rows: bd_last_row) + quantize
         int last = l + 1 == p->n_layers, nr = last ? job->nsel + (job->nhid ? n : 0) : n;
+        if (m->trl) {
+            TrlJob tj = { w->w2[l].trl, c->hb_b, hidden, c->xb_b, xs, NULL };
+            trl_pass(c, tid, &k_, &tj, 1, n);
+        }
         if (job->epi) {
             PH_BEGIN(dim / 16, 1)
                 rows_mm(c, w->w2 + l, c->xb_b, xs, &c->hq_b, hidden, c->bh_corr, c->bh_xf, c->bh_c16, n, hidden, lo * 16, hi * 16);
@@ -3724,7 +4063,9 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
         }
     }
 
-    if (job->nsel > 0) { // classifier over the rows with logits (xq_b rows 0..nsel-1)
+    if (job->nsel > 0 && m->trl) { // NariQ: the classifier's coded linears on the normed fp32 rows (xb_b rows sel_row[j])
+        trl_cls_pass(c, tid, &k_, c->xb_b, xs, c->sel_row, job->out, p->vocab_size, job->nsel);
+    } else if (job->nsel > 0) { // classifier over the rows with logits (xq_b rows 0..nsel-1)
         // (a vocabulary that is not a multiple of 16: the generic kernels' last block is partial, as in decode)
         int nblk = m->cls_n[1] ? cls_blocks(m) : (p->vocab_size + 15) / 16, cc = nblk / (8 * nt) > 1 ? nblk / (8 * nt) : 1;
         PH_BEGIN(nblk, cc)
@@ -3763,7 +4104,7 @@ static int batch_decode(RqCtx *c, int n, int nseg, int nrb, int nsel, int nhid, 
             c->row_it0[u + 1] = c->row_it0[u] + (c->row_pos[c->rb_b1[u] - 1] + 1 + ATT_P - 1) / ATT_P;
     }
     PROF_START(c);
-    if (rq_begin(&c->sync, bd_phases(c->m, job.epi), p->n_layers * bd_counters(nkv, n, c->m->hy.on ? c->m->hy.nv : 0), nt, rq_spin_dec) != 0)
+    if (rq_begin(&c->sync, bd_phases(c->m, job.epi, nsel), p->n_layers * bd_counters(nkv, n, c->m->hy.on ? c->m->hy.nv : 0), nt, rq_spin_dec) != 0)
         return ctx_fail(c, RQ_ERR_NOMEM, "malloc failed!");
     rq_parallel(batch_decode_worker, &job);
     return RQ_OK;
@@ -3872,7 +4213,7 @@ int rq_forward_batch(RqCtx *c, const RqSegment *sg, int nseg, float *out, float 
             }
         }
         PROF_START(c);
-        if (rq_begin(&c->sync, prefill_phases(m, nhid), p->n_layers * (nrb + job.nsp * p->n_kv_heads), rq_nthreads(), rq_spin_pf) != 0)
+        if (rq_begin(&c->sync, prefill_phases(m, nhid, nsel), p->n_layers * (nrb + job.nsp * p->n_kv_heads), rq_nthreads(), rq_spin_pf) != 0)
             return ctx_fail(c, RQ_ERR_NOMEM, "malloc failed!");
         rq_parallel(prefill_worker, &job);
     }

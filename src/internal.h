@@ -39,6 +39,8 @@
 #include "kquants.h"
 // Q2_K and the i-quants (IQ1_S .. IQ4_XS): block formats, repacked layouts, arithmetic, generic and AVX-512 kernels
 #include "iquants.h"
+// NariQ trellis-coded weights (GGUF TRL1 .. TRL6 with trellis.version 1): the format, its arithmetic, the kernels
+#include "trellis.h"
 // phase synchronization and the parallel region of a decode step / prefill chunk
 #include "threads.h"
 // the per-thread GEMM scratch bytes for k columns: a K-quant tile (KQX_SCRATCH), AVX-512: or a Q2_K / i-quant tile
@@ -123,6 +125,9 @@ typedef struct {
     uint8_t *kp;  // K-quant weights: repacked (Q3P / Q4P / Q5P / Q6P layout, kquants.h; Q2_K and the i-quants: iquants.h), else NULL
     float *f;     // F32 / BF16 weights (ssm_alpha / ssm_beta only: Qwen3.8-27B's): the rows copied at load (prepare_weights;
                   // BF16 widened to F32, exact), applied to the fp32 activations (forward.c, f32_rows), else NULL
+    TrlMat *trl;  // NariQ coded weights (type TRL1 .. TRL6, trellis.h): the matrix (ntrl 1) or a banded classifier's ntrl bands
+    int ntrl;     // (consecutive in RqModel.trl_mats), else NULL / 0. Run as whole coded linears (forward.c, trl_pass), never
+                  // by matvec_rows / the GEMMs
 } QuantizedTensor;
 
 // The MTP (multi-token prediction) block of a qwen35 file with nextn_predict_layers 1 (Qwen3.8-27B's blk.64, after the
@@ -198,7 +203,7 @@ RQ_NORETURN void load_fail(LoadErr *e, const char *fmt, ...);
 // from the metadata, Q8_0 / Q3_K / Q4_K / Q5_K / Q6_K / F32 tensors from the mapped file (layout: gguf.c)
 #define GGUF_MAGIC 0x46554747u // "GGUF"
 enum { GV_U8, GV_I8, GV_U16, GV_I16, GV_U32, GV_I32, GV_F32, GV_BOOL, GV_STR, GV_ARR, GV_U64, GV_I64, GV_F64, GV_N };
-enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q8_0 = 8, GGML_BF16 = 30 }; // tensor types (ggml numbering) used here
+enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q8_0 = 8, GGML_I32 = 26, GGML_BF16 = 30 }; // tensor types (ggml numbering) used here
 #define Q8_0_BLOCK 34 // ggml block_q8_0: fp16 scale d, int8 qs[32]; value = qs[i] * d
 
 typedef struct { const char *key; uint64_t key_len, off, n; uint32_t type, arr_type; } GgufKV; // off: value / first element
@@ -286,6 +291,14 @@ struct RqModel {
     int cls_n[2], cls_lo[2];
     QuantizedTensor cls_part[2];
     char *path;                 // the file (a copy: rq_mtp_load reads the block from it), NULL for a view
+    // NariQ coded weights (trellis.h; docs/nariq.md): trl 1 if the matrices are coded (all of them: checked at load); the
+    // matrices (trl_n of trl_cap), their side vectors (one buffer, trl_load_sides), a banded classifier's bands
+    int trl, trl_n, trl_cap;
+    TrlMat *trl_mats;
+    void *trl_side;
+    QuantizedTensor *cls_bands;
+    int n_bands;
+    const int32_t *trl_vg;      // the banded classifier's vocab_gather in the mapping (logit t = banded row trl_vg[t])
 };
 
 // floats of a thread's attention score scratch for the batched passes (forward.c's attention_kv / attention_part,
@@ -337,6 +350,8 @@ int ctx_vocab(const RqCtx *c);
 float random_f32(unsigned long long *state);
 int forward_model_init(RqModel *m); // the derived shape parameters; 0 if the shape is not supported
 
+// forward.c: the bytes of a context's NariQ scratch for batches of nb rows on nt threads (rq_ctx_new's, trl_pass)
+size_t trl_ctx_bytes(const RqModel *m, int nb, int nt);
 // forward.c: pre-fault the KV cache blocks of positions 0..n-1 of item it (attention layer it / 2, K / V: it % 2)
 void seq_kv_populate(const RqSeq *s, int n, int it);
 // forward.c: rq_prefill (its chunking: token by token through the decode path if the context's max_batch <= 1, else

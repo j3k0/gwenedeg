@@ -30,12 +30,15 @@ def parse(spec):
     return model, {k: v for k, v in kv if k != "ARG"}, [v for k, v in kv if k == "ARG"]
 
 
+RUN_KV = "f16"
+
+
 def run(model, env_extra, ids_path, n, t, consume, args=()):
     tmp = tempfile.mkdtemp()
     fifo = os.path.join(tmp, "l.fifo")
     os.mkfifo(fifo)
     env = dict(os.environ, OMP_NUM_THREADS=str(t), **env_extra)
-    p = subprocess.Popen([os.path.join(ROOT, "build", "long_ctx"), model, "-I", ids_path, "-A", "-o", fifo, *args],
+    p = subprocess.Popen([os.path.join(ROOT, "build", "long_ctx"), model, "-I", ids_path, "-A", "-o", fifo, "-k", RUN_KV, *args],
                          env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     err = []
     th = threading.Thread(target=lambda: err.append(p.stderr.read()))
@@ -70,8 +73,11 @@ def main():
     ap.add_argument("tests", nargs="+")
     ap.add_argument("-t", type=int, default=8)
     ap.add_argument("--topk", type=int, default=1024)
+    ap.add_argument("-k", default="f16", help="KV cache type of the runs")
     a = ap.parse_args()
     K = a.topk
+    global RUN_KV
+    RUN_KV = a.k
     seqs = [np.fromfile(p, np.int32) for p in a.ids.split(",")]
     refs = []
     rm, renv, rargs = parse(a.ref)

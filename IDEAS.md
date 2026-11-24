@@ -74,8 +74,9 @@ activation format for the existing types, measured on the 27B. V4H itself only w
 [section 10](docs/v4h.md#10-flat-activations-for-the-existing-types-kernel-measurement-2026-11-24) measured it per type
 (`make flat-bench`): 1.21-1.23x on the 27B file's i-quant GEMMs at 512 rows, weighted by type, small batches unchanged.
 [section 11](docs/v4h.md#11-implemented-as---act256-2026-11-24): implemented as the opt-in `gwenedeg --act256` (commit
-6a35a07), all paths bit-identical; Qwen3.5-0.8B prefill 1.14x / 1.11x, KL vs the default <= +0.004. Open: the 27B's
-end-to-end numbers (the day server has to be stopped).
+6a35a07), all paths bit-identical; Qwen3.5-0.8B prefill 1.14x / 1.11x, KL vs the default <= +0.004. On the 27B (2026-11-24,
+the day server stopped): prefill 1.16-1.18x at 1.5k and 8k prompts (103 / 100 -> 122 / 117 tok/s), decode
+unchanged, KL vs the default 0.0030 / 0.0014, PPL x1.004 / x1.00.
 
 `vpdpbusd` still needs one byte per weight, so a lower bit width alone cannot raise its compute peak. A format co-designed with the
 kernel could nevertheless beat the i-quants by making nibble expansion and scaling cheaper. V4H uses 16-row x 256-column

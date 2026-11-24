@@ -509,8 +509,20 @@ same way in an HEAD worktree (server admission order and the KV-disk watcher: en
 vs generic, api_test) all pass with the same bitwise invariants as the default, at thresholds for their lower
 cosine vs the numpy reference (TH_Q35_ACT256).
 
-Open (before this could become the default):
+On the 27B (ISTA's `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf`, `--repack`, `-k q4-dot`, 14 threads, the day server stopped,
+2026-11-24; `scripts/bench_prefill.sh -P`'s prompts, best / median of 3 interleaved runs):
 
-- The 27B: end-to-end prefill and KL vs the current definition (step 4; the day server has to be stopped).
+| | default | `--act256` | ratio |
+|---|---:|---:|---:|
+| prefill 1,500 tok | 106.1 / 103.1 tok/s | 123.4 / 121.9 tok/s | 1.16 / 1.18 |
+| prefill 8,000 tok | 100.8 / 99.1 tok/s | 117.7 / 116.2 tok/s | 1.17 / 1.17 |
+| decode 32 tok | 13.1 - 13.2 tok/s | 12.3 - 13.2 tok/s | 1.0 |
+
+KL of `--act256` vs the default on the same file (`tools/v4h_kl.py`, `build/long_ctx -A`, 8,192 tokens each of wikitext
+and llama.cpp source): 0.0030 (p99 0.030, top-1 97.2%, PPL x1.004) and 0.0014 (p99 0.024, top-1 99.4%, PPL x1.00) --
+about the same as on the 0.8B files, and 1.5-2% of the file's KL against its higher-precision reference.
+
+Open:
+
 - The attention / linear-attention epilogue quantizes: measure their cost on a real workload.
 - A user-visible way to compare (e.g. the logit KL of `--act256` vs the default on one prompt).

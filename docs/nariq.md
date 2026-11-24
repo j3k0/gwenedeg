@@ -112,6 +112,27 @@ French: its classifier is 13 of 16 bands at 2 bits and its embedding 2-bit (Nari
 MGSM, a significant drop, while their report calls it level). gwenedeg vs llama.cpp on the IQ3_S file: median KL 1e-4,
 mean 0.048 (those sensitive positions; gwenedeg's perplexity on the transcript 3.96, llama.cpp's 4.02): worth a look.
 
+Second round (2026-11-24, the same reference and engines): 16 code excerpts of ~2,800 characters (~650-1,100 tokens:
+C, TypeScript, Rust, Python, JavaScript, PHP, Go, Java, shell; local repositories and vendored open-source files) and
+model-written answers (an LRU cache in Python, a C off-by-one bug, two tool-call turns; written greedily by each quant,
+both scored on all), per-position KL from Q8_0, the ratio NariQ / IQ3_S of the mean KL per text with a 95% moving-block
+bootstrap interval (blocks of 32 positions), pooled as the geometric mean of the per-text ratios with a bootstrap over
+texts:
+
+| set | NariQ / IQ3_S mean KL | texts NariQ lower | per-text CI excludes 1 |
+|---|---|---|---|
+| code, both quants run by gwenedeg | 0.94 [0.85, 1.04] | 10 of 16 | better 6, worse 1 |
+| code, both run by llama.cpp | 0.90 [0.82, 1.00] | 11 of 16 | |
+| code, engine-sensitive positions left out | 0.94 [0.85, 1.05] | 10 of 16 | |
+| model-written answers (4 of ~450 tokens) | 0.79-0.90 each, ~0.85 pooled | 4 of 4 | none alone |
+
+Per code file the ratio runs from 0.71 (src/threads.c, the first round's only code text: its -30% was the favorable
+end) to 1.37 (a PHP file); medians per file are within ~20% either way. So on code NariQ 3.0 is about level with the
+IQ3_S file (6-10% lower KL on average, not significant over 16 files), on model-written coding answers ~15% closer
+(consistent but small samples), on the hand-written agent transcript of the first round 30% closer (one text), and on
+French twice as far. By the rule of thumb of 2-4x KL per bit per weight, level-to-15% is 0-0.25 bit: NariQ matches
+the 3.44 bpw file with 0.45 bpw less, not a quality step up.
+
 ## Open
 
 - Decode at full threads: ~20% of the GEMV phase waits at its end (load from other processes, 16 vs 14 threads);

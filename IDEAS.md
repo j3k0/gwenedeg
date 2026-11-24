@@ -71,9 +71,11 @@ IQ4_XS's 0.061 / 0.041. The activation subscale is unnecessary: even one activat
 kernels (`make v4h-bench`) are bit-identical to the definition. A tile decoded to `s q` bytes runs 1.34-1.38x faster than
 IQ3_S/r, but the existing IQ3_S/r and IQ4_XS tiles with one activation scale per 256 already get 1.17-1.25x. Next step: that
 activation format for the existing types, measured on the 27B. V4H itself only with a better quantizer.
-The kernel measurement for the 27B file's types ([section 10](docs/v4h.md#10-flat-activations-for-the-existing-types-kernel-measurement-2026-11-24),
-`make flat-bench`) gives 1.21-1.23x on its i-quant GEMMs at 512 rows, weighted by type, bit-identical to the new definition.
-Small batches are unchanged. Next: the opt-in implementation in `forward.c`.
+[section 10](docs/v4h.md#10-flat-activations-for-the-existing-types-kernel-measurement-2026-11-24) measured it per type
+(`make flat-bench`): 1.21-1.23x on the 27B file's i-quant GEMMs at 512 rows, weighted by type, small batches unchanged.
+[section 11](docs/v4h.md#11-implemented-as---act256-2026-11-24): implemented as the opt-in `gwenedeg --act256` (commit
+6a35a07), all paths bit-identical; Qwen3.5-0.8B prefill 1.14x / 1.11x, KL vs the default <= +0.004. Open: the 27B's
+end-to-end numbers (the day server has to be stopped).
 
 `vpdpbusd` still needs one byte per weight, so a lower bit width alone cannot raise its compute peak. A format co-designed with the
 kernel could nevertheless beat the i-quants by making nibble expansion and scaling cheaper. V4H uses 16-row x 256-column

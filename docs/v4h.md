@@ -468,3 +468,49 @@ What it means:
   one scale per 256, plus the X pairs; `iqf_dot` as the generic definition; the rows and tiled kernels; NEON (`iqn_*`:
   untested here, no AArch64 machine); and the bitwise tests across paths, thread counts and batch sizes. Then step 4: on
   the 27B, prefill speed and KL against today's definition, with the day server stopped.
+
+## 11. Implemented as `--act256` (2026-11-24)
+
+`RqModelOpts.act256` (`gwenedeg --act256`, `gwenedeg serve --act256`, opt-in) implements the activation change, including
+where section 10's benchmark could not check it:
+
+- **Activation prep.** `forward.c quantize256`: quantize()'s operations with one scale per 256, the scale written to each
+  of its groups of GS, so every kernel still reads per-group scales as before (only the Q2_K / i-quant kernels under the
+  flag take it as the super-block's). 24 call sites: the decode row, its FFN and attention parts, the batched rows,
+  batched prefill, the verify row, the hidden rows, an MTP view's input row and the trellis side buffers.
+- **Kernels.** `iquants.h`: `iqf_dot` (the definition, and the generic and NEON builds' kernel), `iqf_rows` (the AVX-512
+  rows kernel) and `iqf_tile` / `iqf_gemm_item` (the tiled GEMM on the existing scratch). Dispatch per matrix on
+  `QuantizedTensor.act256`, so a model runs mixed: IQ3_S / IQ3_XXS / IQ4_XS / Q2_K / IQ2_* / IQ1_* flat, Q4_K / Q6_K /
+  Q8_0 / NariQ per 32.
+- **Where a part is not a whole super-block.** An attention group (kv_mul * hd) or a linear-attention head (dv) that is
+  not a multiple of 256 (Qwen3.5's are 128, and most of Qwen3's attention groups) would otherwise quantize a partial
+  super-block: those phases quantize their whole row once in the phase epilogue instead (a few % slower than a whole
+  super-block there, not measured; Qwen3-0.6B's kv groups are 128 too). The FFN items are whole super-blocks
+  (ff_rows = 256 under the flag).
+- **Rejected inputs** (`RqModelOpts.act256 = 0` with a warning): a NariQ file (trellis matrices cannot take it) and a
+  hidden size not a multiple of 256. Not implemented for the flag: Q4_K / Q6_K flat tiles (the K-quant GEMMs keep the
+  per-32 folds; 12% of ISTA's 27B weights), and the `--repack-info` timings do not load with the flag set.
+- **Decode (`quantize` on one row at a time)** is the same function with n = dim: whole rows, no partial super-blocks.
+
+Quality and speed:
+
+- `tests/kernels/flat_bench.c`: the prototype kernels of section 10 are gone; the production `iqf_*` ones are tested
+  (143 cases) and give the same times. Weighted by ISTA's file's types: 1.20-1.23x at 512 rows, 1.13x at 24.
+- Qwen3.5-0.8B, 1,500-token prompt, `-b 512`, 8 threads, day server up, best of 5 interleaved: IQ3_S 2377 -> 2707 tok/s
+  (1.14x), IQ4_XS 2414 -> 2667 (1.11x). End-to-end on the 27B should be less (its non-i-quant phases do not change);
+  not measured yet (the day server would have to be stopped).
+- KL vs the default on the same files (`tools/v4h_kl.py`, gwenedeg itself): IQ3_S +0.0036 wiki / +0.0014 code, IQ4_XS
+  +0.0028 / +0.0007, Q4_K +0.0021 / +0.0005, Q8_0 +0.0037 / +0.0010. About 2-7% of those files' total KL. Q8_0's
+  +0.0037 is the activation change alone, on 8-bit weights.
+
+The test suite (`tests/run_tests.sh`, TMPDIR on disk, the day server up): 1,902 passed, 3 failed; those three fail the
+same way in an HEAD worktree (server admission order and the KV-disk watcher: environment-sensitive). The q35 group's
+`act256` runs (synth-q35-iq with all nine i-quant types, synth-q35-ista-mtp, synth-q35-27b; batched, threads, AVX-512
+vs generic, api_test) all pass with the same bitwise invariants as the default, at thresholds for their lower
+cosine vs the numpy reference (TH_Q35_ACT256).
+
+Open (before this could become the default):
+
+- The 27B: end-to-end prefill and KL vs the current definition (step 4; the day server has to be stopped).
+- The attention / linear-attention epilogue quantizes: measure their cost on a real workload.
+- A user-visible way to compare (e.g. the logit KL of `--act256` vs the default on one prompt).

@@ -91,8 +91,26 @@ The embedding row is decoded from the mapping at lookup (`trl_embed_row`).
 | decode, 0.8B draft -G 3 | 8.6-8.7 tok/s (2.37 tok/pass) | (its MTP block: 14-15 in the server) |
 | prefill, 1,959 tokens | 81.7 tok/s | 102.6 tok/s |
 
-Quality (Nari's numbers, not measured here): agent KL from BF16 0.0063 at 3.0 bpw, against 0.0239 for the best
-published file at or below 3.24 bpw; GSQ-RCO IQ3_S (3.50 bpw) is not in their table.
+Quality (Nari's numbers): agent KL from BF16 0.0063 at 3.0 bpw, against 0.0239 for the best published file at or
+below 3.24 bpw; GSQ-RCO IQ3_S (3.50 bpw), the file of the day server, is not in their table. Measured here against it
+(2026-11-24): KL from Unsloth's Q8_0 (as a stand-in for BF16, run by the fork's llama.cpp CPU build from the mapping:
+29 GB on this 30 GB machine) on four texts written by hand (not by the model: higher KLs than Nari's, which counts
+model-written tokens only), both quants run by gwenedeg:
+
+| text (positions) | NariQ KL mean / median | IQ3_S KL mean / median | top-1 vs Q8_0 |
+|---|---|---|---|
+| coding-agent transcript, tool calls (857) | **0.127** / **0.0009** | 0.182 / 0.0010 | 91.4 / 88.7% |
+| C source, src/threads.c (796) | **0.023** / **0.009** | 0.032 / 0.010 | 95.2 / 93.7% |
+| English technical prose, docs/iquants.md (1148) | 0.074 / **0.038** | **0.067** / 0.040 | 86.3 / 86.8% |
+| French + Breton chat (537) | 0.165 / 0.042 | **0.085** / **0.018** | 83.1 / 91.1% |
+
+(Agent row: the 73 positions where the two engines disagree on the same weights by more than KL 0.05 left out: a few
+positions are very sensitive to rounding, and there every run differs, even llama.cpp's Q8_0 from its own IQ3_S, by
+KL up to 20; with them the means are 0.29 / 0.36. The ranking is the same with both quants run by llama.cpp.) NariQ is
+closer to the reference on code and agent traces (its calibration data), even with English prose, and twice as far on
+French: its classifier is 13 of 16 bands at 2 bits and its embedding 2-bit (Nari's 2.5 bpw file loses 2.2 points on
+MGSM, a significant drop, while their report calls it level). gwenedeg vs llama.cpp on the IQ3_S file: median KL 1e-4,
+mean 0.048 (those sensitive positions; gwenedeg's perplexity on the transcript 3.96, llama.cpp's 4.02): worth a look.
 
 ## Open
 

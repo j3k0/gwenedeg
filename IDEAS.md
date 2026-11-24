@@ -71,6 +71,9 @@ IQ4_XS's 0.061 / 0.041. The activation subscale is unnecessary: even one activat
 kernels (`make v4h-bench`) are bit-identical to the definition. A tile decoded to `s q` bytes runs 1.34-1.38x faster than
 IQ3_S/r, but the existing IQ3_S/r and IQ4_XS tiles with one activation scale per 256 already get 1.17-1.25x. Next step: that
 activation format for the existing types, measured on the 27B. V4H itself only with a better quantizer.
+The kernel measurement for the 27B file's types ([section 10](docs/v4h.md#10-flat-activations-for-the-existing-types-kernel-measurement-2026-11-24),
+`make flat-bench`) gives 1.21-1.23x on its i-quant GEMMs at 512 rows, weighted by type, bit-identical to the new definition.
+Small batches are unchanged. Next: the opt-in implementation in `forward.c`.
 
 `vpdpbusd` still needs one byte per weight, so a lower bit width alone cannot raise its compute peak. A format co-designed with the
 kernel could nevertheless beat the i-quants by making nibble expansion and scaling cheaper. V4H uses 16-row x 256-column

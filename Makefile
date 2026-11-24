@@ -31,7 +31,7 @@ HDR = $(wildcard src/*.h)
 Q8  = models/Qwen3-0.6B-q8.bin
 B   = build
 
-.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test iq-neon-test iq-repack-test iq-gemm-test v4h-bench api-test tools-test bench-batch bench-verify long-ctx bench-long bench-mtp spec-sweep teacher-force mem-probe bf16dp-test FORCE
+.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test iq-neon-test iq-repack-test iq-gemm-test v4h-bench flat-bench api-test tools-test bench-batch bench-verify long-ctx bench-long bench-mtp spec-sweep teacher-force mem-probe bf16dp-test FORCE
 
 all: gwenedeg
 
@@ -181,6 +181,13 @@ $(B)/v4h_bench: tests/kernels/v4h_bench.c src/kernels_avx512.h src/iquants.h src
 	$(CC) $(CFLAGS) -ffp-contract=off -fopenmp $< -o $@
 v4h-bench: $(B)/v4h_bench
 	$(B)/v4h_bench
+# flat activations (one scale per 256) for the i-quants (docs/v4h.md section 9): rows and tiled kernels vs their generic
+# definition for every type, and the micro-benchmark against today's kernels (build/flat_bench -b [NB [D [K [REPS]]]])
+$(B)/flat_bench: tests/kernels/flat_bench.c src/kernels_avx512.h src/iquants.h src/iq_grids.h src/kquants.h
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -fopenmp $< -o $@
+flat-bench: $(B)/flat_bench
+	$(B)/flat_bench
 
 generic: gwenedeg-generic
 

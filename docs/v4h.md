@@ -409,3 +409,62 @@ ns per weight and activation row (x threads); in parentheses, speed relative to 
    prefill and 1.1-1.3x on cache-resident GEMV. On the 0.8B model its quality per bit is worse than IQ4_XS. Better rounding
    (GPTQ-style error feedback), and the unexplained perplexity loss above, come before any 27B quantization. Quantizing the
    27B needs its BF16 checkpoint (about 54 GB) and a reference run that does not fit beside the day server.
+
+## 10. Flat activations for the existing types: kernel measurement (2026-11-24)
+
+This is item 1 of the plan above, as a micro-benchmark only: nothing in `forward.c` changes yet.
+`tests/kernels/flat_bench.c` (`make flat-bench`) covers every i-quant type of ISTA's 27B file. The definition, `iqf_dot`
+(generic C), is the current one, except for where the fold happens:
+
+```
+I = sum over the 8 groups of (S_0 T_0 + S_1 T_1)            int32, exact: |I_g| < 2^23 (IQ4_XS < 2^24), so |I| < 2^27
+val = val + (D * A[s]) * (float) I                          one fp32 scale A per 256 activations, each operation rounded
+Q2_K: M = sum over the groups of (m_0 X_0 + m_1 X_1),  val = val + ((D * A) * (float) I - (Dm * A) * (float) M)
+```
+
+The codes, `D`, `S`, `c16`, the decode (`iq512_group`) and the tile scratch (`iqx_unpack_tile`) are today's. The AVX-512
+rows kernel (`iqf_blk`: GEMV, verify and batched decode) and the tiled kernel (`iqf_tile`) are bit-identical to `iqf_dot`
+for all 11 types (the file's 8, plus IQ1_S and the non-repacked IQ3_S / IQ3_XXS). The test covers 1 to 77 rows, k up to
+17408, activations at ±127, and both decodes, VBMI and gather: 143 cases. A deliberate off-by-one in the tiled kernel
+fails 261 comparisons.
+
+Q2_K needs the activation prep to store each group's pair `X_0 | X_1 << 16`, one int32 per 32 activations. With the pair
+rebuilt from `c16` inside the kernel, as today's Q2_K tile does, the mins term costs the whole gain (0.98x). With the
+stored pair, summed in the group loop, the gain is 1.28x. Today's kernel could use the stored pairs too, so part of Q2_K's
+gain is not from the activation format; Q2_K is 2.7% of the weights.
+
+ns per weight and activation row (x threads), best of 5, day server running (load 2-4). Ratio = today's faster path /
+the flat format's faster path:
+
+| type (share of the 27B file) | today rows | today tiled | flat tiled | 512 rows, 17408 x 5120 | 512 rows, 5120 x 17408 | 512 rows, 1 thr, 1024 x 5120 | 24 rows |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| IQ3_S/r (31.0%) | 0.00615 | 0.00403 | 0.00327 | 1.23 | 1.22 | 1.23 | 1.14 |
+| IQ4_XS (20.8%) | 0.00600 | 0.00417 | 0.00332 | 1.25 | 1.23 | 1.23 | 1.18 |
+| IQ3_XXS/r (19.8%) | 0.00565 | 0.00398 | 0.00329 | 1.21 | 1.20 | 1.23 | 1.11 |
+| IQ2_S (9.1%) | 0.00751 | 0.00466 | 0.00399 | 1.17 | 1.17 | 1.18 | 1.09 |
+| IQ2_XS (2.8%) | 0.00712 | 0.00477 | 0.00396 | 1.20 | 1.17 | 1.19 | 1.10 |
+| Q2_K (2.7%) | 0.00666 | 0.00449 | 0.00351 | 1.28 | 1.29 | 1.32 | 1.24 |
+| IQ2_XXS (1.4%) | 0.00648 | 0.00394 | 0.00319 | 1.24 | 1.25 | 1.23 | 1.18 |
+| IQ1_M (0.3%) | 0.00647 | 0.00456 | 0.00385 | 1.19 | 1.17 | 1.19 | 1.09 |
+| **weighted by share (87.9%)** | | | | **1.225** | **1.213** | **1.222** | **1.137** |
+
+The first three numeric columns are the 512-row, 8-thread, 17408 x 5120 run.
+
+Weighted totals for the other batch sizes (8 threads, 17408 x 5120): 64 rows 1.17x; 16 rows 1.07x (with the tiled
+kernel; with today's rule of rows below `IQX_MIN` = 24, 0.96x); 8 rows 1.02x; 4 rows 1.07-1.20x; 1 row 1.05x. In cache
+(1 thread, 1024 x 5120): 8 rows 1.10x, 1 row 1.02x. Below 24 rows the same configuration varies by 10-20% between runs
+with the day server up. Passes of 4, 6 or 8 rows in the rows kernel give 0.93-1.2x with no consistent order, so verify
+and batched decode should be counted as unchanged. At 16 rows the flat tiled kernel beats both rows kernels, so `IQX_MIN`
+may move down to about 16.
+
+What it means:
+
+- **Prefill.** The i-quant GEMMs gain 1.21-1.23x for the file's mix, on both shapes and on one thread. The 27B's prefill is
+  about 90% GEMM phases (PP-RESULTS.md), and 12% of the weights are K-quants (Q4_K, Q6_K) that this does not cover. The
+  arithmetic gives about 1.17x end-to-end. The last kernel change delivered 1.32x where the micro-benchmark said 1.5x, so
+  expect roughly **1.1-1.15x end-to-end prefill**, to be measured.
+- **Decode, verify and small batches:** no reliable change.
+- **Next (step 3):** the definition in `forward.c`'s matmul paths as an opt-in mode. That means: activations quantized with
+  one scale per 256, plus the X pairs; `iqf_dot` as the generic definition; the rows and tiled kernels; NEON (`iqn_*`:
+  untested here, no AArch64 machine); and the bitwise tests across paths, thread counts and batch sizes. Then step 4: on
+  the 27B, prefill speed and KL against today's definition, with the day server stopped.

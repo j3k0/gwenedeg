@@ -27,6 +27,7 @@ that is not rewritten when the code moves on.
 |---|---|---|
 | [library.md](library.md) | reference | the C API (`src/gwenedeg.h`): models, sequences, contexts, the forward passes; the source file map |
 | [iquants.md](iquants.md) | design + reference | Q2_K and the i-quants: formats, arithmetic, AVX-512 and NEON kernels, `--repack`, measurements, what is not done |
+| [v4h.md](v4h.md) | design proposal | unimplemented VNNI-native 4-bit weights and activations: layout, integer subscales, arithmetic bounds, expected headroom and prototype plan |
 | [kv-quant.md](kv-quant.md) | design + reference | the 8-bit and 4-bit KV caches: definition, quality (KL vs HF), speed |
 | [qwen35.md](qwen35.md) | design | Qwen3.5's architecture and GGUF layout, design decisions, performance, long context |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | design + history | changes from qwen3.c, chat / KV / threads details, per-step benchmark notes, platform and test status, testing and benchmark scripts, CI with Dagger, rejected experiments, the step table |

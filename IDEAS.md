@@ -60,3 +60,34 @@ the index (through `rope_row`, the KV cache, the checkpoints and the sequence AP
 API; the server's OpenAI image content parts; the template's image items; HF goldens with images. Several weeks.
 Notes: `docs/qwen35.md` (the text model only), llama.cpp's `mtmd` / `clip` and `conversion/qwen3vl.py` as the
 reference for the layout.
+
+## V4H: a VNNI-native 4-bit weight and activation format
+
+Full analysis, layout, arithmetic proof and prototype plan: [docs/v4h.md](docs/v4h.md).
+
+`vpdpbusd` still needs one byte per weight, so a lower bit width alone cannot raise its compute peak. A format co-designed with the
+kernel could nevertheless beat the i-quants by making nibble expansion and scaling cheaper. V4H uses 16-row x 256-column
+superblocks: 4-bit codes `u = q + 8` (`q = -8 .. 7`), an fp16 `D` per row and superblock, and a 4-bit unsigned subscale `s`
+per row and group of 32. Activations are int8 `z = -127 .. 127`, with an fp32 `A` per 256 values and a u8 subscale `a` per 32.
+The definition is `w = D s q`, `x = A a z`, hence `y += D A * sum_g(s_g a_g * sum_j(q_j z_j))`. Weight storage is 2048 + 64 +
+32 = 2144 bytes per 16 x 256 values, the same 4.1875 bits/weight and physical D / scales / nibbles arrangement as IQ3_S/r.
+This is a new quantization, not a lossless repack, and needs a quantizer plus KL / perplexity evaluation.
+
+The nibbles decode directly with `and`, `shift`, `and`, without IQ3_S/r's `vpshufb`, codebooks or sign handling; the fixed bias
+uses the activation sums as now. For each group of 32, `T = sum(q z)`, `C = s a`, and an int32 accumulator takes `I += C T`;
+there is one float fold per 256 columns instead of eight. The ranges fit the other VNNI instruction exactly: `|T| <= 32512`,
+`C <= 3825`, and `|I| < 1 billion`. With C's high 16 bits zero, `vpdpwssd(I, T, C)` multiplies the complete signed low-16-bit
+T by C and accumulates it, with no narrowing or packing (the high-T product is multiplied by zero). Compare that with
+`vpmulld + vpaddd`: the former uses fewer instructions but may compete for the same execution ports as `vpdpbusd`.
+
+The target is the measured per-32-fold overhead in docs/iquants.md: one-scale tiled GEMMs run at 0.0038-0.0039 ns per weight
+and activation row, versus 0.0031 in the diagnostic without the fold, so about 1.25x kernel speed is the plausible headroom,
+not another 4x. Direct nibbles should matter most to GEMV and small batches; tiled prefill already amortizes decoding. At the
+memory-bound end V4H has the same traffic as IQ3_S/r and should not beat it merely by having a simpler kernel. V4-flat (no
+subscales, one scale per 256 or per row) is the speed-ceiling experiment; V3H (the same hierarchy with 3-bit codes, 3.1875
+bits/weight) is the DRAM-bound-decode variant, with more unpacking and unknown quality.
+
+Prototype from `iq512_group` / `iqx_tile` in `src/iquants.h`, with the Q8P register-tile rules in `src/kernels_avx512.h`. Benchmark
+both integer scale-and-accumulate forms at 1, 4, 8, 64 and 512 activation rows against IQ3_S/r. Every build needs the same
+arithmetic definition and rounded float operations. Open: quantization quality, the activation subscale representation, whether
+`vpdpwssd` wins on Zen 4, and whether any end-to-end gain survives the memory-bound phases.

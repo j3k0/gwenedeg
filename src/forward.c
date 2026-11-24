@@ -150,7 +150,7 @@ int forward_model_init(RqModel *m) {
     m->xs = hy->vdim > m->xs ? hy->vdim : m->xs; // (the linear layers' output: the input of their projection)
     m->att_scale = 1.0f / sqrtf(p->head_dim);
     m->att_rows = m->kv_mul < 1 ? 0 : ATT_NV_MAX / m->kv_mul < ATT_ROWS ? ATT_NV_MAX / m->kv_mul : ATT_ROWS;
-    m->ff_rows = GS > 64 ? GS : 64;
+    m->ff_rows = m->act256 ? 256 : GS > 64 ? GS : 64; // (--act256: each FFN item quantizes whole super-blocks of 256)
     m->ssm_layer = hy->on ? ssm_conv_floats(hy) + (size_t)hy->nv * hy->dk * hy->dv : 0;
     return !(m->kv_mul < 1 || m->att_rows < 1 || p->head_dim % 16 || (m->kv_mul * p->head_dim) % GS ||
              p->hidden_dim % m->ff_rows || m->ff_rows % GS || p->dim % 16 || m->rope_dim % 2 || m->rope_dim > p->head_dim ||
@@ -906,6 +906,42 @@ void quantize(QuantizedTensor *qx, float *x, int n) {
     }
 }
 
+static void quantize256(QuantizedTensor *qx, const float *x, int n) {
+    // RqModelOpts.act256: quantize()'s operations with one scale per 256 values from x (a shorter tail: its own), the
+    // scale written to each of its groups of GS (every kernel reads per-group scales; the Q2_K / i-quant ones under
+    // --act256 take s[8 j] for super-block j: iquants.h iqf_*). Callers pass whole rows or super-blocks from a row's start
+    const int gs = GS;
+    for (int i0 = 0; i0 < n; i0 += 256) {
+        const int len = n - i0 < 256 ? n - i0 : 256;
+        const float *restrict xg = x + i0;
+        int8_t *restrict qg = qx->q + i0;
+        float wmax = 0;
+        for (int i = 0; i < len; i++) {
+            float val = fabsf(xg[i]);
+            if (val > wmax)
+                wmax = val;
+        }
+        float sc = wmax * (1.0f / 127.0f);
+        for (int g = 0; g < len / gs; g++)
+            qx->s[i0 / gs + g] = sc;
+        if (!(wmax > 0)) {
+            memset(qg, 0, len);
+            continue;
+        }
+        float inv = 127.0f / wmax;
+        for (int i = 0; i < len; i++) {
+            float v = xg[i] * inv;
+            qg[i] = (int8_t)(int32_t)(v + copysignf(0.49999997f, v));
+        }
+    }
+}
+
+static inline void quantize_act(const RqModel *m, QuantizedTensor *qx, float *x, int n) {
+    // a matmul's activations: per 256 under RqModelOpts.act256, else per GS (quantize)
+    if (m->act256) quantize256(qx, x, n);
+    else quantize(qx, x, n);
+}
+
 // (fp16_to_f32: kquants.h)
 void embed_row(float *x, const QuantizedTensor *t, int token, int dim) {
     // row `token` of the Q8_0 embedding table t, dequantized with upstream's dequantize()
@@ -1060,7 +1096,7 @@ static inline void matvec_rows(float *xout, QuantizedTensor *x, const int32_t *c
     // xout[i] = W (d,n) row i . x (n,) for i0 <= i < i1 (multiples of 16, as the VNNI blocks)
     if (w->trl) return; // (NariQ: computed whole before the phase, trl_pass)
     if (w->kp && iq_type(w->type)) { // Q2_K, i-quants (iquants.h: AVX-512 or generic; c16 read by the AVX-512 kernels)
-        iq_rows(w->type, xout, 0, x->q, 0, x->s, c16, 1, w->kp, n, i0 / KQ_ROWS, i1 / KQ_ROWS);
+        (w->act256 ? iqf_rows : iq_rows)(w->type, xout, 0, x->q, 0, x->s, c16, 1, w->kp, n, i0 / KQ_ROWS, i1 / KQ_ROWS);
         return;
     }
     if (w->kp) { // K-quants, 16-row blocks (kquants.h; AVX-512: kernels_avx512.h)
@@ -1286,7 +1322,8 @@ NO_FP_CONTRACT static void gemm_item(const Gemm *g, int it, uint8_t *scr, const 
         int t = i / g->nchunk, ch = i % g->nchunk;
 #ifdef GWENEDEG_IQX
         if (w->kp && iq_type(w->type)) {
-            iqx_gemm_item(jb->out, jb->ldo, w->kp, w->type, jb->d, t, ch, g->nbi, x->q, x->s, ldx, nb, k, g->c16, scr, last);
+            (w->act256 ? iqf_gemm_item : iqx_gemm_item)(jb->out, jb->ldo, w->kp, w->type, jb->d, t, ch, g->nbi, x->q, x->s, ldx,
+                                                        nb, k, g->c16, scr, last);
             return;
         }
 #endif
@@ -1305,7 +1342,7 @@ NO_FP_CONTRACT static void gemm_item(const Gemm *g, int it, uint8_t *scr, const 
     (void)scr; (void)last;
     int ng = k / GS;
     if (w->kp && iq_type(w->type)) { // Q2_K, i-quants: one 16-row block over all rows (iquants.h, AVX-512 or generic)
-        iq_rows(w->type, jb->out, jb->ldo, x->q, ldx, x->s, g->c16, nb, w->kp, k, i, i + 1);
+        (w->act256 ? iqf_rows : iq_rows)(w->type, jb->out, jb->ldo, x->q, ldx, x->s, g->c16, nb, w->kp, k, i, i + 1);
         return;
     }
     if (w->kp) { // K-quants, generic: one 16-row block over all rows, KQ_NC rows per kq_dot call
@@ -2842,10 +2879,10 @@ static void decode_norm(RqCtx *c, const Config *p, const TransformerWeights *w, 
             c->x[i] += c->xb[i];
     if (l < p->n_layers) {
         rmsnorm(c->xb, c->x, w->rms_att_weight + l * dim, dim);
-        quantize(&c->xq, c->xb, dim);
+        quantize_act(c->m, &c->xq, c->xb, dim);
     } else {
         rmsnorm(c->x, c->x, w->rms_final_weight, dim);
-        quantize(&c->xq, c->x, dim);
+        quantize_act(c->m, &c->xq, c->x, dim);
     }
     matvec_prep(c->xq_corr, c->xq_xf, c->xq_c16, &c->xq, 0, dim);
 }
@@ -2864,6 +2901,7 @@ static void decode_worker(void *arg, int tid, int nt) {
     int kv_dim = nkv * hd;
     int kv_mul = nh / nkv; // integer multiplier of the kv sharing in multiquery
     int all_heads_dim = nh * hd, ff = m->ff_rows;
+    const int att_whole = m->act256 && (kv_mul * hd) % 256; // (--act256: the attention phase's epilogue quantizes the row)
     int ng = kv_mul + 2; // qkv items per kv head: its kv_mul query heads, its key head, its value head
     int nb = (pos + 1 + ATT_P - 1) / ATT_P; // attention blocks (kernels_avx512.h): items per kv head
     size_t bs = (size_t)nkv * ATT_P * hd, pst = ATT_PSTRIDE(hd); // (cache: elements from a head's block to its next)
@@ -2914,6 +2952,7 @@ static void decode_worker(void *arg, int tid, int nt) {
             // (F32 alpha / beta: items 0 .. nab - 1, ab_items, on the fp32 row xb; counter dc counts them)
             float *st = s->ssm + (size_t)li * m->ssm_layer;
             int nblk = dn_nblk(hy), dc = dn_counter0(m, l), nab = ab_items(w->wa + li, w->wb + li, hy->nv);
+            const int lin_whole = m->act256 && hy->dv % 256; // (--act256: the epilogue quantizes the row; Qwen3.5: dv 128)
             PH_BEGIN_DYN(nab + hy->nv + hy->nv * nblk, 1)
             for (int it = lo; it < hi; it++) {
                 if (it < nab) {
@@ -2952,11 +2991,18 @@ static void decode_worker(void *arg, int tid, int nt) {
                 if (rq_count(S, dc + 1 + hy->nv + h, 1) < nblk)
                     continue;
                 dn_out(m, li, h, c->lin, c->xb + i0);
-                QuantizedTensor ag = qsub(&c->aq, i0);
-                quantize(&ag, c->xb + i0, hy->dv);
-                matvec_prep(c->aq_corr, c->aq_xf, c->aq_c16, &c->aq, i0, hy->dv);
+                if (!lin_whole) {
+                    QuantizedTensor ag = qsub(&c->aq, i0);
+                    quantize_act(m, &ag, c->xb + i0, hy->dv);
+                    matvec_prep(c->aq_corr, c->aq_xf, c->aq_c16, &c->aq, i0, hy->dv);
+                }
             }
-            PH_END_NOEPI
+            PH_EPILOGUE
+            if (lin_whole) { // (--act256, heads of fewer than 256 values: the whole row once every head is done)
+                quantize_act(m, &c->aq, c->xb, hy->vdim);
+                matvec_prep(c->aq_corr, c->aq_xf, c->aq_c16, &c->aq, 0, hy->vdim);
+            }
+            PH_END
         } else {
         uint64_t loff = al * (uint64_t)s->kv_len * kv_dim; // kv cache layer offset for convenience
         char *kl = (char *)s->key_cache + seq_kvb(s, loff, 0), *vl = (char *)s->value_cache + seq_kvb(s, loff, 1);
@@ -3015,11 +3061,18 @@ static void decode_worker(void *arg, int tid, int nt) {
                 for (int r = 0; r < kv_mul; r++)
                     attn_gate(ov[r], qv[r] + hd, hd);
             int i0 = g * kv_mul * hd;
-            QuantizedTensor ag = qsub(&c->aq, i0);
-            quantize(&ag, c->xb + i0, kv_mul * hd);
-            matvec_prep(c->aq_corr, c->aq_xf, c->aq_c16, &c->aq, i0, kv_mul * hd);
+            if (!att_whole) {
+                QuantizedTensor ag = qsub(&c->aq, i0);
+                quantize_act(m, &ag, c->xb + i0, kv_mul * hd);
+                matvec_prep(c->aq_corr, c->aq_xf, c->aq_c16, &c->aq, i0, kv_mul * hd);
+            }
         }
-        PH_END_NOEPI
+        PH_EPILOGUE
+        if (att_whole) { // (--act256 with kv groups not whole super-blocks: the row once every group is done)
+            quantize_act(m, &c->aq, c->xb, all_heads_dim);
+            matvec_prep(c->aq_corr, c->aq_xf, c->aq_c16, &c->aq, 0, all_heads_dim);
+        }
+        PH_END
         }
 
         // final matmul to get the output of the attention (16-row blocks; Qwen3.5's linear layers: ssm_out);
@@ -3037,7 +3090,7 @@ static void decode_worker(void *arg, int tid, int nt) {
             for (int i = 0; i < dim; i++)
                 c->x[i] += c->xb[i];
             rmsnorm(c->xb, c->x, w->rms_ffn_weight + l * dim, dim);
-            quantize(&c->xq, c->xb, dim);
+            quantize_act(m, &c->xq, c->xb, dim);
             matvec_prep(c->xq_corr, c->xq_xf, c->xq_c16, &c->xq, 0, dim);
         PH_END
 
@@ -3053,7 +3106,7 @@ static void decode_worker(void *arg, int tid, int nt) {
             matvec_rows(c->hb2, &c->xq, c->xq_corr, c->xq_xf, c->xq_c16, w->w3 + l, dim, i0, i0 + ff);
             swiglu(c->hb + i0, c->hb2 + i0, ff);
             QuantizedTensor hg = qsub(&c->hq, i0);
-            quantize(&hg, c->hb + i0, ff);
+            quantize_act(m, &hg, c->hb + i0, ff);
             matvec_prep(c->hq_corr, c->hq_xf, c->hq_c16, &c->hq, i0, ff);
         }
         PH_END_NOEPI
@@ -3105,7 +3158,7 @@ static int decode_step(RqCtx *c, RqSeq *s, int token, float *logits, float *hidd
     int pos = s->len;
     if (c->m->mtp_of) { // an MTP view: its input row [e | h] into xb, quantized for the eh_proj GEMV (decode_worker)
         mtp_in_row(c->m, c->xb, token, h_in);
-        quantize(&c->xq, c->xb, 2 * p->dim);
+        quantize_act(c->m, &c->xq, c->xb, 2 * p->dim);
         matvec_prep(c->xq_corr, c->xq_xf, c->xq_c16, &c->xq, 0, 2 * p->dim);
         rope_row(c->rope, c->m->rope_dim, pos, c->m->rope_log_theta);
     } else {
@@ -3232,7 +3285,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
             QuantizedTensor xq = qrow(&c->xq_b, b, xs);
             mtp_in_row(m, c->xb_b + (size_t)b * xs, c->row_tok[b], row_hin(c, b));
             rope_row(c->rope_b + (size_t)b * hd, rd, c->row_pos[b], m->rope_log_theta);
-            quantize(&xq, c->xb_b + (size_t)b * xs, 2 * dim);
+            quantize_act(m, &xq, c->xb_b + (size_t)b * xs, 2 * dim);
             act_prep_row(&xq, 2 * dim, c->bq_corr, c->bq_xf, c->bq_c16, b);
         }
         PH_END_NOEPI
@@ -3250,7 +3303,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
             float *x = c->x_b + (size_t)b * dim, *xb = c->xb_b + (size_t)b * xs;
             QuantizedTensor xq = qrow(&c->xq_b, b, xs);
             rmsnorm(xb, x, w->rms_att_weight, dim);
-            quantize(&xq, xb, dim);
+            quantize_act(m, &xq, xb, dim);
             act_prep_row(&xq, dim, c->bq_corr, c->bq_xf, c->bq_c16, b);
         }
         PH_END_NOEPI
@@ -3268,7 +3321,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
         embed_row(x, w->q_tokens, c->row_tok[b], dim);
         rope_row(c->rope_b + (size_t)b * hd, rd, c->row_pos[b], m->rope_log_theta);
         rmsnorm(xb, x, w->rms_att_weight, dim);
-        quantize(&xq, xb, dim);
+        quantize_act(m, &xq, xb, dim);
         act_prep_row(&xq, dim, c->bq_corr, c->bq_xf, c->bq_c16, b);
     }
     PH_END_NOEPI
@@ -3287,7 +3340,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
                 for (int i = 0; i < dim; i++)
                     x[i] += xb[i];
                 rmsnorm(xb, x, w->rms_att_weight + l * dim, dim);
-                quantize(&xq, xb, dim);
+                quantize_act(m, &xq, xb, dim);
                 act_prep_row(&xq, dim, c->bq_corr, c->bq_xf, c->bq_c16, b);
             }
             PH_END_NOEPI
@@ -3355,7 +3408,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
                 for (int h = 0; h < hy->nv; h++)
                     dn_out(m, li, h, lb + (size_t)b * lw, c->xb_b + (size_t)b * xs + h * hy->dv);
                 QuantizedTensor xr = qrow(&c->xq_b, b, xs);
-                quantize(&xr, c->xb_b + (size_t)b * xs, hy->vdim);
+                quantize_act(m, &xr, c->xb_b + (size_t)b * xs, hy->vdim);
                 act_prep_row(&xr, hy->vdim, c->bq_corr, c->bq_xf, c->bq_c16, b);
             }
             PH_END_NOEPI
@@ -3474,7 +3527,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
                 if (m->gated) // (the gate: after every kv head of the row is done)
                     for (int h = 0; h < p->n_heads; h++)
                         attn_gate(c->xb_b + (size_t)b * xs + h * hd, c->q_b + (size_t)b * qd + h * qh + hd, hd);
-                quantize(&xq, c->xb_b + (size_t)b * xs, all_heads_dim);
+                quantize_act(m, &xq, c->xb_b + (size_t)b * xs, all_heads_dim);
                 act_prep_row(&xq, all_heads_dim, c->bq_corr, c->bq_xf, c->bq_c16, b);
             }
         }
@@ -3506,7 +3559,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
             for (int i = 0; i < dim; i++)
                 x[i] += xb[i];
             rmsnorm(xb, x, w->rms_ffn_weight + l * dim, dim);
-            quantize(&xq, xb, dim);
+            quantize_act(m, &xq, xb, dim);
             act_prep_row(&xq, dim, c->bq_corr, c->bq_xf, c->bq_c16, b);
         }
         PH_END_NOEPI
@@ -3532,7 +3585,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
         for (int b = lo; b < hi; b++) {
             QuantizedTensor hq = qrow(&c->hq_b, b, hidden);
             swiglu(c->hb_b + (size_t)b * hidden, c->hb2_b + (size_t)b * hidden, hidden);
-            quantize(&hq, c->hb_b + (size_t)b * hidden, hidden);
+            quantize_act(m, &hq, c->hb_b + (size_t)b * hidden, hidden);
             act_prep_row(&hq, hidden, c->bh_corr, c->bh_xf, c->bh_c16, b);
         }
         PH_END_NOEPI
@@ -3573,7 +3626,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
             rmsnorm(c->x, x, w->rms_final_weight, dim);
             if (h)
                 memcpy(h, c->x, dim * sizeof(float));
-            quantize(&c->xq, c->x, dim);
+            quantize_act(m, &c->xq, c->x, dim);
             matvec_prep(c->xq_corr, c->xq_xf, c->xq_c16, &c->xq, 0, dim);
         PH_END_NOEPI
         int nblk = m->cls_n[1] ? cls_blocks(m) : (p->vocab_size + 15) / 16, cc = nblk / (8 * nt) > 1 ? nblk / (8 * nt) : 1;
@@ -3603,7 +3656,7 @@ static void prefill_worker(void *arg, int tid, int nt) {
             rmsnorm(xb, x, w->rms_final_weight, dim);
             if (h)
                 memcpy(h, xb, dim * sizeof(float));
-            quantize(&xq, xb, dim);
+            quantize_act(m, &xq, xb, dim);
             act_prep_row(&xq, dim, c->bq_corr, c->bq_xf, c->bq_c16, j);
         }
         PH_END_NOEPI
@@ -3677,7 +3730,7 @@ static void rows_mm(const RqCtx *c, QuantizedTensor *w, float *out, int ldo, Qua
     // decode GEMV per row. Either way each output is the GEMV's (bit-identical). Q2_K, i-quants: iq_rows
     if (w->trl) return; // (NariQ: trl_pass)
     if (w->kp && iq_type(w->type)) {
-        iq_rows(w->type, out, ldo, x->q, ldx, x->s, c16, nb, w->kp, k, i0 / 16, i1 / 16);
+        (w->act256 ? iqf_rows : iq_rows)(w->type, out, ldo, x->q, ldx, x->s, c16, nb, w->kp, k, i0 / 16, i1 / 16);
         return;
     }
 #ifdef GWENEDEG_SMB
@@ -3737,7 +3790,7 @@ static void bd_norm_row(RqCtx *c, const Config *p, const TransformerWeights *w, 
     const float *wt = l < 0 ? w->rms_ffn_weight + (size_t)(-1 - l) * dim : l < p->n_layers ? w->rms_att_weight + (size_t)l * dim
                                                                                            : w->rms_final_weight;
     rmsnorm(xb, x, (float *)wt, dim);
-    quantize(&xq, xb, dim);
+    quantize_act(c->m, &xq, xb, dim);
     act_prep_row(&xq, dim, c->bq_corr, c->bq_xf, c->bq_c16, dst);
 }
 
@@ -3812,7 +3865,7 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
             QuantizedTensor xq = qrow(&c->xq_b, it, xs);
             mtp_in_row(m, c->xb_b + (size_t)it * xs, c->row_tok[it], row_hin(c, it));
             rope_row(c->rope_b + (size_t)it * hd, rd, c->row_pos[it], m->rope_log_theta);
-            quantize(&xq, c->xb_b + (size_t)it * xs, 2 * dim);
+            quantize_act(m, &xq, c->xb_b + (size_t)it * xs, 2 * dim);
             act_prep_row(&xq, 2 * dim, c->bq_corr, c->bq_xf, c->bq_c16, it);
         }
         PH_END_NOEPI
@@ -4001,7 +4054,7 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
                 if (m->gated)
                     for (int h = 0; h < nh; h++)
                         attn_gate(c->xb_b + (size_t)b * xs + h * hd, c->q_b + (size_t)b * qd + h * qh + hd, hd);
-                quantize(&xq, c->xb_b + (size_t)b * xs, ahd);
+                quantize_act(m, &xq, c->xb_b + (size_t)b * xs, ahd);
                 act_prep_row(&xq, ahd, c->bq_corr, c->bq_xf, c->bq_c16, b);
             }
         }
@@ -4017,7 +4070,7 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
             PH_BEGIN(n, 1)
             for (int b = lo; b < hi; b++) {
                 QuantizedTensor xq = qrow(&c->xq_b, b, xs);
-                quantize(&xq, c->xb_b + (size_t)b * xs, kin);
+                quantize_act(m, &xq, c->xb_b + (size_t)b * xs, kin);
                 act_prep_row(&xq, kin, c->bq_corr, c->bq_xf, c->bq_c16, b);
             }
             PH_END_NOEPI
@@ -4059,7 +4112,7 @@ static void batch_decode_worker(void *arg, int tid, int nt) {
                 float *hb = c->hb_b + (size_t)b * hidden;
                 swiglu(hb + i0, c->hb2_b + (size_t)b * hidden + i0, ff);
                 QuantizedTensor hr = qrow(&c->hq_b, b, hidden), hg = qsub(&hr, i0);
-                quantize(&hg, hb + i0, ff);
+                quantize_act(m, &hg, hb + i0, ff);
                 matvec_prep(c->bh_corr + (size_t)b * (hidden / GS), c->bh_xf ? c->bh_xf + (size_t)b * (hidden / GS) : NULL,
                             c->bh_c16 ? c->bh_c16 + (size_t)b * (hidden / 16) : NULL, &hr, i0, ff);
             }

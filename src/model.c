@@ -592,6 +592,15 @@ static int repack_types(RqModel *m) {
     return n;
 }
 
+static void act256_flags(RqModel *m) {
+    // RqModelOpts.act256: every matmul weight's kernels take the activations' scale per 256 (QuantizedTensor.act256)
+    PrepMat mt[PREP_MAX];
+    int nm = prep_mats(m, mt);
+    for (int i = 0; i < nm; i++)
+        for (int l = 0; l < mt[i].n; l++)
+            mt[i].t[l].act256 = m->act256;
+}
+
 static int prep_pack(const PrepMat *mt, int nm, char *warning, size_t wlen) {
     // 1 if the Q8_0 matrices are repacked for the SIMD kernels (else a warning, if not NULL)
     int pack = 0;
@@ -1214,6 +1223,13 @@ static void load_model(RqModel *m, const char *path, const RqModelOpts *o, Loade
     else if (o->ctx_len == 0 && c->seq_len > RQ_CTX_DEFAULT_MAX) // (Qwen3: 40,960 = the cap; 2507: 262,144)
         c->seq_len = RQ_CTX_DEFAULT_MAX;
     m->gated = m->hy.on; // (Qwen3.5's attention layers are gated)
+    // RqModelOpts.act256 (before forward_model_init: its FFN items are then whole super-blocks of 256 hidden rows)
+    m->act256 = o->act256 > 0 && !m->trl && c->hidden_dim % 256 == 0;
+    if (o->act256 > 0 && !m->act256) {
+        size_t l = strlen(m->warning);
+        snprintf(m->warning + l, sizeof(m->warning) - l, "%s--act256 not taken (%s): one activation scale per 32",
+                 l ? "; " : "", m->trl ? "a NariQ file" : "hidden size not a multiple of 256");
+    }
     if (!forward_model_init(m))
         load_fail(e, "unsupported model shape (heads %d / %d, head_dim %d, dim %d, hidden %d, GS %d%s)", c->n_heads,
                   c->n_kv_heads, c->head_dim, c->dim, c->hidden_dim, GS, m->hy.on ? ", linear attention" : "");
@@ -1225,6 +1241,7 @@ static void load_model(RqModel *m, const char *path, const RqModelOpts *o, Loade
         trl_tab_init();
     m->repack = o->repack > 0 ? o->repack : 0;
     repack_types(m); // (before the check: it counts the repacked sizes)
+    act256_flags(m);
     mem_check(m, o, path, e); // (nothing of the tensor data read yet)
     if (m->is_gguf) {
         gguf_copy_norms(m);
@@ -1397,6 +1414,7 @@ static void mtp_build(RqModel *v, const RqMtpOpts *o, MtpLoader *ld) {
         if (src[i]->type != GGML_Q8_0) v->kq = 1; // (the target's kq covers its embedding and classifier)
         (*dst[i])->type = repack_type(t->repack, src[i]->type); // (RqModelOpts.repack: as the target's)
     }
+    act256_flags(v); // (v->act256: the target's)
     if (!forward_model_init(v)) load_fail(e, "%s: MTP block of an unsupported shape", path);
     if (v->xs < 2 * dim) v->xs = 2 * dim; // (the input row [e | h] in the batched xb / xq rows and decode's xb / xq)
     // the classifier rows (RqMtpOpts.vocab): [0, vocab) and the added tokens, in whole 16-row blocks

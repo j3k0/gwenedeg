@@ -21,6 +21,7 @@
  *       -A         every row's logits of the N tokens into OUT, streamed per chunk of -b rows (rq_prefill RQ_LOGITS_ALL:
  *                  the bits of gwenedeg -m logits, in its file format: int32 N, vocab, ids[N], float32 logits[N][vocab]; the
  *                  memory of one chunk, not of N rows: scripts/kl_kv.py)
+ *       -F         RqModelOpts.act256 (--act256: one activation scale per 256 values)
  *       -c CTX     sequence capacity (default N + G + 1); -k f16|bf16|f32|bf16-dot|f16-dot (default f16); -b chunk rows
  *                  (default 512)
  *   stderr: timings ([long_ctx] lines). Threads: OMP_NUM_THREADS (else the default). */
@@ -72,11 +73,12 @@ static void prefill_to(RqCtx *c, RqSeq *s, const int *ids, int n, float **lg) {
 
 int main(int argc, char **argv) {
     const char *path = NULL, *text = NULL, *idsf = NULL, *outf = NULL, *plist = NULL;
-    int N = -1, G = 0, cap = 0, chunk = 512, kvt = RQ_KV_DEFAULT, vfy = 0, all = 0;
+    int N = -1, G = 0, cap = 0, chunk = 512, kvt = RQ_KV_DEFAULT, vfy = 0, all = 0, act256 = 0;
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-') { path = argv[i]; continue; }
         if (!strcmp(argv[i], "-V")) { vfy = 1; continue; }
         if (!strcmp(argv[i], "-A")) { all = 1; continue; }
+        if (!strcmp(argv[i], "-F")) { act256 = 1; continue; }
         if (i + 1 >= argc) goto usage;
         const char *v = argv[++i];
         switch (argv[i - 1][1]) {
@@ -126,6 +128,7 @@ int main(int argc, char **argv) {
     const char *w = rq_threads_init(0);
     if (w) fprintf(stderr, "%s\n", w);
     RqModelOpts o = { 0 };
+    o.act256 = act256;
     o.ctx_len = cap;
     o.kv_bits = rq_kv_bits(kvt);
     double t0 = rq_now();
@@ -231,7 +234,7 @@ int main(int argc, char **argv) {
     rq_model_free(m);
     return 0;
 usage:
-    fprintf(stderr, "usage: long_ctx MODEL -T TEXT -o IDS | long_ctx MODEL -I IDS [-n N] [-P p1,p2,... | -A] [-o OUT] [-V] [-g G] "
+    fprintf(stderr, "usage: long_ctx MODEL -T TEXT -o IDS | long_ctx MODEL -I IDS [-n N] [-P p1,p2,... | -A] [-o OUT] [-V] [-F] [-g G] "
                     "[-c CTX] [-b CHUNK] [-k f16|bf16|f32|bf16-dot|f16-dot]\n");
     return 2;
 }

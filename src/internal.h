@@ -129,6 +129,8 @@ typedef struct {
     TrlMat *trl;  // NariQ coded weights (type TRL1 .. TRL6, trellis.h): the matrix (ntrl 1) or a banded classifier's ntrl bands
     int ntrl;     // (consecutive in RqModel.trl_mats), else NULL / 0. Run as whole coded linears (forward.c, trl_pass), never
                   // by matvec_rows / the GEMMs
+    int act256;   // matmul weights of a model loaded with RqModelOpts.act256: the Q2_K / i-quant kernels take the
+                  // activations' one scale per 256 (iquants.h iqf_*), the others read it per group as any scale
 } QuantizedTensor;
 
 // The MTP (multi-token prediction) block of a qwen35 file with nextn_predict_layers 1 (Qwen3.8-27B's blk.64, after the
@@ -253,6 +255,7 @@ struct RqModel {
     int kq;                     // K-quant weights (Q3_K .. Q6_K): the activation sums xf are needed
     int repack;                 // RqModelOpts.repack (RQ_REPACK_*; 0 none): IQ3_XXS / IQ3_S matmul weights as 4-bit codes
                                 // (iq_repack_type; an MTP view: its target's)
+    int act256;                 // RqModelOpts.act256 as taken (forward.c quantize_act; an MTP view: its target's)
     // derived shape parameters of the forward passes (checked at load)
     int kv_dim, all_heads_dim, kv_mul;
     int xs;                     // row stride of the batched xb / xq rows: max(dim, all_heads_dim)

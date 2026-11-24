@@ -7,7 +7,7 @@ a test run is scored against them as scripts/kl_quant.py does:
   KL(p || q) ~= sum_{v in top-K(p)} p_v (log p_v - log q_v) + p_tail log(p_tail / q_tail)   (a lower bound, tight)
 plus the top-1 agreement and both runs' NLL of the next token (perplexity ratio).
 
-Usage: .venv/bin/python -I tools/v4h_kl.py IDS1[,IDS2...] REF_MODEL[:ENV=V] TEST_MODEL[:ENV=V] [TEST ...] [-t 8]
+Usage: .venv/bin/python -I tools/v4h_kl.py IDS1[,IDS2...] REF_MODEL[:ENV=V] TEST_MODEL[:ENV=V][:ARG=-F] [TEST ...] [-t 8]
   (ids: int32 files from `build/long_ctx MODEL -T TEXT -o IDS`; each file is one sequence)
 """
 import argparse
@@ -24,16 +24,18 @@ BLOCK = 64
 
 
 def parse(spec):
+    # MODEL[:ENV=V ...][:ARG=-F]: environment variables, and long_ctx arguments (ARG; -F: --act256)
     model, *envs = spec.split(":")
-    return model, dict(e.split("=", 1) for e in envs)
+    kv = [e.split("=", 1) for e in envs]
+    return model, {k: v for k, v in kv if k != "ARG"}, [v for k, v in kv if k == "ARG"]
 
 
-def run(model, env_extra, ids_path, n, t, consume):
+def run(model, env_extra, ids_path, n, t, consume, args=()):
     tmp = tempfile.mkdtemp()
     fifo = os.path.join(tmp, "l.fifo")
     os.mkfifo(fifo)
     env = dict(os.environ, OMP_NUM_THREADS=str(t), **env_extra)
-    p = subprocess.Popen([os.path.join(ROOT, "build", "long_ctx"), model, "-I", ids_path, "-A", "-o", fifo],
+    p = subprocess.Popen([os.path.join(ROOT, "build", "long_ctx"), model, "-I", ids_path, "-A", "-o", fifo, *args],
                          env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     err = []
     th = threading.Thread(target=lambda: err.append(p.stderr.read()))
@@ -72,7 +74,7 @@ def main():
     K = a.topk
     seqs = [np.fromfile(p, np.int32) for p in a.ids.split(",")]
     refs = []
-    rm, renv = parse(a.ref)
+    rm, renv, rargs = parse(a.ref)
     for path, ids in zip(a.ids.split(","), seqs):
         n = len(ids)
         top = np.zeros((n, K), np.int32)
@@ -88,12 +90,12 @@ def main():
             amax[r0:r0 + len(blk)] = L.argmax(1)
             nx = ids[r0 + 1:r0 + 1 + len(blk)]
             nll[r0:r0 + len(nx)] = -L[np.arange(len(nx)), nx]
-        run(rm, renv, path, n, a.t, c)
+        run(rm, renv, path, n, a.t, c, rargs)
         refs.append((top, lp, nll, amax))
     print(f"reference {a.ref}: {sum(len(s) for s in seqs)} tokens, PPL " +
           " / ".join(f"{np.exp(r[2][:-1].mean()):.4f}" for r in refs))
     for spec in a.tests:
-        m, env = parse(spec)
+        m, env, args = parse(spec)
         out = []
         for (path, ids), (top, lp, rnll, ramax) in zip(zip(a.ids.split(","), seqs), refs):
             n = len(ids)
@@ -112,7 +114,7 @@ def main():
                 same[sl] = L.argmax(1) == ramax[sl]
                 nx = ids[r0 + 1:r0 + 1 + len(blk)]
                 nll[r0:r0 + len(nx)] = -L[np.arange(len(nx)), nx]
-            run(m, env, path, n, a.t, c)
+            run(m, env, path, n, a.t, c, args)
             out.append((kl[:-1], same[:-1], nll[:-1], rnll[:-1]))
         cols = []
         for kl, same, nll, rnll in out:

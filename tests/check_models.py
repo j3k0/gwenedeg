@@ -364,6 +364,14 @@ def iq_synth_run(a, sd, tmp, texts):
         out.append((p.returncode == 0 and nok > 0, "q35/iq_gemm_test",
                     f"{nok} cases bit-identical (iqx_gemm_item, iq_rows, iq_dot; every type, 1 .. 77 rows)" if p.returncode == 0
                     else "; ".join(l for l in lines if l.startswith("FAIL"))[:300] or f"exit {p.returncode}"))
+    kt = os.path.join(ROOT, "build", "flat_bench")  # (--act256's kernels vs their definition iqf_dot, random blocks; AVX-512)
+    if os.path.exists(kt):
+        p = run([kt], 4)
+        lines = p.stdout.decode(errors="replace").splitlines()
+        nok = sum(l.startswith("ok ") for l in lines)
+        out.append((p.returncode == 0 and nok > 0, "q35/flat_bench",
+                    f"{nok} cases bit-identical (--act256: iqf_rows, iqf_gemm_item, iqf_dot; every type, 1 .. 77 rows)"
+                    if p.returncode == 0 else "; ".join(l for l in lines if l.startswith("FAIL"))[:300] or f"exit {p.returncode}"))
     model = os.path.join(sd, "synth-q35-iq.gguf")
     if not os.path.exists(model):
         return out
@@ -788,6 +796,12 @@ TH_Q35_SYNTH_KQ = {"synth-q35-27b": dict(cos_mean=0.993, cos_pos=0.95, top1=0.7)
                    "synth-q35-iq": dict(cos_mean=0.993, cos_pos=0.95, top1=0.7),
                    "synth-q35-ista-mtp": dict(cos_mean=0.989, cos_pos=0.956, top1=0.67)}  # (per model, else TH_Q35_SYNTH)
 TH_Q35_ISTA = TH_Q35_SYNTH_KQ["synth-q35-ista-mtp"]
+# --act256 (one activation scale per 256 instead of 32; the q35 group's synth_a256 runs). Measured vs the numpy reference
+# (en / code / long2): synth-q35-iq cos mean 0.99265 / 0.99317 / 0.99004, min 0.97067, top-1 243/338; synth-q35-ista-mtp
+# 0.99274 / 0.99178 / 0.98505, min 0.93596, 256/338; synth-q35-27b 0.99424 / 0.99316 / 0.98969, min 0.92454, 239/338 (the
+# default's: ~0.997, 280/338). The coarser activations of these synthetic models cost 2-3x their weights' error (on
+# Qwen3.5-0.8B: KL +0.0036 wiki / +0.0011 code, 2-5% of a 4-bit file's KL; docs/v4h.md section 11); bounds ~2x the error
+TH_Q35_ACT256 = dict(cos_mean=0.97, cos_pos=0.85, top1=0.6)
 Q35_SYNTH_SAME = [(("en", 1), ("en", 7)), (("en", 1), ("en", 64)), (("all", 1), ("all", 64)), (("long2", 1), ("long2", 64)),
                   (("long2", 64), ("long2", 512)), (("long2", 64), ("long2", 64, 3)),
                   (("en", 1), ("en", 1, "gen")), (("en", 7), ("en", 7, "gen")), (("long2", 64), ("long2", 64, "gen"))]
@@ -1214,16 +1228,19 @@ def q35_api_lines(p, name):
              f"{len(lines) - len(bad)}/{len(lines)} passed" + (f"; failed: {', '.join(bad)}" if bad else ""))]
 
 
-def q35_synth_run(a, tmp, model, texts, full_api, kv=""):
+def q35_synth_run(a, tmp, model, texts, full_api, kv="", act256=False):
     """the checks of one synthetic model, run in the background: [(ok, name, detail)]. The logits files (248k ids per
     position: long2 is 0.3 GB) are reduced to a sha256 and the reference's classifier rows, then removed. kv: a KV cache
-    type (-k; e.g. bf16-dot, the bf16 dot-product attention: the same checks, the same thresholds)"""
+    type (-k; e.g. bf16-dot, the bf16 dot-product attention: the same checks, the same thresholds); act256: --act256
+    (one activation scale per 256: its own definition, the same reference thresholds and bitwise invariants)"""
     import hashlib
     import ref_qwen35 as R35
     tag = os.path.basename(model)[:-5]
-    pre = f"q35/{tag}" + (f"_{kv}" if kv else "")
+    pre = f"q35/{tag}" + (f"_{kv}" if kv else "") + ("_act256" if act256 else "")
     extra, kvx = (["-k", kv], ["--kv-type", kv]) if kv else ([], [])
-    th = TH_Q35_SYNTH_KQ.get(tag, TH_Q35_SYNTH)
+    if act256:
+        extra, kvx = extra + ["--act256"], kvx + ["--act256"]
+    th = TH_Q35_ACT256 if act256 else TH_Q35_SYNTH_KQ.get(tag, TH_Q35_SYNTH)
     out = []
     f = G.GgufFile(model)
     sub = np.sort(np.random.default_rng(0).choice(f.tensors["token_embd.weight"][0][1], 4096, replace=False))
@@ -1235,7 +1252,7 @@ def q35_synth_run(a, tmp, model, texts, full_api, kv=""):
             name, chunk = key[:2]
             gen = len(key) > 2 and key[2] == "gen"
             th = 3 if len(key) > 2 else SYNTH_THREADS
-            path = os.path.join(tmp, f"{tag}{kv}_{name}_b{chunk}_{th}{'_gen' if gen else ''}.bin")
+            path = os.path.join(tmp, f"{tag}{kv}{'_a256' if act256 else ''}_{name}_b{chunk}_{th}{'_gen' if gen else ''}.bin")
             logits_run(a.generic if gen else a.gwenedeg, model, texts[name], path, chunk, th, extra)
             with open(path, "rb") as fh:
                 h = hashlib.sha256(fh.read()).hexdigest()
@@ -1277,7 +1294,7 @@ def q35_synth_run(a, tmp, model, texts, full_api, kv=""):
     # the file's sampling defaults (TODO P5; general.sampling.temp / top_p / top_k = 1.0 / 0.95 / 20 as in the 27B's
     # file, written by make_synth_q35.py): applied to the options not given, silently. Seeded generate without -p / -K
     # == with -p 0.95 -K 20 (stdout, stderr without the numbers), != with the CLI's own defaults -p 0.9 -K 0
-    if tag == "synth-q35-27b" and not kv:
+    if tag == "synth-q35-27b" and not kv and not act256:
         import re
         base = [a.gwenedeg, model, "-c", "256", "-t", "0.8", "-s", "7", "-n", "24", "-m", "generate", "-i", texts["en"][:60]]
         ps = [run(base + x, SYNTH_THREADS) for x in ([], ["-p", "0.95", "-K", "20"], ["-p", "0.9", "-K", "0"])]
@@ -1359,6 +1376,11 @@ def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
     if s27 and os.path.exists(s27):
         os.makedirs(os.path.join(t, "synth_dot"), exist_ok=True)
         synth.append(ex.submit(q35_synth_run, a, os.path.join(t, "synth_dot"), s27, texts, True, "bf16-dot"))
+    # --act256 (docs/v4h.md section 10): the i-quant files (synth-q35-iq: all nine types, ISTA's mix) and a K-quant one
+    for fn, full in (("synth-q35-iq.gguf", True), ("synth-q35-ista-mtp.gguf", False), ("synth-q35-27b.gguf", False)):
+        if sd and os.path.exists(os.path.join(sd, fn)):
+            os.makedirs(os.path.join(t, "synth_a256"), exist_ok=True)
+            synth.append(ex.submit(q35_synth_run, a, os.path.join(t, "synth_a256"), os.path.join(sd, fn), texts, full, "", True))
     if a.api_test:
         synth.append(ex.submit(q35_api_dot, a))
     if sd and a.api_test and getattr(a, "v1ref_api_test", ""):

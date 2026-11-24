@@ -1,5 +1,5 @@
 /* Tests of the library API (src/gwenedeg.h), run by `make test` (tests/check.py, group api) on each model:
- *   tests/api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv] [--kv-type TYPE]
+ *   tests/api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv] [--kv-type TYPE] [--act256]
  * Prints PASS / FAIL lines, exit status 1 if any failed. The forward-pass checks are bitwise: a
  * sequence's logits must not depend on what else the context ran in between or batched with it
  * (sequences interleaved, several sequences in one rq_forward_batch, a prefill chunk next to decode
@@ -95,7 +95,7 @@ static int V;
 // fill (~0.7-1.7 GB of RSS), so it refused them whenever MemAvailable was under ~5 GiB. The check itself: gguf_mem/*
 // (tests/check.py), mtp_load here. (Not in the seqfile-out block: 915894a's api_test gets it as it is, and its loads are
 // of Qwen3.5-0.8B, ~1.5 GiB)
-static const RqModelOpts NOCHECK = { 0, 0, 0, -1 };
+static RqModelOpts NOCHECK = { 0, 0, 0, -1 }; // (--act256: its act256)
 
 static void die(const char *what, int e) {
     printf("FAIL setup  %s: %s\n", what, rq_strerror(e));
@@ -507,10 +507,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--n65")) bd_n65 = 1;
         else if (!strcmp(argv[i], "--kv")) bd_kv = 1;
         else if (!strcmp(argv[i], "--kv-type") && i + 1 < argc && (KVT = rq_kv_parse(argv[i + 1])) >= 0) i++;
+        else if (!strcmp(argv[i], "--act256")) NOCHECK.act256 = 1;
         else argc = 0;
     }
     if (argc < 2) {
-        fprintf(stderr, "usage: api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv] [--kv-type TYPE]\n"
+        fprintf(stderr, "usage: api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv] [--kv-type TYPE] [--act256]\n"
                         "       api_test --two MODEL_A MODEL_B [--gs MODEL_OTHER_GROUP_SIZE]\n"
                         "       api_test --spec TARGET DRAFT [--quick] [--other MODEL_OTHER_VOCABULARY]\n"
                         "       api_test --mtp TARGET [--quick] [--plain MODEL_WITHOUT_BLOCK] [--optional MODEL_WITH_OPTIONAL_NEXTN]\n"

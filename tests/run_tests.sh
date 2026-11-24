@@ -52,7 +52,7 @@ V1REF=""
 if [[ -z "$GWENEDEG_BIN" ]]; then
     make -s -j8 gwenedeg gwenedeg-generic api-test tools-test
     if [[ "$(uname -m)" == x86_64 ]]; then make -s -j8 build/bf16dp_test build/bf16dp_test-emu; fi
-    if grep -qw avx512_vnni /proc/cpuinfo 2>/dev/null; then make -s build/iq_repack_test build/iq_gemm_test; fi # (--repack's kernels, the i-quant GEMM)
+    if grep -qw avx512_vnni /proc/cpuinfo 2>/dev/null; then make -s build/iq_repack_test build/iq_gemm_test build/flat_bench; fi # (--repack's kernels, the i-quant GEMM, --act256's)
     GWENEDEG_BIN="$ROOT/gwenedeg"
     GWENEDEG_GENERIC="${GWENEDEG_GENERIC:-$ROOT/gwenedeg-generic}"
     API_TEST="$ROOT/build/api_test"

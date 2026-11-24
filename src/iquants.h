@@ -695,6 +695,65 @@ KQ_EXACT static void iq_dot(int type, float *out, size_t ldo, const uint8_t *wb,
         memcpy(out + c * ldo, val[c], sizeof(val[c]));
 }
 
+/* ---------------------------------------------------------------------------------------------
+ * --act256 (RqModelOpts.act256; docs/v4h.md sections 9-10): one activation scale per 256 values. forward.c quantizes
+ * the matmul activations with one scale A per 256 (quantize256) and writes it to each of the super-block's 8 xs[g], so
+ * every kernel still reads per-32 scales; the Q2_K / i-quant matrices then use this definition instead of iq_dot's,
+ * one fold per super-block s (A = xs[8 s]):
+ *   I = sum over its 8 groups of (S_0 T_0 + S_1 T_1)             (int32, exact: |I_g| < 2^23, IQ4_XS < 2^24: |I| < 2^27)
+ *   val = val + (D * A) * (float) I
+ *   Q2_K: M = sum over its groups of (m_0 X_0 + m_1 X_1),  val = val + ((d * A) * (float) I - (dmin * A) * (float) M)
+ * each fp32 operation rounded, super-blocks in order. iqf_dot is the definition (the generic and NEON builds' kernel);
+ * the AVX-512 rows (iqf_blk) and tiled (iqf_tile) kernels are bit-identical to it (tests/kernels/flat_bench.c).
+ */
+KQ_EXACT static void iqf_dot(int type, float *out, size_t ldo, const uint8_t *wb, int k, int nc, const int8_t *xq, size_t ldx,
+                             const float *xs, size_t ldxs) { RQ_FP_EXACT
+    // iq_dot's arguments; xs[c * ldxs + 8 s] is row c's scale of super-block s
+    float val[KQ_NC][KQ_ROWS];
+    memset(val, 0, sizeof(val));
+    int sbb = iq_sb_bytes(type), q2 = type == GGML_Q2_K;
+    for (int s = 0; s < k / QK_K; s++) {
+        const uint8_t *o = wb + (size_t)s * sbb;
+        float D[KQ_ROWS], Dm[KQ_ROWS];
+        int32_t I[KQ_NC][KQ_ROWS], M[KQ_NC][KQ_ROWS];
+        memset(I, 0, sizeof(I));
+        memset(M, 0, sizeof(M));
+        iq_sb_d(type, o, D, Dm);
+        for (int g8 = 0; g8 < 8; g8++) {
+            int g = 8 * s + g8;
+            int8_t v[KQ_ROWS][32];
+            int32_t S[KQ_ROWS][2], Mm[KQ_ROWS][2];
+            iq_unpack_group(type, o, g8, v, S, Mm);
+            for (int c = 0; c < nc; c++) {
+                const int8_t *x = xq + c * ldx + 32 * g;
+                int32_t X[2] = { 0, 0 };
+                for (int i = 0; i < 16; i++) {
+                    X[0] += x[i];
+                    X[1] += x[16 + i];
+                }
+                for (int r = 0; r < KQ_ROWS; r++) {
+                    for (int h = 0; h < 2; h++) {
+                        int32_t t = 0;
+                        for (int i = 0; i < 16; i++)
+                            t += v[r][16 * h + i] * x[16 * h + i];
+                        I[c][r] += S[r][h] * t;
+                    }
+                    M[c][r] += Mm[r][0] * X[0] + Mm[r][1] * X[1];
+                }
+            }
+        }
+        for (int c = 0; c < nc; c++) {
+            float a = xs[c * ldxs + 8 * s];
+            for (int r = 0; r < KQ_ROWS; r++) {
+                if (q2) val[c][r] = val[c][r] + ((D[r] * a) * (float)I[c][r] - (Dm[r] * a) * (float)M[c][r]);
+                else val[c][r] = val[c][r] + (D[r] * a) * (float)I[c][r];
+            }
+        }
+    }
+    for (int c = 0; c < nc; c++)
+        memcpy(out + c * ldo, val[c], sizeof(val[c]));
+}
+
 // ---------------------------------------------------------------------------- AVX-512 VNNI
 
 #ifdef GWENEDEG_VNNI
@@ -1298,6 +1357,235 @@ static void iqx_gemm_item(float *out, int ldo, const uint8_t *kp, int type, int 
                                      c16 + (size_t)b * n16, n16, out + (size_t)b * ldo + (size_t)rb0 * KQ_ROWS, ldo, Bi);
     }
 }
+
+/* --act256 on AVX-512 (iqf_dot above is the definition): the rows kernel (iq512_blk with I summed over the super-block,
+ * one fold per 256) and the tiled GEMM (iqx_tile's, on iqx_unpack_tile's scratch: per-32 types t, I, f; two-scale types
+ * per half; Q2_K, whose scratch codes carry S with no bias, one vpdpbusd chain over the super-block, its mins summed per
+ * group by vpdpwssd from the pairs X_0 | X_1 << 16 made once per super-block). 8 threads, 17408 x 5120, the 27B IQ3_S
+ * file's types weighted: 1.21-1.23x the per-32 tiled GEMM at 512 rows, 1.14x at 24 (docs/v4h.md section 10) */
+static inline uint32_t iqf_xpair(const int32_t *cc) { // X_0 | X_1 << 16 of a group, from its c16 pair (-32 X)
+    return (uint32_t)(uint16_t)(-(cc[0] >> 5)) | (uint32_t)(-(cc[1] >> 5)) << 16;
+}
+static inline __m512 iqf_fold(__m512 f, __m512 d, float a, __m512i I) {
+    return _mm512_add_round_ps(f, _mm512_mul_round_ps(_mm512_mul_round_ps(d, _mm512_set1_ps(a), Q8P_RND),
+                                                      _mm512_cvtepi32_ps(I), Q8P_RND), Q8P_RND);
+}
+static inline __m512 iqf_fold2(__m512 f, __m512 d, __m512 dm, float a, __m512i I, __m512i M) { // (Q2_K: x - y, then the add)
+    __m512 av = _mm512_set1_ps(a);
+    __m512 x = _mm512_mul_round_ps(_mm512_mul_round_ps(d, av, Q8P_RND), _mm512_cvtepi32_ps(I), Q8P_RND);
+    __m512 y = _mm512_mul_round_ps(_mm512_mul_round_ps(dm, av, Q8P_RND), _mm512_cvtepi32_ps(M), Q8P_RND);
+    return _mm512_add_round_ps(f, _mm512_sub_round_ps(x, y, Q8P_RND), Q8P_RND);
+}
+
+static inline __attribute__((always_inline)) void iqf_blk(const int type, const int NC, float *out, size_t ldo,
+                                                          const uint8_t *wb, int nsb, int nc, const int8_t *xq, size_t ldx,
+                                                          const float *xs, size_t ldxs, const int32_t *c16, size_t ldc) {
+    const int sbb = iq_sb_bytes(type), Bi = iq_bias(type), q2 = type == GGML_Q2_K, per32 = iqx_per32(type);
+    const float cm = iq_dmul(type);
+    __m512 val[NC];
+    for (int c = 0; c < NC; c++) val[c] = _mm512_setzero_ps();
+    for (int s = 0; s < nsb; s++) {
+        const uint8_t *o = wb + (size_t)s * sbb;
+        __m512 D = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)o));
+        if (cm != 1.0f) D = _mm512_mul_round_ps(D, _mm512_set1_ps(cm), Q8P_RND); // (exact: a power of 2)
+        __m512 Dm = q2 ? _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(o + 32))) : _mm512_setzero_ps();
+        __m512i I[NC], Mp[8];
+        for (int c = 0; c < NC; c++) I[c] = _mm512_setzero_si512();
+        for (int g8 = 0; g8 < 8; g8++) {
+            __m512i w[8], S0, S1, M0 = _mm512_setzero_si512(), M1 = _mm512_setzero_si512();
+            iq512_group(type, o, g8, w, &S0, &S1, &M0, &M1);
+            if (q2) Mp[g8] = _mm512_or_si512(M0, _mm512_slli_epi32(M1, 16));
+            int g = 8 * s + g8;
+            for (int c = 0; c < NC; c++) {
+                if (c >= nc) break;
+                const int8_t *x = xq + c * ldx + 32 * g;
+                const int32_t *cc = c16 + c * ldc + 2 * g;
+                __m512i p0 = _mm512_set1_epi32(Bi * (cc[0] >> 5)), p1 = _mm512_set1_epi32(Bi * (cc[1] >> 5));
+                for (int t = 0; t < 4; t++) {
+                    p0 = _mm512_dpbusd_epi32(p0, w[t], iq512_bc4(x + 4 * t));
+                    p1 = _mm512_dpbusd_epi32(p1, w[4 + t], iq512_bc4(x + 16 + 4 * t));
+                }
+                I[c] = per32 ? _mm512_add_epi32(I[c], _mm512_mullo_epi32(S0, _mm512_add_epi32(p0, p1)))
+                             : _mm512_add_epi32(I[c], _mm512_add_epi32(_mm512_mullo_epi32(S0, p0), _mm512_mullo_epi32(S1, p1)));
+            }
+        }
+        for (int c = 0; c < NC && c < nc; c++) {
+            if (q2) {
+                __m512i M = _mm512_setzero_si512();
+                for (int g8 = 0; g8 < 8; g8++) // (m <= 15, |X| <= 2032: int16 pairs)
+                    M = _mm512_dpwssd_epi32(M, Mp[g8], _mm512_set1_epi32((int)iqf_xpair(c16 + c * ldc + 2 * (8 * s + g8))));
+                val[c] = iqf_fold2(val[c], D, Dm, xs[c * ldxs + 8 * s], I[c], M);
+            } else val[c] = iqf_fold(val[c], D, xs[c * ldxs + 8 * s], I[c]);
+        }
+    }
+    for (int c = 0; c < nc && c < NC; c++) _mm512_storeu_ps(out + c * ldo, val[c]);
+}
+
+#define IQF_INST(NAME, TYPE) \
+    static void NAME##_1(IQ512_ARGS) { iqf_blk(TYPE, 1, out, ldo, wb, nsb, nc, xq, ldx, xs, ldxs, c16, ldc); } \
+    static void NAME##_8(IQ512_ARGS) { iqf_blk(TYPE, 8, out, ldo, wb, nsb, nc, xq, ldx, xs, ldxs, c16, ldc); }
+IQF_INST(iqf_q2k, GGML_Q2_K)
+IQF_INST(iqf_i2xxs, GGML_IQ2_XXS)
+IQF_INST(iqf_i2xs, GGML_IQ2_XS)
+IQF_INST(iqf_i2s, GGML_IQ2_S)
+IQF_INST(iqf_i3xxs, GGML_IQ3_XXS)
+IQF_INST(iqf_i3s, GGML_IQ3_S)
+IQF_INST(iqf_i1s, GGML_IQ1_S)
+IQF_INST(iqf_i1m, GGML_IQ1_M)
+IQF_INST(iqf_i4xs, GGML_IQ4_XS)
+IQF_INST(iqf_i3xxsr, GGML_IQ3_XXS_R)
+IQF_INST(iqf_i3sr, GGML_IQ3_S_R)
+#undef IQF_INST
+
+static inline void iqf_fns(int type, Iq512Fn *f1, Iq512Fn *f8) {
+#define IQF_C(T, N) case T: *f1 = N##_1; *f8 = N##_8; break;
+    switch (type) {
+    IQF_C(GGML_Q2_K, iqf_q2k) IQF_C(GGML_IQ2_XXS, iqf_i2xxs) IQF_C(GGML_IQ2_XS, iqf_i2xs) IQF_C(GGML_IQ2_S, iqf_i2s)
+    IQF_C(GGML_IQ3_XXS, iqf_i3xxs) IQF_C(GGML_IQ3_S, iqf_i3s) IQF_C(GGML_IQ1_S, iqf_i1s) IQF_C(GGML_IQ1_M, iqf_i1m)
+    IQF_C(GGML_IQ4_XS, iqf_i4xs) IQF_C(GGML_IQ3_XXS_R, iqf_i3xxsr) default: IQF_C(GGML_IQ3_S_R, iqf_i3sr)
+    }
+#undef IQF_C
+}
+
+#ifndef IQF_C_P32
+#define IQF_C_P32 6 // activation rows per register tile: per-32 scale types (t, I, f: spills a little, still the fastest)
+#endif
+#ifndef IQF_C_TWO
+#define IQF_C_TWO 5 // two scales per group (8 threads, 512 rows: 3 / 4 / 5 / 6 rows 1.00 / 0.86 / 1.20 / 1.20x)
+#endif
+#ifndef IQF_C_Q2
+#define IQF_C_Q2 5  // Q2_K (I, its mins M, f; 4 / 5 / 6: 1.26 / 1.28 / 1.20x)
+#endif
+
+static inline __attribute__((always_inline))
+void iqf_tile(const int RB, const int C, const int P32, const int Q2, const int Bi, const uint8_t *ws, size_t bstride, int nsb,
+              const int8_t *x, size_t ldx, const float *xs, size_t ldxs, const int32_t *c16, size_t ldc, float *out, size_t ldo) {
+    // iqx_tile's arguments (ng -> nsb super-blocks); out[c * ldo + 16 r + lane]
+    const int rec = Q2 ? IQS_Q2 : IQS_REC;
+    __m512 f[2][8];
+    for (int r = 0; r < RB; r++)
+        for (int c = 0; c < C; c++) f[r][c] = _mm512_setzero_ps();
+    for (int s = 0; s < nsb; s++) {
+        __m512i I[2][8], Ms[2][8];
+        int32_t xp[8][8]; // (Q2_K: [c][g8] the X pairs)
+        for (int r = 0; r < RB; r++)
+            for (int c = 0; c < C; c++) I[r][c] = Ms[r][c] = _mm512_setzero_si512();
+        if (Q2)
+            for (int c = 0; c < C; c++)
+                for (int g8 = 0; g8 < 8; g8++) xp[c][g8] = (int32_t)iqf_xpair(c16 + c * ldc + 2 * (8 * s + g8));
+        for (int g8 = 0; g8 < 8; g8++) {
+            const int g = 8 * s + g8;
+            const uint8_t *wg = ws + (size_t)g * rec;
+            const int8_t *xg = x + (size_t)g * 32;
+            if (Q2) {
+                #pragma GCC unroll 8
+                for (int st = 0; st < 8; st++) {
+                    __m512i w[2];
+                    for (int r = 0; r < RB; r++) w[r] = _mm512_load_si512((const void *)(wg + r * bstride + st * 64));
+                    for (int c = 0; c < C; c++) {
+                        __m512i xv = q8p_bcast4(xg + c * ldx + st * 4);
+                        for (int r = 0; r < RB; r++) I[r][c] = _mm512_dpbusd_epi32(I[r][c], w[r], xv);
+                    }
+                }
+                for (int r = 0; r < RB; r++) {
+                    __m512i Mp = _mm512_load_si512((const void *)(wg + r * bstride + 704));
+                    for (int c = 0; c < C; c++) Ms[r][c] = _mm512_dpwssd_epi32(Ms[r][c], Mp, _mm512_set1_epi32(xp[c][g8]));
+                }
+            } else if (P32) {
+                __m512i t[2][8];
+                for (int c = 0; c < C; c++) {
+                    const int32_t *cc = c16 + c * ldc + 2 * g;
+                    __m512i cv = _mm512_set1_epi32(Bi * (cc[0] >> 5) + Bi * (cc[1] >> 5));
+                    for (int r = 0; r < RB; r++) t[r][c] = cv;
+                }
+                #pragma GCC unroll 8
+                for (int st = 0; st < 8; st++) {
+                    __m512i w[2];
+                    for (int r = 0; r < RB; r++) w[r] = _mm512_load_si512((const void *)(wg + r * bstride + st * 64));
+                    for (int c = 0; c < C; c++) {
+                        __m512i xv = q8p_bcast4(xg + c * ldx + st * 4);
+                        for (int r = 0; r < RB; r++) t[r][c] = _mm512_dpbusd_epi32(t[r][c], w[r], xv);
+                    }
+                }
+                for (int r = 0; r < RB; r++) {
+                    __m512i sc = _mm512_load_si512((const void *)(wg + r * bstride + 512));
+                    for (int c = 0; c < C; c++) I[r][c] = _mm512_add_epi32(I[r][c], _mm512_mullo_epi32(sc, t[r][c]));
+                }
+            } else {
+                for (int h = 0; h < 2; h++) {
+                    __m512i t[2][8];
+                    for (int c = 0; c < C; c++) {
+                        __m512i cv = _mm512_set1_epi32(Bi * (c16[c * ldc + 2 * g + h] >> 5));
+                        for (int r = 0; r < RB; r++) t[r][c] = cv;
+                    }
+                    #pragma GCC unroll 4
+                    for (int st = 4 * h; st < 4 * h + 4; st++) {
+                        __m512i w[2];
+                        for (int r = 0; r < RB; r++) w[r] = _mm512_load_si512((const void *)(wg + r * bstride + st * 64));
+                        for (int c = 0; c < C; c++) {
+                            __m512i xv = q8p_bcast4(xg + c * ldx + st * 4);
+                            for (int r = 0; r < RB; r++) t[r][c] = _mm512_dpbusd_epi32(t[r][c], w[r], xv);
+                        }
+                    }
+                    for (int r = 0; r < RB; r++) {
+                        __m512i sc = _mm512_load_si512((const void *)(wg + r * bstride + 512 + 64 * h));
+                        for (int c = 0; c < C; c++) I[r][c] = _mm512_add_epi32(I[r][c], _mm512_mullo_epi32(sc, t[r][c]));
+                    }
+                }
+            }
+        }
+        const uint8_t *w0 = ws + (size_t)8 * s * rec; // (D, Dm: the same in every group record of the super-block)
+        for (int r = 0; r < RB; r++) {
+            __m512 d = _mm512_load_ps((const float *)(w0 + r * bstride + 640));
+            if (Q2) {
+                __m512 dm = _mm512_load_ps((const float *)(w0 + r * bstride + 768));
+                for (int c = 0; c < C; c++) f[r][c] = iqf_fold2(f[r][c], d, dm, xs[c * ldxs + 8 * s], I[r][c], Ms[r][c]);
+            } else
+                for (int c = 0; c < C; c++) f[r][c] = iqf_fold(f[r][c], d, xs[c * ldxs + 8 * s], I[r][c]);
+        }
+    }
+    for (int r = 0; r < RB; r++)
+        for (int c = 0; c < C; c++) _mm512_storeu_ps(out + c * ldo + r * KQ_ROWS, f[r][c]);
+}
+
+#define IQFT_PASS ws, bstride, ng / 8, x, ldx, xs, ldxs, c16, ldc, out, ldo
+#define IQFT_FN(R, CC) \
+    static void iqft_p32_##R##_##CC(IQX_ARGS) { iqf_tile(R, CC, 1, 0, Bi, IQFT_PASS); } \
+    static void iqft_two_##R##_##CC(IQX_ARGS) { iqf_tile(R, CC, 0, 0, Bi, IQFT_PASS); } \
+    static void iqft_q2k_##R##_##CC(IQX_ARGS) { (void)Bi; iqf_tile(R, CC, 0, 1, 0, IQFT_PASS); }
+#define IQFT_FNS(R) IQFT_FN(R, 1) IQFT_FN(R, 2) IQFT_FN(R, 3) IQFT_FN(R, 4) IQFT_FN(R, 5) IQFT_FN(R, 6) IQFT_FN(R, 7) IQFT_FN(R, 8)
+IQFT_FNS(1)
+IQFT_FNS(2)
+#define IQFT_ROW(K, R) { iqft_##K##_##R##_1, iqft_##K##_##R##_2, iqft_##K##_##R##_3, iqft_##K##_##R##_4, iqft_##K##_##R##_5, \
+                         iqft_##K##_##R##_6, iqft_##K##_##R##_7, iqft_##K##_##R##_8 }
+static const IqxFn iqft_fns[3][2][8] = { { IQFT_ROW(p32, 1), IQFT_ROW(p32, 2) }, { IQFT_ROW(two, 1), IQFT_ROW(two, 2) },
+                                         { IQFT_ROW(q2k, 1), IQFT_ROW(q2k, 2) } };
+#undef IQFT_ROW
+#undef IQFT_FNS
+#undef IQFT_FN
+#undef IQFT_PASS
+
+static void iqf_gemm_item(float *out, int ldo, const uint8_t *kp, int type, int d, int t, int ch, int nbi,
+                          const int8_t *xq, const float *xs, int ldx, int nb, int k, const int32_t *c16, uint8_t *scr,
+                          const void **last) {
+    // iqx_gemm_item under --act256 (the same work items, scratch and decode; iqf_tile)
+    int ng = k / 32, n16 = k / 16, sbb = iq_sb_bytes(type), q2 = type == GGML_Q2_K;
+    size_t ldxs = (size_t)ldx / 32, bstride = (size_t)ng * (q2 ? IQS_Q2 : IQS_REC);
+    int nblk = d / KQ_ROWS, rb0 = 2 * t, rb = nblk - rb0 < 2 ? nblk - rb0 : 2;
+    const uint8_t *wt = kp + (size_t)rb0 * (k / QK_K) * sbb;
+    if (*last != wt) {
+        iqx_unpack_tile(type, scr, wt, rb, k);
+        *last = wt;
+    }
+    int kind = q2 ? 2 : iqx_per32(type) ? 0 : 1, C = kind == 2 ? IQF_C_Q2 : kind ? IQF_C_TWO : IQF_C_P32, Bi = iq_bias(type);
+    int b1 = (ch + 1) * nbi < nb ? (ch + 1) * nbi : nb;
+    for (int b = ch * nbi; b < b1; b += C) {
+        int c = b1 - b < C ? b1 - b : C;
+        iqft_fns[kind][rb - 1][c - 1](scr, bstride, ng, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
+                                      c16 + (size_t)b * n16, n16, out + (size_t)b * ldo + (size_t)rb0 * KQ_ROWS, ldo, Bi);
+    }
+}
+
 #endif // GWENEDEG_VNNI
 
 static void iq_r_convert(int type, uint8_t *o, const uint8_t *sb) {
@@ -1729,6 +2017,35 @@ static void iq_rows(int type, float *out, size_t ldo, const int8_t *xq, size_t l
         for (int b = 0; b < nb; b += KQ_NC)
             iq_dot(type, out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo, wb, k, nb - b < KQ_NC ? nb - b : KQ_NC,
                    xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs);
+    }
+#endif
+}
+
+static void iqf_rows(int type, float *out, size_t ldo, const int8_t *xq, size_t ldx, const float *xs, const int32_t *c16,
+                     int nb, const uint8_t *kp, int k, int rb0, int rb1) {
+    // iq_rows under --act256: the AVX-512 rows kernel (iqf_blk), elsewhere the definition (iqf_dot; NEON: no kernel yet)
+    int nsb = k / QK_K;
+    size_t sbb = (size_t)iq_sb_bytes(type), ldxs = ldx / 32;
+#ifdef GWENEDEG_IQX
+    Iq512Fn f1, f8;
+    iqf_fns(type, &f1, &f8);
+    for (int rb = rb0; rb < rb1; rb++) {
+        const uint8_t *wb = kp + (size_t)rb * nsb * sbb;
+        if (nb == 1) {
+            f1(out + (size_t)rb * KQ_ROWS, ldo, wb, nsb, 1, xq, ldx, xs, ldxs, c16, (size_t)k / 16);
+            continue;
+        }
+        for (int b = 0; b < nb; b += 8)
+            f8(out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo, wb, nsb, nb - b < 8 ? nb - b : 8, xq + (size_t)b * ldx, ldx,
+               xs + (size_t)b * ldxs, ldxs, c16 + (size_t)b * (k / 16), (size_t)k / 16);
+    }
+#else
+    (void)c16;
+    for (int rb = rb0; rb < rb1; rb++) {
+        const uint8_t *wb = kp + (size_t)rb * nsb * sbb;
+        for (int b = 0; b < nb; b += KQ_NC)
+            iqf_dot(type, out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo, wb, k, nb - b < KQ_NC ? nb - b : KQ_NC,
+                    xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs);
     }
 #endif
 }

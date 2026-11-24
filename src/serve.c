@@ -1082,6 +1082,8 @@ static void usage(void) {
             "  --repack[=LIST]     store the IQ3_XXS / IQ3_S weights as 4-bit codes at load (LIST: IQ3_S, IQ3_XXS; default\n"
             "                      all): bit-identical output, faster where compute-bound, more RAM (gwenedeg M --repack-info)\n"
             "  --no-repack         weights as in the file (default)\n"
+            "  --act256            one activation scale per 256 values (not 32): faster i-quant prefill, slightly\n"
+            "                      different results (the draft model too)\n"
             "  -b <int>            prompt tokens per pass when no request is decoding, default 512\n"
             "  --chunk <int>       prompt tokens per pass while others decode, default 64\n"
             "  --prefix-copy <int> copy a cached prompt prefix into another slot if that saves this many tokens, default 32\n"
@@ -1143,12 +1145,14 @@ int serve_main(int argc, char **argv) {
     long long maxbody = 4 << 20;
     double timeout = 600, temp = 1.0, topp = 1.0, kv_mem = 0, mem = 0;
     int page_cache = 0, repack = 0; // (--repack[=LIST] / --no-repack: RqModelOpts.repack)
+    int act256 = 0; // (--act256: RqModelOpts.act256)
     int topk = 0, samp_given = 0; // (RQ_SAMPLING_* given: else the model's values, if any)
     for (int i = 2; i < argc; i++) {
         const char *f = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         if (!strcmp(f, "-v") || !strcmp(f, "--verbose")) { verbose = 1; continue; }
         if (!strcmp(f, "--repack")) { repack = RQ_REPACK_ALL; continue; }
         if (!strcmp(f, "--no-repack")) { repack = -1; continue; }
+        if (!strcmp(f, "--act256")) { act256 = 1; continue; }
         if (!strncmp(f, "--repack=", 9)) { if ((repack = rq_repack_parse(f + 9)) < 0) usage(); continue; }
         if (!v) usage();
         i++;
@@ -1228,6 +1232,7 @@ int serve_main(int argc, char **argv) {
     // (positions up to -c: the default cap of 40,960 would clamp a larger -c; the memory check counts one sequence of -c
     // positions, the pool is bounded by --kv-mem)
     RqModelOpts mo = { ctx, 0, 0, mem, rq_kv_bits(kv), page_cache, ckpts, repack };
+    mo.act256 = act256;
     RqModel *m = rq_model_load(path, &mo, err, sizeof(err));
     if (!m) { fprintf(stderr, "%s\n", err); return 1; }
     if (repack > 0) rq_repack_note(m);

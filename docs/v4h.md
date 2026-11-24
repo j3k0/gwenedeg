@@ -1,9 +1,10 @@
 # V4H: a VNNI-native 4-bit weight and activation format
 
-Status: **design proposal, not implemented or benchmarked**. V4H is a new quantization, not a lossless repack of an existing
-GGUF type. The short, unscheduled version is in [IDEAS.md](../IDEAS.md#v4h-a-vnni-native-4-bit-weight-and-activation-format).
-The starting points are the Q8P layout in `src/kernels_avx512.h` and the i-quant layouts and kernels in `src/iquants.h`;
-current measurements are in [iquants.md](iquants.md).
+Status: **prototyped 2026-11-24 on Qwen3.5-0.8B and in a kernel micro-benchmark; not integrated** (results:
+[section 9](#9-prototype-results-2026-11-24)). V4H is a new quantization, not a lossless repack of an existing GGUF type.
+The short version is in [IDEAS.md](../IDEAS.md#v4h-a-vnni-native-4-bit-weight-and-activation-format). The starting points
+are the Q8P layout in `src/kernels_avx512.h` and the i-quant layouts and kernels in `src/iquants.h`; current measurements
+are in [iquants.md](iquants.md).
 
 ## Summary
 
@@ -291,3 +292,120 @@ Open questions:
 
 The design is worth testing because it attacks measured overhead with the same storage cost as the existing fast repack. It is not
 yet evidence that a custom model format will be faster end to end or accurate enough to ship.
+
+## 9. Prototype results (2026-11-24)
+
+Steps 1-4 of section 8, at small scale. The short answer: **most of the prefill gain needs only a different activation format,
+not V4H.** With one activation scale per 256 values, the existing IQ3_S/r and IQ4_XS tiles already reach 1.2x, with no new
+quantization. V4H adds about 1.1x on top of that, at the cost of a new quantizer and, on the 0.8B model, worse quality than
+IQ4_XS for the same bits.
+
+Tools (none is used by gwenedeg itself):
+
+- `tools/v4h_quant.py`: the V4H weight quantizer (numpy). It reads a BF16 GGUF and writes the V4H weights into a copy of a
+  Q8_0 GGUF of the same model, the *carrier*: each Q8_0 block holds `q` and `d = fp16(D s)`, which dequantizes to `D s q`
+  (relative error at most 2^-11 from rounding the product). So llama.cpp and gwenedeg can measure V4H's quality before a
+  file type exists. For each group of 32 it searches candidate scales, weighting values as IQ4_XS does: the imatrix times
+  `sqrt(sigma2 + x^2)`, or `x^2` without an imatrix. Each candidate is refit by least squares. It then searches `D` per
+  superblock, with the subscales rounded and `D` refit. Variants: `v4h`, `flat256` (V4-flat) and `s6` (6-bit subscales,
+  an ablation).
+- `GWENEDEG_ACTQ_SIM=v4h|flat` (`forward.c` `quantize_sim`, off by default): a diagnostic that quantizes activations as a
+  V4H kernel would. `v4h` uses `A` per 256 and `a_g = ceil(sigma_g / A)`; `flat` uses one scale per 256 (llama.cpp's Q8_K).
+  The result is written as the usual per-32 scales, so every existing kernel computes the same products.
+- `tools/v4h_kl.py`: KL of gwenedeg runs against a reference run, using `build/long_ctx -A`, as `scripts/kl_quant.py` does.
+- `tests/kernels/v4h_bench.c` (`make v4h-bench`): the packing and the scalar definition of section 2, plus kernels that are
+  bit-identical to it (checked on 1 to 77 rows and on the extremes `q = -8`, `s = 15`, `z = -127 / 127`, `|T| = 32512`).
+  It also has a micro-benchmark against IQ3_S/r and IQ4_XS, run in the same process.
+
+### Quality, Qwen3.5-0.8B
+
+Source: unsloth's BF16 GGUF. All files were made with llama-quantize `--pure` (llama.cpp `225a534`), with `token_embd` (the
+tied output) and `ssm_alpha` / `ssm_beta` at Q8_0. The V4H carriers use the same tensor set: every other matrix, 484M
+weights. The imatrix is unsloth's `imatrix_unsloth.gguf_file`. KL is against BF16 (llama-perplexity `--kl-divergence`,
+512-token chunks): wikitext-2 test, 48 chunks (12k scored tokens), and llama.cpp C++ source, 32 chunks (8k).
+
+| file | bits/weight | wiki KL | wiki PPL / BF16 | wiki same top-1 | code KL | code PPL / BF16 |
+|---|---:|---:|---:|---:|---:|---:|
+| Q8_0 | 8.5 | 0.0012 | 1.002 | 97.8% | 0.0007 | 1.001 |
+| Q4_K, imatrix | 4.5 | 0.048 | 1.055 | 88.6% | 0.030 | 1.041 |
+| IQ4_XS, imatrix | 4.25 | 0.061 | 1.062 | 86.9% | 0.041 | 1.066 |
+| **V4H, imatrix** | 4.1875 | **0.092** | 1.176 | 83.6% | **0.050** | 1.055 |
+| V4H, 6-bit subscales | 4.4375 | 0.090 | 1.169 | 83.9% | 0.049 | 1.053 |
+| V4H, no imatrix | 4.1875 | 0.114 | 1.178 | 82.3% | 0.064 | 1.073 |
+| Q4_0, imatrix | 4.5 | 0.097 | 1.181 | 84.1% | 0.054 | 1.071 |
+| V4-flat, imatrix | 4.0625 | 0.171 | 1.289 | 78.8% | 0.112 | 1.144 |
+| IQ3_S, imatrix | 3.4375 (4.1875 as /r) | 0.180 | 1.112 | 78.6% | 0.115 | 1.115 |
+
+- V4H falls between IQ3_S and IQ4_XS. At IQ3_S/r's in-memory size it has half llama.cpp IQ3_S's KL. It has 1.5x / 1.2x
+  IQ4_XS's KL (wiki / code), although IQ4_XS costs only 1.5% more bits. Quality per bit therefore depends on IQ4_XS's
+  non-uniform levels, not on the subscale width: 4-bit subscales cost almost nothing compared with 6-bit ones
+  (0.092 vs 0.090).
+- V4-flat is as bad as IQ3_S. One weight scale per 256 is not practical without the rotation or equalization of section 7.
+- The uniform symmetric formats (V4H, Q4_0, V4-flat) lose much more wikitext perplexity than their KL suggests: +18% for
+  V4H, against +11% for IQ3_S at twice V4H's KL. The mean probability of the text's token drops by 1.8 points, against
+  0.8 for IQ4_XS. This is unexplained; the quantizer's least-squares scale refit, which shrinks scales, is a suspect.
+- These are not the 27B's numbers. The 0.8B model is more sensitive to quantization. ISTA's 27B IQ3_S file also comes from
+  a GSQ/RCO quantizer, which is much better than llama-quantize; V4H was quantized round-to-nearest with an imatrix.
+
+Activation formats, measured in gwenedeg (`tools/v4h_kl.py`; KL against the Q8_0 file with the current per-32
+activations; 8,192 tokens each of wikitext and code):
+
+| weights | activations | wiki KL | code KL |
+|---|---|---:|---:|
+| Q8_0 | V4H (`A` per 256, u8 `a` per 32) | 0.0010 | 0.0003 |
+| Q8_0 | flat (one scale per 256) | 0.0036 | 0.0010 |
+| V4H | per 32 / V4H / flat | 0.1032 / 0.1019 / 0.1036 | 0.0271 / 0.0271 / 0.0277 |
+| IQ4_XS / Q4_K / IQ3_S (imatrix) | per 32 | 0.057 / 0.047 / 0.180 | 0.021 / 0.015 / 0.064 |
+
+Next to 4-bit weight error, the activation format is invisible, even with one scale per 256 (llama.cpp's CPU i-quants and
+K-quants use that format). The activation subscale `a` of section 2 is therefore unnecessary.
+
+### Kernels (`build/v4h_bench -b NB D K 7`, best of 7 interleaved, the day server running: load 2-5)
+
+Kernels compared:
+
+- *rows*: GEMV and small batches from the packed blocks. V4H: nibbles by `and` / shift, `T_g` by `vpdpbusd`, then
+  `I += s_g T_g` by `vpdpwssd` or `vpmulld + vpaddd`, and one fold per 256.
+- *tiled-u*: the proposal's tile. The `u` codes are decoded to scratch; per group, `T_g` and one `vpdpwssd`; one fold per 256.
+- ***tiled-p***: the tile decoded once to the signed bytes `s q`. This needs `|s q| <= 120`, which only V4H's ranges give.
+  `s u` takes one `vpmullw` on byte pairs, since `s u <= 225` cannot carry into the next byte; then `8 s` is subtracted.
+  The activations are stored as u8 `z + 128`, and a bias of `-128 sum(s q)` per row is precomputed at decode. Per
+  superblock this leaves 64 `vpdpbusd` and one fold, with no per-group work at all. It uses a 2 x 5 register tile (6 and
+  up spill).
+- *tiled-flat*: the control, with no new format. It uses the existing IQ3_S/r or IQ4_XS scratch (`iqx_unpack_tile`) and
+  flat activations. Per group it computes `T` and `I += S T` with `vpmulld` (`|T|` exceeds int16 for these types), with one
+  fold per 256. Checked against `iq_rows` with `xs = A`: equal up to float rounding (relative 2e-7).
+
+ns per weight and activation row (x threads); in parentheses, speed relative to IQ3_S/r's faster path:
+
+| shape, threads | rows | IQ3_S/r | IQ4_XS | IQ3_S/r flat | IQ4_XS flat | V4H rows | V4H tiled-u | **V4H tiled-p** |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 x 5120, 1 thr | 512 | 0.00374 | 0.00378 | 0.00301 (1.24) | 0.00300 (1.25) | 0.00410 | 0.00302 (1.24) | **0.00271 (1.38)** |
+| | 64 | 0.00369 | 0.00367 | 0.00312 (1.18) | 0.00302 (1.22) | 0.00369 | 0.00300 (1.23) | **0.00270 (1.37)** |
+| | 8 | 0.00491 (rows) | 0.00447 (rows) | 0.00558 | 0.00532 | **0.00388 (1.27)** | 0.00465 | 0.00460 |
+| | 1 | 0.00923 | 0.00763 | | | **0.00712 (1.30)** | | |
+| 17408 x 5120, 8 thr | 512 | 0.00393 | 0.00397 | 0.00331 (1.19) | 0.00336 (1.17) | 0.00467 | 0.00330 (1.19) | **0.00292 (1.34)** |
+| | 64 | 0.00454 | 0.00457 | 0.00377 (1.20) | 0.00379 (1.20) | 0.00486 | 0.00367 (1.24) | **0.00339 (1.34)** |
+| | 8 | 0.00830 (rows) | 0.00875 (rows) | 0.00981 | 0.00977 | 0.00759 (1.09) | 0.00711 (1.17) | 0.00736 (1.13) |
+| | 1 | 0.03645 | 0.03620 | | | **0.02806 (1.30)** | | |
+| 65536 x 5120, 8 thr (DRAM) | 1 | 0.04028 | 0.04027 | | | 0.03884 (1.04) | | |
+
+- **The activation format accounts for most of the prefill gain.** IQ3_S/r and IQ4_XS with flat activations reach
+  1.17-1.25x. That is about the whole headroom of section 6, and it would apply to ISTA's existing 27B file.
+- V4H's own gain comes from the premultiplied tile: 1.34-1.38x against IQ3_S/r, or 1.10-1.13x over the flat-activation
+  control. The proposal's tile with `vpdpwssd` (tiled-u) gives no more than the control. Whether `vpdpwssd` or
+  `vpmulld + vpaddd` is faster depends on the case and changes between runs (open question 1: no consistent difference).
+- GEMV and small batches gain 1.1-1.3x when the weights are in cache (no `vpshufb`, a fold per 256). In DRAM-bound decode
+  the gain is 1.04x, as section 6 predicted.
+
+### What this means for the plan
+
+1. **Flat activations for the existing formats come first.** Use one activation scale per 256, accumulate the integer
+   subscales per group, and fold once per 256, in the tiled GEMM, the rows kernels and the generic and NEON definitions.
+   This is a new arithmetic definition, not a new quantization. Expected: 1.2x on the tiled GEMM kernel for the ISTA IQ3_S
+   file, at an activation cost of KL +0.001-0.004 on the 0.8B model. It must be measured on the 27B: end-to-end prefill,
+   and KL against the current definition.
+2. **V4H only if a 27B V4H file can match ISTA IQ3_S's quality.** Its remaining advantage over item 1 is about 1.1x on
+   prefill and 1.1-1.3x on cache-resident GEMV. On the 0.8B model its quality per bit is worse than IQ4_XS. Better rounding
+   (GPTQ-style error feedback), and the unexplained perplexity loss above, come before any 27B quantization. Quantizing the
+   27B needs its BF16 checkpoint (about 54 GB) and a reference run that does not fit beside the day server.

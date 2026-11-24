@@ -65,6 +65,13 @@ reference for the layout.
 
 Full analysis, layout, arithmetic proof and prototype plan: [docs/v4h.md](docs/v4h.md).
 
+**Prototyped 2026-11-24** ([docs/v4h.md section 9](docs/v4h.md#9-prototype-results-2026-11-24)). On Qwen3.5-0.8B against
+BF16, V4H with an imatrix has KL 0.092 / 0.050 (wiki / code): half llama.cpp IQ3_S's 0.180 / 0.115, but worse than
+IQ4_XS's 0.061 / 0.041. The activation subscale is unnecessary: even one activation scale per 256 costs KL ≤ 0.004. The
+kernels (`make v4h-bench`) are bit-identical to the definition. A tile decoded to `s q` bytes runs 1.34-1.38x faster than
+IQ3_S/r, but the existing IQ3_S/r and IQ4_XS tiles with one activation scale per 256 already get 1.17-1.25x. Next step: that
+activation format for the existing types, measured on the 27B. V4H itself only with a better quantizer.
+
 `vpdpbusd` still needs one byte per weight, so a lower bit width alone cannot raise its compute peak. A format co-designed with the
 kernel could nevertheless beat the i-quants by making nibble expansion and scaling cheaper. V4H uses 16-row x 256-column
 superblocks: 4-bit codes `u = q + 8` (`q = -8 .. 7`), an fp16 `D` per row and superblock, and a 4-bit unsigned subscale `s`

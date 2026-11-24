@@ -31,7 +31,7 @@ HDR = $(wildcard src/*.h)
 Q8  = models/Qwen3-0.6B-q8.bin
 B   = build
 
-.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test iq-neon-test iq-repack-test iq-gemm-test api-test tools-test bench-batch bench-verify long-ctx bench-long bench-mtp spec-sweep teacher-force mem-probe bf16dp-test FORCE
+.PHONY: all debug generic clean test test-models bench bench-prefill models kq-neon-test iq-neon-test iq-repack-test iq-gemm-test v4h-bench api-test tools-test bench-batch bench-verify long-ctx bench-long bench-mtp spec-sweep teacher-force mem-probe bf16dp-test FORCE
 
 all: gwenedeg
 
@@ -174,6 +174,13 @@ $(B)/iq_gemm_test: tests/kernels/iq_gemm_test.c src/kernels_avx512.h src/iquants
 	$(CC) $(CFLAGS) -fopenmp $< -o $@
 iq-gemm-test: $(B)/iq_gemm_test
 	$(B)/iq_gemm_test
+# the V4H prototype kernels (docs/v4h.md) vs their scalar definition, and their micro-benchmark against IQ3_S/r and
+# IQ4_XS (build/v4h_bench -b [NB [D [K [REPS]]]], OMP_NUM_THREADS threads); AVX-512 VNNI only, not part of make test
+$(B)/v4h_bench: tests/kernels/v4h_bench.c src/kernels_avx512.h src/iquants.h src/iq_grids.h src/kquants.h
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -ffp-contract=off -fopenmp $< -o $@
+v4h-bench: $(B)/v4h_bench
+	$(B)/v4h_bench
 
 generic: gwenedeg-generic
 

@@ -55,6 +55,7 @@
 // setting of the kernels, read in their loops (a parameter would change the -Ofast code generation
 // of the exact functions); set by rq_model_load, which rejects a second model with another one
 extern int GS;
+extern int rq_actq_sim; // GWENEDEG_ACTQ_SIM: 0 off, 1 V4H's hierarchical scales, 2 one scale per 256 (forward.c)
 extern int rq_iq_gather; // GWENEDEG_IQ_GATHER (iquants.h)
 
 static inline uint64_t fnv1a64(uint64_t h, const void *p, size_t n) {

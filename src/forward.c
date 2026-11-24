@@ -833,7 +833,45 @@ int rq_ctx_profile(const RqCtx *c, const char **names, double *seconds, int max)
 // ----------------------------------------------------------------------------
 // Quantization functions
 
+static void quantize_sim(QuantizedTensor *qx, const float *x, int n) {
+    // GWENEDEG_ACTQ_SIM (a quality diagnostic for docs/v4h.md; not bit-identical to anything, off by default): the
+    // activations quantized as a V4H kernel would take them, written as the usual per-32 scale + int8 values so that
+    // every existing kernel computes the same products. Per superblock of 8 groups (256 values from the row's start;
+    // a short tail is its own superblock), sigma_g = max |x_g| / 127:
+    //   1 (V4H)  A = max_g sigma_g / 255, a_g = ceil(sigma_g / A) in 1..255, the group's scale A * a_g (>= sigma_g)
+    //   2 (flat) one scale max_g sigma_g for all 8 groups (llama.cpp's Q8_K activations, V4-flat)
+    // z = round(x / scale) in -127..127.
+    const int gs = GS, ng = n / gs;
+    for (int g0 = 0; g0 < ng; g0 += 8) {
+        int g1 = g0 + 8 < ng ? g0 + 8 : ng;
+        float sig[8], smax = 0;
+        for (int g = g0; g < g1; g++) {
+            float m = 0;
+            for (int i = 0; i < gs; i++) m = fmaxf(m, fabsf(x[(size_t)g * gs + i]));
+            sig[g - g0] = m / 127.0f;
+            smax = fmaxf(smax, sig[g - g0]);
+        }
+        float A = smax / 255.0f;
+        for (int g = g0; g < g1; g++) {
+            float sc = smax;
+            if (rq_actq_sim == 1 && A > 0) {
+                float a = ceilf(sig[g - g0] / A);
+                a = a < 1 ? 1 : a > 255 ? 255 : a;
+                sc = A * a;
+                if (sc < sig[g - g0]) sc = sig[g - g0] * (1 + 1e-6f); // (never clip)
+            }
+            qx->s[g] = sc;
+            for (int i = 0; i < gs; i++) {
+                float v = sc > 0 ? x[(size_t)g * gs + i] / sc : 0;
+                int q = (int)lrintf(v);
+                qx->q[(size_t)g * gs + i] = (int8_t)(q > 127 ? 127 : q < -127 ? -127 : q);
+            }
+        }
+    }
+}
+
 void quantize(QuantizedTensor *qx, float *x, int n) {
+    if (rq_actq_sim) { quantize_sim(qx, x, n); return; }
     // per group of GS values: scale = max |x| / 127, q = x / scale rounded half away from zero.
     // Written as the operations gcc -Ofast made of upstream's expressions (`wmax / 127.0f`,
     // `(int8_t) round(x / scale)`; read off its asm): scale = wmax * (float)(1 / 127), inv = 127 /
@@ -1144,6 +1182,8 @@ static void smb_config(RqCtx *c) {
     env_ints("GWENEDEG_SMB", smb, 6);
     const char *ig = rq_getenv("GWENEDEG_IQ_GATHER"); // (iquants.h: the gather decode of the i-quants, a test switch; process-wide)
     rq_iq_gather = ig && atoi(ig) != 0;
+    const char *aq = rq_getenv("GWENEDEG_ACTQ_SIM"); // (quantize_sim: a quality diagnostic, process-wide)
+    rq_actq_sim = !aq ? 0 : !strcmp(aq, "v4h") ? 1 : !strcmp(aq, "flat") ? 2 : 0;
     memcpy(c->smb_max, smb, 4 * sizeof(int));
     c->smb_max[SMB_Q3] = smb[5];
     c->smb_pf = smb[4];

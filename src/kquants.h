@@ -618,4 +618,109 @@ static inline void kq_dot(int type, float *out, size_t ldo, const uint8_t *wb, i
         q6p_dot(out, ldo, wb, k, nc, xq, ldx, xs, ldxs);
 }
 
+/* ---------------------------------------------------------------------------------------------
+ * --act256 (RqModelOpts.act256; docs/v4h.md sections 11-12): one activation scale A per 256 values (forward.c quantize256
+ * writes it to each of the super-block's 8 xs[g]). The K-quant matrices then use this definition instead of the one above:
+ * the same integer sums, one fold per super-block s (A = xs[8 s]), each fp32 operation rounded, super-blocks in order:
+ *   Q4_K / Q5_K (sub-blocks j of 32, X_j = the sum of the 32 activations of sub-block j):
+ *     I = sum over j of sc_j * (sum of q * xq)        int32, exact: |I| <= 8 * 63 * 15 * 127 * 32 = 30.7M (Q5_K: 63.5M)
+ *     M = sum over j of m_j * X_j                     int32, exact: |M| <= 8 * 63 * 4064 = 2.05M
+ *     val = val + ((d * A) * (float) I - (dmin * A) * (float) M)
+ *   Q6_K / Q3_K: the 16 sub-blocks' sc_j * t_j of the definition above summed over the super-block (int32, exact: Q6_K
+ *     |I| <= 16 * 128 * 32 * 127 * 16 = 133.2M, Q3_K <= 16 * 32 * 4 * 127 * 16 = 4.2M), val = val + (d * A) * (float) I
+ * (xf is not used.) kqf_dot is the definition (the generic and NEON builds' kernel); the AVX-512 rows (kqf512_rows) and
+ * tiled (kqf512_gemm_item) kernels are bit-identical to it (tests/kernels/flat_bench.c).
+ */
+static void kqf_unpack(int type, const uint8_t *o, int g8, int32_t w[KQ_ROWS][32], int32_t S[KQ_ROWS][2],
+                       int32_t Mn[KQ_ROWS]) {
+    // group g8 of a repacked super-block o (Q3P .. Q6P): the signed values w (Q4_K / Q5_K: q; Q6_K: q - 32; Q3_K: q),
+    // the scale of each half S (Q4_K / Q5_K: sc_j twice; Q3_K: sc - 32), the min Mn (Q4_K / Q5_K, else 0)
+    for (int r = 0; r < KQ_ROWS; r++) {
+        Mn[r] = 0;
+        if (type == GGML_Q4_K || type == GGML_Q5_K) {
+            int q5 = type == GGML_Q5_K;
+            const uint8_t *qs = o + 320 + (q5 ? 320 : 256) * g8;
+            S[r][0] = S[r][1] = o[64 + 16 * g8 + r];
+            Mn[r] = o[192 + 16 * g8 + r];
+            for (int i = 0; i < 32; i++) {
+                int q = qs[64 * (i / 8) + 4 * r + i % 4] >> (4 * (i % 8 / 4)) & 15;
+                if (q5) q |= (int)(kq_u64(qs + 256 + 8 * (i / 4)) >> (4 * r + i % 4) & 1) << 4;
+                w[r][i] = q;
+            }
+        } else if (type == GGML_Q6_K) {
+            for (int h = 0; h < 2; h++) {
+                int j = 2 * g8 + h;
+                const uint8_t *ql = o + 320 + 192 * j, *qh = ql + 128;
+                S[r][h] = (int8_t)o[64 + 16 * j + r];
+                for (int t = 0; t < 4; t++)
+                    for (int b = 0; b < 4; b++)
+                        w[r][16 * h + 4 * t + b] = ((ql[64 * (t >> 1) + 4 * r + b] >> (4 * (t & 1)) & 15) |
+                                                    (qh[4 * r + b] >> (2 * t) & 3) << 4) - 32;
+            }
+        } else {
+            const uint8_t *qg = o + 256 + 192 * g8;
+            for (int h = 0; h < 2; h++) {
+                int j = 2 * g8 + h;
+                S[r][h] = ((o[64 + 16 * g8 + r] >> (4 * h) & 15) | (o[192 + 16 * (j / 4) + r] >> (2 * (j % 4)) & 3) << 4) - 32;
+                for (int t = 0; t < 4; t++)
+                    for (int b = 0; b < 4; b++)
+                        w[r][16 * h + 4 * t + b] = ((qg[64 * h + 4 * r + b] >> (2 * t) & 3) |
+                                                    (int)(kq_u64(qg + 128 + 8 * (4 * h + t)) >> (4 * r + b) & 1) << 2) - 4;
+            }
+        }
+    }
+}
+
+KQ_EXACT static void kqf_dot(int type, float *out, size_t ldo, const uint8_t *wb, int k, int nc, const int8_t *xq, size_t ldx,
+                             const float *xs, size_t ldxs) { RQ_FP_EXACT
+    // kq_dot under --act256 (the definition above; no xf): xs[c * ldxs + 8 s] is row c's scale of super-block s
+    float val[KQ_NC][KQ_ROWS];
+    memset(val, 0, sizeof(val));
+    int sbb = kq_sb_bytes(type), mins = type == GGML_Q4_K || type == GGML_Q5_K;
+    for (int s = 0; s < k / QK_K; s++) {
+        const uint8_t *o = wb + (size_t)s * sbb;
+        float d[KQ_ROWS], dmin[KQ_ROWS];
+        int32_t I[KQ_NC][KQ_ROWS], M[KQ_NC][KQ_ROWS];
+        memset(I, 0, sizeof(I));
+        memset(M, 0, sizeof(M));
+        for (int r = 0; r < KQ_ROWS; r++) {
+            if (mins) {
+                d[r] = fp16_to_f32(kq_u16(o + 2 * r));
+                dmin[r] = fp16_to_f32(kq_u16(o + 32 + 2 * r));
+            } else {
+                memcpy(&d[r], o + 4 * r, 4);
+                dmin[r] = 0.0f;
+            }
+        }
+        for (int g8 = 0; g8 < 8; g8++) {
+            int32_t w[KQ_ROWS][32], S[KQ_ROWS][2], Mn[KQ_ROWS];
+            kqf_unpack(type, o, g8, w, S, Mn);
+            for (int c = 0; c < nc; c++) {
+                const int8_t *x = xq + c * ldx + 32 * (8 * s + g8);
+                int32_t X = 0;
+                for (int i = 0; i < 32; i++)
+                    X += x[i];
+                for (int r = 0; r < KQ_ROWS; r++) {
+                    for (int h = 0; h < 2; h++) {
+                        int32_t t = 0;
+                        for (int i = 0; i < 16; i++)
+                            t += w[r][16 * h + i] * x[16 * h + i];
+                        I[c][r] += S[r][h] * t;
+                    }
+                    M[c][r] += Mn[r] * X;
+                }
+            }
+        }
+        for (int c = 0; c < nc; c++) {
+            float a = xs[c * ldxs + 8 * s];
+            for (int r = 0; r < KQ_ROWS; r++) {
+                if (mins) val[c][r] = val[c][r] + ((d[r] * a) * (float)I[c][r] - (dmin[r] * a) * (float)M[c][r]);
+                else val[c][r] = val[c][r] + (d[r] * a) * (float)I[c][r];
+            }
+        }
+    }
+    for (int c = 0; c < nc; c++)
+        memcpy(out + c * ldo, val[c], sizeof(val[c]));
+}
+
 #endif // GWENEDEG_KQUANTS_H

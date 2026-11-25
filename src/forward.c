@@ -908,8 +908,9 @@ void quantize(QuantizedTensor *qx, float *x, int n) {
 
 static void quantize256(QuantizedTensor *qx, const float *x, int n) {
     // RqModelOpts.act256: quantize()'s operations with one scale per 256 values from x (a shorter tail: its own), the
-    // scale written to each of its groups of GS (every kernel reads per-group scales; the Q2_K / i-quant ones under
-    // --act256 take s[8 j] for super-block j: iquants.h iqf_*). Callers pass whole rows or super-blocks from a row's start
+    // scale written to each of its groups of GS (every kernel reads per-group scales; the Q2_K / i-quant and K-quant ones
+    // under --act256 take s[8 j] for super-block j: iquants.h iqf_*, kquants.h kqf_dot). Callers pass whole rows or
+    // super-blocks from a row's start
     const int gs = GS;
     for (int i0 = 0; i0 < n; i0 += 256) {
         const int len = n - i0 < 256 ? n - i0 : 256;
@@ -1070,6 +1071,28 @@ static inline const QuantizedTensor *ab_item(const QuantizedTensor *wa, const Qu
     return t;
 }
 
+#ifndef SMB_PF
+#define SMB_PF 4096 // the K-quant small-batch kernels' software prefetch distance in bytes (0: none; below)
+#endif
+
+static inline void kqf_rows(int type, float *out, size_t ldo, const int8_t *xq, size_t ldx, const float *xs, const int32_t *c16,
+                            int nb, const uint8_t *kp, int k, int rb0, int rb1, int pf) {
+    // a K-quant matrix under --act256 (kquants.h kqf_dot's definition): out[b * ldo + i] = W row i . x row b for the rows
+    // of 16-row blocks rb0..rb1-1, b < nb (x row b at xq + b * ldx, its scales at xs + b * ldx / 32, c16 + b * k / 16).
+    // AVX-512: the rows kernel (kernels_avx512.h kqf512_rows; pf: its prefetch distance), elsewhere kqf_dot (NEON: no
+    // kernel yet, PLAN-A256 stage A256.3)
+#ifdef GWENEDEG_KQF
+    kqf512_rows(type, out, ldo, xq, ldx, xs, c16, nb, kp, k, rb0, rb1, pf);
+#else
+    (void)c16; (void)pf;
+    size_t bstride = (size_t)(k / QK_K) * kq_sb_bytes(type), ldxs = ldx / 32;
+    for (int rb = rb0; rb < rb1; rb++)
+        for (int b = 0; b < nb; b += KQ_NC)
+            kqf_dot(type, out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo, kp + (size_t)rb * bstride, k,
+                    nb - b < KQ_NC ? nb - b : KQ_NC, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs);
+#endif
+}
+
 // Decode GEMV, in pieces: decode_step runs all of a token in one parallel region, with the rows
 // of each matrix split into work items. matvec_prep: the VNNI kernel's activation corrections for
 // x[i0 .. i0+n) (one per GS-group; nothing to do for the generic kernel), and with K-quant weights
@@ -1100,6 +1123,10 @@ static inline void matvec_rows(float *xout, QuantizedTensor *x, const int32_t *c
         return;
     }
     if (w->kp) { // K-quants, 16-row blocks (kquants.h; AVX-512: kernels_avx512.h)
+        if (w->act256) { // (--act256: kqf_dot's definition; AVX-512: the 1-row small-batch kernel)
+            kqf_rows(w->type, xout, 0, x->q, 0, x->s, c16, 1, w->kp, n, i0 / KQ_ROWS, i1 / KQ_ROWS, SMB_PF);
+            return;
+        }
 #ifdef GWENEDEG_KQX
         kqx_gemv_rows(w->type, xout, x->q, x->s, xf, c16, w->kp, n, i0 / KQ_ROWS, i1 / KQ_ROWS);
 #else
@@ -1193,9 +1220,6 @@ enum { SMB_Q8, SMB_Q4, SMB_Q6, SMB_Q5, SMB_Q3 };
 #ifndef BD_MAX
 #define BD_MAX 64 // decode rows per batched pass in batch_decode_worker (if the small-batch kernels take them)
 #endif
-#ifndef SMB_PF
-#define SMB_PF 4096 // the K-quant small-batch kernels' software prefetch distance in bytes (0: none)
-#endif
 #ifndef BD_SEG
 #define BD_SEG 16 // rows of one sequence per segment in batch_decode_worker, at most (more: prefill_worker; TODO S2:
                   // 2-16 rows mostly 0-7% faster there on Qwen3, 2-24% on Qwen3.5; 24-32 within noise / up to 3% slower)
@@ -1261,6 +1285,10 @@ static void gemm_plan(const RqCtx *c, Gemm *g, int nj, const MatJob *job, Quanti
         g->tiled[j] = 0;
 #ifdef GWENEDEG_KQX
         g->tiled[j] = job[j].w->kp != NULL && !iq_type(job[j].w->type); // (Q2_K, i-quants: blocks over all rows, iq_rows)
+#ifndef GWENEDEG_KQF
+        if (job[j].w->act256)
+            g->tiled[j] = 0; // (--act256 K-quants without their tiled kernel (NEON): blocks over all rows, kqf_rows)
+#endif
 #endif
 #ifdef GWENEDEG_IQX
         if (job[j].w->kp && iq_type(job[j].w->type) && nb >= IQX_MIN)
@@ -1312,8 +1340,11 @@ NO_FP_CONTRACT static void gemm_item(const Gemm *g, int it, uint8_t *scr, const 
     }
 #ifdef GWENEDEG_SMB
     if (g->smb[j]) { // 16-row block i, all rows
-        smb_rows(w->kp ? w->type : 0, jb->out, jb->ldo, x->q, ldx, x->s, g->corr, g->xf, g->c16, nb, w->kp ? w->kp : w->p, k, GS,
-                 i, i + 1, g->pf);
+        if (w->kp && w->act256) // (--act256: kqf_dot's definition)
+            kqf_rows(w->type, jb->out, jb->ldo, x->q, ldx, x->s, g->c16, nb, w->kp, k, i, i + 1, g->pf);
+        else
+            smb_rows(w->kp ? w->type : 0, jb->out, jb->ldo, x->q, ldx, x->s, g->corr, g->xf, g->c16, nb, w->kp ? w->kp : w->p, k,
+                     GS, i, i + 1, g->pf);
         return;
     }
 #endif
@@ -1329,6 +1360,12 @@ NO_FP_CONTRACT static void gemm_item(const Gemm *g, int it, uint8_t *scr, const 
 #endif
 #ifdef GWENEDEG_KQX
         if (w->kp) {
+#ifdef GWENEDEG_KQF
+            if (w->act256) { // (--act256: kqf_dot's definition)
+                kqf512_gemm_item(jb->out, jb->ldo, w->kp, w->type, jb->d, t, ch, g->nbi, x->q, x->s, ldx, nb, k, g->c16, scr, last);
+                return;
+            }
+#endif
             kqx_gemm_item(jb->out, jb->ldo, w->kp, w->type, jb->d, t, ch, g->nbi, x->q, x->s, ldx, nb, k, g->xf, g->c16, scr, last);
             return;
         }
@@ -1343,6 +1380,10 @@ NO_FP_CONTRACT static void gemm_item(const Gemm *g, int it, uint8_t *scr, const 
     int ng = k / GS;
     if (w->kp && iq_type(w->type)) { // Q2_K, i-quants: one 16-row block over all rows (iquants.h, AVX-512 or generic)
         (w->act256 ? iqf_rows : iq_rows)(w->type, jb->out, jb->ldo, x->q, ldx, x->s, g->c16, nb, w->kp, k, i, i + 1);
+        return;
+    }
+    if (w->kp && w->act256) { // K-quants under --act256 without their tiled kernel: one 16-row block over all rows
+        kqf_rows(w->type, jb->out, jb->ldo, x->q, ldx, x->s, g->c16, nb, w->kp, k, i, i + 1, g->pf);
         return;
     }
     if (w->kp) { // K-quants, generic: one 16-row block over all rows, KQ_NC rows per kq_dot call
@@ -3734,6 +3775,10 @@ static void rows_mm(const RqCtx *c, QuantizedTensor *w, float *out, int ldo, Qua
         return;
     }
 #ifdef GWENEDEG_SMB
+    if (w->kp && w->act256) { // (--act256: kqf_dot's definition)
+        kqf_rows(w->type, out, ldo, x->q, ldx, x->s, c16, nb, w->kp, k, i0 / 16, i1 / 16, c->smb_pf);
+        return;
+    }
     if (w->kp || w->p) {
         smb_rows(w->kp ? w->type : 0, out, ldo, x->q, ldx, x->s, corr, xf, c16, nb, w->kp ? w->kp : w->p, k, GS, i0 / 16, i1 / 16,
                  c->smb_pf);

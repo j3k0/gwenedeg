@@ -630,7 +630,8 @@ static void error_usage(void) {
     fprintf(stderr, "              matmuls where compute-bound, +0.75 / +1.0 bit per such weight of RAM (AVX-512 builds)\n");
     fprintf(stderr, "  --repack=LIST  only these types: IQ3_S, IQ3_XXS (comma-separated)\n");
     fprintf(stderr, "  --no-repack weights as in the file (default)\n");
-    fprintf(stderr, "  --act256    one activation scale per 256 values (not 32): faster i-quant prefill, slightly different results\n");
+    fprintf(stderr, "  --act256    one activation scale per 256 values (not 32): faster i-quant / K-quant prefill, slightly\n");
+    fprintf(stderr, "              different results\n");
     fprintf(stderr, "  --repack-info  what --repack costs (RAM) and gains here (a decode step, a 4-row pass; the current threads)\n");
     fprintf(stderr, "              per type: loads and times the model with each choice in turn (~4 loads), then exits\n");
     fprintf(stderr, "  -i <string> input prompt (chat: one turn, then exit; without -i, one turn per stdin line,\n");

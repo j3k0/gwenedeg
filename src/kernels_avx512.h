@@ -1062,6 +1062,453 @@ static void smb512_rows(int type, float *out, size_t ldo, const int8_t *xq, size
 #define GWENEDEG_SMB 1
 #define smb_rows smb512_rows
 
+/* ---------------------------------------------------------------------------------------------
+ * --act256 for the K-quants (kquants.h kqf_dot is the definition: one fold per super-block of 256; docs/v4h.md section 12):
+ * the rows kernel (kqf512_rows: the small-batch kernels above with the fold moved; GEMV, verify, batched decode and the
+ * small-batch GEMM phases) and the tiled GEMM (kqf512_gemm_item). Q6_K's tile reads kq_unpack_tile's scratch as it is;
+ * Q4_K / Q5_K's has the integer scales and the mins as int16 pairs (kqf_unpack_tile), Q3_K's both half-group scales as
+ * one int16 pair. Bit-identical to kqf_dot (tests/kernels/flat_bench.c). 8 threads, 512 rows, today's tiled GEMM ->
+ * these: Q3_K 1.22-1.29x, Q6_K 1.16-1.20x, Q4_K / Q5_K 0.98-1.10x (Zen 4: their per-32 fold has no integer multiply, so
+ * moving it saves only 8 of 88 multiply-class operations per super-block)
+ */
+static inline __m512 kqf_fold2(__m512 f, __m512 d, __m512 dm, float a, __m512i I, __m512i M) {
+    // f + ((d * a) * (float) I - (dm * a) * (float) M), each operation rounded (kqf_dot: Q4_K / Q5_K)
+    __m512 av = _mm512_set1_ps(a);
+    __m512 x = _mm512_mul_round_ps(_mm512_mul_round_ps(d, av, Q8P_RND), _mm512_cvtepi32_ps(I), Q8P_RND);
+    __m512 y = _mm512_mul_round_ps(_mm512_mul_round_ps(dm, av, Q8P_RND), _mm512_cvtepi32_ps(M), Q8P_RND);
+    return _mm512_add_round_ps(f, _mm512_sub_round_ps(x, y, Q8P_RND), Q8P_RND);
+}
+
+
+static inline uint32_t kqf_xpair(const int32_t *cc) {
+    // X_g | X_g+1 << 16 of two groups of 32, from their four c16 (-32 x the sums of 16: exact shifts; |X| <= 4064)
+    return (uint32_t)(uint16_t)(-((cc[0] + cc[1]) >> 5)) | (uint32_t)(-((cc[2] + cc[3]) >> 5)) << 16;
+}
+
+static inline __attribute__((always_inline))
+void kqf45_smb_block(const int C, const int Q5, const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs,
+                     size_t ldxs, const int32_t *c16, size_t ldc, float *out, size_t ldo, int pf) {
+    // one Q4P / Q5P block x C activation rows (kq4_smb_block / kq5_smb_block): I += sc_j * (the group's sum) in int32,
+    // the mins by vpdpwssd on (m_j | m_j+1 << 16) x (X_j | X_j+1 << 16), one fold per super-block
+    const __m512i m4 = _mm512_set1_epi8(0x0f), m16 = _mm512_set1_epi8(0x10);
+    const int sbb = Q5 ? Q5P_SB : Q4P_SB;
+    __m512 f[8];
+    for (int c = 0; c < C; c++)
+        f[c] = _mm512_setzero_ps();
+    for (int s = 0; s < nsb; s++) {
+        const uint8_t *o = wb + (size_t)s * sbb;
+        __m512i I[8];
+        for (int c = 0; c < C; c++)
+            I[c] = _mm512_setzero_si512();
+        for (int j = 0; j < 8; j++) {
+            int g = 8 * s + j;
+            const uint8_t *qs = o + 320 + (Q5 ? 320 : 256) * j, *mp = qs + 256;
+            smb_pf(o + j * (sbb / 8), sbb / 8, pf);
+            __m512i w[8];
+            for (int cc = 0; cc < 4; cc++) {
+                __m512i v = _mm512_load_si512((const void *)(qs + 64 * cc));
+                w[2 * cc] = _mm512_and_si512(v, m4);
+                w[2 * cc + 1] = _mm512_and_si512(_mm512_srli_epi16(v, 4), m4);
+                if (Q5) {
+                    w[2 * cc] = _mm512_or_si512(w[2 * cc], _mm512_maskz_mov_epi8((__mmask64)kq_u64(mp + 8 * (2 * cc)), m16));
+                    w[2 * cc + 1] = _mm512_or_si512(w[2 * cc + 1],
+                                                    _mm512_maskz_mov_epi8((__mmask64)kq_u64(mp + 8 * (2 * cc + 1)), m16));
+                }
+            }
+            __m512i sc = _mm512_cvtepu8_epi32(_mm_load_si128((const __m128i *)(o + 64 + 16 * j)));
+            for (int c = 0; c < C; c++) {
+                const int8_t *xg = x + (size_t)c * ldx + 32 * g;
+                __m512i a0 = _mm512_setzero_si512(), a1 = _mm512_setzero_si512();
+                for (int cc = 0; cc < 4; cc++) {
+                    a0 = _mm512_dpbusd_epi32(a0, w[2 * cc], q8p_bcast4(xg + 8 * cc));
+                    a1 = _mm512_dpbusd_epi32(a1, w[2 * cc + 1], q8p_bcast4(xg + 8 * cc + 4));
+                }
+                I[c] = _mm512_add_epi32(I[c], _mm512_mullo_epi32(_mm512_add_epi32(a0, a1), sc));
+            }
+        }
+        __m512 d = _mm512_cvtph_ps(_mm256_load_si256((const __m256i *)o));
+        __m512 dm = _mm512_cvtph_ps(_mm256_load_si256((const __m256i *)(o + 32)));
+        __m512i mp[4];
+        for (int p = 0; p < 4; p++)
+            mp[p] = _mm512_or_si512(_mm512_cvtepu8_epi32(_mm_load_si128((const __m128i *)(o + 192 + 32 * p))),
+                                    _mm512_slli_epi32(_mm512_cvtepu8_epi32(_mm_load_si128((const __m128i *)(o + 208 + 32 * p))), 16));
+        for (int c = 0; c < C; c++) {
+            __m512i M = _mm512_setzero_si512();
+            for (int p = 0; p < 4; p++)
+                M = _mm512_dpwssd_epi32(M, mp[p], _mm512_set1_epi32((int)kqf_xpair(c16 + (size_t)c * ldc + 2 * (8 * s + 2 * p))));
+            f[c] = kqf_fold2(f[c], d, dm, xs[(size_t)c * ldxs + 8 * s], I[c], M);
+        }
+    }
+    for (int c = 0; c < C; c++)
+        _mm512_storeu_ps(out + (size_t)c * ldo, f[c]);
+}
+
+static inline __attribute__((always_inline))
+void kqf36_smb_block(const int C, const int Q3, const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs,
+                     size_t ldxs, const int32_t *c16, size_t ldc, float *out, size_t ldo, int pf) {
+    // one Q6P / Q3P block x C activation rows (kq6_smb_block / kq3_smb_block): I over the super-block, one fold
+    const int sbb = Q3 ? Q3P_SB : Q6P_SB, div = Q3 ? 8 : 1;
+    __m512 f[8];
+    for (int c = 0; c < C; c++)
+        f[c] = _mm512_setzero_ps();
+    for (int s = 0; s < nsb; s++) {
+        const uint8_t *o = wb + (size_t)s * sbb;
+        __m512i I[8], S0 = _mm512_setzero_si512(); // (Q3_K: the sum of the first-half scales, the 8192 bias)
+        for (int c = 0; c < C; c++)
+            I[c] = _mm512_setzero_si512();
+        for (int g8 = 0; g8 < 8; g8++) {
+            int g = 8 * s + g8;
+            const uint8_t *qg = o + 256 + 192 * g8;
+            smb_pf(o + g8 * (sbb / 8), sbb / 8, pf);
+            __m512i s3[2];
+            if (Q3) {
+                kq3_scales(o, g8, &s3[0], &s3[1]);
+                S0 = _mm512_add_epi32(S0, s3[0]);
+                __m512i sp = _mm512_or_si512(_mm512_and_si512(s3[0], _mm512_set1_epi32(0xffff)), _mm512_slli_epi32(s3[1], 16));
+                __m512i q0[4], q1[4];
+                kq3_unpack4(qg, qg + 128, q0);
+                kq3_unpack4(qg + 64, qg + 160, q1);
+                for (int c = 0; c < C; c++) { // (u = t_0 + 65536 t_1: the tile's packing)
+                    const int8_t *xg = x + (size_t)c * ldx + 32 * g;
+                    __m512i a = _mm512_set1_epi32(c16[(size_t)c * ldc + 2 * g + 1] / 8), b = _mm512_setzero_si512();
+                    a = _mm512_dpbusd_epi32(a, q1[0], q8p_bcast4(xg + 16));
+                    b = _mm512_dpbusd_epi32(b, q1[1], q8p_bcast4(xg + 20));
+                    a = _mm512_dpbusd_epi32(a, q1[2], q8p_bcast4(xg + 24));
+                    b = _mm512_dpbusd_epi32(b, q1[3], q8p_bcast4(xg + 28));
+                    __m512i u = _mm512_add_epi32(_mm512_slli_epi32(_mm512_add_epi32(a, b), 16),
+                                                 _mm512_set1_epi32(c16[(size_t)c * ldc + 2 * g] / 8 + 8192)), v = _mm512_setzero_si512();
+                    u = _mm512_dpbusd_epi32(u, q0[0], q8p_bcast4(xg));
+                    v = _mm512_dpbusd_epi32(v, q0[1], q8p_bcast4(xg + 4));
+                    u = _mm512_dpbusd_epi32(u, q0[2], q8p_bcast4(xg + 8));
+                    v = _mm512_dpbusd_epi32(v, q0[3], q8p_bcast4(xg + 12));
+                    I[c] = _mm512_dpwssd_epi32(I[c], _mm512_add_epi32(u, v), sp);
+                }
+                continue;
+            }
+            for (int h = 0; h < 2; h++) {
+                int j = 2 * g8 + h;
+                __m512i q[4], sc;
+                if (Q3) {
+                    kq3_unpack4(qg + 64 * h, qg + 128 + 32 * h, q);
+                    sc = s3[h];
+                } else {
+                    kq6_unpack4(o + 320 + 192 * j, o + 448 + 192 * j, q);
+                    sc = _mm512_cvtepi8_epi32(_mm_load_si128((const __m128i *)(o + 64 + 16 * j)));
+                }
+                for (int c = 0; c < C; c++) {
+                    const int8_t *xg = x + (size_t)c * ldx + 32 * g + 16 * h;
+                    __m512i t0 = _mm512_set1_epi32(c16[(size_t)c * ldc + 2 * g + h] / div), t1 = _mm512_setzero_si512();
+                    t0 = _mm512_dpbusd_epi32(t0, q[0], q8p_bcast4(xg));
+                    t1 = _mm512_dpbusd_epi32(t1, q[1], q8p_bcast4(xg + 4));
+                    t0 = _mm512_dpbusd_epi32(t0, q[2], q8p_bcast4(xg + 8));
+                    t1 = _mm512_dpbusd_epi32(t1, q[3], q8p_bcast4(xg + 12));
+                    I[c] = _mm512_add_epi32(I[c], _mm512_mullo_epi32(_mm512_add_epi32(t0, t1), sc));
+                }
+            }
+        }
+        __m512 d = _mm512_load_ps((const float *)o);
+        if (Q3)
+            for (int c = 0; c < C; c++)
+                I[c] = _mm512_sub_epi32(I[c], _mm512_slli_epi32(S0, 13));
+        for (int c = 0; c < C; c++)
+            f[c] = kq6_fold(f[c], d, xs[(size_t)c * ldxs + 8 * s], I[c]);
+    }
+    for (int c = 0; c < C; c++)
+        _mm512_storeu_ps(out + (size_t)c * ldo, f[c]);
+}
+
+#define KQF_SMB_ARGS const uint8_t *wb, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs, const int32_t *c16, \
+                     size_t ldc, float *out, size_t ldo, int pf
+#define KQF_SMB_PASS wb, nsb, x, ldx, xs, ldxs, c16, ldc, out, ldo, pf
+#define KQF_SMB_FN(C) \
+    static void kqf_smb4_##C(KQF_SMB_ARGS) { kqf45_smb_block(C, 0, KQF_SMB_PASS); } \
+    static void kqf_smb5_##C(KQF_SMB_ARGS) { kqf45_smb_block(C, 1, KQF_SMB_PASS); } \
+    static void kqf_smb6_##C(KQF_SMB_ARGS) { kqf36_smb_block(C, 0, KQF_SMB_PASS); } \
+    static void kqf_smb3_##C(KQF_SMB_ARGS) { kqf36_smb_block(C, 1, KQF_SMB_PASS); }
+KQF_SMB_FN(1) KQF_SMB_FN(2) KQF_SMB_FN(3) KQF_SMB_FN(4) KQF_SMB_FN(5) KQF_SMB_FN(6) KQF_SMB_FN(7) KQF_SMB_FN(8)
+typedef void (*KqfSmbFn)(KQF_SMB_ARGS);
+#define KQF_SMB_ROW(T) { kqf_smb##T##_1, kqf_smb##T##_2, kqf_smb##T##_3, kqf_smb##T##_4, kqf_smb##T##_5, kqf_smb##T##_6, \
+                         kqf_smb##T##_7, kqf_smb##T##_8 }
+static const KqfSmbFn kqf_smb_fns[4][8] = { KQF_SMB_ROW(4), KQF_SMB_ROW(5), KQF_SMB_ROW(6), KQF_SMB_ROW(3) };
+#undef KQF_SMB_ROW
+#undef KQF_SMB_FN
+#undef KQF_SMB_PASS
+
+static inline int kqf_kind(int type) { return type == GGML_Q4_K ? 0 : type == GGML_Q5_K ? 1 : type == GGML_Q6_K ? 2 : 3; }
+
+static void kqf512_rows(int type, float *out, size_t ldo, const int8_t *xq, size_t ldx, const float *xs, const int32_t *c16,
+                     int nb, const uint8_t *kp, int k, int rb0, int rb1, int pf) {
+    // smb512_rows under --act256 (blocks rb0..rb1-1, activation rows 0..nb-1, 8 per pass; nb = 1: the GEMV)
+    int nsb = k / QK_K, n16 = k / 16;
+    size_t bstride = (size_t)nsb * kq_sb_bytes(type), ldxs = ldx / 32;
+    const KqfSmbFn *fn = kqf_smb_fns[kqf_kind(type)];
+    for (int rb = rb0; rb < rb1; rb++)
+        for (int b = 0; b < nb; b += 8) {
+            int c = nb - b < 8 ? nb - b : 8;
+            fn[c - 1](kp + (size_t)rb * bstride, nsb, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
+                      c16 + (size_t)b * n16, n16, out + (size_t)b * ldo + (size_t)rb * KQ_ROWS, ldo, pf);
+        }
+}
+
+static void kqf_unpack_tile(int type, uint8_t *scr, const uint8_t *wp, int nblk, int k) {
+    // kq_unpack_tile under --act256. Q6_K / Q3_K: its KQS_Q6 records as they are (q, sc_j0, sc_j1, d). Q4_K / Q5_K:
+    // KQS_Q4 records of 640 bytes per (block, group j): +0 the 8 x 64 codes (kq_unpack_tile's), +512 sc_j (int32),
+    // +576 per super-block: j = 0, 2, 4, 6: the mins m_j | m_j+1 << 16 (int16 pairs); j = 1: d, j = 3: dmin (fp32)
+    if (type == GGML_Q6_K || type == GGML_Q3_K) {
+        kq_unpack_tile(type, scr, wp, nblk, k);
+        if (type == GGML_Q3_K) // (+512: the scales sc - 32 of the group's two sub-blocks as one int16 pair; +576 of the
+                               // super-block's first record: -8192 x the sum of its 8 first-half scales, kqf36_tile's I start)
+            for (size_t sb = 0; sb < (size_t)nblk * (k / QK_K); sb++) {
+                __m512i S0 = _mm512_setzero_si512();
+                for (int g8 = 0; g8 < 8; g8++) {
+                    uint8_t *dst = scr + (8 * sb + g8) * KQS_Q6;
+                    __m512i s0 = _mm512_load_si512((const void *)(dst + 512)), s1 = _mm512_load_si512((const void *)(dst + 576));
+                    S0 = _mm512_add_epi32(S0, s0);
+                    _mm512_store_si512((void *)(dst + 512), _mm512_or_si512(_mm512_and_si512(s0, _mm512_set1_epi32(0xffff)),
+                                                                            _mm512_slli_epi32(s1, 16)));
+                }
+                _mm512_store_si512((void *)(scr + 8 * sb * KQS_Q6 + 576), _mm512_sub_epi32(_mm512_setzero_si512(),
+                                                                                          _mm512_slli_epi32(S0, 13)));
+            }
+        return;
+    }
+    int nsb = k / QK_K, ng = k / 32, q5 = type == GGML_Q5_K, sbb = q5 ? Q5P_SB : Q4P_SB;
+    const __m512i m4 = _mm512_set1_epi8(0x0f), m16 = _mm512_set1_epi8(0x10);
+    for (int r = 0; r < nblk; r++)
+        for (int s = 0; s < nsb; s++) {
+            const uint8_t *o = wp + ((size_t)r * nsb + s) * sbb;
+            for (int j = 0; j < 8; j++) {
+                uint8_t *dst = scr + ((size_t)r * ng + 8 * s + j) * KQS_Q4;
+                const uint8_t *qs = o + 320 + (q5 ? 320 : 256) * j, *mp = qs + 256;
+                for (int c = 0; c < 4; c++) {
+                    __m512i v = _mm512_load_si512((const void *)(qs + 64 * c));
+                    __m512i lo = _mm512_and_si512(v, m4), hi = _mm512_and_si512(_mm512_srli_epi16(v, 4), m4);
+                    if (q5) {
+                        lo = _mm512_or_si512(lo, _mm512_maskz_mov_epi8((__mmask64)kq_u64(mp + 8 * (2 * c)), m16));
+                        hi = _mm512_or_si512(hi, _mm512_maskz_mov_epi8((__mmask64)kq_u64(mp + 8 * (2 * c + 1)), m16));
+                    }
+                    _mm512_store_si512((void *)(dst + 128 * c), lo);
+                    _mm512_store_si512((void *)(dst + 128 * c + 64), hi);
+                }
+                _mm512_store_si512((void *)(dst + 512), _mm512_cvtepu8_epi32(_mm_load_si128((const __m128i *)(o + 64 + 16 * j))));
+                __m512i aux;
+                if (!(j & 1))
+                    aux = _mm512_or_si512(_mm512_cvtepu8_epi32(_mm_load_si128((const __m128i *)(o + 192 + 16 * j))),
+                                          _mm512_slli_epi32(_mm512_cvtepu8_epi32(_mm_load_si128((const __m128i *)(o + 208 + 16 * j))), 16));
+                else if (j == 1)
+                    aux = _mm512_castps_si512(_mm512_cvtph_ps(_mm256_load_si256((const __m256i *)o)));
+                else if (j == 3)
+                    aux = _mm512_castps_si512(_mm512_cvtph_ps(_mm256_load_si256((const __m256i *)(o + 32))));
+                else
+                    aux = _mm512_setzero_si512();
+                _mm512_store_si512((void *)(dst + 576), aux);
+            }
+        }
+}
+
+static inline __attribute__((always_inline))
+void kqf45_tile(const int RB, const int C, const uint8_t *ws, size_t bstride, int nsb, const int8_t *x, size_t ldx,
+                const float *xs, size_t ldxs, const int32_t *c16, size_t ldc, float *out, size_t ldo) {
+    // kq45_tile under --act256 on kqf_unpack_tile's records: per group one vpdpbusd chain (8 steps), I += sc * it;
+    // per super-block the mins (4 vpdpwssd) and one fold
+    __m512 f[KQ_RB][8];
+    for (int r = 0; r < RB; r++)
+        for (int c = 0; c < C; c++)
+            f[r][c] = _mm512_setzero_ps();
+    for (int s = 0; s < nsb; s++) {
+        __m512i I[KQ_RB][8];
+        for (int r = 0; r < RB; r++)
+            for (int c = 0; c < C; c++)
+                I[r][c] = _mm512_setzero_si512();
+        for (int g8 = 0; g8 < 8; g8++) {
+            const int g = 8 * s + g8;
+            const uint8_t *wg = ws + (size_t)g * KQS_Q4;
+            const int8_t *xg = x + (size_t)g * 32;
+            __m512i acc[KQ_RB][8];
+            for (int r = 0; r < RB; r++)
+                for (int c = 0; c < C; c++)
+                    acc[r][c] = _mm512_setzero_si512();
+            #pragma GCC unroll 8
+            for (int st = 0; st < 8; st++) {
+                __m512i w[KQ_RB];
+                for (int r = 0; r < RB; r++)
+                    w[r] = _mm512_load_si512((const void *)(wg + r * bstride + st * 64));
+                for (int c = 0; c < C; c++) {
+                    __m512i xv = q8p_bcast4(xg + c * ldx + st * 4);
+                    for (int r = 0; r < RB; r++)
+                        acc[r][c] = _mm512_dpbusd_epi32(acc[r][c], w[r], xv);
+                }
+            }
+            for (int r = 0; r < RB; r++) {
+                __m512i sc = _mm512_load_si512((const void *)(wg + r * bstride + 512));
+                for (int c = 0; c < C; c++)
+                    I[r][c] = _mm512_add_epi32(I[r][c], _mm512_mullo_epi32(acc[r][c], sc));
+            }
+        }
+        int32_t xp[8][4];
+        for (int c = 0; c < C; c++)
+            for (int p = 0; p < 4; p++)
+                xp[c][p] = (int32_t)kqf_xpair(c16 + c * ldc + 2 * (8 * s + 2 * p));
+        const uint8_t *w0 = ws + (size_t)8 * s * KQS_Q4 + 576;
+        for (int r = 0; r < RB; r++) {
+            __m512 d = _mm512_load_ps((const float *)(w0 + r * bstride + KQS_Q4));
+            __m512 dm = _mm512_load_ps((const float *)(w0 + r * bstride + 3 * KQS_Q4));
+            __m512i mp[4];
+            for (int p = 0; p < 4; p++)
+                mp[p] = _mm512_load_si512((const void *)(w0 + r * bstride + 2 * p * KQS_Q4));
+            for (int c = 0; c < C; c++) {
+                __m512i M = _mm512_setzero_si512();
+                for (int p = 0; p < 4; p++)
+                    M = _mm512_dpwssd_epi32(M, mp[p], _mm512_set1_epi32(xp[c][p]));
+                f[r][c] = kqf_fold2(f[r][c], d, dm, xs[c * ldxs + 8 * s], I[r][c], M);
+            }
+        }
+    }
+    for (int r = 0; r < RB; r++)
+        for (int c = 0; c < C; c++)
+            _mm512_storeu_ps(out + c * ldo + r * KQ_ROWS, f[r][c]);
+}
+
+static inline __attribute__((always_inline))
+void kqf36_tile(const int RB, const int C, const int DIV, const uint8_t *ws, size_t bstride, int nsb, const int8_t *x,
+                size_t ldx, const float *xs, size_t ldxs, const int32_t *c16, size_t ldc, float *out, size_t ldo) {
+    // kq6_tile under --act256 (the same scratch; Q3_K: DIV 8): I over the super-block, one fold
+    __m512 f[KQ_RB][8];
+    for (int r = 0; r < RB; r++)
+        for (int c = 0; c < C; c++)
+            f[r][c] = _mm512_setzero_ps();
+    for (int s = 0; s < nsb; s++) {
+        __m512i I[KQ_RB][8];
+        for (int r = 0; r < RB; r++) {
+            __m512i i0 = DIV == 8 ? _mm512_load_si512((const void *)(ws + (size_t)8 * s * KQS_Q6 + r * bstride + 576))
+                                  : _mm512_setzero_si512();
+            for (int c = 0; c < C; c++)
+                I[r][c] = i0;
+        }
+        for (int g8 = 0; g8 < 8; g8++) {
+            const int g = 8 * s + g8;
+            const uint8_t *wg = ws + (size_t)g * KQS_Q6;
+            const int8_t *xg = x + (size_t)g * 32;
+            if (DIV == 8) { // Q3_K: |t_h| <= 4 * 127 * 16 = 8128, so u = (t_0 + 8192) + 65536 t_1 holds t_0 + 8192 (0..16320)
+                            // and t_1 as its int16 halves: one vpdpwssd with the scale pair (the 8192 s taken off at the start)
+                __m512i u[KQ_RB][8];
+                for (int h = 1; h >= 0; h--) {
+                    for (int c = 0; c < C; c++) {
+                        __m512i cv = _mm512_set1_epi32(c16[c * ldc + 2 * g + h] / 8 + (h ? 0 : 8192));
+                        for (int r = 0; r < RB; r++)
+                            u[r][c] = h ? cv : _mm512_add_epi32(_mm512_slli_epi32(u[r][c], 16), cv);
+                    }
+                    #pragma GCC unroll 4
+                    for (int st = 4 * h; st < 4 * h + 4; st++) {
+                        __m512i w[KQ_RB];
+                        for (int r = 0; r < RB; r++)
+                            w[r] = _mm512_load_si512((const void *)(wg + r * bstride + st * 64));
+                        for (int c = 0; c < C; c++) {
+                            __m512i xv = q8p_bcast4(xg + c * ldx + st * 4);
+                            for (int r = 0; r < RB; r++)
+                                u[r][c] = _mm512_dpbusd_epi32(u[r][c], w[r], xv);
+                        }
+                    }
+                }
+                for (int r = 0; r < RB; r++) {
+                    __m512i sp = _mm512_load_si512((const void *)(wg + r * bstride + 512));
+                    for (int c = 0; c < C; c++)
+                        I[r][c] = _mm512_dpwssd_epi32(I[r][c], u[r][c], sp);
+                }
+                continue;
+            }
+            for (int h = 0; h < 2; h++) {
+                __m512i t[KQ_RB][8];
+                for (int c = 0; c < C; c++) {
+                    __m512i cv = _mm512_set1_epi32(c16[c * ldc + 2 * g + h] / DIV);
+                    for (int r = 0; r < RB; r++)
+                        t[r][c] = cv;
+                }
+                #pragma GCC unroll 4
+                for (int st = 4 * h; st < 4 * h + 4; st++) {
+                    __m512i w[KQ_RB];
+                    for (int r = 0; r < RB; r++)
+                        w[r] = _mm512_load_si512((const void *)(wg + r * bstride + st * 64));
+                    for (int c = 0; c < C; c++) {
+                        __m512i xv = q8p_bcast4(xg + c * ldx + st * 4);
+                        for (int r = 0; r < RB; r++)
+                            t[r][c] = _mm512_dpbusd_epi32(t[r][c], w[r], xv);
+                    }
+                }
+                for (int r = 0; r < RB; r++) {
+                    __m512i sc = _mm512_load_si512((const void *)(wg + r * bstride + 512 + 64 * h));
+                    for (int c = 0; c < C; c++)
+                        I[r][c] = _mm512_add_epi32(I[r][c], _mm512_mullo_epi32(t[r][c], sc));
+                }
+            }
+        }
+        const uint8_t *w0 = ws + (size_t)8 * s * KQS_Q6; // (d: the same in every group record of the super-block)
+        for (int r = 0; r < RB; r++) {
+            __m512 d = _mm512_load_ps((const float *)(w0 + r * bstride + 640));
+            for (int c = 0; c < C; c++)
+                f[r][c] = kq6_fold(f[r][c], d, xs[c * ldxs + 8 * s], I[r][c]);
+        }
+    }
+    for (int r = 0; r < RB; r++)
+        for (int c = 0; c < C; c++)
+            _mm512_storeu_ps(out + c * ldo + r * KQ_ROWS, f[r][c]);
+}
+
+#ifndef KQF4_C
+#define KQF4_C 4 // activation rows per register tile, Q4_K / Q5_K (f, I, the group sums; 3 / 4 / 5 / 6: 0.99 / 1.06 / 0.99 / 0.99x)
+#endif
+#ifndef KQF6_C
+#define KQF6_C 6 // the same, Q6_K (f, I, t: spills a little; 1 thread, 512 rows: C 3 / 4 / 5 / 6 1.09 / 0.88 / 1.17 / 1.19x)
+#endif
+#ifndef KQF3_C
+#define KQF3_C 5 // the same, Q3_K (f, I, u; 3 / 4 / 5 / 6: 1.09 / 1.22 / 1.26 / 1.26x)
+#endif
+
+#define KQFT_ARGS const uint8_t *ws, size_t bstride, int nsb, const int8_t *x, size_t ldx, const float *xs, size_t ldxs, \
+                  const int32_t *c16, size_t ldc, float *out, size_t ldo
+#define KQFT_PASS ws, bstride, nsb, x, ldx, xs, ldxs, c16, ldc, out, ldo
+#define KQFT_FN(R, CC) \
+    static void kqft_45_##R##_##CC(KQFT_ARGS) { kqf45_tile(R, CC, KQFT_PASS); } \
+    static void kqft_6_##R##_##CC(KQFT_ARGS) { kqf36_tile(R, CC, 1, KQFT_PASS); } \
+    static void kqft_3_##R##_##CC(KQFT_ARGS) { kqf36_tile(R, CC, 8, KQFT_PASS); }
+#define KQFT_FNS(R) KQFT_FN(R, 1) KQFT_FN(R, 2) KQFT_FN(R, 3) KQFT_FN(R, 4) KQFT_FN(R, 5) KQFT_FN(R, 6) KQFT_FN(R, 7) KQFT_FN(R, 8)
+KQFT_FNS(1)
+KQFT_FNS(2)
+typedef void (*KqftFn)(KQFT_ARGS);
+#define KQFT_ROW(K, R) { kqft_##K##_##R##_1, kqft_##K##_##R##_2, kqft_##K##_##R##_3, kqft_##K##_##R##_4, kqft_##K##_##R##_5, \
+                         kqft_##K##_##R##_6, kqft_##K##_##R##_7, kqft_##K##_##R##_8 }
+static const KqftFn kqft_fns[3][2][8] = { { KQFT_ROW(45, 1), KQFT_ROW(45, 2) }, { KQFT_ROW(6, 1), KQFT_ROW(6, 2) },
+                                          { KQFT_ROW(3, 1), KQFT_ROW(3, 2) } };
+#undef KQFT_ROW
+#undef KQFT_FNS
+#undef KQFT_FN
+#undef KQFT_PASS
+
+static void kqf512_gemm_item(float *out, int ldo, const uint8_t *kp, int type, int d, int t, int ch, int nbi,
+                          const int8_t *xq, const float *xs, int ldx, int nb, int k, const int32_t *c16, uint8_t *scr,
+                          const void **last) {
+    // kq512_gemm_item under --act256 (the same work items and scratch size; no xf)
+    int ng = k / 32, n16 = k / 16, sbb = kq_sb_bytes(type), q36 = type == GGML_Q6_K || type == GGML_Q3_K;
+    size_t ldxs = (size_t)ldx / 32, bstride = (size_t)ng * (q36 ? KQS_Q6 : KQS_Q4);
+    int nblk = d / KQ_ROWS, rb0 = t * KQ_RB, rb = nblk - rb0 < KQ_RB ? nblk - rb0 : KQ_RB;
+    const uint8_t *wt = kp + (size_t)rb0 * (k / QK_K) * sbb;
+    if (*last != wt) {
+        kqf_unpack_tile(type, scr, wt, rb, k);
+        *last = wt;
+    }
+    int kind = type == GGML_Q6_K ? 1 : type == GGML_Q3_K ? 2 : 0, C = kind == 2 ? KQF3_C : kind ? KQF6_C : KQF4_C;
+    int b1 = (ch + 1) * nbi < nb ? (ch + 1) * nbi : nb;
+    for (int b = ch * nbi; b < b1; b += C) {
+        int c = b1 - b < C ? b1 - b : C;
+        kqft_fns[kind][rb - 1][c - 1](scr, bstride, ng / 8, xq + (size_t)b * ldx, ldx, xs + (size_t)b * ldxs, ldxs,
+                                      c16 + (size_t)b * n16, n16, out + (size_t)b * ldo + (size_t)rb0 * KQ_ROWS, ldo);
+    }
+}
+
+// the --act256 K-quant kernel interface of forward.c (elsewhere: kqf_dot)
+#define GWENEDEG_KQF 1
+
+
 // the K-quant SIMD kernel interface of forward.c (kernels_neon.h implements the same on AArch64)
 #define GWENEDEG_KQX 1
 #define kqx_c16 kq512_c16

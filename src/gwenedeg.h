@@ -82,9 +82,9 @@ typedef struct {
                         // it). RQ_REPACK_ALL, or RQ_REPACK_IQ3_S / _IQ3_XXS bits: those types only; 0 / < 0: none
                         // (default). AVX-512 builds only (elsewhere ignored). rq_repack_info: what it costs
     int act256;         // 1: one activation scale per 256 values instead of per 32 (gwenedeg --act256; docs/v4h.md sections
-                        // 9-10): a different arithmetic definition (results differ slightly from the default), faster Q2_K
-                        // / i-quant matmuls on AVX-512 (prefill ~1.2x their GEMMs; the generic and NEON builds compute the
-                        // same bits with the generic kernel). Every build and path gives the same results under it. Not
+                        // 9-13): a different arithmetic definition (results differ slightly from the default), faster
+                        // Q2_K / i-quant and Q3_K / Q6_K matmuls on AVX-512 (prefill ~1.2x their GEMMs; Q4_K / Q5_K ~1.05x;
+                        // the generic and NEON builds compute the same bits with the generic kernels). Every build and path gives the same results under it. Not
                         // for NariQ (trellis) files or a hidden size not a multiple of 256: the default then (a warning)
 } RqModelOpts;
 enum { RQ_REPACK_ALL = 1, RQ_REPACK_IQ3_S = 2, RQ_REPACK_IQ3_XXS = 4 };

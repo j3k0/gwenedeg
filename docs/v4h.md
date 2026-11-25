@@ -787,3 +787,7 @@ So the 27B Q3_K_M pays +0.0022 KL on 8k of wikipedia and +0.0012 on 8k of code (
 effect on the 0.8B files: +0.003), for the 1.13-1.15x prefill of section 13. The small model's cost is larger (the table
 above: the synthetic files cut from Qwen3-0.6B Q4_K_M fall from 0.9958 to 0.9838 cosine). The effect grows with the
 prompt's length: the tail of `long2` (297 positions) sees more of it than the first 8k of a fresh sequence.
+
+The 13.8 GB Q3_K_M file and the `a256` worktree were removed after the measurement (2026-11-25 21:15), `/` from 24 to 37 GB
+free; the worktree's branch was merged, so nothing is lost. Anything here can be re-measured with `tools/v4h_kl.py` and
+`models/v4h/eval/*.ids`, or re-downloaded (unsloth, reasoning-1 @4a03c64).

@@ -704,5 +704,24 @@ apart. The flag vs the default on the same positions is 0.0053-0.0063.
 and Q6_K matrices (12.4% of its weights) switch to these kernels and its results change slightly. Section 12 predicts
 about +1% prefill.
 
-Pending: the 27B end to end. That needs the Q3_K_M file (13.8 GB, not downloaded) and ISTA's file, prompts of 1.5k and
-8k tokens, default vs `--act256`, with the day server stopped.
+**On the 27B** (2026-11-25, the day server stopped). Main's `./gwenedeg` was rebuilt from this commit; it is the binary
+the day server restarted on. Setup: 14 threads, `-k q4-dot`, `-b 512`, `scripts/bench_prefill.sh -P`'s prompts (1,540 and
+8,040 tokens with the 27B's template), 32 decode tokens per run, best / median of 3 interleaved runs. The load rose from 2
+to 15-18 midway (other jobs on the box):
+
+| file, prompt | default | `--act256`, e3a44ef (per-32 K-quant folds) | `--act256`, K-quant kernels | ratio |
+|---|---:|---:|---:|---:|
+| Q3_K_M (unsloth 4a03c64), 1,540 tok | 98.8 / 95.2 tok/s | | 111.6 / 109.0 | **1.13 / 1.14** |
+| Q3_K_M, 8,040 tok | 96.5 / 95.8 | | 111.3 / 109.6 | **1.15 / 1.14** |
+| ISTA IQ3_S (`--repack`), 1,540 tok | 99.9 / 99.6 | 116.9 / 115.5 | 115.0 / 111.5 | 1.15 / 1.12 |
+| ISTA, 8,040 tok | (section 11: 100.8 / 99.1) | 111.7 / 110.6 | 110.5 / 108.4 | |
+
+- **Q3_K_M:** prefill is 1.13-1.15x end to end, on both prompt sizes. That is close to section 12's kernel ratio for
+  its mix (1.16-1.19x), and better than the 1.12x estimated from the i-quants.
+- **Decode** (Q3_K_M, 128 tokens, 3 interleaved runs, load 9-17) is unchanged within the noise: 9.8 / 10.2 / 10.8 tok/s
+  default, 10.9 / 10.6 / 9.6 with the flag.
+- **ISTA:** its K-quant matrices' kernels made no difference within this run's noise. The old and new `--act256` are
+  0.97-0.99 apart against the expected +1%. The flag vs the default is 1.12-1.17x, as in section 11.
+
+Not measured yet: the Q3_K_M's KL against the default on the 27B, at the next stop of the day server (stage A256.5
+needs one for the 27B goldens).

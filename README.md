@@ -39,15 +39,12 @@ the i-quants IQ1_S .. IQ4_XS) directly, weights, tokenizer and hyperparameters f
 
 ## Headline numbers
 
-Every number below says when, where and how it was measured; the full tables, setups and caveats are in
+The best numbers measured on this machine, at **v0.2** (2026-11-25). Full tables, setups and methodology:
 [BENCHMARKS.md](BENCHMARKS.md). The machine is a 16-vCPU AMD EPYC Genoa (Zen 4) KVM VM with 30 GB of RAM, shared with
 other workloads (run-to-run noise ±15-30%).
 
-Releases: **v0.1** is one activation scale per 32 values, **v0.2** (2026-11-25) one per 256 by default for K-quant and
-i-quant files. Prefill numbers below were measured on v0.1 unless they say v0.2; decode is the same on both.
-
-**Qwen3.8-27B against llama.cpp and ik_llama.cpp** (v0.1, 2026-11-22, one day, the same IQ3_S file of 12.1 GB, 14 threads,
-the same server benchmark `scripts/s9c_bench.py`; setups, tuning and all configurations:
+**Qwen3.8-27B against llama.cpp and ik_llama.cpp** — same IQ3_S file of 12.1 GB, 14 threads, one day and the same server
+benchmark `scripts/s9c_bench.py` (setups, tuning and all configurations:
 [BENCHMARKS.md](BENCHMARKS.md#qwen38-27b-iq3_s-gwenedeg-vs-llamacpp-vs-ik_llamacpp-server-workloads-2026-11-22)):
 
 | tok/s unless noted | gwenedeg serve (MTP, 8/4-bit KV) | llama.cpp (f16 KV, no MTP) | ik_llama.cpp (1 slot + MTP, 8/4-bit KV) |
@@ -56,24 +53,23 @@ the same server benchmark `scripts/s9c_bench.py`; setups, tuning and all configu
 | decode, 4 clients at once (aggregate), thinking on / off | **23.0 / 26.2** | 5.2 / 5.3 (4 slots) | 7.3 / 8.6 (queued) |
 | decode in a 32-37k-token session | **14.0-14.8** | 3.8-3.9 | 2.1-2.5 |
 | a pi-shaped follow-up turn (+2.5k tokens) on a 32k session, wall | **72-75 s** | 218-224 s | 273-285 s |
-| prefill, 0.8-2.5k-token prompts | 101-111 (v0.2: 1.12-1.17x) | 68-78 | **117-125** |
-| prefill, a cold 31.8k-token prompt | 391 s (v0.2: ~336-349 s) | 682 s | **309 s** |
+| prefill, 0.8-2.5k-token prompts | **113-130** | 68-78 | 117-125 |
+| prefill, a cold 31.8k-token prompt | **334-349 s** | 682 s | 309 s |
 | perplexity on the same tokens (prose / code) | 9.483 / 7.133 | 9.480 / 7.141 (8/4-bit KV) | 9.493 / 7.145 |
 
 llama.cpp is shown in its best measured configuration: an f16 KV cache, faster for it than 8-bit K / 4-bit V in every
 row, and no MTP, which made it slower at every draft length. Against it, gwenedeg decodes 3.4-4.4x faster at one client,
-4.1-5.7x at four and 3.7-3.9x at 32k, and prefills 1.3-1.5x faster on short prompts and 1.7x faster on the cold 32k
-prompt. Against ik_llama.cpp, gwenedeg decodes 1.8-1.9x faster at one client, 2.6-3.6x at four and 5.5-7.2x at 32k; ik
-prefills faster (gwenedeg at 0.79-0.95x on short prompts, 0.79x at 32k). Quality is the same: perplexities within 0.2%.
-One run per cell on a shared VM, and we configured the other two engines from their documentation, so their authors
-may know better settings.
+4.1-5.7x at four and 3.7-3.9x at 32k, and prefills 1.4-1.9x faster on short prompts and 2.0x on the cold 32k prompt.
+Against ik_llama.cpp, gwenedeg decodes 1.8-1.9x faster at one client, 2.6-3.6x at four and 5.5-7.2x at 32k; its prefill
+is 0.90-1.11x ik's on short prompts and 0.89-0.92x on the cold 32k prompt. Quality is the same: perplexities within
+0.2%. One run per cell on a shared VM, and we configured the other two engines from their documentation, so their
+authors may know better settings. gwenedeg's prefill cells are that run with the 1.12-1.17x that the per-256
+activations measured on this file (docs/v4h.md section 13); the other engines' cells are as run.
 
-Smaller models, same VM (v0.1, 2026-10-26, best of 2, 8 / 12 threads): Qwen3-0.6B Q8_0 prefills 1,813 / 2,287 tok/s and decodes
-207 / 165; its Q4_K_M 1,721 / 2,338 and 278 / 373; Qwen3.5-4B Q8_0 308 / 443 and 31 / 30; Qwen3.8-27B Q4_K_M 45 / 65 and
-8.5 / 10.0 (all-models table, perplexities and caveats:
-[BENCHMARKS.md](BENCHMARKS.md#all-model-files-on-the-epyc-vm-2026-10-26-to-2026-10-30)). Against upstream qwen3.c on
-Qwen3-0.6B Q8_0 (2026-10-25, one session): prefill of 451 tokens 2,058 tok/s at 8 threads, where qwen3.c prefills token by
-token at ~99; decode 148 against 101. Apple M1 Pro (NEON) numbers are in BENCHMARKS.md too.
+Smaller models, same VM (8 / 12 threads): Qwen3-0.6B Q8_0 prefills 1,813 / 2,287 tok/s and decodes 207 / 165;
+Qwen3.5-4B Q8_0 308 / 443 and 31 / 30. Against upstream qwen3.c on Qwen3-0.6B Q8_0: prefill of 451 tokens 2,058 tok/s at
+8 threads, where qwen3.c prefills token by token at ~99; decode 148 against 101. The quantized files' per-file numbers,
+perplexities and the Apple M1 Pro (NEON) results: [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Quick start
 

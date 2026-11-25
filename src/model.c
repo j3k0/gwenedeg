@@ -592,6 +592,24 @@ static int repack_types(RqModel *m) {
     return n;
 }
 
+static int act256_auto(const RqModel *m) {
+    // RqModelOpts.act256 0 (auto): on for a GGUF file whose matmul weights (the 2-D tensors but token_embd) are at least
+    // half, by values, of the types with --act256 kernels (Q2_K, the i-quants, Q3_K .. Q6_K: their prefill GEMMs gain
+    // 1.05-1.3x, docs/v4h.md sections 10-13); off for the others (Q8_0, F32 / BF16, NariQ, .bin: their kernels fold per
+    // 32 whatever the activations, so the flag would only cost them). From the file's tensor table, never from the build:
+    // the same command gives the same bits everywhere
+    if (!m->is_gguf || !m->gguf.t) return 0;
+    uint64_t flat = 0, all = 0;
+    for (uint64_t i = 0; i < m->gguf.n_t; i++) {
+        const GgufTensor *t = &m->gguf.t[i];
+        if (t->n_dims != 2 || (t->name_len == 17 && !memcmp(t->name, "token_embd.weight", 17))) continue;
+        uint64_t n = t->ne[0] * t->ne[1];
+        all += n;
+        if (iq_type((int)t->type) || (t->type >= GGML_Q3_K && t->type <= GGML_Q6_K)) flat += n;
+    }
+    return all && 2 * flat >= all;
+}
+
 static void act256_flags(RqModel *m) {
     // RqModelOpts.act256: every matmul weight's kernels take the activations' scale per 256 (QuantizedTensor.act256)
     PrepMat mt[PREP_MAX];
@@ -1223,9 +1241,16 @@ static void load_model(RqModel *m, const char *path, const RqModelOpts *o, Loade
     else if (o->ctx_len == 0 && c->seq_len > RQ_CTX_DEFAULT_MAX) // (Qwen3: 40,960 = the cap; 2507: 262,144)
         c->seq_len = RQ_CTX_DEFAULT_MAX;
     m->gated = m->hy.on; // (Qwen3.5's attention layers are gated)
-    // RqModelOpts.act256 (before forward_model_init: its FFN items are then whole super-blocks of 256 hidden rows)
-    m->act256 = o->act256 > 0 && !m->trl && c->hidden_dim % 256 == 0;
-    if (o->act256 > 0 && !m->act256) {
+    // RqModelOpts.act256 (before forward_model_init: its FFN items are then whole super-blocks of 256 hidden rows):
+    // > 0 on, < 0 off, 0 the file's choice (act256_auto), which the environment variable GWENEDEG_ACT256 = 1 / 0 (a test
+    // switch: the suite pins the per-32 goldens' definition with it) overrides
+    int want = o->act256;
+    if (want == 0) {
+        const char *ev = rq_getenv("GWENEDEG_ACT256");
+        want = ev && (*ev == '0' || *ev == '1') ? (*ev == '1' ? 1 : -1) : act256_auto(m) ? 1 : -1;
+    }
+    m->act256 = want > 0 && !m->trl && c->hidden_dim % 256 == 0;
+    if (want > 0 && o->act256 > 0 && !m->act256) {
         size_t l = strlen(m->warning);
         snprintf(m->warning + l, sizeof(m->warning) - l, "%s--act256 not taken (%s): one activation scale per 32",
                  l ? "; " : "", m->trl ? "a NariQ file" : "hidden size not a multiple of 256");
@@ -1567,6 +1592,7 @@ void rq_model_info(const RqModel *m, RqModelInfo *info) {
     info->rope_theta = m->rope_theta;
     info->linear_layers = m->hy.n_lin;
     info->fingerprint = m->fp;
+    info->act256 = m->act256;
 }
 
 // ---------------------------------------------------------------------------- test hook

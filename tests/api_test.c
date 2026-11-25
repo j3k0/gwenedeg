@@ -1,5 +1,5 @@
 /* Tests of the library API (src/gwenedeg.h), run by `make test` (tests/check.py, group api) on each model:
- *   tests/api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv] [--kv-type TYPE] [--act256]
+ *   tests/api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv] [--kv-type TYPE] [--act256 | --no-act256]
  * Prints PASS / FAIL lines, exit status 1 if any failed. The forward-pass checks are bitwise: a
  * sequence's logits must not depend on what else the context ran in between or batched with it
  * (sequences interleaved, several sequences in one rq_forward_batch, a prefill chunk next to decode
@@ -508,10 +508,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--kv")) bd_kv = 1;
         else if (!strcmp(argv[i], "--kv-type") && i + 1 < argc && (KVT = rq_kv_parse(argv[i + 1])) >= 0) i++;
         else if (!strcmp(argv[i], "--act256")) NOCHECK.act256 = 1;
+        else if (!strcmp(argv[i], "--no-act256")) NOCHECK.act256 = -1;
         else argc = 0;
     }
     if (argc < 2) {
-        fprintf(stderr, "usage: api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv] [--kv-type TYPE] [--act256]\n"
+        fprintf(stderr, "usage: api_test MODEL [--digest | --digest-small [--long]] [--n65] [--kv] [--kv-type TYPE] [--act256 | --no-act256]\n"
                         "       api_test --two MODEL_A MODEL_B [--gs MODEL_OTHER_GROUP_SIZE]\n"
                         "       api_test --spec TARGET DRAFT [--quick] [--other MODEL_OTHER_VOCABULARY]\n"
                         "       api_test --mtp TARGET [--quick] [--plain MODEL_WITHOUT_BLOCK] [--optional MODEL_WITH_OPTIONAL_NEXTN]\n"

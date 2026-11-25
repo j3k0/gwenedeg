@@ -631,7 +631,7 @@ static void error_usage(void) {
     fprintf(stderr, "  --repack=LIST  only these types: IQ3_S, IQ3_XXS (comma-separated)\n");
     fprintf(stderr, "  --no-repack weights as in the file (default)\n");
     fprintf(stderr, "  --act256    one activation scale per 256 values (not 32): faster i-quant / K-quant prefill, slightly\n");
-    fprintf(stderr, "              different results\n");
+    fprintf(stderr, "              different results; default for files mostly of those types (--no-act256: per 32)\n");
     fprintf(stderr, "  --repack-info  what --repack costs (RAM) and gains here (a decode step, a 4-row pass; the current threads)\n");
     fprintf(stderr, "              per type: loads and times the model with each choice in turn (~4 loads), then exits\n");
     fprintf(stderr, "  -i <string> input prompt (chat: one turn, then exit; without -i, one turn per stdin line,\n");
@@ -897,13 +897,14 @@ int main(int argc, char *argv[]) {
     int spec_auto = 0;          // --spec auto (G7: the cost model's choice per pass)
     int mtp_vocab = -1;         // --mtp-vocab (-D mtp: RqMtpOpts.vocab; 0 all; -1: RQ_MTP_VOCAB_DEFAULT)
     int repack = 0, repack_info = 0; // --repack[=LIST] / --no-repack (-1): RqModelOpts.repack; --repack-info
-    int act256 = 0;             // --act256: RqModelOpts.act256
+    int act256 = 0;             // --act256 / --no-act256: RqModelOpts.act256 (0: the file's choice)
 
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
     for (int i = 2; i < argc; i+=2) {
         // the flags without a value (i - 1: the loop's step is 2)
         if (!strcmp(argv[i], "--act256")) { act256 = 1; i--; continue; }
+        if (!strcmp(argv[i], "--no-act256")) { act256 = -1; i--; continue; }
         if (!strcmp(argv[i], "--repack") || !strcmp(argv[i], "--no-repack") || !strcmp(argv[i], "--repack-info") ||
             !strncmp(argv[i], "--repack=", 9)) {
             if (argv[i][2] == 'n') repack = -1;

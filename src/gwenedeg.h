@@ -81,11 +81,14 @@ typedef struct {
                         // compute-bound), 4.19 bits per weight instead of 3.44 / 3.19 (more RAM; the memory check counts
                         // it). RQ_REPACK_ALL, or RQ_REPACK_IQ3_S / _IQ3_XXS bits: those types only; 0 / < 0: none
                         // (default). AVX-512 builds only (elsewhere ignored). rq_repack_info: what it costs
-    int act256;         // 1: one activation scale per 256 values instead of per 32 (gwenedeg --act256; docs/v4h.md sections
-                        // 9-13): a different arithmetic definition (results differ slightly from the default), faster
-                        // Q2_K / i-quant and Q3_K / Q6_K matmuls on AVX-512 (prefill ~1.2x their GEMMs; Q4_K / Q5_K ~1.05x;
-                        // the generic and NEON builds compute the same bits with the generic kernels). Every build and path gives the same results under it. Not
-                        // for NariQ (trellis) files or a hidden size not a multiple of 256: the default then (a warning)
+    int act256;         // one activation scale per 256 values instead of per 32 (docs/v4h.md sections 9-14): a different
+                        // arithmetic definition (results differ slightly), faster Q2_K / i-quant and K-quant matmuls on
+                        // AVX-512 (prefill GEMMs ~1.2x; Q4_K / Q5_K ~1.05x; the generic and NEON builds compute the same bits
+                        // with the generic kernels). 0 (default): the file's choice, on for GGUF files whose matmul weights
+                        // are mostly Q2_K / i-quants / K-quants, off for Q8_0 / F32 / BF16 / NariQ / .bin files (RqModelInfo
+                        // .act256: what was taken); > 0 on (gwenedeg --act256), < 0 off (--no-act256). Every build and path
+                        // gives the same results under either. Never on for NariQ (trellis) files or a hidden size not a
+                        // multiple of 256 (> 0: a warning)
 } RqModelOpts;
 enum { RQ_REPACK_ALL = 1, RQ_REPACK_IQ3_S = 2, RQ_REPACK_IQ3_XXS = 4 };
 
@@ -151,6 +154,7 @@ typedef struct {
     int linear_layers;     // Qwen3.5: linear-attention layers, whose recurrent state cannot be rewound (rq_seq_truncate,
                            // rq_seq_checkpoint_at); 0 for Qwen3
     unsigned long long fingerprint; // of the model file (its size, first MiB, last 64 KiB): the owner of saved sequences
+    int act256;            // one activation scale per 256 (RqModelOpts.act256 as taken: the file's choice or forced)
 } RqModelInfo;
 void rq_model_info(const RqModel *m, RqModelInfo *info);
 

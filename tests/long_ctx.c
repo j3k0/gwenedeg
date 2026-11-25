@@ -21,7 +21,8 @@
  *       -A         every row's logits of the N tokens into OUT, streamed per chunk of -b rows (rq_prefill RQ_LOGITS_ALL:
  *                  the bits of gwenedeg -m logits, in its file format: int32 N, vocab, ids[N], float32 logits[N][vocab]; the
  *                  memory of one chunk, not of N rows: scripts/kl_kv.py)
- *       -F         RqModelOpts.act256 (--act256: one activation scale per 256 values)
+ *       -F, -f     RqModelOpts.act256 1 / -1 (--act256 / --no-act256: one activation scale per 256 values or per 32;
+ *                  default: the file's choice)
  *       -c CTX     sequence capacity (default N + G + 1); -k f16|bf16|f32|bf16-dot|f16-dot (default f16); -b chunk rows
  *                  (default 512)
  *   stderr: timings ([long_ctx] lines). Threads: OMP_NUM_THREADS (else the default). */
@@ -79,6 +80,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "-V")) { vfy = 1; continue; }
         if (!strcmp(argv[i], "-A")) { all = 1; continue; }
         if (!strcmp(argv[i], "-F")) { act256 = 1; continue; }
+        if (!strcmp(argv[i], "-f")) { act256 = -1; continue; }
         if (i + 1 >= argc) goto usage;
         const char *v = argv[++i];
         switch (argv[i - 1][1]) {

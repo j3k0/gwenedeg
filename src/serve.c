@@ -1083,7 +1083,8 @@ static void usage(void) {
             "                      all): bit-identical output, faster where compute-bound, more RAM (gwenedeg M --repack-info)\n"
             "  --no-repack         weights as in the file (default)\n"
             "  --act256            one activation scale per 256 values (not 32): faster i-quant / K-quant prefill,\n"
-            "                      slightly different results (the draft model too)\n"
+            "                      slightly different results (the draft model too); default for files mostly of\n"
+            "                      those types (--no-act256: per 32)\n"
             "  -b <int>            prompt tokens per pass when no request is decoding, default 512\n"
             "  --chunk <int>       prompt tokens per pass while others decode, default 64\n"
             "  --prefix-copy <int> copy a cached prompt prefix into another slot if that saves this many tokens, default 32\n"
@@ -1145,7 +1146,7 @@ int serve_main(int argc, char **argv) {
     long long maxbody = 4 << 20;
     double timeout = 600, temp = 1.0, topp = 1.0, kv_mem = 0, mem = 0;
     int page_cache = 0, repack = 0; // (--repack[=LIST] / --no-repack: RqModelOpts.repack)
-    int act256 = 0; // (--act256: RqModelOpts.act256)
+    int act256 = 0; // (--act256 / --no-act256: RqModelOpts.act256; 0: the file's choice)
     int topk = 0, samp_given = 0; // (RQ_SAMPLING_* given: else the model's values, if any)
     for (int i = 2; i < argc; i++) {
         const char *f = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -1153,6 +1154,7 @@ int serve_main(int argc, char **argv) {
         if (!strcmp(f, "--repack")) { repack = RQ_REPACK_ALL; continue; }
         if (!strcmp(f, "--no-repack")) { repack = -1; continue; }
         if (!strcmp(f, "--act256")) { act256 = 1; continue; }
+        if (!strcmp(f, "--no-act256")) { act256 = -1; continue; }
         if (!strncmp(f, "--repack=", 9)) { if ((repack = rq_repack_parse(f + 9)) < 0) usage(); continue; }
         if (!v) usage();
         i++;
@@ -1331,8 +1333,10 @@ int serve_main(int argc, char **argv) {
     if (lfd < 0) { fprintf(stderr, "gwenedeg serve: %s\n", err); return 1; }
     char desc[1024];
     engine_describe(a.eng, desc, sizeof(desc));
-    fprintf(stderr, "gwenedeg serve: %s as '%s' (context %d of %d, KV %s, %d threads, chat template %s, vocab index %.0f ms)\ngwenedeg serve: %s\n",
-            path, a.model_id, ctx, a.info.ctx_max, rq_kv_name(kv), rq_threads(), rq_chat_name(a.info.chat), (rq_now() - t0) * 1e3, desc);
+    fprintf(stderr, "gwenedeg serve: %s as '%s' (context %d of %d, KV %s, activations per %d%s, %d threads, chat template %s, "
+            "vocab index %.0f ms)\ngwenedeg serve: %s\n", path, a.model_id, ctx, a.info.ctx_max, rq_kv_name(kv),
+            a.info.act256 ? 256 : a.info.group_size, act256 ? "" : " (the file's choice)", rq_threads(), rq_chat_name(a.info.chat),
+            (rq_now() - t0) * 1e3, desc);
     if (engine_describe_admit(a.eng, desc, sizeof(desc))) fprintf(stderr, "gwenedeg serve: %s\n", desc);
     if (a.spec_mode != SPEC_OFF || dm) {
         char sd[1024], lk[64] = "off";

@@ -85,6 +85,9 @@ Q3_K_M 1.16-1.19x (passes the 1.15 gate), the Q4_K_M 1.02-1.12x (fails).
 NEON: the generic kernel). Qwen3.5-0.8B prefill: Q3_K_M 1.10x, Q4_K_M 1.04x. The flag's quality cost is unchanged and
 per file: KL against the Q8_0 file +1-2% (Q3_K_M) / +6-8% (Q4_K_M) of the file's own. Qwen3.8-27B Q3_K_M (the day server
 stopped): prefill 1.13-1.15x at 1.5k and 8k tokens, decode unchanged.
+[section 14](docs/v4h.md#14-the-per-file-default-a256-4--a256-5-2026-11-25-on-the-branch-a256-not-on-main): the per-file
+default (auto on for K-quant / i-quant files, `--no-act256`, the generic build's kernels made as fast as per 32) is on the
+branch `a256`; main waits for the go. Cost on Qwen3-0.6B Q4_K_M vs HF fp32: 1 - cos +11%.
 
 `vpdpbusd` still needs one byte per weight, so a lower bit width alone cannot raise its compute peak. A format co-designed with the
 kernel could nevertheless beat the i-quants by making nibble expansion and scaling cheaper. V4H uses 16-row x 256-column

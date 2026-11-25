@@ -71,6 +71,10 @@ else
 fi
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+# the goldens and thresholds are the per-32 activation definition (--no-act256); the file's own choice (auto: on for the
+# K-quant / i-quant files) is tested by q35/act256_auto, the --act256 definition by the act256 runs of the q35 group.
+# GWENEDEG_ACT256=auto runs the whole suite under the auto rule (its goldens would then differ)
+export GWENEDEG_ACT256="${GWENEDEG_ACT256-0}"
 ARGS=()
 LONG=0
 for x in "$@"; do

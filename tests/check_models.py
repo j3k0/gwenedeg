@@ -31,11 +31,13 @@ models  (opt-in: tests/run_tests.sh --models, make test-models) every downloaded
 """
 import argparse
 import concurrent.futures as cf
+import hashlib
 import json
 import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -1327,6 +1329,37 @@ def q35_synth_run(a, tmp, model, texts, full_api, kv="", act256=False):
     return out
 
 
+# the files' own choice of the activation definition (RqModelOpts.act256 0: model.c act256_auto): on for GGUF files whose
+# matmul weights are mostly Q2_K / i-quants / K-quants, off for the others. file (build/synth-q35 or models/), expected
+ACT256_AUTO = [("synth-q35-iq.gguf", 1), ("synth-q35-27b.gguf", 1), ("synth-q35-ista-mtp.gguf", 1), ("synth-q35-r2.gguf", 0),
+               ("synth-q35-27b-f32.gguf", 1)]
+
+
+def q35_act256_auto(a, sd, extra):
+    """the auto rule: with no flag (GWENEDEG_ACT256=auto: the suite pins it to 0 otherwise) a file's logits are those of
+    --act256 or of --no-act256 as the rule says, the two definitions differ on it, and an explicit flag beats the pin
+    (GWENEDEG_ACT256=0 with --act256 == --act256). extra: more files (path, expected) -- the real 0.8B files"""
+    out = []
+    text = "The quick brown fox jumps over the lazy dog. In 1907 the river flooded the old town, and the mayor ordered new dikes."
+    files = [(os.path.join(sd, f), w) for f, w in ACT256_AUTO if os.path.exists(os.path.join(sd, f))] + extra
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as t:
+        def lg(model, flag, env):
+            path = os.path.join(t, "l.bin")
+            p = run([a.gwenedeg, model, "-c", "512", "-m", "logits", "-b", "16", "-i", text, "-o", path] + flag, 4, {"GWENEDEG_ACT256": env})
+            if p.returncode != 0:
+                return p.stderr.decode(errors="replace")[-200:]
+            with open(path, "rb") as fh:
+                return hashlib.sha256(fh.read()).hexdigest()
+        for model, want in files:
+            auto, on, off, pinned = lg(model, [], "auto"), lg(model, ["--act256"], "auto"), lg(model, ["--no-act256"], "auto"), \
+                lg(model, ["--act256"], "0")
+            got = "on" if auto == on else "off" if auto == off else "neither"
+            ok = got == ("on" if want else "off") and on != off and pinned == on
+            out.append((ok, f"q35/act256_auto/{os.path.splitext(os.path.basename(model))[0]}", f"no flag: {got} (expected {'on' if want else 'off'}); "
+                        f"--act256 != --no-act256: {on != off}; --act256 with GWENEDEG_ACT256=0 == --act256: {pinned == on}"))
+    return out
+
+
 class Recorded:
     """a Results stand-in that keeps the reports, for a group run in the background (replayed at its turn)"""
     def __init__(self):
@@ -1386,6 +1419,9 @@ def q35_start(a, tmp, ex, mx, texts, tok_test, chat_case, load_vocab):
         if sd and os.path.exists(os.path.join(sd, fn)):
             os.makedirs(os.path.join(t, "synth_a256"), exist_ok=True)
             synth.append(ex.submit(q35_synth_run, a, os.path.join(t, "synth_a256"), os.path.join(sd, fn), texts, full, "", True))
+    if sd:
+        auto_extra = [(f, w) for f, w in ((a.q35, 0), (q4, 1), (q3, 1), (a.model, 0), (a.gguf, 0), (a.q4, 1)) if f and os.path.exists(f)]
+        synth.append(ex.submit(q35_act256_auto, a, sd, auto_extra))
     if q3:
         os.makedirs(os.path.join(t, "q3_a256"), exist_ok=True)
         synth.append(ex.submit(q35_synth_run, a, os.path.join(t, "q3_a256"), q3, texts, False, "", True))

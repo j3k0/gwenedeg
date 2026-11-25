@@ -725,3 +725,49 @@ to 15-18 midway (other jobs on the box):
 
 Not measured yet: the Q3_K_M's KL against the default on the 27B, at the next stop of the day server (stage A256.5
 needs one for the 27B goldens).
+
+## 14. The per-file default (A256.4 / A256.5, 2026-11-25; on the branch `a256`, not on main)
+
+`RqModelOpts.act256` is now three-valued: > 0 on (`--act256`), < 0 off (`--no-act256`), 0 the file's choice. The auto rule
+(`model.c act256_auto`) reads the GGUF tensor table: on when at least half of the matmul weights (2-D tensors but
+`token_embd`), by values, are Q2_K, i-quants or Q3_K .. Q6_K. It is off for Q8_0, F32 / BF16, NariQ and `.bin` files, and
+never on for NariQ or a hidden size not a multiple of 256. It depends on the file only, never on the build: the same command
+gives the same bits on every build. The decision is in `RqModelInfo.act256` and the `gwenedeg serve` banner
+("activations per 256 (the file's choice)"). `launch-server ista-iq3s` keeps its explicit `--act256`.
+
+Files measured (`tests/check_models.py q35_act256_auto`): on for the synthetic i-quant / K-quant files, the 0.8B Q4_K_M and
+Q3_K_M, the 0.6B Q4_K_M; off for the 0.8B and 0.6B Q8_0, the 0.6B `.bin` and the synthetic Q8_0 file.
+
+**Generic build.** With the flag, K-quant files on `gwenedeg-generic` first ran 3x slower (prefill 19.8 vs 59.4 tok/s, decode
+3.7 vs 14.9): `kqf_dot` unpacked values to int32 and multiplied them signed by signed. It now uses the codes as stored and
+takes their offset off through the activation sums, like `kq_dot`. Generic build, Qwen3.5-0.8B Q4_K_M, 248-token prompt:
+`--act256` 72.8 tok/s vs 64.0 per 32, decode 18.5 vs 18.3. `kqf_dot` / `kq_dot` is 0.70-1.10 per type, `iqf_dot` / `iq_dot`
+0.92-1.06 (commit 93e5c0f). Without that, the default could not have flipped for the generic build.
+
+**The cost, measured by the suite on the default definition vs the flag** (Qwen3-0.6B Q4_K_M, the same prompts):
+
+| check | per 32 | per 256 (the flag) |
+|---|---:|---:|
+| vs the HF fp32 reference, 1 - cos pooled over 79 positions | 0.0159 | 0.0177 (+11%) |
+| the same, top-1 agreement | 68/84 | 68/84 |
+| vs the same weights dequantized (isolates the activation error), 1 - cos | 0.00041 | 0.00204 |
+| the same, top-1 | 82/84 | 76/84 |
+
+On the synthetic models cut from it, the numpy-reference cosine falls from 0.9958 to 0.9838 (mean over the long prompt) and
+top-1 from 245 to 201 of 297. The synthetic models are more sensitive than real files: section 11 measured KL +0.003 on the
+27B and +0.002-0.004 on the 0.8B files. For small models the flag costs more than the table's 27B figures.
+
+**The goldens (A256.5): pinned, not regenerated.** `tests/run_tests.sh` exports `GWENEDEG_ACT256=0`, a test switch read when no
+flag is given (an explicit flag beats it), so every golden and threshold keeps its per-32 meaning, including the server,
+API and generic-build runs. Two kinds of tests cover the new default: `q35/act256_auto/*` (11 files: no flag == the flag the
+rule says, the two definitions differ, an explicit flag beats the pin) and the existing `--act256` runs of the q35 group
+(numpy reference, `-b`, threads, AVX-512 vs generic, API). The alternative, regenerating every golden under auto, would need
+the 27B reference runs with the day server stopped, and would drop the suite's check of the per-32 definition. Under
+`GWENEDEG_ACT256=auto` the suite runs under the auto rule, and 24 checks fail on their per-32 goldens and thresholds.
+
+Suite on the branch with the pin: 1,953 passed, 5 failed: `spec_server/mtp_admit/admit/strict_fifo`, `mtp_disk/disk/watch_above`
+and `watch_purge` (the known load / disk-dependent ones) and two `admit_chunk_qwen35/tool_call*` timing checks, which pass on
+a rerun of the server group (198/198).
+
+**Not decided.** Flipping the default on main: it changes the output of every K-quant / i-quant file for anyone running
+`gwenedeg` without the flag, in return for 1.04-1.15x prefill and a small quality cost (the table above). The code is on `a256`.

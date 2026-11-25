@@ -81,6 +81,9 @@ unchanged, KL vs the default 0.0030 / 0.0014, PPL x1.004 / x1.00.
 (`build/flat_bench -kb`, bit-identical to their definition). At 512 rows: Q3_K 1.22-1.29x (int16-pair scales), Q6_K
 1.14-1.20x, Q4_K / Q5_K 0.98-1.10x. On Zen 4 their flat form saves only 8 of 88 multiply-class ops. Weighted: the 27B
 Q3_K_M 1.16-1.19x (passes the 1.15 gate), the Q4_K_M 1.02-1.12x (fails).
+[section 13](docs/v4h.md#13-the-k-quant-kernels-in-the-engine-2026-11-25): in the engine (`--act256` on K-quant files;
+NEON: the generic kernel). Qwen3.5-0.8B prefill: Q3_K_M 1.10x, Q4_K_M 1.04x. The flag's quality cost is unchanged and
+per file: KL against the Q8_0 file +1-2% (Q3_K_M) / +6-8% (Q4_K_M) of the file's own.
 
 `vpdpbusd` still needs one byte per weight, so a lower bit width alone cannot raise its compute peak. A format co-designed with the
 kernel could nevertheless beat the i-quants by making nibble expansion and scaling cheaper. V4H uses 16-row x 256-column

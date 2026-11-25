@@ -645,3 +645,64 @@ The choice for A256.2 is between:
 1. all four types, which gives one consistent K-quant definition, the Q3_K_M gain, and Q4_K's small one;
 2. Q3_K and Q6_K only, with Q4_K / Q5_K keeping today's per-32 folds under the flag (Q3_K_M weighted about 1.13);
 3. no K-quant work, with K-quant files off in the per-file default.
+
+## 13. The K-quant kernels in the engine (2026-11-25)
+
+Stage A256.2: under `--act256` the K-quant matrices (Q3_K, Q4_K, Q5_K, Q6_K) now use section 12's definition, one fold
+per super-block, instead of the per-32 folds with the super-block's scale in every group. The changes:
+
+- `kquants.h`: the definition `kqf_dot`, which is also the kernel of the generic and NEON builds.
+- `kernels_avx512.h`: `kqf512_rows` and `kqf512_gemm_item`, moved from `flat_bench.c`. The first is the small-batch
+  kernels with the fold moved: the GEMV, small-batch GEMM phases, batched decode and verify rows. The second is the
+  tiled GEMM.
+- `forward.c`: dispatches on `QuantizedTensor.act256` in `matvec_rows`, `gemm_item` (small-batch, tiled and block items)
+  and `rows_mm`. Up to 32 rows take the rows kernel, as without the flag (section 12: at 24 rows it beats the flat tile).
+- NEON builds have no flat K-quant kernel yet (stage A256.3), so under the flag they run `kqf_dot` without tiles: the
+  same bits, slower.
+- The default is unchanged: logits are bit-identical to a fresh build of e3a44ef.
+
+Tests:
+
+- `build/flat_bench` now tests the engine's kernels: 199 cases.
+- The suite has two more `--act256` runs in the q35 group:
+  - `synth-q35-27b` (Q4_K / Q5_K / Q6_K) with the whole `api_test`: 34/34;
+  - the real Qwen3.5-0.8B Q3_K_M (Q3_K): numpy reference cos 0.9991 / 0.9989 / 0.9990, and bit-identical across
+    `-b 1 / 7 / 64 / 512`, threads, AVX-512 vs generic, and the API's batched passes.
+- With the day server up the suite ran 1,945 passed and 2 failed. The failures are the known disk-space ones
+  (`spec_server/mtp_disk/disk/watch_above`, `watch_purge`).
+
+Qwen3.5-0.8B: 1,500-token prompt, `-b 512`, 8 threads, best of 5 interleaved, the day server up (load 5-7):
+
+| file | default | `--act256`, e3a44ef (per-32 K-quant folds) | `--act256`, K-quant kernels |
+|---|---:|---:|---:|
+| Q3_K_M | 2304 tok/s | 2257 (1.0x) | 2529 (**1.10x**) |
+| Q4_K_M | 2399 tok/s | 2375 (1.0x) | 2502 (**1.04x**) |
+
+Decode (64 tokens) is unchanged, within the noise of 150-245 tok/s. The 0.8B's prefill spends less of its time in the
+GEMMs than the 27B's, where section 12's kernel ratios (Q3_K_M 1.16-1.19x, Q4_K_M 1.02-1.12x) should come closer.
+
+**Quality.** The kernels change only the float rounding. Measured as KL against the 0.8B Q8_0 file on 8,192 tokens of
+wiki and of code (`tools/v4h_kl.py`), next to the file's own error:
+
+| file | default | `--act256`, e3a44ef | `--act256`, K-quant kernels | the flag's cost |
+|---|---:|---:|---:|---:|
+| Q4_K_M, wiki | 0.0321 (PPL x1.032) | 0.0346 | 0.0346 (PPL x1.043) | +0.0025 (+8%) |
+| Q4_K_M, code | 0.0107 (PPL x1.011) | 0.0112 | 0.0113 (PPL x1.012) | +0.0006 (+6%) |
+| Q3_K_M, wiki | 0.1202 (PPL x1.070) | 0.1221 | 0.1214 (PPL x1.076) | +0.0012 (+1%) |
+| Q3_K_M, code | 0.0424 (PPL x1.046) | 0.0433 | 0.0432 (PPL x1.046) | +0.0008 (+2%) |
+
+The flag's cost is that of the activation format, as in section 11. It is a per-file cost: every matmul's activations
+change, whichever kernels the matrices have. Measured this way it is 1-8% of the 0.8B files' own error. The 27B is less
+sensitive: section 11 measured PPL x1.004 / x1.000 for ISTA's file.
+
+The KL between the flag and the default exaggerates the cost. Every layer re-quantizes its activations to int8, so a
+float rounding difference flips a few values at rounding boundaries, and the flips cascade. Two `--act256` runs that
+differ only in the K-quant fold's rounding (e3a44ef vs these kernels, 45 positions of the 0.8B files) are KL 0.0041-0.0043
+apart. The flag vs the default on the same positions is 0.0053-0.0063.
+
+**Production.** `launch-server ista-iq3s` runs `--act256`. Once `./gwenedeg` is rebuilt with this commit, ISTA's Q4_K
+and Q6_K matrices (12.4% of its weights) switch to these kernels and its results change slightly. Section 12 predicts
+about +1% prefill.
+
+Pending: the 27B end to end. That needs the Q3_K_M file (13.8 GB, not downloaded) and ISTA's file, prompts of 1.5k and
+8k tokens, default vs `--act256`, with the day server stopped.

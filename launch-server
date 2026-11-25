@@ -51,7 +51,10 @@ elif [ "$CONFIG" = "ista-iq3s" ]; then
   NAME=qwen3.8-27b-iq3s
   KV_CACHE_TYPE=q8-dot
   SPEC_ARGS="--draft mtp -G 6 --tau 0.5"
-  EXTRA_ARGS="--repack"
+  # --act256 (2026-11-24, the production default since then): one activation scale per 256; the library default stays
+  # per 32 (the goldens and the bit-exactness rule: under it every file's activations change, not only the i-quant
+  # matrices'), docs/v4h.md sections 9-11
+  EXTRA_ARGS="--repack --act256"
 elif [ "$CONFIG" = "nariq" ]; then
   # nari-labs' NariQ 3.0 bpw Qwen3.8-27B (10.1 GB; trellis-coded: src/trellis.h, docs/nariq.md). No MTP block: the
   # Qwen3.5-0.8B drafter (2026-11-24: 8.7 vs 6.6 tok/s plain at 1 client, output identical)

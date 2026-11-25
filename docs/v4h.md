@@ -522,6 +522,15 @@ KL of `--act256` vs the default on the same file (`tools/v4h_kl.py`, `build/long
 and llama.cpp source): 0.0030 (p99 0.030, top-1 97.2%, PPL x1.004) and 0.0014 (p99 0.024, top-1 99.4%, PPL x1.00) --
 about the same as on the 0.8B files, and 1.5-2% of the file's KL against its higher-precision reference.
 
+**Scope of "the default".** The production server config runs `--act256` since 2026-11-24 (`launch-server` ista-iq3s),
+like `--repack` before it: a config-level choice. The library default stays per 32, and so do the test goldens: under
+the flag **every** file's activations change (quantize_act covers all matmul activations, Q8_0 included), so flipping
+the library default would invalidate every golden in the suite (greedy, logits, long-context, chat) and break the
+project's rule that the default definition is bit-exact -- the reason PP-RESULTS.md rejected "fold once per 256" when
+it was considered silently. `--no-act256` (the old per-32 definition) remains one flag away, and the suite tests both
+definitions (the act256 runs of the q35 group). Making it the library default would be its own project: regenerating
+all goldens, re-deriving the HF-comparison thresholds, and dropping the per-32 reference the docs describe.
+
 Open:
 
 - The attention / linear-attention epilogue quantizes: measure their cost on a real workload.

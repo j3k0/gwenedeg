@@ -1,4 +1,4 @@
-# Faster prefill for the i-quants: results (branch `pp-tiled-iq`, 2026-11-21)
+# Faster prefill for the i-quants: results (branch `pp-tiled-iq`, 2026-11-21; v0.1, BENCHMARKS.md: Versions)
 
 **In short.** I added a tiled prefill GEMM for Q2_K and all the i-quants on AVX-512 (`iqx_gemm_item`, `src/iquants.h`).
 It decodes a 32-row weight tile once per chunk into a per-thread scratch (exact u8 codes plus their integer scales),

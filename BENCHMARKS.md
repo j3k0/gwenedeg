@@ -26,6 +26,21 @@ The [Apple M1 Pro section](#apple-m1-pro-macos-neon) is a different machine and 
 (2026-10-25, 14:56-22:30 UTC, branch `mac-m1-pro`) and is not comparable with the tables above
 (other CPU; Q4_K_M as well as Q8_0).
 
+## Versions
+
+Numbers carry the release they were measured on. **v0.1** (tag `v0.1`) is one activation scale per 32 values;
+**v0.2** (tag `v0.2`, 2026-11-25 on) makes one per 256 the default for K-quant and i-quant files. The two differ in
+prefill speed only: decode is unchanged, and Q8_0 / F32 / NariQ files are unaffected. Every table below is v0.1 unless
+marked otherwise. Measured v0.2 prefill, same sessions on both (measurements and setups: docs/v4h.md sections 12-14):
+
+| file | v0.1 | v0.2 | |
+|---|---:|---:|---|
+| Qwen3.5-0.8B Q3_K_M, 1,500 tok, 8 threads | 2,304 tok/s | 2,529 | 1.10x |
+| Qwen3.5-0.8B Q4_K_M, 1,500 tok, 8 threads | 2,399 | 2,502 | 1.04x |
+| Qwen3.8-27B Q3_K_M, 1,540 tok, 14 threads | 98.8 | 111.6 | 1.13x |
+| Qwen3.8-27B Q3_K_M, 8,040 tok, 14 threads | 96.5 | 111.3 | 1.15x |
+| Qwen3.8-27B IQ3_S (`--repack`, this box's server file), 1,540 tok | 99.9 | 115.0 | 1.15x |
+
 ## Setup
 
 | | |
@@ -141,6 +156,8 @@ VNNI weights (~630 MB, ~55 ms to pack). mynah-slm reports a 0.14-0.15 s model lo
 
 ## Qwen3.8-27B (IQ3_S): Gwenedeg vs llama.cpp vs ik_llama.cpp, server workloads (2026-11-22)
 
+**v0.1.** gwenedeg's prefill is 1.12-1.17x faster on this file at v0.2 (Versions above, docs/v4h.md section 13).
+
 The same model, prompts and harness as the section below, a different day: mainline **llama.cpp** added, **gwenedeg
 re-measured at current main** (the numbers below were of `13d55a5`, before the i-quant tiled GEMM), and ik_llama.cpp's
 `--short` and `--long` re-run with the same commands so all three columns come from one day. Raw data, commands and
@@ -230,6 +247,8 @@ turn's 2.5k tokens 0.91-0.94x (37-39 s vs 35-36 s). Quality is equal.
 
 ## Qwen3.8-27B (IQ3_S) vs ik_llama.cpp, server workloads (2026-11-21)
 
+**v0.1.**
+
 A different session, model and comparison from everything above: not comparable with the 0.6B tables. One engine
 against another on the **same GGUF file**, the same prompts, requests and measurement script, one box, one window.
 Raw per-request data, commands and logs' numbers: [bench/ikllama-2026-11-21/](bench/ikllama-2026-11-21/).
@@ -310,6 +329,8 @@ context and the session-to-session spread.
 
 ## Qwen3.8-27B (IQ3_S) prefill with the i-quant tiled GEMM (2026-11-21)
 
+**v0.1.**
+
 One change measured before / after on the same file as the section above: the prefill GEMM for Q2_K and the i-quants
 (branch `pp-tiled-iq`; docs/iquants.md, "Batched rows"; the work and its micro-benchmarks: PP-RESULTS.md). Raw log:
 [bench/pp-window-2026-11-21/](bench/pp-window-2026-11-21/), produced by `scripts/pp_window.sh`.
@@ -351,6 +372,8 @@ One change measured before / after on the same file as the section above: the pr
   (PP-RESULTS.md lists the likely causes).
 
 ## All model files on the EPYC VM (2026-10-26 to 2026-10-30)
+
+**v0.1.** At v0.2 the prefill of the K-quant rows is 1.04-1.15x faster (Versions above); the Q8_0 rows are unchanged.
 
 A different set of sessions from the Results above (other days, other loads: not comparable with the 2026-10-25 tables;
 this is the table the README carried until the documentation was reorganised on 2026-11-21, moved here unchanged except

@@ -185,7 +185,7 @@ codes are always stored, below), NEON (no kernels for the codes: `--repack` is i
 
 ## Measurements
 
-16-vCPU AMD EPYC Genoa VM, 2026-10-30, `scripts/bench_models.py -t 8,16 -r 2` with Unsloth's Qwen3.8-27B Q3_K_M
+v0.1 numbers (BENCHMARKS.md: Versions). 16-vCPU AMD EPYC Genoa VM, 2026-10-30, `scripts/bench_models.py -t 8,16 -r 2` with Unsloth's Qwen3.8-27B Q3_K_M
 alongside (best of 2, load 10-17):
 
 | file | weights in RAM | peak RSS (1,500 + 128 tokens, -c 4096) | prefill 488 / 1,532 tok, 8 / 16 threads | decode short / after 1,500, 8 threads | 16 threads | startup, 16 threads | perplexity (512-token windows; full) |

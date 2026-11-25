@@ -236,7 +236,7 @@ int main(int argc, char **argv) {
     rq_model_free(m);
     return 0;
 usage:
-    fprintf(stderr, "usage: long_ctx MODEL -T TEXT -o IDS | long_ctx MODEL -I IDS [-n N] [-P p1,p2,... | -A] [-o OUT] [-V] [-F] [-g G] "
+    fprintf(stderr, "usage: long_ctx MODEL -T TEXT -o IDS | long_ctx MODEL -I IDS [-n N] [-P p1,p2,... | -A] [-o OUT] [-V] [-F|-f] [-g G] "
                     "[-c CTX] [-b CHUNK] [-k f16|bf16|f32|bf16-dot|f16-dot]\n");
     return 2;
 }

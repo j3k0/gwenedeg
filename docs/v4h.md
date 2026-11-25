@@ -769,5 +769,8 @@ Suite on the branch with the pin: 1,953 passed, 5 failed: `spec_server/mtp_admit
 and `watch_purge` (the known load / disk-dependent ones) and two `admit_chunk_qwen35/tool_call*` timing checks, which pass on
 a rerun of the server group (198/198).
 
-**Not decided.** Flipping the default on main: it changes the output of every K-quant / i-quant file for anyone running
-`gwenedeg` without the flag, in return for 1.04-1.15x prefill and a small quality cost (the table above). The code is on `a256`.
+**Flipped (2026-11-25, at the user's word; rows 14.1).** Merged to main as `f956808` (plus `d7b198f`, `launch-server`'s
+comment), `./gwenedeg` rebuilt, the day server restarted on it 20:45-20:46: its banner "activations per 256, ... chat template
+qwen3.8" is unchanged, because `ista-iq3s` passes `--act256` anyway and its file is an i-quant mix. From now on, a K-quant or
+i-quant GGUF without a flag runs per 256 (Qwen3-0.6B Q4_K_M: no flag == `--act256`, bit-identical; Qwen3.5-0.8B Q8_0: no flag
+== `--no-act256`), in return for 1.04-1.15x prefill and the quality cost in the table above. `--no-act256` goes back to per 32.

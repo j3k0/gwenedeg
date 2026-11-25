@@ -55,16 +55,17 @@ benchmark `scripts/s9c_bench.py` (setups, tuning and all configurations:
 | a pi-shaped follow-up turn (+2.5k tokens) on a 32k session, wall | **72-75 s** | 218-224 s | 273-285 s |
 | prefill, 0.8-2.5k-token prompts | **113-130** | 68-78 | 117-125 |
 | prefill, a cold 31.8k-token prompt | **334-349 s** | 682 s | 309 s |
-| perplexity on the same tokens (prose / code) | 9.483 / 7.133 | 9.480 / 7.141 (8/4-bit KV) | 9.493 / 7.145 |
+| perplexity on the same tokens (prose / code) | 9.52 / 7.13 | 9.480 / 7.141 (8/4-bit KV) | 9.493 / 7.145 |
 
 llama.cpp is shown in its best measured configuration: an f16 KV cache, faster for it than 8-bit K / 4-bit V in every
 row, and no MTP, which made it slower at every draft length. Against it, gwenedeg decodes 3.4-4.4x faster at one client,
 4.1-5.7x at four and 3.7-3.9x at 32k, and prefills 1.4-1.9x faster on short prompts and 2.0x on the cold 32k prompt.
 Against ik_llama.cpp, gwenedeg decodes 1.8-1.9x faster at one client, 2.6-3.6x at four and 5.5-7.2x at 32k; its prefill
-is 0.90-1.11x ik's on short prompts and 0.89-0.92x on the cold 32k prompt. Quality is the same: perplexities within
-0.2%. One run per cell on a shared VM, and we configured the other two engines from their documentation, so their
-authors may know better settings. gwenedeg's prefill cells are that run with the 1.12-1.17x that the per-256
-activations measured on this file (docs/v4h.md section 13); the other engines' cells are as run.
+is 0.90-1.11x ik's on short prompts and 0.89-0.92x on the cold 32k prompt. Quality is close: perplexities within
+0.5%. One run per cell on a shared VM, and we configured the other two engines from their documentation, so their
+authors may know better settings. gwenedeg's prefill and perplexity cells are that run with the 1.12-1.17x faster
+prefill and the +0.4% prose perplexity that the per-256 activations measured on this file (docs/v4h.md sections 11-13);
+the other engines' cells are as run.
 
 Smaller models, same VM (8 / 12 threads): Qwen3-0.6B Q8_0 prefills 1,813 / 2,287 tok/s and decodes 207 / 165;
 Qwen3.5-4B Q8_0 308 / 443 and 31 / 30. Against upstream qwen3.c on Qwen3-0.6B Q8_0: prefill of 451 tokens 2,058 tok/s at
@@ -109,7 +110,7 @@ chat templates and what is not supported (MoE, images, RoPE scaling, other GGUF 
 | **Users** | [docs/usage.md](docs/usage.md): command line, memory check, chat, speculative decoding, KV cache types · [docs/models.md](docs/models.md): model sets and files |
 | **Operators** | [docs/server.md](docs/server.md): `gwenedeg serve` flags, endpoints, tool calls, speculation, pi / LiteLLM setups · [docs/memory-admission.md](docs/memory-admission.md): `--admit` · [docs/kv-disk.md](docs/kv-disk.md): the disk tier |
 | **Internals** | [docs/library.md](docs/library.md): the C API and source map · [docs/iquants.md](docs/iquants.md) · [docs/kv-quant.md](docs/kv-quant.md) · [docs/qwen35.md](docs/qwen35.md) · [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): changes from qwen3.c, rejected experiments, CI |
-| **Measurements** | [BENCHMARKS.md](BENCHMARKS.md), [bench/](bench/) (raw logs) |
+| **Measurements** | [BENCHMARKS.md](BENCHMARKS.md), [bench/](bench/) (raw logs), [CHANGELOG.md](CHANGELOG.md) (what moved per release) |
 | **Open work** | [TODO.md](TODO.md), [IDEAS.md](IDEAS.md) |
 | **History and lab notes** | [docs/notes/](docs/notes/qwen38-speculative.md): the dated notebook of the Qwen3.8-27B speculative-decoding work |
 | **Tests** | [tests/README.md](tests/README.md) |

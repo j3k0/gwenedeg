@@ -30,7 +30,8 @@ The [Apple M1 Pro section](#apple-m1-pro-macos-neon) is a different machine and 
 
 Numbers carry the release they were measured on. **v0.1** (tag `v0.1`) is one activation scale per 32 values;
 **v0.2** (tag `v0.2`, 2026-11-25 on) makes one per 256 the default for K-quant and i-quant files. The two differ in
-prefill speed only: decode is unchanged, and Q8_0 / F32 / NariQ files are unaffected. Every table below is v0.1 unless
+prefill speed and, slightly, in quality ([CHANGELOG.md](CHANGELOG.md), v0.2); decode is unchanged, and Q8_0 / F32 /
+NariQ files are unaffected. Every table below is v0.1 unless
 marked otherwise. Measured v0.2 prefill, same sessions on both (measurements and setups: docs/v4h.md sections 12-14):
 
 | file | v0.1 | v0.2 | |
@@ -40,6 +41,9 @@ marked otherwise. Measured v0.2 prefill, same sessions on both (measurements and
 | Qwen3.8-27B Q3_K_M, 1,540 tok, 14 threads | 98.8 | 111.6 | 1.13x |
 | Qwen3.8-27B Q3_K_M, 8,040 tok, 14 threads | 96.5 | 111.3 | 1.15x |
 | Qwen3.8-27B IQ3_S (`--repack`, this box's server file), 1,540 tok | 99.9 | 115.0 | 1.15x |
+
+Quality: on that IQ3_S file the format costs 0.4% of prose perplexity (x1.004) and none of code (x1.000); on the 27B
+Q3_K_M it is KL +0.00215 (8k wiki) and +0.00119 (8k code) against per 32.
 
 ## Setup
 

@@ -535,3 +535,113 @@ Open:
 
 - The attention / linear-attention epilogue quantizes: measure their cost on a real workload.
 - A user-visible way to compare (e.g. the logit KL of `--act256` vs the default on one prompt).
+
+## 12. Flat activations for the K-quants: kernel measurement (2026-11-25)
+
+Stage A256.1 of the per-256 plan: the K-quant types (Q3_K, Q4_K, Q5_K, Q6_K) under `--act256`, as a micro-benchmark
+only, like section 10 for the i-quants. Nothing in `src/` changes. Today, under the flag, these matrices keep their per-32
+folds with the super-block's scale in each group. A K-quant file therefore pays the flag's quality cost and gets no speed.
+`tests/kernels/flat_bench.c` now also holds the K-quant definition `kqf_dot`, the AVX-512 rows and tiled kernels, the
+bitwise test, and `build/flat_bench -kb NB D K REPS`.
+
+The definition keeps today's integer sums and only moves the fold to once per super-block (A = the super-block's
+activation scale):
+
+```
+Q4_K / Q5_K   I = sum over the 8 sub-blocks j of sc_j * (sum of q * x)          |I| <= 30.7M (Q5_K 63.5M)
+              M = sum over j of m_j * X_j        (X_j: sum of the 32 x of j)    |M| <= 2.05M
+              val = val + ((d * A) * (float) I - (dmin * A) * (float) M)
+Q6_K / Q3_K   I = sum over the 16 sub-blocks of sc_j * t_j  (today's t_j: q - 32 / q in -4..3)   Q6_K |I| <= 133.2M
+              val = val + (d * A) * (float) I
+```
+
+All sums are exact in int32. Q4_K / Q5_K's mins term becomes the integer `M`. Today it is `dmin * m_j * xf[g]` per group
+in float, so `kq_act_prep`'s `xf` is no longer needed on that path.
+
+Kernels:
+
+- *Rows*: today's small-batch kernels (`kq*_smb_block`) with the fold moved. The 1-row instance is the GEMV.
+- *Tiled*: Q6_K uses `kq_unpack_tile`'s scratch as is. Q4_K / Q5_K store the integer scale per group instead of `d sc`,
+  plus the mins as int16 pairs `m_j | m_j+1 << 16` and `d`, `dmin` per super-block. That gives one `vpmulld` per group,
+  and 4 `vpdpwssd` per super-block for `M`.
+- *Q3_K packing*: Q3_K's half-group sums fit in int16 (|t| <= 4 * 127 * 16 = 8128). The kernel builds
+  `u = (t_0 + 8192) + 65536 t_1` and applies both scales with one `vpdpwssd`, instead of two `vpmulld`. The bias keeps the
+  low half non-negative, so the high half reads `t_1` without a borrow. The unpack precomputes `8192 * (sum of the first-half
+  scales)` per row and super-block, and `I` starts at its negative.
+
+Tests: rows and tiled are bit-identical to `kqf_dot` for all four types over 56 cases: 1 to 77 rows, k up to 17408, and
+weights and activations at their extremes (Q6_K q - 32 = -32 with scale -128, Q3_K q = -4, Q4_K / Q5_K at the largest q,
+sc and m). `kqf_dot` agrees with today's `kq_dot`, fed the same scale in every group, to within 8.3e-7 relative. Mutating
+the mins loop of the Q4_K tile, or the Q3_K bias of the rows kernel, fails 29 and 15 cases respectively.
+
+Type mixes (% of the matmul weights, token_embd excluded). The 27B files' shares come from their GGUF headers, fetched by
+HTTP range request at unsloth's commit 4a03c64, so no download was needed:
+
+| file | Q3_K | Q4_K | Q5_K | Q6_K |
+|---|---:|---:|---:|---:|
+| 27B Q3_K_M | 54.7 | 38.3 | 1.8 | 4.9 |
+| 27B Q4_K_M | | 72.7 | 5.8 | 21.2 |
+| 0.8B Q4_K_M | | 60.2 | 30.3 | 9.3 |
+| ISTA 27B IQ3_S (K part) | | 10.8 | | 1.6 |
+
+Results: ns per weight and activation row (x threads), tiled GEMM, best of 5-7 interleaved. Three runs of the 512-row
+cases, the day server up, load 1.7-3.4 (one earlier run at load 15 is not counted). Ratio = today's faster path / the flat
+format's faster path; at 64 rows and up both are the tiled GEMM:
+
+| type | 17408 x 5120, 8 thr: today / flat | ratio | 5120 x 17408, 8 thr | 1024 x 5120, 1 thr | 64 rows, 8 thr |
+|---|---:|---:|---:|---:|---:|
+| Q4_K | 0.00399 / 0.00366 | 1.07-1.10 | 0.98-1.08 | 1.05-1.09 | 1.00-1.07 |
+| Q5_K | 0.00393 / 0.00367 | 1.07-1.09 | 0.98-1.06 | 1.05-1.08 | 1.00-1.04 |
+| Q6_K | 0.00449 / 0.00374 | 1.16-1.20 | 1.16-1.20 | 1.14-1.17 | 1.12-1.17 |
+| Q3_K | 0.00471 / 0.00383 | 1.22-1.23 | 1.22-1.29 | 1.23-1.27 | 1.16-1.22 |
+| **weighted, 27B Q3_K_M** | | **1.161-1.179** | **1.155-1.175** | **1.157-1.189** | 1.106-1.156 |
+| **weighted, 27B Q4_K_M** | | **1.094-1.122** | **1.024-1.093** | **1.078-1.106** | 1.031-1.085 |
+| weighted, 0.8B Q4_K_M | | 1.084-1.102 | 1.00-1.08 | 1.069-1.094 | 1.013-1.069 |
+| weighted, ISTA's K part | | 1.086-1.116 | 1.005-1.087 | 1.068-1.101 | 1.018-1.078 |
+
+Small batches use today's path (the small-batch kernels up to 32 rows, else tiled), one run each at 8 threads:
+
+- 24 rows: Q3_K_M 1.10-1.13, Q4_K_M 1.05.
+- 16 rows: 1.08-1.10 / 1.05.
+- 8 rows: 1.14 / 1.04-1.16.
+- 1 row (GEMV): 1.04-1.08 / 1.05-1.11, memory-bound and noisy.
+
+No batch size got slower in the weighted totals.
+
+**Why Q4_K / Q5_K gain little.** On this Zen 4, `vpdpbusd`, `vpdpwssd`, `vpmulld` and `vmulps` on zmm have the same
+throughput: 0.14-0.16 ns each, 8 independent chains on one core, alone or mixed. The tiled kernels are bound by how many of
+these multiply-class operations they issue. Counted per (16-row block, activation row, super-block), the count predicts the
+measured ratios:
+
+| type | today | flat | predicted | measured |
+|---|---|---|---:|---:|
+| IQ4_XS (section 10) | 64 + 8 `vpmulld` + 16 fold mul = 88 | 64 + 8 + 2 = 74 | 1.19 | 1.20-1.25 |
+| Q6_K | 64 + 16 `vpmulld` + 16 fold mul = 96 | 64 + 16 + 2 = 82 | 1.17 | 1.14-1.20 |
+| Q3_K | 96, as Q6_K | 64 + 8 `vpdpwssd` + 2 = 74 | 1.30 | 1.22-1.29 |
+| Q4_K / Q5_K | 64 + 24 fold mul (`d sc * xs`, `* I`, `dm * xf`) = 88 | 64 + 8 `vpmulld` + 4 `vpdpwssd` (M) + 4 = 80 | 1.10 | 0.98-1.10 |
+
+Today's Q4_K fold has no integer multiply: the scale is folded in float (`d sc` precomputed). The flat form must multiply
+each group's sum by its scale in int32, so it saves only 2 of the 3 multiplies per group. It then pays 0.5 per group for
+the mins. Avoiding that `vpmulld` does not work:
+
+- `sc q` <= 945 does not fit the u8 operand of `vpdpbusd`.
+- A group's sum (<= 60,960) does not fit the int16 operand of `vpdpwssd`.
+- With signed codes `q - 8` the sum fits, but restoring it needs `8 sc_j X_j`: another 4 `vpdpwssd` per super-block, so
+  the total stays 80.
+
+Q3_K is the exception, because its sums fit in int16.
+
+**Gate A256.1** (>= ~1.15x weighted at 512 rows):
+
+- **Passes for the 27B Q3_K_M mix: 1.155-1.189** on both shapes and on one thread. Sections 10-11 went from 1.22x on
+  the kernel to 1.17x end to end, which suggests about 1.12x end-to-end prefill here.
+- **Fails for the Q4_K_M mix: 1.02-1.12.** About 1.05x end-to-end, at the same quality cost as every file under the flag
+  (KL +0.002-0.004 on the 0.8B files, section 11).
+- **ISTA's file:** its Q4_K / Q6_K (12.4% of the weights) at 1.01-1.12 would add about 1% to its 1.17x.
+- **Per type:** Q3_K (1.22-1.29) and Q6_K (1.14-1.20) pass. Q4_K (0.98-1.10) and Q5_K (0.98-1.09) do not.
+
+The choice for A256.2 is between:
+
+1. all four types, which gives one consistent K-quant definition, the Q3_K_M gain, and Q4_K's small one;
+2. Q3_K and Q6_K only, with Q4_K / Q5_K keeping today's per-32 folds under the flag (Q3_K_M weighted about 1.13);
+3. no K-quant work, with K-quant files off in the per-file default.

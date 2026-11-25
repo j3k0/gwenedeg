@@ -181,8 +181,9 @@ $(B)/v4h_bench: tests/kernels/v4h_bench.c src/kernels_avx512.h src/iquants.h src
 	$(CC) $(CFLAGS) -ffp-contract=off -fopenmp $< -o $@
 v4h-bench: $(B)/v4h_bench
 	$(B)/v4h_bench
-# flat activations (one scale per 256) for the i-quants (docs/v4h.md section 9): rows and tiled kernels vs their generic
-# definition for every type, and the micro-benchmark against today's kernels (build/flat_bench -b [NB [D [K [REPS]]]])
+# flat activations (one scale per 256) for the i-quants and the K-quants (docs/v4h.md sections 10-12): rows and tiled
+# kernels vs their generic definition for every type, and the micro-benchmarks against today's kernels
+# (build/flat_bench -b [NB [D [K [REPS]]]], K-quants: -kb)
 $(B)/flat_bench: tests/kernels/flat_bench.c src/kernels_avx512.h src/iquants.h src/iq_grids.h src/kquants.h
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -fopenmp $< -o $@

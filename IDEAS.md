@@ -77,6 +77,10 @@ activation format for the existing types, measured on the 27B. V4H itself only w
 6a35a07), all paths bit-identical; Qwen3.5-0.8B prefill 1.14x / 1.11x, KL vs the default <= +0.004. On the 27B (2026-11-24,
 the day server stopped): prefill 1.16-1.18x at 1.5k and 8k prompts (103 / 100 -> 122 / 117 tok/s), decode
 unchanged, KL vs the default 0.0030 / 0.0014, PPL x1.004 / x1.00.
+[section 12](docs/v4h.md#12-flat-activations-for-the-k-quants-kernel-measurement-2026-11-25): the K-quants, kernels only
+(`build/flat_bench -kb`, bit-identical to their definition). At 512 rows: Q3_K 1.22-1.29x (int16-pair scales), Q6_K
+1.14-1.20x, Q4_K / Q5_K 0.98-1.10x. On Zen 4 their flat form saves only 8 of 88 multiply-class ops. Weighted: the 27B
+Q3_K_M 1.16-1.19x (passes the 1.15 gate), the Q4_K_M 1.02-1.12x (fails).
 
 `vpdpbusd` still needs one byte per weight, so a lower bit width alone cannot raise its compute peak. A format co-designed with the
 kernel could nevertheless beat the i-quants by making nibble expansion and scaling cheaper. V4H uses 16-row x 256-column

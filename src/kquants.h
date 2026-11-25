@@ -631,52 +631,66 @@ static inline void kq_dot(int type, float *out, size_t ldo, const uint8_t *wb, i
  * (xf is not used.) kqf_dot is the definition (the generic and NEON builds' kernel); the AVX-512 rows (kqf512_rows) and
  * tiled (kqf512_gemm_item) kernels are bit-identical to it (tests/kernels/flat_bench.c).
  */
-static void kqf_unpack(int type, const uint8_t *o, int g8, int32_t w[KQ_ROWS][32], int32_t S[KQ_ROWS][2],
-                       int32_t Mn[KQ_ROWS]) {
-    // group g8 of a repacked super-block o (Q3P .. Q6P): the signed values w (Q4_K / Q5_K: q; Q6_K: q - 32; Q3_K: q),
-    // the scale of each half S (Q4_K / Q5_K: sc_j twice; Q3_K: sc - 32), the min Mn (Q4_K / Q5_K, else 0)
-    for (int r = 0; r < KQ_ROWS; r++) {
-        Mn[r] = 0;
-        if (type == GGML_Q4_K || type == GGML_Q5_K) {
-            int q5 = type == GGML_Q5_K;
-            const uint8_t *qs = o + 320 + (q5 ? 320 : 256) * g8;
+KQ_EXACT static inline __attribute__((always_inline))
+void kqf_unpack(const int type, const uint8_t *o, int g8, uint8_t w[KQ_ROWS][32], uint8_t wh[2][KQ_ROWS][16],
+                int32_t S[KQ_ROWS][2], int32_t Mn[KQ_ROWS]) {
+    // group g8 of a repacked super-block o (Q3P .. Q6P): the codes as stored, unsigned (Q4_K / Q5_K: q, in w; Q6_K: q + 32,
+    // Q3_K: q + 4, the halves in wh: kqf_dot takes the offset off with the activation sums, as q6p_dot / q3p_dot), the
+    // scale of each half S
+    // (Q4_K / Q5_K: sc_j twice; Q3_K: sc - 32), the min Mn (Q4_K / Q5_K); the loops of q4p_dot .. q3p_dot
+    if (type == GGML_Q4_K || type == GGML_Q5_K) {
+        const int q5 = type == GGML_Q5_K;
+        const uint8_t *qs = o + 320 + (q5 ? 320 : 256) * g8;
+        uint64_t mask[8] = { 0 };
+        if (q5) memcpy(mask, qs + 256, sizeof(mask));
+        for (int c = 0; c < 4; c++)
+            for (int r = 0; r < KQ_ROWS; r++)
+                for (int b = 0; b < 4; b++) {
+                    uint8_t v = qs[64 * c + 4 * r + b];
+                    w[r][8 * c + b] = (uint8_t)((v & 15) | (mask[2 * c] >> (4 * r + b) & 1) << 4);
+                    w[r][8 * c + 4 + b] = (uint8_t)((v >> 4) | (mask[2 * c + 1] >> (4 * r + b) & 1) << 4);
+                }
+        for (int r = 0; r < KQ_ROWS; r++) {
             S[r][0] = S[r][1] = o[64 + 16 * g8 + r];
             Mn[r] = o[192 + 16 * g8 + r];
-            for (int i = 0; i < 32; i++) {
-                int q = qs[64 * (i / 8) + 4 * r + i % 4] >> (4 * (i % 8 / 4)) & 15;
-                if (q5) q |= (int)(kq_u64(qs + 256 + 8 * (i / 4)) >> (4 * r + i % 4) & 1) << 4;
-                w[r][i] = q;
-            }
-        } else if (type == GGML_Q6_K) {
-            for (int h = 0; h < 2; h++) {
-                int j = 2 * g8 + h;
-                const uint8_t *ql = o + 320 + 192 * j, *qh = ql + 128;
+        }
+    } else if (type == GGML_Q6_K) {
+        for (int h = 0; h < 2; h++) {
+            int j = 2 * g8 + h;
+            const uint8_t *ql = o + 320 + 192 * j, *qh = ql + 128;
+            for (int r = 0; r < KQ_ROWS; r++) {
                 S[r][h] = (int8_t)o[64 + 16 * j + r];
                 for (int t = 0; t < 4; t++)
                     for (int b = 0; b < 4; b++)
-                        w[r][16 * h + 4 * t + b] = ((ql[64 * (t >> 1) + 4 * r + b] >> (4 * (t & 1)) & 15) |
-                                                    (qh[4 * r + b] >> (2 * t) & 3) << 4) - 32;
+                        wh[h][r][4 * t + b] = (uint8_t)((ql[64 * (t >> 1) + 4 * r + b] >> (4 * (t & 1)) & 15) |
+                                                             (qh[4 * r + b] >> (2 * t) & 3) << 4);
             }
-        } else {
-            const uint8_t *qg = o + 256 + 192 * g8;
-            for (int h = 0; h < 2; h++) {
-                int j = 2 * g8 + h;
+        }
+    } else {
+        const uint8_t *qg = o + 256 + 192 * g8;
+        uint64_t mask[8];
+        memcpy(mask, qg + 128, sizeof(mask));
+        for (int h = 0; h < 2; h++) {
+            int j = 2 * g8 + h;
+            for (int r = 0; r < KQ_ROWS; r++) {
                 S[r][h] = ((o[64 + 16 * g8 + r] >> (4 * h) & 15) | (o[192 + 16 * (j / 4) + r] >> (2 * (j % 4)) & 3) << 4) - 32;
                 for (int t = 0; t < 4; t++)
                     for (int b = 0; b < 4; b++)
-                        w[r][16 * h + 4 * t + b] = ((qg[64 * h + 4 * r + b] >> (2 * t) & 3) |
-                                                    (int)(kq_u64(qg + 128 + 8 * (4 * h + t)) >> (4 * r + b) & 1) << 2) - 4;
+                        wh[h][r][4 * t + b] = (uint8_t)((qg[64 * h + 4 * r + b] >> (2 * t) & 3) |
+                                                             (int)(mask[4 * h + t] >> (4 * r + b) & 1) << 2);
             }
         }
     }
 }
 
-KQ_EXACT static void kqf_dot(int type, float *out, size_t ldo, const uint8_t *wb, int k, int nc, const int8_t *xq, size_t ldx,
-                             const float *xs, size_t ldxs) { RQ_FP_EXACT
-    // kq_dot under --act256 (the definition above; no xf): xs[c * ldxs + 8 s] is row c's scale of super-block s
+KQ_EXACT static inline __attribute__((always_inline))
+void kqf_dot_t(const int type, float *out, size_t ldo, const uint8_t *wb, int k, int nc, const int8_t *xq, size_t ldx,
+               const float *xs, size_t ldxs) { RQ_FP_EXACT
+    // kqf_dot for one type (a compile-time constant: the loops specialized)
+    const int mins = type == GGML_Q4_K || type == GGML_Q5_K, B = type == GGML_Q6_K ? 32 : type == GGML_Q3_K ? 4 : 0;
+    const int sbb = kq_sb_bytes(type);
     float val[KQ_NC][KQ_ROWS];
     memset(val, 0, sizeof(val));
-    int sbb = kq_sb_bytes(type), mins = type == GGML_Q4_K || type == GGML_Q5_K;
     for (int s = 0; s < k / QK_K; s++) {
         const uint8_t *o = wb + (size_t)s * sbb;
         float d[KQ_ROWS], dmin[KQ_ROWS];
@@ -693,21 +707,33 @@ KQ_EXACT static void kqf_dot(int type, float *out, size_t ldo, const uint8_t *wb
             }
         }
         for (int g8 = 0; g8 < 8; g8++) {
-            int32_t w[KQ_ROWS][32], S[KQ_ROWS][2], Mn[KQ_ROWS];
-            kqf_unpack(type, o, g8, w, S, Mn);
+            uint8_t w[KQ_ROWS][32], wh[2][KQ_ROWS][16]; // (Q4_K / Q5_K: w; Q6_K / Q3_K: the two halves, wh)
+            int32_t S[KQ_ROWS][2], Mn[KQ_ROWS];
+            kqf_unpack(type, o, g8, w, wh, S, Mn);
             for (int c = 0; c < nc; c++) {
                 const int8_t *x = xq + c * ldx + 32 * (8 * s + g8);
-                int32_t X = 0;
-                for (int i = 0; i < 32; i++)
-                    X += x[i];
+                int32_t X0 = 0, X1 = 0;
+                for (int i = 0; i < 16; i++) {
+                    X0 += x[i];
+                    X1 += x[16 + i];
+                }
                 for (int r = 0; r < KQ_ROWS; r++) {
-                    for (int h = 0; h < 2; h++) {
+                    if (mins) { // (one scale per 32: the sum over the group, as q4p_dot)
                         int32_t t = 0;
-                        for (int i = 0; i < 16; i++)
-                            t += w[r][16 * h + i] * x[16 * h + i];
-                        I[c][r] += S[r][h] * t;
+                        for (int i = 0; i < 32; i++)
+                            t += w[r][i] * x[i];
+                        I[c][r] += S[r][0] * t;
+                        M[c][r] += Mn[r] * (X0 + X1);
+                    } else { // (sub-blocks of 16: the codes' offset B through the sums, as q6p_dot / q3p_dot)
+                        int32_t t[2];
+                        for (int h = 0; h < 2; h++) {
+                            int32_t th = 0;
+                            for (int i = 0; i < 16; i++)
+                                th += wh[h][r][i] * x[16 * h + i];
+                            t[h] = th;
+                        }
+                        I[c][r] += S[r][0] * (t[0] - B * X0) + S[r][1] * (t[1] - B * X1);
                     }
-                    M[c][r] += Mn[r] * X;
                 }
             }
         }
@@ -721,6 +747,17 @@ KQ_EXACT static void kqf_dot(int type, float *out, size_t ldo, const uint8_t *wb
     }
     for (int c = 0; c < nc; c++)
         memcpy(out + c * ldo, val[c], sizeof(val[c]));
+}
+
+KQ_EXACT static void kqf_dot(int type, float *out, size_t ldo, const uint8_t *wb, int k, int nc, const int8_t *xq, size_t ldx,
+                             const float *xs, size_t ldxs) {
+    // kq_dot under --act256 (the definition above; no xf): xs[c * ldxs + 8 s] is row c's scale of super-block s
+    switch (type) {
+    case GGML_Q4_K: kqf_dot_t(GGML_Q4_K, out, ldo, wb, k, nc, xq, ldx, xs, ldxs); break;
+    case GGML_Q5_K: kqf_dot_t(GGML_Q5_K, out, ldo, wb, k, nc, xq, ldx, xs, ldxs); break;
+    case GGML_Q6_K: kqf_dot_t(GGML_Q6_K, out, ldo, wb, k, nc, xq, ldx, xs, ldxs); break;
+    default: kqf_dot_t(GGML_Q3_K, out, ldo, wb, k, nc, xq, ldx, xs, ldxs); break;
+    }
 }
 
 #endif // GWENEDEG_KQUANTS_H

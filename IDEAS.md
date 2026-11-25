@@ -87,7 +87,8 @@ per file: KL against the Q8_0 file +1-2% (Q3_K_M) / +6-8% (Q4_K_M) of the file's
 stopped): prefill 1.13-1.15x at 1.5k and 8k tokens, decode unchanged.
 [section 14](docs/v4h.md#14-the-per-file-default-a256-4--a256-5-2026-11-25-on-the-branch-a256-not-on-main): the per-file
 default (auto on for K-quant / i-quant files, `--no-act256`, the generic build's kernels made as fast as per 32) is on the
-branch `a256`; main waits for the go. Cost on Qwen3-0.6B Q4_K_M vs HF fp32: 1 - cos +11%.
+branch `a256`; main waits for the go. Cost on Qwen3-0.6B Q4_K_M vs HF fp32: 1 - cos +11%. FLIPPED on main and measured
+on the 27B Q3_K_M (8k wiki + 8k code, vs per 32): KL +0.00215 / +0.00119, top-1 97.77% / 99.51%, PPL x1.0014 / x0.9994.
 
 `vpdpbusd` still needs one byte per weight, so a lower bit width alone cannot raise its compute peak. A format co-designed with the
 kernel could nevertheless beat the i-quants by making nibble expansion and scaling cheaper. V4H uses 16-row x 256-column

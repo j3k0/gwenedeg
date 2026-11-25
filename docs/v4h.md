@@ -774,3 +774,16 @@ comment), `./gwenedeg` rebuilt, the day server restarted on it 20:45-20:46: its 
 qwen3.8" is unchanged, because `ista-iq3s` passes `--act256` anyway and its file is an i-quant mix. From now on, a K-quant or
 i-quant GGUF without a flag runs per 256 (Qwen3-0.6B Q4_K_M: no flag == `--act256`, bit-identical; Qwen3.5-0.8B Q8_0: no flag
 == `--no-act256`), in return for 1.04-1.15x prefill and the quality cost in the table above. `--no-act256` goes back to per 32.
+
+**The 27B's quality cost (2026-11-25 20:49-21:00, the day server stopped).** Qwen3.8-27B-Q3_K_M, 16,384 tokens
+(wiki40k.8k + code30k.8k), the reference per 32 (`long_ctx -f`), the test per 256 (`-F`), 12 threads, KV f16, top-1024 KL:
+
+| prompt | KL | p99 | top-1 agreement | PPL ratio |
+|---|---:|---:|---:|---:|
+| wiki 8k (PPL 6.5950) | 0.00215 ± 0.00012 | 0.019 | 97.77% | x1.0014 |
+| code 8k (PPL 1.3034) | 0.00119 ± 0.00007 | 0.022 | 99.51% | x0.9994 |
+
+So the 27B Q3_K_M pays +0.0022 KL on 8k of wikipedia and +0.0012 on 8k of code (section 11's estimate from the flag's
+effect on the 0.8B files: +0.003), for the 1.13-1.15x prefill of section 13. The small model's cost is larger (the table
+above: the synthetic files cut from Qwen3-0.6B Q4_K_M fall from 0.9958 to 0.9838 cosine). The effect grows with the
+prompt's length: the tail of `long2` (297 positions) sees more of it than the first 8k of a fresh sequence.

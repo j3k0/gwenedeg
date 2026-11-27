@@ -6,7 +6,7 @@
 #include "internal.h"
 
 #ifndef ATT_ROWS
-#define ATT_ROWS 6 // query rows per prefill attention work item (x kv_mul query heads)
+#define ATT_ROWS 10 // query rows per prefill attention work item (x kv_mul query heads; at most ATT_NV_MAX / kv_mul)
 #endif
 #define ATT_NV_MAX 64 // max query vectors per attention_kv call
 

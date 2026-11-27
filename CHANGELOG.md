@@ -7,6 +7,15 @@ and the README can be updated without re-measuring anything.
 Numbers live in [README.md](README.md#headline-numbers) (current, one set) and [BENCHMARKS.md](BENCHMARKS.md) (every
 table, labelled with its release). Measurements and setups behind a figure are linked from each.
 
+## Unreleased (after v0.2)
+
+- **Prefill attention against a long cache is 5-7% faster** (`cb7f5cf`, ATT_ROWS 6 -> 10: more query rows share each
+  attention item's K/V expansion). Output bit-identical (compare_bins 792/792). Measured on Qwen3.8-27B ISTA IQ3_S,
+  14 threads, a 2,560-token chunk: -4.8% at 64k, -6.6% at 98k; no change on short prompts. Not re-measured for the README
+  rows (0.8-2.5k prompts: unaffected; the cold 31.8k prompt: the chunks average ~16k of context, so the gain is smaller
+  and was not measured). Details: PLAN-KVQ.md / branch `kvq` docs/notes/kvq.md. The q4-i8 int8-attention experiment
+  did not beat `q4-dot` (0.83-0.95x per prefill item) and is not on main.
+
 ## v0.2 — 2026-11-25
 
 One activation scale per 256 values replaces per 32 as the default for the quantized files that have kernels for it.
